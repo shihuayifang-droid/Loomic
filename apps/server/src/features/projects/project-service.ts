@@ -22,6 +22,8 @@ const PROJECT_NOT_FOUND_MESSAGE = "Project not found.";
 const PROJECT_UPDATE_FAILED_MESSAGE = "Unable to update project.";
 const PROJECT_SLUG_TAKEN_MESSAGE =
   "Project slug is already taken in this workspace.";
+const NOT_TEAM_MEMBER_MESSAGE =
+  "Not a member of the HaHart team workspace.";
 
 export type ProjectService = {
   archiveProject(
@@ -62,6 +64,7 @@ export type ProjectService = {
 export class ProjectServiceError extends Error {
   readonly statusCode: number;
   readonly code:
+    | "not_team_member"
     | "project_create_failed"
     | "project_delete_failed"
     | "project_not_found"
@@ -71,6 +74,7 @@ export class ProjectServiceError extends Error {
 
   constructor(
     code:
+      | "not_team_member"
       | "project_create_failed"
       | "project_delete_failed"
       | "project_not_found"
@@ -144,14 +148,14 @@ export function createProjectService(options: {
       return data;
     },
     async createProject(user, input) {
-      await ensureFoundation(options.viewerService, user, "project_create_failed");
-
-      const client = options.createUserClient(user.accessToken);
-      const workspace = await resolvePersonalWorkspace(
-        client,
-        user.id,
+      const viewer = await ensureFoundation(
+        options.viewerService,
+        user,
         "project_create_failed",
       );
+
+      const client = options.createUserClient(user.accessToken);
+      const workspace = requireTeamWorkspace(viewer, "project_create_failed");
       const normalizedName = input.name.trim();
       const slug = slugify(normalizedName);
 
@@ -202,20 +206,26 @@ export function createProjectService(options: {
       });
     },
     async listProjects(user) {
-      // Skip bootstrap for read-only queries — user is already authenticated,
-      // and /api/viewer handles bootstrap on page load.
-      const client = options.createUserClient(user.accessToken);
-      const workspace = await resolvePersonalWorkspace(
-        client,
-        user.id,
+      // Content is team-scoped (Q1), so the team workspace comes from the viewer
+      // rather than a personal-workspace lookup. The viewer call is also what
+      // bootstraps the foundation for a first-time user.
+      const viewer = await ensureFoundation(
+        options.viewerService,
+        user,
         "project_query_failed",
       );
+      const client = options.createUserClient(user.accessToken);
+      const workspace = requireTeamWorkspace(viewer, "project_query_failed");
+      // PJ-11: the project page lists only the caller's own projects. RLS lets
+      // admins read every project in the workspace, so without this filter an
+      // admin's list would be mixed with other people's projects.
       const { data: projects, error: projectQueryError } = await client
         .from("projects")
         .select(
           "id, name, slug, description, created_at, updated_at, workspace_id, thumbnail_path",
         )
         .eq("workspace_id", workspace.id)
+        .eq("created_by", user.id)
         .is("archived_at", null)
         .order("updated_at", { ascending: false });
 
@@ -403,7 +413,7 @@ async function ensureFoundation(
   errorCode: "project_create_failed" | "project_query_failed",
 ) {
   try {
-    await viewerService.ensureViewer(user);
+    return await viewerService.ensureViewer(user);
   } catch (error) {
     if (error instanceof BootstrapError) {
       throw new ProjectServiceError(
@@ -418,36 +428,27 @@ async function ensureFoundation(
   }
 }
 
-async function resolvePersonalWorkspace(
-  client: UserSupabaseClient,
-  userId: string,
+/**
+ * Content lives in the team workspace (Q1): projects are created and listed
+ * there, while credits / generation / skills / settings keep using the personal
+ * `viewer.workspace`. A null team workspace means "not a team member" — the
+ * gate already rejects that, so this is the second line of defence.
+ */
+function requireTeamWorkspace(
+  viewer: { teamWorkspace?: { id: string; name: string; ownerUserId: string; type: "personal" | "team" } | null | undefined },
   errorCode: "project_create_failed" | "project_query_failed",
 ) {
-  const { data, error } = await client
-    .from("workspaces")
-    .select("id, name, type, owner_user_id")
-    .eq("owner_user_id", userId)
-    .eq("type", "personal")
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
+  const teamWorkspace = viewer.teamWorkspace;
 
-  if (error || !data) {
+  if (!teamWorkspace) {
     throw new ProjectServiceError(
-      errorCode,
-      errorCode === "project_create_failed"
-        ? PROJECT_CREATE_FAILED_MESSAGE
-        : PROJECT_QUERY_FAILED_MESSAGE,
-      500,
+      "not_team_member",
+      NOT_TEAM_MEMBER_MESSAGE,
+      403,
     );
   }
 
-  return {
-    id: data.id,
-    name: data.name,
-    ownerUserId: data.owner_user_id,
-    type: data.type,
-  } as const;
+  return teamWorkspace;
 }
 
 function mapProjectCreateError(error: { code?: string; message?: string }) {

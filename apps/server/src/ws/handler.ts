@@ -12,6 +12,7 @@ import type { AgentRunMetadataService } from "../features/agent-runs/agent-run-s
 import type { ThreadService } from "../features/chat/thread-service.js";
 import type { SettingsService } from "../features/settings/settings-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
+import type { TeamMembershipService } from "../features/team/team-membership.js";
 import type {
   AuthenticatedUser,
   RequestAuthenticator,
@@ -30,6 +31,7 @@ type RegisterWsOptions = {
   connectionManager: ConnectionManager;
   eventBuffer?: CanvasEventBuffer;
   settingsService?: SettingsService;
+  teamMembership: TeamMembershipService;
   threadService?: ThreadService;
   viewerService?: ViewerService;
 };
@@ -79,6 +81,25 @@ async function authenticateAndBind(
   } catch (err) {
     log.warn("auth_error", { error: err instanceof Error ? err.message : String(err) });
     socket.close(4001, "Unauthorized");
+    return;
+  }
+
+  // AD-08 / PJ-11 member gate for the socket: the HTTP gate exempts /api/ws, so
+  // the check has to happen here. Fails closed — a membership lookup error must
+  // not hand a working socket to someone we could not verify.
+  try {
+    const membership = await options.teamMembership.get(authenticatedUser.id);
+    if (membership === null) {
+      log.warn("team_gate_rejected", { userId: authenticatedUser.id });
+      socket.close(4003, "Forbidden");
+      return;
+    }
+  } catch (err) {
+    log.warn("team_gate_error", {
+      error: err instanceof Error ? err.message : String(err),
+      userId: authenticatedUser.id,
+    });
+    socket.close(1011, "Membership check failed");
     return;
   }
 

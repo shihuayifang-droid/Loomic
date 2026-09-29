@@ -62,9 +62,23 @@ export async function registerUploadRoutes(
 
       const fileBuffer = await file.toBuffer();
 
-      // Resolve workspace from viewer
+      // Content is team-scoped (Q1): uploads land in the team workspace, while
+      // credits / generation keep using the personal `viewer.workspace`.
       const viewer = await options.viewerService.ensureViewer(user);
-      const workspaceId = viewer.workspace.id;
+      const teamWorkspace = viewer.teamWorkspace;
+
+      if (!teamWorkspace) {
+        return reply.code(403).send(
+          applicationErrorResponseSchema.parse({
+            error: {
+              code: "not_team_member",
+              message: "Not a member of the HaHart team workspace.",
+            },
+          }),
+        );
+      }
+
+      const workspaceId = teamWorkspace.id;
 
       // Extract projectId from fields if provided
       const projectId =

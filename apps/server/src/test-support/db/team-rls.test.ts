@@ -550,7 +550,7 @@ describe("team workspace and owner-scoped project RLS", () => {
         [USER_A, USER_M],
       )).rows,
     ).r;
-    expect(removed).toEqual({ projects: 1, assets: 1, objects: 1, removed: 1 });
+    expect(removed).toEqual({ projects: 1, assets: 2, objects: 1, removed: 1 });
 
     const again = firstRow(
       (await db.query<{ r: Record<string, number> }>(
@@ -572,6 +572,15 @@ describe("team workspace and owner-scoped project RLS", () => {
       tx.query("update public.projects set name = 'pA-now-owned-by-m' where id = $1", [projectId]),
     );
     expect(byM.affectedRows ?? 0).toBe(1);
+
+    // 工单 4 T0：接手人必须也能删项目内的素材（工单 3 的缺口就在这一行）
+    const mDeleteAsset = await asUser(db, USER_M, (tx) =>
+      tx.query("delete from public.asset_objects where workspace_id = $1 and project_id = $2", [
+        teamId,
+        projectId,
+      ]),
+    );
+    expect(mDeleteAsset.affectedRows ?? 0).toBe(1);
   });
 
   it("case 13: personal workspaces are untouched (Q1 keeps credits per person)", async () => {

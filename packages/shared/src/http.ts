@@ -42,6 +42,12 @@ export const viewerResponseSchema = z.object({
   profile: viewerProfileSchema,
   workspace: workspaceSummarySchema,
   membership: workspaceMembershipSchema,
+  // Team identity is additive: `workspace` stays the personal workspace (Q1), so
+  // credits / generation / skills / settings keep working unchanged. Optional so
+  // existing contract fixtures that predate the team workspace still parse; the
+  // server always sets both fields explicitly (null for non-members).
+  teamWorkspace: workspaceSummarySchema.nullable().optional(),
+  teamMembership: workspaceMembershipSchema.nullable().optional(),
   credits: viewerCreditsSchema.optional(),
 });
 
@@ -129,6 +135,9 @@ export const applicationErrorCodeSchema = z.enum([
   "variant_not_found",
   "checkout_failed",
   "generation_failed",
+  // AD-08 / PJ-11: the team-member gate rejects a valid token that is not in the
+  // HaHart team workspace. Client must be able to tell this apart from 401.
+  "not_team_member",
 ]);
 
 export const applicationErrorResponseSchema = z.object({

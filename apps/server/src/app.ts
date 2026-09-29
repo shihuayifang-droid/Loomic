@@ -43,6 +43,10 @@ import {
   type SettingsService,
 } from "./features/settings/settings-service.js";
 import {
+  createTeamMembershipService,
+  type TeamMembershipService,
+} from "./features/team/team-membership.js";
+import {
   createUploadService,
   type UploadService,
 } from "./features/uploads/upload-service.js";
@@ -84,6 +88,7 @@ import { registerVideoModelRoutes } from "./http/video-models.js";
 import { registerProjectRoutes } from "./http/projects.js";
 import { registerRunRoutes } from "./http/runs.js";
 import { registerSettingsRoutes } from "./http/settings.js";
+import { registerTeamGate } from "./http/team-gate.js";
 import { registerUploadRoutes } from "./http/uploads.js";
 import { registerSkillRoutes } from "./http/skills.js";
 import { registerMarketplaceRoutes } from "./http/skills-marketplace.js";
@@ -117,6 +122,7 @@ export type BuildAppOptions = {
   mockEventDelayMs?: number;
   projectService?: ProjectService;
   settingsService?: SettingsService;
+  teamMembershipService?: TeamMembershipService;
   threadService?: ThreadService;
   viewerService?: ViewerService;
 };
@@ -143,6 +149,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       connectionManager,
       eventBuffer,
       settingsService,
+      teamMembership: teamMembershipService,
       threadService,
       viewerService,
     });
@@ -156,8 +163,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     adminClient ??= createAdminSupabaseClient(env);
     return adminClient;
   };
+  const teamMembershipService =
+    options.teamMembershipService ??
+    createTeamMembershipService({ getAdminClient });
   const viewerService =
-    options.viewerService ?? createViewerService({ getAdminClient });
+    options.viewerService ??
+    createViewerService({ getAdminClient, teamMembership: teamMembershipService });
   const projectService =
     options.projectService ??
     createProjectService({ createUserClient, viewerService });
@@ -257,6 +268,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     if (corsResult.isPreflight) {
       return reply.code(204).send();
     }
+  });
+
+  // AD-08 / PJ-11 member gate. Registered after CORS so preflight is answered
+  // first, and before the routes so it covers every /api/ handler below.
+  registerTeamGate(app, {
+    auth,
+    teamMembership: teamMembershipService,
   });
 
   void registerHealthRoutes(app, env);

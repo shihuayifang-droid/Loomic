@@ -5,6 +5,7 @@ import {
 } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type { TeamMembershipService } from "../team/team-membership.js";
 import type { AuthenticatedUser } from "../../supabase/user.js";
 
 const BOOTSTRAP_FAILED_MESSAGE = "Unable to prepare viewer workspace.";
@@ -24,6 +25,7 @@ export class BootstrapError extends Error {
 
 export function createViewerService(options: {
   getAdminClient: () => AdminSupabaseClient;
+  teamMembership: TeamMembershipService;
 }): ViewerService {
   return {
     async ensureViewer(user) {
@@ -54,10 +56,21 @@ export function createViewerService(options: {
         throw new BootstrapError();
       }
 
+      // Team identity is additive: `workspace` / `membership` stay the personal
+      // workspace (Q1 — credits, generation, skills, settings and payments all
+      // keep keying off the personal workspace id). Content (projects, uploads)
+      // uses the fields below. A lookup failure propagates: turning it into
+      // "not a member" would 403 the whole team on a transient error.
+      const team = await options.teamMembership.get(user.id);
+
       return viewerResponseSchema.parse({
         membership,
         profile,
         workspace,
+        teamWorkspace: team ? team.workspace : null,
+        teamMembership: team
+          ? { workspaceId: team.workspace.id, userId: user.id, role: team.role }
+          : null,
       });
     },
   };
