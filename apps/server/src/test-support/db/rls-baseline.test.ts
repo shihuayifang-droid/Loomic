@@ -41,16 +41,6 @@ async function visibleRows(userId: string | null, table: string): Promise<number
   });
 }
 
-/** Run `statement` and return the rejection message; fails if it is allowed. */
-async function denialMessage(statement: () => Promise<unknown>): Promise<string> {
-  try {
-    await statement();
-  } catch (error) {
-    return error instanceof Error ? error.message : String(error);
-  }
-  throw new Error("expected the statement to be denied, but it succeeded");
-}
-
 beforeAll(async () => {
   const created = await createMigratedDb();
   db = created.db;
@@ -99,7 +89,7 @@ beforeAll(async () => {
 describe("migration harness", () => {
   it("loads every migration in supabase/migrations", () => {
     const files = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith(".sql"));
-    expect(applied.length).toBe(30);
+    expect(applied.length).toBe(31);
     expect(applied.length).toBe(files.length);
   });
 
@@ -138,57 +128,48 @@ describe("a member of workspace A", () => {
   });
 
   for (const table of CONTENT_TABLES) {
-    it(`BASELINE-GAP: can read another member's ${table}`, async () => {
-      expect(await visibleRows(USER_B, table)).toBe(1);
+    it(`FIXED: cannot read another member's ${table}`, async () => {
+      expect(await visibleRows(USER_B, table)).toBe(0);
     });
   }
 
-  it("BASELINE-GAP: cannot create a project by direct insert", async () => {
-    const message = await denialMessage(() =>
-      asUser(db, USER_B, (tx) =>
-        tx.query(
-          `insert into public.projects (workspace_id, name, slug, created_by)
-           values ($1, $2, $3, $4)`,
-          [workspaceA, "Project B", "project-b", USER_B],
-        ),
+  it("FIXED: can create their own project by direct insert", async () => {
+    const inserted = await asUser(db, USER_B, (tx) =>
+      tx.query(
+        `insert into public.projects (workspace_id, name, slug, created_by)
+         values ($1, $2, $3, $4) returning id`,
+        [workspaceA, "Project B", "project-b", USER_B],
       ),
     );
 
-    expect(message).toContain("row-level security");
-    expect(message).not.toContain("permission denied");
+    expect(inserted.rows.length).toBe(1);
   });
 
-  it("BASELINE-GAP: cannot create a project through create_project_with_canvas", async () => {
-    const message = await denialMessage(() =>
-      asUser(db, USER_B, (tx) =>
-        tx.query("select public.create_project_with_canvas($1, $2, $3)", [
-          workspaceA,
-          "Project B2",
-          "project-b2",
-        ]),
+  it("FIXED: can create their own project through create_project_with_canvas", async () => {
+    const created = await asUser(db, USER_B, (tx) =>
+      tx.query<{ j: { project: { id: string } } }>(
+        "select public.create_project_with_canvas($1, $2, $3) as j",
+        [workspaceA, "Project B2", "project-b2"],
       ),
     );
 
-    expect(message).toContain("Not an admin or owner of this workspace");
+    expect(created.rows.length).toBe(1);
   });
 
-  it("BASELINE-GAP: cannot upload a storage object under the workspace prefix", async () => {
-    const message = await denialMessage(() =>
-      asUser(db, USER_B, (tx) =>
-        tx.query("insert into storage.objects (bucket_id, name) values ($1, $2)", [
-          "project-assets",
-          `${workspaceA}/x.png`,
-        ]),
+  it("FIXED: can upload a storage object under the workspace prefix", async () => {
+    const uploaded = await asUser(db, USER_B, (tx) =>
+      tx.query(
+        "insert into storage.objects (bucket_id, name, owner) values ($1, $2, $3) returning id",
+        ["project-assets", `${workspaceA}/x.png`, USER_B],
       ),
     );
 
-    expect(message).toContain("row-level security");
-    expect(message).not.toContain("permission denied");
+    expect(uploaded.rows.length).toBe(1);
   });
 });
 
 describe("daily credits", () => {
-  it("BASELINE-GAP: are claimed once per workspace, not once per user", async () => {
+  it("credits stay on the personal workspace (Q1): one claim per workspace per day", async () => {
     const first = await db.query<{ claimed: boolean }>(
       "select public.claim_daily_credits($1, $2) as claimed",
       [workspaceA, 50],
