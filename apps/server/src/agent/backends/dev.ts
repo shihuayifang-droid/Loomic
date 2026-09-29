@@ -5,22 +5,26 @@ import {
   type StateAndStore,
   CompositeBackend,
   FilesystemBackend,
-  LocalShellBackend,
   StoreBackend,
 } from "deepagents";
 
 import type { ServerEnv } from "../../config/env.js";
 import type { AgentBackendResult } from "./index.js";
+import { withoutExecution } from "./no-exec.js";
 
 type AgentBackendEnv = Pick<ServerEnv, "agentFilesRoot" | "skillsRoot">;
 
 const DEFAULT_DEV_SANDBOX_ROOT = "/tmp/loomic-sandbox-dev";
 
 /**
- * Create a development backend with local sandbox execution.
+ * Create a development backend with a local per-run sandbox directory.
  *
- * Uses LocalShellBackend for code execution. The agent's workspace files
- * are stored locally at agentFilesRoot, and skills are loaded from skillsRoot.
+ * 一期关闭 execute（D-24，AG-39）：default backend 用 `virtualMode: true` 的
+ * FilesystemBackend，factory 再把返回值交给 `withoutExecution()` 去掉执行能力，
+ * 所以 deepagents 不会注入内置 `execute` 工具；文件工具也只能在 sandboxDir 内读写，
+ * 不能再按宿主绝对路径操作磁盘（含 `.env.local`）。
+ * The agent's workspace files are stored locally at agentFilesRoot,
+ * and skills are loaded from skillsRoot.
  */
 export function createDevelopmentBackend(
   env: AgentBackendEnv,
@@ -44,16 +48,10 @@ export function createDevelopmentBackend(
 
   const skillsRoot = resolve(env.skillsRoot ?? join(env.agentFilesRoot, "skills"));
 
-  const sandbox = new LocalShellBackend({
+  // 一期关闭 execute（D-24，AG-39）：不再使用会附带 execute 的 shell 后端。
+  const sandbox = new FilesystemBackend({
     rootDir: sandboxDir,
-    timeout: 120,
-    maxOutputBytes: 200_000,
-    env: {
-      PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
-      HOME: process.env.HOME ?? "/tmp",
-      FONT_DIR: join(skillsRoot, "canvas-design", "canvas-fonts"),
-      PYTHONDONTWRITEBYTECODE: "1",
-    },
+    virtualMode: true,
   });
   const skillsBackend = new FilesystemBackend({ rootDir: skillsRoot, virtualMode: true });
 
@@ -75,7 +73,8 @@ export function createDevelopmentBackend(
       });
     }
 
-    return new CompositeBackend(sandbox, routes);
+    // 一期关闭 execute（D-24，AG-39）：只保留 BackendProtocol 文件方法。
+    return withoutExecution(new CompositeBackend(sandbox, routes));
   };
 
   return { factory, sandboxDir: realSandboxDir };

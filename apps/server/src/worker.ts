@@ -33,7 +33,7 @@ import type { BackgroundJobType } from "@loomic/shared";
 // Register all image/video providers via shared helper (keeps parity with app.ts)
 import { registerAllProviders } from "./generation/providers/register-all.js";
 
-// 代码执行由 LocalShellBackend 的内置 execute 工具直接处理，不走 PGMQ。
+// 一期关闭 execute（D-24，AG-39），代码执行不走 PGMQ。
 //
 // Queue list, queue->type mapping, visibility timeouts and concurrency caps all
 // come from JOB_TYPE_REGISTRY now; they used to be four separate tables here.

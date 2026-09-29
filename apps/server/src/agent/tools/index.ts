@@ -36,19 +36,18 @@ export { createManipulateCanvasTool } from "./manipulate-canvas.js";
 //   edit_file   — 编辑文件（find & replace）
 //   glob        — 按模式匹配文件路径
 //   grep        — 按正则搜索文件内容
-//   execute     — 执行 shell 命令（仅 SandboxBackendProtocol 时可用）
 //   task        — 分发子任务到 subagent
 //   write_todos — 管理 TODO 列表
 //
-// 我们使用 LocalShellBackend 作为 CompositeBackend 的 default backend，
-// 它实现了 SandboxBackendProtocol，因此 execute 工具自动可用。
-// 代码执行无需额外自定义工具。
+// 一期关闭 execute（D-24，AG-39）：后端不再实现 SandboxBackendProtocol 的
+// execute，FilesystemMiddleware 因此会把 execute 从工具清单里过滤掉。
+// 代码执行没有替代品，也不在这里补。
 //
 // CompositeBackend 路由互不干扰：
 //   /workspace/  → StoreBackend (PostgresStore) — 文件持久化
 //   /memories/   → StoreBackend (PostgresStore) — agent 记忆
 //   /skills/     → FilesystemBackend            — 系统 skills
-//   default      → LocalShellBackend            — execute + 临时文件
+//   default      → FilesystemBackend            — 临时文件（无 execute）
 // ---------------------------------------------------------------------------
 
 export function createMainAgentTools(
@@ -67,14 +66,20 @@ export function createMainAgentTools(
     createProjectSearchTool(backend),
     createInspectCanvasTool(deps),
     createManipulateCanvasTool(deps),
-    createPersistSandboxFileTool({
-      createUserClient: deps.createUserClient,
-      ...(deps.sandboxDir ? { sandboxDir: deps.sandboxDir } : {}),
-    }),
-    // execute 工具由 deepagents FilesystemMiddleware 自动注入，
-    // 因为 CompositeBackend 的 default backend 是 LocalShellBackend。
-    // 不需要在这里手动注册。
+    // 一期关闭 execute（D-24，AG-39）：deepagents 不再注入 execute，
+    // 这里也不手动注册任何代码执行工具。
   ];
+
+  // persist_sandbox_file 必须有沙箱根目录才有可校验的上传范围。
+  // 没有 sandboxDir 就不注册这个工具，而不是注册一个不校验路径的版本。
+  if (deps.sandboxDir) {
+    tools.push(
+      createPersistSandboxFileTool({
+        createUserClient: deps.createUserClient,
+        sandboxDir: deps.sandboxDir,
+      }),
+    );
+  }
 
   // LOCAL FORK: generation tools are registered ONLY when a job channel exists.
   //
