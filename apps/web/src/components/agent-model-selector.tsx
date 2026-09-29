@@ -14,6 +14,16 @@ const SPARKLE_ICON_PATH =
 const CHECK_PATH =
   "M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 1 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0";
 
+// Group headings. Unlisted providers fall back to the raw id, which the
+// uppercase style renders acceptably, so a new provider shows up without
+// needing an entry here.
+const PROVIDER_LABELS: Record<string, string> = {
+  openai: "kwjm",
+  google: "Google",
+  deepseek: "DeepSeek",
+  aether: "Aether (LAN)",
+};
+
 function ProviderLogo({ provider }: { provider: string }) {
   if (provider === "openai") {
     return (
@@ -179,7 +189,7 @@ export function AgentModelSelector({ compact }: { compact?: boolean } = {}) {
                 <div key={provider} className="mt-2">
                   <div className="flex items-center gap-1.5 px-2 pb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground/60">
                     <ProviderLogo provider={provider} />
-                    {provider === "openai" ? "OpenAI" : provider === "google" ? "Google" : provider}
+                    {PROVIDER_LABELS[provider] ?? provider}
                   </div>
                   {providerModels.map((m) => (
                     <button

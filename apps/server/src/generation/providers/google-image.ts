@@ -3,8 +3,8 @@ import { GoogleGenAI } from "@google/genai";
 import type {
   GeneratedImage,
   ImageGenerateParams,
+  ImageModelInfo,
   ImageProvider,
-  ModelInfo,
 } from "../types.js";
 import { aspectRatioToDimensions, fetchAsBase64, GenerationError } from "../utils.js";
 
@@ -28,27 +28,43 @@ const MODEL_MAP: Record<string, string> = {
     "gemini-3-pro-image-preview",
 };
 
-const GOOGLE_IMAGE_MODELS: readonly ModelInfo[] = [
+/**
+ * Shared by every Gemini image model: text-to-image plus editing via reference
+ * images, 14 of them, any aspect ratio the tool exposes, and no output-format
+ * parameter (the API always returns PNG via inlineData — see `generate`).
+ */
+const GEMINI_IMAGE_DEFAULTS = {
+  operation: "generate",
+  limits: {
+    maxInputImages: 14,
+    supportsOutputFormat: false,
+  },
+} as const;
+
+const GOOGLE_IMAGE_MODELS: readonly ImageModelInfo[] = [
   {
     id: "google-official/gemini-3-pro-image-preview",
     displayName: "Nano Banana Pro",
     description:
-      "Google Gemini 3 Pro image generation & editing preview. Image input: up to 14 images. Up to 4K resolution. Best quality with advanced reasoning.",
+      "Google Gemini 3 Pro image generation & editing preview. Up to 4K resolution. Best quality with advanced reasoning.",
     iconUrl: ICON_GOOGLE,
+    ...GEMINI_IMAGE_DEFAULTS,
   },
   {
     id: "google-official/gemini-3.1-flash-image-preview",
     displayName: "Nano Banana 2",
     description:
-      "Google Gemini 3.1 image generation & editing preview. Image input: up to 14 images. Faster generation, newest capabilities.",
+      "Google Gemini 3.1 image generation & editing preview. Faster generation, newest capabilities.",
     iconUrl: ICON_GOOGLE,
+    ...GEMINI_IMAGE_DEFAULTS,
   },
   {
     id: "google-official/gemini-2.5-flash-image",
     displayName: "Nano Banana",
     description:
-      "Google Gemini native image generation & editing via direct API. Image input: up to 14 images. Stable. Best balance of speed and quality.",
+      "Google Gemini native image generation & editing via direct API. Stable. Best balance of speed and quality.",
     iconUrl: ICON_GOOGLE,
+    ...GEMINI_IMAGE_DEFAULTS,
   },
 ];
 
@@ -76,8 +92,28 @@ export class GoogleImageProvider implements ImageProvider {
 
   private client: GoogleGenAI;
 
-  constructor(apiKey: string) {
-    this.client = new GoogleGenAI({ apiKey });
+  /**
+   * @param apiKey  Gemini API key, or the gateway key when `baseUrl` is set.
+   * @param baseUrl Optional Gemini-compatible gateway host WITHOUT the version
+   *   segment (e.g. "https://kwjm.com"); the SDK appends `/v1beta/models/...`.
+   *
+   * When routing through a gateway we must also send `Authorization: Bearer`.
+   * The SDK only sends `x-goog-api-key`, which gateways like kwjm reject with
+   * 401. We add the header ONLY in gateway mode so the official endpoint keeps
+   * using the SDK's own auth untouched.
+   */
+  constructor(apiKey: string, baseUrl?: string) {
+    this.client = new GoogleGenAI({
+      apiKey,
+      ...(baseUrl
+        ? {
+            httpOptions: {
+              baseUrl,
+              headers: { Authorization: `Bearer ${apiKey}` },
+            },
+          }
+        : {}),
+    });
   }
 
   async generate(params: ImageGenerateParams): Promise<GeneratedImage> {

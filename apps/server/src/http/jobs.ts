@@ -1,12 +1,15 @@
 // @credits-system — Job creation routes with credit balance checks and tier enforcement
 import type { FastifyInstance, FastifyReply } from "fastify";
 
-import type { BackgroundJobStatus, BackgroundJobType, ImageQualityLevel } from "@loomic/shared";
+import type {
+  BackgroundJobStatus,
+  BackgroundJobType,
+  VideoResolution,
+} from "@loomic/shared";
 import {
   applicationErrorResponseSchema,
   createImageJobRequestSchema,
   createVideoJobRequestSchema,
-  getPlanConfig,
   jobListResponseSchema,
   jobResponseSchema,
   unauthenticatedErrorResponseSchema,
@@ -24,6 +27,7 @@ import {
   TierGuardError,
   type TierGuard,
 } from "../features/credits/tier-guard.js";
+import { withBilling } from "../features/credits/with-billing.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 
@@ -46,61 +50,46 @@ export async function registerJobRoutes(
       const payload = createImageJobRequestSchema.parse(request.body);
       const viewer = await options.viewerService.ensureViewer(user);
 
-      // Credit checks (skip if credit system not configured)
       const model = payload.model ?? "black-forest-labs/flux-kontext-pro";
-      let creditsCost = 0;
 
-      if (options.creditService && options.tierGuard) {
-        const sub = await options.creditService.getSubscription(viewer.workspace.id);
-        const planConfig = getPlanConfig(sub.plan);
-        // Use the plan's max resolution as the quality for cost calculation
-        const quality: ImageQualityLevel = planConfig.maxResolution;
-        options.tierGuard.checkModelAccess(sub.plan, model);
-        await options.tierGuard.checkConcurrency(viewer.workspace.id, sub.plan);
-        creditsCost = options.tierGuard.calculateCreditCost(model, "image_generation", { quality });
-      }
-
-      const job = await options.jobService.createJob(user, {
-        workspaceId: viewer.workspace.id,
-        ...(payload.project_id !== undefined
-          ? { projectId: payload.project_id }
-          : {}),
-        ...(payload.canvas_id !== undefined
-          ? { canvasId: payload.canvas_id }
-          : {}),
-        ...(payload.session_id !== undefined
-          ? { sessionId: payload.session_id }
-          : {}),
-        ...(payload.thread_id !== undefined
-          ? { threadId: payload.thread_id }
-          : {}),
-        jobType: "image_generation",
-        payload: {
-          prompt: payload.prompt,
-          ...(payload.model !== undefined ? { model: payload.model } : {}),
-          ...(payload.aspect_ratio !== undefined
-            ? { aspect_ratio: payload.aspect_ratio }
-            : {}),
+      const { job } = await withBilling(
+        options,
+        {
+          user,
+          workspaceId: viewer.workspace.id,
+          modelId: model,
+          // This request has no `quality` field, so bill at the plan maximum —
+          // what this route already did via getPlanConfig(sub.plan).
+          guard: { jobType: "image_generation", quality: "plan_max" },
+          description: `Image generation: ${model}`,
+          job: {
+            payload: {
+              prompt: payload.prompt,
+              ...(payload.model !== undefined ? { model: payload.model } : {}),
+              ...(payload.aspect_ratio !== undefined
+                ? { aspect_ratio: payload.aspect_ratio }
+                : {}),
+            },
+            refs: {
+              ...(payload.project_id !== undefined
+                ? { projectId: payload.project_id }
+                : {}),
+              ...(payload.canvas_id !== undefined
+                ? { canvasId: payload.canvas_id }
+                : {}),
+              ...(payload.session_id !== undefined
+                ? { sessionId: payload.session_id }
+                : {}),
+              ...(payload.thread_id !== undefined
+                ? { threadId: payload.thread_id }
+                : {}),
+            },
+          },
         },
-      });
-
-      // Deduct credits after job creation (we need the job ID for tracking)
-      if (options.creditService && creditsCost > 0) {
-        try {
-          const txId = await options.creditService.deductCredits(
-            viewer.workspace.id,
-            user.id,
-            creditsCost,
-            job.id,
-            `Image generation: ${model}`,
-          );
-          await options.jobService.setCreditsInfo(job.id, creditsCost, txId);
-        } catch (deductError) {
-          // Deduction failed — cancel the job and re-throw
-          await options.jobService.cancelJob(user, job.id).catch(() => {});
-          throw deductError;
-        }
-      }
+        // Nothing to do here: the worker picks the job up off the queue. The
+        // response just hands the job back to the caller to poll.
+        async (outcome) => outcome,
+      );
 
       return reply.code(201).send(jobResponseSchema.parse({ job }));
     } catch (error) {
@@ -122,64 +111,57 @@ export async function registerJobRoutes(
       const payload = createVideoJobRequestSchema.parse(request.body);
       const viewer = await options.viewerService.ensureViewer(user);
 
-      // Credit checks (skip if credit system not configured)
       const model = payload.model ?? "wan-video/wan-2.6";
-      let creditsCost = 0;
 
-      if (options.creditService && options.tierGuard) {
-        const sub = await options.creditService.getSubscription(viewer.workspace.id);
-        options.tierGuard.checkModelAccess(sub.plan, model);
-        await options.tierGuard.checkConcurrency(viewer.workspace.id, sub.plan);
-        creditsCost = options.tierGuard.calculateCreditCost(
-          model,
-          "video_generation",
-          payload.duration != null ? { duration: payload.duration } : {},
-        );
-      }
-
-      const job = await options.jobService.createJob(user, {
-        workspaceId: viewer.workspace.id,
-        ...(payload.project_id !== undefined
-          ? { projectId: payload.project_id }
-          : {}),
-        ...(payload.canvas_id !== undefined
-          ? { canvasId: payload.canvas_id }
-          : {}),
-        ...(payload.session_id !== undefined
-          ? { sessionId: payload.session_id }
-          : {}),
-        ...(payload.thread_id !== undefined
-          ? { threadId: payload.thread_id }
-          : {}),
-        jobType: "video_generation",
-        payload: {
-          prompt: payload.prompt,
-          ...(payload.model !== undefined ? { model: payload.model } : {}),
-          ...(payload.duration !== undefined ? { duration: payload.duration } : {}),
-          ...(payload.resolution !== undefined ? { resolution: payload.resolution } : {}),
-          ...(payload.aspect_ratio !== undefined ? { aspect_ratio: payload.aspect_ratio } : {}),
-          ...(payload.input_images !== undefined ? { input_images: payload.input_images } : {}),
-          ...(payload.input_video !== undefined ? { input_video: payload.input_video } : {}),
-          ...(payload.enable_audio !== undefined ? { enable_audio: payload.enable_audio } : {}),
+      const { job } = await withBilling(
+        options,
+        {
+          user,
+          workspaceId: viewer.workspace.id,
+          modelId: model,
+          guard: {
+            jobType: "video_generation",
+            // BEHAVIOUR FIX: this route used to pass only `duration` into the
+            // cost calculation while writing `resolution` into the job payload,
+            // so a 1080p request was billed at the base rate and the
+            // resolutionMultipliers entry (1080p: 2 for the Veo models) never
+            // applied. The other two video paths always passed both. Now it also
+            // goes through checkVideoResolution, which this route skipped.
+            ...(payload.duration != null ? { duration: payload.duration } : {}),
+            ...(payload.resolution != null
+              ? { resolution: payload.resolution as VideoResolution }
+              : {}),
+          },
+          description: `Video generation: ${model}`,
+          job: {
+            payload: {
+              prompt: payload.prompt,
+              ...(payload.model !== undefined ? { model: payload.model } : {}),
+              ...(payload.duration !== undefined ? { duration: payload.duration } : {}),
+              ...(payload.resolution !== undefined ? { resolution: payload.resolution } : {}),
+              ...(payload.aspect_ratio !== undefined ? { aspect_ratio: payload.aspect_ratio } : {}),
+              ...(payload.input_images !== undefined ? { input_images: payload.input_images } : {}),
+              ...(payload.input_video !== undefined ? { input_video: payload.input_video } : {}),
+              ...(payload.enable_audio !== undefined ? { enable_audio: payload.enable_audio } : {}),
+            },
+            refs: {
+              ...(payload.project_id !== undefined
+                ? { projectId: payload.project_id }
+                : {}),
+              ...(payload.canvas_id !== undefined
+                ? { canvasId: payload.canvas_id }
+                : {}),
+              ...(payload.session_id !== undefined
+                ? { sessionId: payload.session_id }
+                : {}),
+              ...(payload.thread_id !== undefined
+                ? { threadId: payload.thread_id }
+                : {}),
+            },
+          },
         },
-      });
-
-      // Deduct credits after job creation
-      if (options.creditService && creditsCost > 0) {
-        try {
-          const txId = await options.creditService.deductCredits(
-            viewer.workspace.id,
-            user.id,
-            creditsCost,
-            job.id,
-            `Video generation: ${model}`,
-          );
-          await options.jobService.setCreditsInfo(job.id, creditsCost, txId);
-        } catch (deductError) {
-          await options.jobService.cancelJob(user, job.id).catch(() => {});
-          throw deductError;
-        }
-      }
+        async (outcome) => outcome,
+      );
 
       return reply.code(201).send(jobResponseSchema.parse({ job }));
     } catch (error) {

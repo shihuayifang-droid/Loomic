@@ -140,6 +140,14 @@ export const canvasDetailSchema = z.object({
   name: z.string().min(1),
   projectId: projectIdSchema,
   content: canvasContentSchema,
+  /**
+   * Optimistic concurrency counter. Send it back with a save so a write built on
+   * stale content is rejected instead of silently overwriting newer elements —
+   * that overwrite is how agent-generated images used to disappear.
+   *
+   * Optional so an older client still parses a newer server response.
+   */
+  version: z.number().int().nonnegative().optional(),
 });
 
 export const profileUpdateRequestSchema = z.object({
@@ -198,7 +206,20 @@ export const toolBlockSchema = z.object({
 export const imageBlockSchema = z.object({
   type: z.literal("image"),
   assetId: z.string().min(1),
+  /**
+   * Full-resolution image. This is what gets sent to the model, so it must not
+   * be a downscaled variant.
+   */
   url: z.string().url(),
+  /**
+   * Display-sized variant, used for the inline pill in the message bubble.
+   * Optional because older rows predate it — renderers fall back to `url`.
+   *
+   * Kept separate from `url` on purpose: a pill is ~16px tall, and reusing the
+   * full-resolution URL there makes the browser decode multi-megabyte images to
+   * draw a thumbnail.
+   */
+  thumbnailUrl: z.string().url().optional(),
   mimeType: z.string().min(1),
   source: z.enum(["upload", "canvas-ref"]),
   name: z.string().min(1).optional(),

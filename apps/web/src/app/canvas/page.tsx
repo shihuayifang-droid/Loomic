@@ -15,8 +15,18 @@ import { ChatSidebar } from "../../components/chat-sidebar";
 import { CanvasEmptyHint } from "../../components/canvas-empty-hint";
 import { CanvasLogoMenu } from "../../components/canvas-logo-menu";
 import { EditableProjectName } from "../../components/editable-project-name";
-import { insertImageOnCanvas, insertVideoOnCanvas } from "../../lib/canvas-elements";
-import { fetchCanvas, fetchProject, ApiAuthError } from "../../lib/server-api";
+import {
+  insertImageOnCanvas,
+  insertVideoOnCanvas,
+  focusGeneratingSlots,
+} from "../../lib/canvas-elements";
+import { syncCanvasFilesIntoScene } from "../../lib/canvas-files";
+import {
+  fetchCanvas,
+  fetchProject,
+  ApiAuthError,
+  ApiApplicationError,
+} from "../../lib/server-api";
 import { BrandKitSelector } from "../../components/brand-kit-selector";
 import { CanvasBottomBar } from "../../components/canvas-bottom-bar";
 import { CanvasFilesPanel } from "../../components/canvas-files-panel";
@@ -42,8 +52,19 @@ function CanvasPageContent() {
       appState: Record<string, unknown>;
       files: Record<string, Record<string, unknown>>;
     };
+    /**
+     * Server's optimistic concurrency counter, handed to CanvasEditor as
+     * initialVersion. Declared here because this local shape is what the reads
+     * below are checked against — leaving it out made `canvasData.version` a type
+     * error while the value was in fact present at runtime.
+     */
+    version?: number;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Whether the failure above is worth another attempt (5xx / no response). */
+  const [errorRetryable, setErrorRetryable] = useState(false);
+  /** Bumped by the retry button to re-run the load effect. */
+  const [reloadNonce, setReloadNonce] = useState(0);
   const [pageLoading, setPageLoading] = useState(true);
   // Default chat open on desktop, closed on mobile/tablet to avoid blocking canvas
   const [chatOpen, setChatOpen] = useState(() => {
@@ -58,6 +79,9 @@ function CanvasPageContent() {
 
   const excalidrawApiRef = useRef<any>(null);
   const [excalidrawApi, setExcalidrawApi] = useState<any>(null);
+  // Generation slots we have already auto-focused. Keeps a batch of images from
+  // repeatedly dragging the viewport back on every canvas.sync.
+  const focusedSlotsRef = useRef<Set<string>>(new Set());
 
   const signOutRef = useRef(signOut);
   signOutRef.current = signOut;
@@ -111,12 +135,20 @@ function CanvasPageContent() {
       const files = (canvas.content as Record<string, unknown>).files as
         Record<string, { id: string; dataURL: string; mimeType: string; created: number }> | undefined;
 
-      // Sync files (base64 dataURLs from backend-inserted images) into Excalidraw
+      // Files arrive as storage URLs, not bytes — they must be fetched before
+      // Excalidraw can draw them. Awaiting this BEFORE updateScene means the
+      // element and its pixels land together, instead of flashing a
+      // broken-image box.
       if (files && Object.keys(files).length > 0) {
-        api.addFiles(Object.values(files));
+        await syncCanvasFilesIntoScene(api, files, elements, canvasData.id);
       }
 
       api.updateScene({ elements, captureUpdate: "IMMEDIATELY" });
+
+      // Move the viewport onto whatever is being generated, so the user does not
+      // have to hunt for it. Runs after updateScene because scrollToContent
+      // resolves element bounds from the live scene.
+      focusGeneratingSlots(api, elements, focusedSlotsRef.current);
     } catch (err) {
       console.warn("Failed to sync canvas:", err);
     }
@@ -142,6 +174,24 @@ function CanvasPageContent() {
     },
     [canvasId],
   );
+
+  // Clicking a thumbnail in the chat input pans the canvas to that element, so
+  // the user can confirm which of several similar images they are referencing.
+  const handleFocusCanvasElement = useCallback((elementId: string) => {
+    const api = excalidrawApiRef.current;
+    if (!api) return;
+    const target = (api.getSceneElements() ?? []).find(
+      (el: any) => el.id === elementId && !el.isDeleted,
+    );
+    if (!target) return;
+    api.scrollToContent([target], {
+      fitToViewport: true,
+      viewportZoomFactor: 0.6,
+      maxZoom: 1,
+      animate: true,
+      duration: 400,
+    });
+  }, []);
 
   const handleRequestCanvasImages = useCallback((): CanvasImageItem[] => {
     const api = excalidrawApiRef.current;
@@ -186,6 +236,7 @@ function CanvasPageContent() {
     if (!canvasId || !token) return;
 
     setPageLoading(true);
+    setError(null);
     fetchCanvas(token, canvasId)
       .then((data) => {
         const c = data.canvas;
@@ -198,6 +249,13 @@ function CanvasPageContent() {
             appState: c.content.appState ?? {},
             files: (c.content as any).files ?? {},
           },
+          // Seeds CanvasEditor's versionRef. Omitting this left it undefined until
+          // the first save response came back, so THE FIRST SAVE AFTER EVERY LOAD
+          // went out with no baseVersion — which replaceCanvasContent handles by
+          // writing unconditionally. That is the exact lost-update the optimistic
+          // concurrency work exists to prevent, and it was open during the riskiest
+          // window: right after load, when the agent may be mid-insert.
+          ...(c.version !== undefined ? { version: c.version } : {}),
         });
         setPageLoading(false);
         // Fetch project to get brand_kit_id and name
@@ -213,14 +271,27 @@ function CanvasPageContent() {
           signOutRef.current().then(() => routerRef.current.replace("/login"));
           return;
         }
-        setError("Failed to load canvas.");
+        // A 5xx (or a fetch that never got a response) says the store could not
+        // answer, not that the canvas is gone. Those are worth another try, and
+        // saying "Failed to load canvas." to someone whose board is intact is how
+        // a proxy blip gets mistaken for data loss. 4xx stays terminal: repeating
+        // an unauthorised or genuinely-missing lookup changes nothing.
+        const status =
+          err instanceof ApiApplicationError ? err.status : undefined;
+        const retryable = status === undefined || status >= 500;
+        setError(
+          retryable
+            ? "Canvas store did not respond. Your work is not lost — retry."
+            : "Canvas not found, or you do not have access to it.",
+        );
+        setErrorRetryable(retryable);
         setPageLoading(false);
       });
     // Intentionally omitting accessTokenRef (stable ref) and signOutRef/routerRef
     // (ref wrappers) from deps — only re-run when auth resolves, user changes, or
     // canvasId changes. Token refresh (e.g. tab switch) must NOT trigger a reload.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authLoading, userId, canvasId]);
+  }, [authLoading, userId, canvasId, reloadNonce]);
 
   if (!canvasId) {
     return (
@@ -236,8 +307,17 @@ function CanvasPageContent() {
 
   if (error) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
+      <div className="flex min-h-screen flex-col items-center justify-center gap-3">
         <p className="text-sm text-destructive">{error}</p>
+        {errorRetryable && (
+          <button
+            type="button"
+            onClick={() => setReloadNonce((n) => n + 1)}
+            className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            Retry
+          </button>
+        )}
       </div>
     );
   }
@@ -277,6 +357,9 @@ function CanvasPageContent() {
           projectId={canvasData.projectId}
           accessToken={accessToken}
           initialContent={canvasData.content}
+          {...(canvasData.version !== undefined
+            ? { initialVersion: canvasData.version }
+            : {})}
           onApiReady={handleApiReady}
           ws={ws}
           leftPanelOpen={layersOpen || filesOpen}

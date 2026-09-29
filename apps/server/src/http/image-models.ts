@@ -48,6 +48,9 @@ export async function registerImageModelRoutes(
       accessible: userPlan !== null && canAccessModel(userPlan, m.id),
       creditCost: getImageCreditCost(m.id, "hd"),
       minTier: MODEL_MIN_TIER[m.id] ?? "pro",
+      // Exposed so the picker can gate the reference-image dropzone and the
+      // aspect-ratio choices per model instead of duplicating those rules.
+      limits: m.limits,
     }));
 
     return reply.code(200).send({ models: annotated });

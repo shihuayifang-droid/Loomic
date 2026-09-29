@@ -1,5 +1,6 @@
 // @credits-system — Image generation executor: applies watermark for free-tier users
 import { registerExecutor, type ExecutorContext } from "../job-executor.js";
+import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateImage } from "../../../generation/image-generation.js";
 import { resolveImageProviderName } from "../../../generation/providers/registry.js";
 import { applyWatermark } from "../../credits/watermark.js";
@@ -42,14 +43,18 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
   // Resolve provider dynamically from model ID via registry
   const model = payload.model ?? "black-forest-labs/flux-kontext-pro";
-  const providerName = resolveImageProviderName(model);
+  const providerName = resolveImageProviderName(model, "generate");
 
-  // Renew VT every 60s (half of the 120s image queue VT) to prevent
-  // the message from becoming visible while we are still processing.
-  const IMAGE_VT_SECONDS = 120;
+  // Keep renewing the visibility timeout so the message does not become visible
+  // again while we are still working. Both the VT and the heartbeat interval come
+  // from JOB_TYPE_REGISTRY: this used to be a hard-coded 120 here plus a
+  // hard-coded 60_000, a second copy of the value in worker.ts's VT table. If the
+  // registry VT ever dropped below the old fixed interval the heartbeat would
+  // silently stop keeping up and the job would run twice.
+  const VT_SECONDS = JOB_TYPE_REGISTRY.image_generation.visibilityTimeoutSeconds;
   const heartbeatTimer = setInterval(() => {
-    ctx.renewVt(IMAGE_VT_SECONDS);
-  }, 60_000);
+    ctx.renewVt(VT_SECONDS);
+  }, (VT_SECONDS / 2) * 1000);
 
   // Log input image format for debugging the data-URI-passthrough pipeline
   if (payload.input_images?.length) {

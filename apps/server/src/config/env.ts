@@ -1,7 +1,10 @@
 import { readFileSync } from "node:fs";
 
 export const DEFAULT_AGENT_BACKEND_MODE = "state";
-export const DEFAULT_AGENT_MODEL = "gpt-4.1";
+// LOCAL FORK: upstream default was "gpt-4.1", which the kwjm gateway rejects
+// with 400 "undefined model name". Must stay in sync with the first entry of
+// OPENAI_MODELS in http/models.ts.
+export const DEFAULT_AGENT_MODEL = "claude-sonnet-5";
 export const DEFAULT_GOOGLE_AGENT_MODEL = "gemini-2.5-flash";
 export const DEFAULT_SERVER_PORT = 3001;
 export const DEFAULT_WEB_ORIGIN = "http://localhost:3000";
@@ -28,6 +31,12 @@ export type ServerEnv = {
   agentBackendMode: AgentBackendMode;
   agentFilesRoot?: string;
   agentModel: string;
+  /**
+   * Override the Gemini API endpoint, e.g. an OpenAI/Gemini-compatible gateway.
+   * Value is the host root WITHOUT the version segment (the SDK appends
+   * `/v1beta/models/...` itself), e.g. "https://kwjm.com".
+   */
+  googleApiBase?: string;
   googleApiKey?: string;
   googleApplicationCredentials?: string;
   googleFontsApiKey?: string;
@@ -99,6 +108,8 @@ export function loadServerEnv(
     normalizeOptionalString(source.SUPABASE_PROJECT_ID);
   const googleApiKey =
     overrides.googleApiKey ?? normalizeOptionalString(source.GOOGLE_API_KEY);
+  const googleApiBase =
+    overrides.googleApiBase ?? normalizeOptionalString(source.GOOGLE_API_BASE);
   const googleApplicationCredentials =
     overrides.googleApplicationCredentials ??
     normalizeOptionalString(source.GOOGLE_APPLICATION_CREDENTIALS);
@@ -211,6 +222,7 @@ export function loadServerEnv(
     webOrigin:
       overrides.webOrigin ?? source.LOOMIC_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
     ...(agentFilesRoot ? { agentFilesRoot } : {}),
+    ...(googleApiBase ? { googleApiBase } : {}),
     ...(googleApiKey ? { googleApiKey } : {}),
     ...(googleApplicationCredentials ? { googleApplicationCredentials } : {}),
     ...(openAIApiBase ? { openAIApiBase } : {}),

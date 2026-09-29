@@ -17,6 +17,7 @@ import {
   computeEdgePoint,
   computeFixedPoint,
 } from "./canvas-element-helpers.js";
+import { mutateCanvasContent } from "../../features/canvas/canvas-version.js";
 
 // Re-export for consumers that import measureTextWidth from this module
 // (e.g. the test suite). New code should import directly from canvas-element-helpers.
@@ -743,65 +744,90 @@ export function createManipulateCanvasTool(deps: {
         });
       }
 
-      // --- Read current canvas -------------------------------------------------
       const client = deps.createUserClient(accessToken);
-      const { data, error } = await client
-        .from("canvases")
-        .select("content")
-        .eq("id", canvasId)
-        .single();
 
-      if (error || !data) {
+      // Accumulated per attempt, not across attempts: the operations are replayed
+      // from scratch on a version conflict, so these must be cleared each time or
+      // a retry would report every description twice.
+      let descriptions: string[] = [];
+      let errors: string[] = [];
+      let createdIds: Record<string, string> = {};
+
+      // Read-apply-write under optimistic concurrency. Previously this tool did
+      // its own bare select-then-update, bypassing canvas-element-writer
+      // entirely, which made it the easiest of the six writers to overlook.
+      let written;
+      try {
+        written = await mutateCanvasContent(
+          client,
+          canvasId,
+          (canvasContent) => {
+            const content = canvasContent as {
+              elements?: CanvasElement[];
+              appState?: Record<string, unknown>;
+            };
+            // Fresh array from the freshly read content on every attempt; the
+            // handlers mutate it in place.
+            const elements: CanvasElement[] = content.elements ?? [];
+
+            descriptions = [];
+            errors = [];
+            createdIds = {};
+
+            for (let i = 0; i < input.operations.length; i++) {
+              const op = input.operations[i]!;
+              try {
+                const handler = handlers[op.action];
+                const result = handler(elements, op);
+                if (result.description.startsWith("[skip]")) {
+                  errors.push(result.description);
+                } else {
+                  descriptions.push(result.description);
+                  if (result.createdId) {
+                    createdIds[`op_${i}`] = result.createdId;
+                  }
+                }
+              } catch (e) {
+                errors.push(`[error] ${op.action}: ${(e as Error).message}`);
+              }
+            }
+
+            // Must run after all operations so cascaded deletes are visible.
+            validateBindings(elements);
+
+            return { ...content, elements } as typeof canvasContent;
+          },
+          { label: "manipulate_canvas" },
+        );
+      } catch (e) {
+        const err = e as { code?: string; message?: string };
+        if (err.code === "canvas_not_found") {
+          return JSON.stringify({
+            error: "canvas_not_found",
+            message: "Canvas not found or access denied.",
+          });
+        }
+        // Distinct from write_failed on purpose: retrying is the right move here,
+        // and nothing was written. Reported as canvas_not_found before the read
+        // path learned to tell a dead connection from a missing row.
+        if (err.code === "canvas_unavailable") {
+          return JSON.stringify({
+            error: "canvas_unavailable",
+            message:
+              "The canvas store did not respond, so nothing was written. This is " +
+              "transient — retry the same call.",
+          });
+        }
         return JSON.stringify({
-          error: "canvas_not_found",
-          message: "Canvas not found or access denied.",
+          error: "write_failed",
+          message: `Failed to save canvas: ${err.message ?? String(e)}`,
         });
       }
 
-      const content = data.content as {
-        elements?: CanvasElement[];
-        appState?: Record<string, unknown>;
-      };
-      const elements: CanvasElement[] = content.elements ?? [];
-
-      // --- Apply operations ----------------------------------------------------
-      const descriptions: string[] = [];
-      const errors: string[] = [];
-      const createdIds: Record<string, string> = {};
-
-      for (let i = 0; i < input.operations.length; i++) {
-        const op = input.operations[i]!;
-        try {
-          const handler = handlers[op.action];
-          const result = handler(elements, op);
-          if (result.description.startsWith("[skip]")) {
-            errors.push(result.description);
-          } else {
-            descriptions.push(result.description);
-            if (result.createdId) {
-              createdIds[`op_${i}`] = result.createdId;
-            }
-          }
-        } catch (e) {
-          errors.push(`[error] ${op.action}: ${(e as Error).message}`);
-        }
-      }
-
-      // --- Post-processing: clean up orphan bindings ---------------------------
-      // Must run after all operations so cascaded deletes are visible.
-      validateBindings(elements);
-
-      // --- Write back ----------------------------------------------------------
-      const updatedContent = { ...content, elements };
-      const { error: writeError } = await client
-        .from("canvases")
-        .update({ content: updatedContent })
-        .eq("id", canvasId);
-
-      if (writeError) {
+      if (!written) {
         return JSON.stringify({
           error: "write_failed",
-          message: `Failed to save canvas: ${writeError.message}`,
+          message: "Canvas write produced no change.",
         });
       }
 

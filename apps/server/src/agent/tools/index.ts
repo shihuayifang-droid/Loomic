@@ -67,13 +67,6 @@ export function createMainAgentTools(
     createProjectSearchTool(backend),
     createInspectCanvasTool(deps),
     createManipulateCanvasTool(deps),
-    createImageGenerateTool({
-      ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
-      ...(deps.submitImageJob ? { submitImageJob: deps.submitImageJob } : {}),
-    }),
-    createVideoGenerateTool({
-      ...(deps.submitVideoJob ? { submitVideoJob: deps.submitVideoJob } : {}),
-    }),
     createPersistSandboxFileTool({
       createUserClient: deps.createUserClient,
       ...(deps.sandboxDir ? { sandboxDir: deps.sandboxDir } : {}),
@@ -82,6 +75,39 @@ export function createMainAgentTools(
     // 因为 CompositeBackend 的 default backend 是 LocalShellBackend。
     // 不需要在这里手动注册。
   ];
+
+  // LOCAL FORK: generation tools are registered ONLY when a job channel exists.
+  //
+  // These used to be registered unconditionally, spreading submitJob in when
+  // present. With it absent the tool still built fine and fell through to a
+  // direct provider call that skipped the job record, the credit deduction and
+  // the tier check. runtime.ts only builds those closures when
+  // `jobService && createUserClient && accessToken && userId` all hold, so the
+  // absent case is a real, reachable state -- not a theoretical one.
+  //
+  // No job channel now means the capability is simply not offered. The agent
+  // sees no generate_image / generate_video tool and says so, which is the
+  // honest outcome; handing out unbilled generations is not.
+  if (deps.submitImageJob) {
+    tools.push(
+      createImageGenerateTool({
+        submitImageJob: deps.submitImageJob,
+        ...(deps.persistImage ? { persistImage: deps.persistImage } : {}),
+      }),
+    );
+  } else {
+    console.warn(
+      "[tools] no submitImageJob channel — generate_image will not be offered",
+    );
+  }
+
+  if (deps.submitVideoJob) {
+    tools.push(createVideoGenerateTool({ submitVideoJob: deps.submitVideoJob }));
+  } else {
+    console.warn(
+      "[tools] no submitVideoJob channel — generate_video will not be offered",
+    );
+  }
   if (deps.brandKitId) {
     tools.push(createBrandKitTool(deps, deps.brandKitId));
   }
@@ -94,11 +120,7 @@ export function createMainAgentTools(
   return tools;
 }
 
-/** @deprecated Use createMainAgentTools + sub-agents instead */
-export function createPhaseATools(backend: BackendProtocol | BackendFactory) {
-  return [
-    createProjectSearchTool(backend),
-    createImageGenerateTool(),
-    createVideoGenerateTool(),
-  ] as const;
-}
+// LOCAL FORK: createPhaseATools removed. It was already @deprecated and unused,
+// but it constructed both generation tools with no arguments -- i.e. it was a
+// ready-made unbilled path waiting to be called. Deleted rather than fixed,
+// since createMainAgentTools + sub-agents replaced it.

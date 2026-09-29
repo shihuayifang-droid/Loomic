@@ -16,6 +16,11 @@ import { createPgmqClient, type PgmqMessage } from "./queue/pgmq-client.js";
 import { createJobService } from "./features/jobs/job-service.js";
 import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
 import { getExecutor, type ExecutorContext } from "./features/jobs/job-executor.js";
+import {
+  JOB_QUEUES,
+  JOB_TYPE_REGISTRY,
+  type JobTypeConfig,
+} from "./features/jobs/job-registry.js";
 import { createAdminSupabaseClient } from "./supabase/admin.js";
 import { createUserSupabaseClientFactory } from "./supabase/user.js";
 
@@ -29,17 +34,9 @@ import type { BackgroundJobType } from "@loomic/shared";
 import { registerAllProviders } from "./generation/providers/register-all.js";
 
 // 代码执行由 LocalShellBackend 的内置 execute 工具直接处理，不走 PGMQ。
-const QUEUES = ["image_generation_jobs", "video_generation_jobs"] as const;
-
-const QUEUE_TO_TYPE: Record<string, BackgroundJobType> = {
-  image_generation_jobs: "image_generation",
-  video_generation_jobs: "video_generation",
-};
-
-const VT_BY_QUEUE: Record<string, number> = {
-  image_generation_jobs: 120,
-  video_generation_jobs: 300,
-};
+//
+// Queue list, queue->type mapping, visibility timeouts and concurrency caps all
+// come from JOB_TYPE_REGISTRY now; they used to be four separate tables here.
 
 async function main() {
   const env = loadServerEnv();
@@ -72,13 +69,8 @@ async function main() {
     env,
   };
 
-  const CONCURRENCY_BY_QUEUE: Record<string, number> = {
-    image_generation_jobs: env.workerImageConcurrency ?? 3,
-    video_generation_jobs: env.workerVideoConcurrency ?? 2,
-  };
-
   const inFlightByQueue = new Map<string, Set<Promise<void>>>(
-    QUEUES.map((q) => [q, new Set()]),
+    JOB_QUEUES.map((q) => [q, new Set()]),
   );
 
   // Server-side long poll: wait up to N seconds inside Postgres for messages,
@@ -106,21 +98,31 @@ async function main() {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  const concurrencyDesc = QUEUES.map((q) => `${q}=${CONCURRENCY_BY_QUEUE[q] ?? 1}`).join(", ");
+  const concurrencyDesc = Object.entries(JOB_TYPE_REGISTRY)
+    .map(([type, config]) => `${type}=${config.concurrency(env)}`)
+    .join(", ");
   console.log(
     `${tag} Started. concurrency={${concurrencyDesc}}, longPollTimeout=${pollTimeoutSeconds}s`,
   );
 
   while (running) {
-    for (const queue of QUEUES) {
+    for (const [jobType, config] of Object.entries(JOB_TYPE_REGISTRY) as [
+      BackgroundJobType,
+      JobTypeConfig,
+    ][]) {
+      const queue = config.queue;
       try {
         const inFlight = inFlightByQueue.get(queue)!;
-        const cap = CONCURRENCY_BY_QUEUE[queue] ?? 1;
-        const available = cap - inFlight.size;
+        const available = config.concurrency(env) - inFlight.size;
         if (available <= 0) continue;
 
-        const vt = VT_BY_QUEUE[queue] ?? 120;
-        const messages = await pgmq.readWithPoll(queue, vt, available, pollTimeoutSeconds, 500);
+        const messages = await pgmq.readWithPoll(
+          queue,
+          config.visibilityTimeoutSeconds,
+          available,
+          pollTimeoutSeconds,
+          500,
+        );
 
         for (const msg of messages) {
           const ctx: ExecutorContext = {
@@ -132,7 +134,7 @@ async function main() {
                 catch (e) { console.warn(`[renewVt] failed for msg ${msg.msg_id}:`, e); }
               },
             };
-            const task = processMessage(queue, msg, ctx, creditService, tag)
+            const task = processMessage(queue, jobType, msg, ctx, creditService, tag)
             .finally(() => inFlight.delete(task));
           inFlight.add(task);
         }
@@ -145,13 +147,16 @@ async function main() {
 
 async function processMessage(
   queue: string,
+  /** The type this queue serves, per JOB_TYPE_REGISTRY — used when the message
+   * itself does not carry job_type. Replaces the old QUEUE_TO_TYPE lookup. */
+  queueJobType: BackgroundJobType,
   msg: PgmqMessage,
   ctx: ExecutorContext,
   creditService: CreditService,
   tag: string,
 ) {
   const jobId = msg.message.job_id as string;
-  const jobType = (msg.message.job_type as BackgroundJobType) ?? QUEUE_TO_TYPE[queue];
+  const jobType = (msg.message.job_type as BackgroundJobType) ?? queueJobType;
 
   if (!jobId || !jobType) {
     console.error(`${tag} Invalid message in ${queue}:`, msg.message);

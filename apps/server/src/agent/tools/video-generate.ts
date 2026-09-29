@@ -318,11 +318,37 @@ export async function runVideoGenerate(
 
 // ── Tool factory ───────────────────────────────────────────────────────────
 
-export function createVideoGenerateTool(deps?: {
+export function createVideoGenerateTool(deps: {
   submitVideoJob?: SubmitVideoJobFn;
   availableModels?: AvailableVideoModel[];
-}) {
-  const models = deps?.availableModels ?? getAvailableVideoModels();
+  /**
+   * Acknowledge that this instance will call providers directly, with NO job
+   * record, NO credit deduction and NO tier check. Tests only.
+   */
+  allowUnbilledDirect?: boolean;
+} = {}) {
+  // LOCAL FORK: guard against the unbilled path being reached by accident.
+  //
+  // `runVideoGenerate` falls through to a direct provider call whenever
+  // submitVideoJob is absent, and that path bills nothing. It was reachable for
+  // real: sub-agents.ts constructed this tool with no arguments at all, so the
+  // video sub-agent generated videos for free and skipped the subscription tier
+  // check as well. Nothing failed or logged -- the only symptom was credits not
+  // moving.
+  //
+  // Throwing at construction rather than at call time is deliberate: a missing
+  // job channel is a wiring mistake, and it should surface when the agent is
+  // assembled, not when a user happens to ask for a video.
+  if (!deps.submitVideoJob && !deps.allowUnbilledDirect) {
+    throw new Error(
+      "createVideoGenerateTool: submitVideoJob is required. Without it the tool " +
+        "calls the provider directly, bypassing the job queue, credit deduction " +
+        "and tier checks. If there is no job channel available, do not register " +
+        "this tool at all. Pass allowUnbilledDirect: true only in tests.",
+    );
+  }
+
+  const models = deps.availableModels ?? getAvailableVideoModels();
 
   const modelSummary = models.length
     ? models.map((m) => `${m.displayName} (${m.id})`).join(", ")
@@ -330,7 +356,7 @@ export function createVideoGenerateTool(deps?: {
 
   return tool(
     async (input: VideoGenerateInput) => {
-      return await runVideoGenerate(input, deps?.submitVideoJob, models);
+      return await runVideoGenerate(input, deps.submitVideoJob, models);
     },
     {
       name: "generate_video",

@@ -22,18 +22,34 @@ export type ToolDisplayConfig = {
   label: string;
   icon: string;
   showCard: boolean;
+  /**
+   * Whether this tool appears in the transcript at all.
+   *
+   * LOCAL FORK: upstream rendered a block for every tool call, so the
+   * conversation filled up with internal plumbing ("读取画布" showing canvas id
+   * / element count / viewport) that the user has no reason to read. Lovart only
+   * surfaces tools that produce an artifact — image and video generation — and
+   * keeps queries invisible. Effects that are already visible on the canvas
+   * (manipulate_canvas) do not need to be narrated in the chat either.
+   *
+   * Note this is purely presentational: the events still flow through
+   * use-chat-stream and chat-sidebar, so artifact-to-canvas insertion is
+   * unaffected by hiding a tool here.
+   */
+  visible: boolean;
 };
 
 const TOOL_CONFIG: Record<string, ToolDisplayConfig> = {
-  think: { label: "\u601d\u8003\u4e2d", icon: "tool", showCard: false },
-  inspect_canvas: { label: "\u8bfb\u53d6\u753b\u5e03", icon: "eye", showCard: true },
-  manipulate_canvas: { label: "\u64cd\u4f5c\u753b\u5e03", icon: "brush", showCard: true },
-  generate_image: { label: "\u751f\u6210\u56fe\u7247", icon: "image", showCard: true },
-  generate_video: { label: "\u751f\u6210\u89c6\u9891", icon: "video", showCard: true },
-  screenshot_canvas: { label: "\u622a\u53d6\u753b\u5e03", icon: "eye", showCard: true },
-  get_brand_kit: { label: "\u54c1\u724c\u5de5\u5177\u5305", icon: "palette", showCard: true },
-  project_search: { label: "\u641c\u7d22\u9879\u76ee", icon: "search", showCard: true },
-  task: { label: "\u6267\u884c\u4efb\u52a1", icon: "tool", showCard: false },
+  think: { label: "\u601d\u8003\u4e2d", icon: "tool", showCard: false, visible: false },
+  inspect_canvas: { label: "\u8bfb\u53d6\u753b\u5e03", icon: "eye", showCard: true, visible: false },
+  manipulate_canvas: { label: "\u64cd\u4f5c\u753b\u5e03", icon: "brush", showCard: true, visible: false },
+  generate_image: { label: "\u751f\u6210\u56fe\u7247", icon: "image", showCard: true, visible: true },
+  generate_video: { label: "\u751f\u6210\u89c6\u9891", icon: "video", showCard: true, visible: true },
+  screenshot_canvas: { label: "\u622a\u53d6\u753b\u5e03", icon: "eye", showCard: true, visible: false },
+  get_brand_kit: { label: "\u54c1\u724c\u5de5\u5177\u5305", icon: "palette", showCard: true, visible: false },
+  project_search: { label: "\u641c\u7d22\u9879\u76ee", icon: "search", showCard: true, visible: false },
+  task: { label: "\u6267\u884c\u4efb\u52a1", icon: "tool", showCard: false, visible: false },
+  persist_sandbox_file: { label: "\u4fdd\u5b58\u6587\u4ef6", icon: "tool", showCard: true, visible: false },
 };
 
 export function getToolConfig(toolName: string): ToolDisplayConfig {
@@ -42,8 +58,16 @@ export function getToolConfig(toolName: string): ToolDisplayConfig {
       label: formatToolName(toolName),
       icon: "tool",
       showCard: true,
+      // Unknown tools default to hidden: anything newly added is far more likely
+      // to be internal plumbing than something worth showing the user.
+      visible: false,
     }
   );
+}
+
+/** Whether a tool call should be rendered in the chat transcript. */
+export function isToolVisible(toolName: string): boolean {
+  return getToolConfig(toolName).visible;
 }
 
 /** Convert raw tool name to human-readable: "generate_image" -> "Generate Image" */

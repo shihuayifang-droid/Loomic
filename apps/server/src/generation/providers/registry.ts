@@ -1,6 +1,7 @@
 import type {
+  ImageModelInfo,
+  ImageOperation,
   ImageProvider,
-  ModelInfo,
   VideoModelInfo,
   VideoProvider,
 } from "../types.js";
@@ -41,8 +42,15 @@ export function getVideoProvider(name: string): VideoProvider {
   return provider;
 }
 
-/** Model info enriched with its owning provider name. */
-export interface AvailableModel extends ModelInfo {
+/**
+ * Model info enriched with its owning provider name.
+ *
+ * Extends ImageModelInfo, not the bare ModelInfo: the spread in
+ * `getAvailableImageModels` always carried `limits` at runtime, but the wider
+ * type hid it from every consumer, so the tool schema had to hard-code reference
+ * image counts in prose instead of reading them.
+ */
+export interface AvailableModel extends ImageModelInfo {
   provider: string;
 }
 
@@ -50,10 +58,21 @@ export interface AvailableVideoModel extends VideoModelInfo {
   provider: string;
 }
 
-/** Returns all image models from all registered providers. */
-export function getAvailableImageModels(): AvailableModel[] {
+/**
+ * Returns image models from all registered providers.
+ *
+ * Pass an operation to get only the models that perform it. Tools must do this:
+ * a text-to-image tool that lists an upscaler would let the LLM pick a model
+ * that ignores its prompt. Omitting the argument returns everything and is only
+ * right for the "show the user the whole catalogue" case.
+ */
+export function getAvailableImageModels(
+  operation?: ImageOperation,
+): AvailableModel[] {
   return [...imageProviders.values()].flatMap((p) =>
-    p.models.map((m) => ({ ...m, provider: p.name })),
+    p.models
+      .filter((m) => operation === undefined || m.operation === operation)
+      .map((m) => ({ ...m, provider: p.name })),
   );
 }
 
@@ -64,12 +83,29 @@ export function getAvailableVideoModels(): AvailableVideoModel[] {
   );
 }
 
-/** Resolves the provider name that handles a given image model ID. */
-export function resolveImageProviderName(modelId: string): string {
+/**
+ * Resolves the provider name that handles a given image model ID.
+ *
+ * Pass `expectedOperation` to also assert the model does what the caller is
+ * about to ask of it. Without that check an upscaler id reaching a text-to-image
+ * call site would be dispatched happily and produce a confusing result rather
+ * than an error.
+ */
+export function resolveImageProviderName(
+  modelId: string,
+  expectedOperation?: ImageOperation,
+): string {
   for (const provider of imageProviders.values()) {
-    if (provider.models.some((m) => m.id === modelId)) {
-      return provider.name;
+    const model = provider.models.find((m) => m.id === modelId);
+    if (!model) continue;
+    if (expectedOperation !== undefined && model.operation !== expectedOperation) {
+      throw new GenerationError(
+        provider.name,
+        "model_not_found",
+        `Image model ${modelId} performs "${model.operation}", not "${expectedOperation}"`,
+      );
     }
+    return provider.name;
   }
   throw new GenerationError(
     "unknown",

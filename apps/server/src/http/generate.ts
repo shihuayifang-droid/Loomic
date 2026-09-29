@@ -5,7 +5,6 @@ import { z } from "zod";
 import {
   applicationErrorResponseSchema,
   unauthenticatedErrorResponseSchema,
-  type ImageQualityLevel,
   type VideoResolution,
 } from "@loomic/shared";
 
@@ -15,8 +14,11 @@ import type { CreditService } from "../features/credits/credit-service.js";
 import { CreditServiceError } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
 import { TierGuardError } from "../features/credits/tier-guard.js";
+import { withBilling } from "../features/credits/with-billing.js";
 import type { JobService } from "../features/jobs/job-service.js";
 import { JobServiceError } from "../features/jobs/job-service.js";
+import { watchJob } from "../features/jobs/job-watcher.js";
+import type { ConnectionManager } from "../ws/connection-manager.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { UploadService } from "../features/uploads/upload-service.js";
 import type { AuthenticatedUser, RequestAuthenticator } from "../supabase/user.js";
@@ -46,6 +48,8 @@ export async function registerGenerateRoutes(
     tierGuard?: TierGuard;
     uploadService: UploadService;
     viewerService: ViewerService;
+    /** Needed to push job.progress. Absent = no progress events, jobs still run. */
+    connectionManager?: ConnectionManager;
   },
 ) {
   app.post("/api/agent/generate-image", async (request, reply) => {
@@ -78,43 +82,45 @@ export async function registerGenerateRoutes(
     const model = payload.model ?? "black-forest-labs/flux-kontext-pro";
 
     try {
-      // ── Tier guard + credit checks ──
       const viewer = await options.viewerService.ensureViewer(user);
-      let creditsCost = 0;
 
-      if (options.creditService && options.tierGuard) {
-        const sub = await options.creditService.getSubscription(viewer.workspace.id);
-        const quality: ImageQualityLevel = payload.quality ?? "hd";
-        options.tierGuard.checkModelAccess(sub.plan, model);
-        // Throws TierGuardError (resolution_not_allowed) if plan doesn't allow this quality
-        options.tierGuard.checkResolution(sub.plan, quality);
-        await options.tierGuard.checkConcurrency(viewer.workspace.id, sub.plan);
-        creditsCost = options.tierGuard.calculateCreditCost(model, "image_generation", { quality });
-
-        // Deduct credits before generation
-        if (creditsCost > 0) {
-          await options.creditService.deductCredits(
-            viewer.workspace.id, user.id, creditsCost, undefined,
-            `Direct image generation: ${model}`,
-          );
-        }
-      }
-
-      const providerName = resolveImageProviderName(model);
-      const result = await generateImage(providerName, {
-        prompt: payload.prompt,
-        model,
-        aspectRatio: payload.aspectRatio ?? "1:1",
-        ...(payload.quality ? { quality: payload.quality } : {}),
-      });
-
-      // Download and persist to Supabase Storage
-      const { signedUrl, assetId } = await downloadAndUpload(
-        result.url,
-        result.mimeType,
-        payload.prompt,
-        user,
+      // No `job` in the request: this route generates synchronously and never
+      // creates one, so withBilling owns the refund if anything below fails --
+      // the provider call, the download, or the Storage upload. The upload case
+      // is deliberately covered: the provider has already charged us by then,
+      // but the user got no image, so eating their credits too is the wrong
+      // trade. Making this route asynchronous so the transaction carries a
+      // job_id is tracked as B-3.
+      const { signedUrl, assetId, result } = await withBilling(
         options,
+        {
+          user,
+          workspaceId: viewer.workspace.id,
+          modelId: model,
+          guard: {
+            jobType: "image_generation",
+            quality: payload.quality ?? "hd",
+          },
+          description: `Direct image generation: ${model}`,
+        },
+        async () => {
+          const providerName = resolveImageProviderName(model, "generate");
+          const generated = await generateImage(providerName, {
+            prompt: payload.prompt,
+            model,
+            aspectRatio: payload.aspectRatio ?? "1:1",
+            ...(payload.quality ? { quality: payload.quality } : {}),
+          });
+
+          const uploaded = await downloadAndUpload(
+            generated.url,
+            generated.mimeType,
+            payload.prompt,
+            user,
+            options,
+          );
+          return { ...uploaded, result: generated };
+        },
       );
 
       return reply.code(200).send({
@@ -209,98 +215,71 @@ export async function registerGenerateRoutes(
     const model = payload.model ?? "google-official/veo-3.1-generate-preview";
 
     try {
-      // ── Tier guard + credit checks ──
       const viewer = await options.viewerService.ensureViewer(user);
       const workspaceId = viewer.workspace.id;
-      let creditsCost = 0;
 
-      if (options.creditService && options.tierGuard) {
-        const sub = await options.creditService.getSubscription(workspaceId);
-        options.tierGuard.checkModelAccess(sub.plan, model);
-        if (payload.resolution) {
-          options.tierGuard.checkVideoResolution(
-            sub.plan,
-            payload.resolution as VideoResolution,
-          );
-        }
-        await options.tierGuard.checkConcurrency(workspaceId, sub.plan);
-        creditsCost = options.tierGuard.calculateCreditCost(
-          model,
-          "video_generation",
-          {
+      const result = await withBilling(
+        options,
+        {
+          user,
+          workspaceId,
+          modelId: model,
+          guard: {
+            jobType: "video_generation",
             ...(payload.duration != null ? { duration: payload.duration } : {}),
             ...(payload.resolution
               ? { resolution: payload.resolution as VideoResolution }
               : {}),
           },
-        );
-      }
-
-      // ── Create job ──
-      const job = await options.jobService.createJob(user, {
-        workspaceId,
-        jobType: "video_generation",
-        payload: {
-          prompt: payload.prompt,
-          model,
-          ...(payload.duration != null ? { duration: payload.duration } : {}),
-          ...(payload.resolution ? { resolution: payload.resolution } : {}),
-          ...(payload.aspectRatio
-            ? { aspect_ratio: payload.aspectRatio }
-            : {}),
-          ...(payload.inputImages?.length
-            ? { input_images: payload.inputImages }
-            : {}),
+          description: `Direct video generation: ${model}`,
+          job: {
+            payload: {
+              prompt: payload.prompt,
+              model,
+              ...(payload.duration != null ? { duration: payload.duration } : {}),
+              ...(payload.resolution ? { resolution: payload.resolution } : {}),
+              ...(payload.aspectRatio
+                ? { aspect_ratio: payload.aspectRatio }
+                : {}),
+              ...(payload.inputImages?.length
+                ? { input_images: payload.inputImages }
+                : {}),
+            },
+          },
         },
-      });
-
-      // ── Deduct credits BEFORE generation ──
-      if (options.creditService && creditsCost > 0) {
-        try {
-          const txId = await options.creditService.deductCredits(
-            workspaceId,
-            user.id,
-            creditsCost,
-            job.id,
-            `Direct video generation: ${model}`,
-          );
-          await options.jobService.setCreditsInfo(job.id, creditsCost, txId);
-        } catch (deductError) {
-          await options.jobService.cancelJob(user, job.id).catch(() => {});
-          throw deductError;
-        }
-      }
-
-      // ── Poll until terminal state ──
-      const POLL_INTERVAL = 3_000;
-      const MAX_WAIT = 300_000; // 5 minutes
-
-      const result = await pollJobUntilDone(
-        options.jobService,
-        job.id,
-        POLL_INTERVAL,
-        MAX_WAIT,
+        // P1-d: the job is created and charged, then we return. This used to poll
+        // here for up to 300s while holding the HTTP request open — video takes
+        // 180-600s, so that request was the first thing certain to be killed by
+        // any proxy or sleeping laptop in between, leaving the client with nothing
+        // even though the job completed fine.
+        //
+        // The worker (and its dead-letter refund) owns the outcome from here on.
+        async ({ job }) => job!,
       );
 
-      if ("error" in result) {
-        return reply.code(502).send(
-          applicationErrorResponseSchema.parse({
-            error: {
-              code: "generation_failed",
-              message: result.error,
-            },
-          }),
-        );
-      }
+      // Detached watcher: polls the job and pushes `job.progress` over the WS.
+      // Fire-and-forget on purpose — the job's fate does not depend on anyone
+      // watching, and a failure to push must not fail this request.
+      watchJob(
+        {
+          jobService: options.jobService,
+          ...(options.connectionManager
+            ? { connectionManager: options.connectionManager }
+            : {}),
+        },
+        {
+          jobId: result.id,
+          userId: user.id,
+          jobType: "video_generation",
+        },
+      );
 
-      return reply.code(200).send({
-        url: result.signed_url,
-        assetId: result.asset_id,
+      // 202, not 200: the work is accepted and still running. The client watches
+      // for job.progress (or queries GET /api/jobs/:id) instead of waiting here.
+      return reply.code(202).send({
+        jobId: result.id,
+        status: result.status,
         prompt: payload.prompt,
-        mimeType: result.mime_type,
-        width: result.width,
-        height: result.height,
-        durationSeconds: result.duration_seconds,
       });
     } catch (error) {
       if (error instanceof TierGuardError) {
@@ -351,49 +330,10 @@ type VideoJobResult = {
   mime_type: string;
 };
 
-type PollResult = VideoJobResult | { error: string };
-
-async function pollJobUntilDone(
-  jobService: JobService,
-  jobId: string,
-  pollInterval: number,
-  maxWait: number,
-): Promise<PollResult> {
-  const start = Date.now();
-
-  while (Date.now() - start < maxWait) {
-    await delay(pollInterval);
-
-    const current = await jobService.getJobAdmin(jobId);
-
-    if (current.status === "succeeded" && current.result) {
-      const r = current.result as Record<string, unknown>;
-      return {
-        signed_url: (r.signed_url as string) ?? "",
-        asset_id: (r.asset_id as string) ?? "",
-        width: (r.width as number) ?? 0,
-        height: (r.height as number) ?? 0,
-        duration_seconds: (r.duration_seconds as number) ?? 0,
-        mime_type: (r.mime_type as string) ?? "video/mp4",
-      };
-    }
-
-    if (current.status === "dead_letter" || current.status === "canceled") {
-      return { error: current.error_message ?? `Job ${current.status}` };
-    }
-
-    if (
-      current.status === "failed" &&
-      current.attempt_count >= current.max_attempts
-    ) {
-      return {
-        error: current.error_message ?? "Job failed after max retries",
-      };
-    }
-  }
-
-  return { error: `Job timed out after ${maxWait / 1000}s` };
-}
+// P1-d removed `pollJobUntilDone` from here. It was the loop that held the HTTP
+// request open for up to 300s. The equivalent polling now lives in
+// features/jobs/job-watcher.ts, detached from any request, and the client learns
+// the outcome from `job.progress` (with GET /api/jobs/:id as its safety net).
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

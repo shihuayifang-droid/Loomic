@@ -5,6 +5,7 @@ import { Geist } from "next/font/google";
 import { cn } from "@/lib/utils";
 
 import { Providers } from "../components/providers";
+import { DevErrorReporter } from "../components/dev-error-reporter";
 
 import "./globals.css";
 
@@ -34,6 +35,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" className={cn(geist.variable, "scroll-smooth")} suppressHydrationWarning>
       <body className="min-h-screen bg-background font-sans antialiased">
+        <DevErrorReporter />
         <Providers>{children}</Providers>
         <Script
           src="https://app.lemonsqueezy.com/js/lemon.js"

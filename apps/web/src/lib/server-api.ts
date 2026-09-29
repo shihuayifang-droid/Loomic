@@ -13,6 +13,7 @@ import type {
   ProjectCreateResponse,
   ProjectListResponse,
   ProjectUpdateRequest,
+  RecoverableArtifact,
   RunCreateRequest,
   RunCreateResponse,
   SessionCreateResponse,
@@ -29,6 +30,7 @@ import type {
 
 import { dedupeRequest } from "./dedupe-request";
 import { getServerBaseUrl } from "./env";
+import { getSupabaseBrowserClient } from "./supabase-browser";
 
 // --- Error types ---
 
@@ -41,10 +43,17 @@ export class ApiAuthError extends Error {
 
 export class ApiApplicationError extends Error {
   code: string;
-  constructor(code: string, message: string) {
+  /**
+   * HTTP status the server replied with, when known. Callers need it to tell a
+   * retriable server fault (5xx) from a request that will fail identically
+   * every time (4xx).
+   */
+  status?: number;
+  constructor(code: string, message: string, status?: number) {
     super(message);
     this.name = "ApiApplicationError";
     this.code = code;
+    if (status !== undefined) this.status = status;
   }
 }
 
@@ -87,6 +96,41 @@ function authJsonHeaders(accessToken: string): Record<string, string> {
   };
 }
 
+/**
+ * Run an authenticated request; if the server rejects the token, get a fresh
+ * one from Supabase and try again exactly once.
+ *
+ * LOCAL FORK. Access tokens live one hour. The canvas auto-saves on a debounce,
+ * so a save routinely fires moments after expiry — especially in a background
+ * tab, where Supabase's refresh timer is throttled. Upstream let the resulting
+ * ApiAuthError escape to a console.error and silently dropped the user's edit.
+ *
+ * Retrying is safe here because a 401 means the request never reached the
+ * database, so nothing was half-written.
+ */
+async function withFreshToken<T>(
+  accessToken: string,
+  run: (token: string) => Promise<T>,
+): Promise<T> {
+  try {
+    return await run(accessToken);
+  } catch (err) {
+    if (!(err instanceof ApiAuthError)) throw err;
+
+    const auth = getSupabaseBrowserClient().auth;
+    // getSession refreshes an expired token; if it hands back the same one
+    // (not yet considered expired locally, but rejected by the server) force a
+    // refresh so we are not just replaying the rejected token.
+    let fresh = (await auth.getSession()).data.session?.access_token;
+    if (!fresh || fresh === accessToken) {
+      fresh = (await auth.refreshSession()).data.session?.access_token;
+    }
+    if (!fresh || fresh === accessToken) throw err;
+
+    return await run(fresh);
+  }
+}
+
 async function handleErrorResponse(response: Response): Promise<never> {
   if (response.status === 401) {
     throw new ApiAuthError();
@@ -94,7 +138,7 @@ async function handleErrorResponse(response: Response): Promise<never> {
   const body = await response.json().catch(() => null);
   const code = body?.error?.code ?? "application_error";
   const message = body?.error?.message ?? "Request failed";
-  throw new ApiApplicationError(code, message);
+  throw new ApiApplicationError(code, message, response.status);
 }
 
 export async function fetchViewer(
@@ -190,24 +234,114 @@ export async function fetchCanvas(
   return (await response.json()) as { canvas: CanvasDetail };
 }
 
+export type CanvasContentPayload = {
+  elements: Record<string, unknown>[];
+  appState: Record<string, unknown>;
+  files: Record<string, Record<string, unknown>>;
+};
+
+/**
+ * Thrown on HTTP 409: the canvas moved on since `baseVersion` was read, so this
+ * save would have erased whatever landed in between (typically an image the agent
+ * just generated). Carries the server's current state so the caller can merge.
+ */
+export class CanvasVersionConflict extends Error {
+  readonly currentVersion: number;
+  readonly currentContent: CanvasContentPayload;
+  constructor(
+    message: string,
+    currentVersion: number,
+    currentContent: CanvasContentPayload,
+  ) {
+    super(message);
+    this.name = "CanvasVersionConflict";
+    this.currentVersion = currentVersion;
+    this.currentContent = currentContent;
+  }
+}
+
 export async function saveCanvas(
   accessToken: string,
   canvasId: string,
-  content: {
-    elements: Record<string, unknown>[];
-    appState: Record<string, unknown>;
-    files: Record<string, Record<string, unknown>>;
-  },
-): Promise<void> {
+  content: CanvasContentPayload,
+  /**
+   * The version this content was built from. Send it so a stale save is rejected
+   * rather than silently overwriting newer content. Omitting it falls back to the
+   * old unconditional write, which can lose a concurrent update.
+   */
+  baseVersion?: number,
+): Promise<{ version?: number }> {
+  const body = JSON.stringify({
+    content,
+    ...(baseVersion !== undefined ? { baseVersion } : {}),
+  });
+  return withFreshToken(accessToken, async (token) => {
+    const response = await fetch(
+      `${getServerBaseUrl()}/api/canvases/${canvasId}`,
+      {
+        method: "PUT",
+        headers: authJsonHeaders(token),
+        body,
+      },
+    );
+    if (response.status === 409) {
+      const payload = (await response.json().catch(() => null)) as {
+        error?: { message?: string };
+        currentVersion?: number;
+        currentContent?: CanvasContentPayload;
+      } | null;
+      throw new CanvasVersionConflict(
+        payload?.error?.message ?? "Canvas was modified by someone else.",
+        payload?.currentVersion ?? 0,
+        payload?.currentContent ?? { elements: [], appState: {}, files: {} },
+      );
+    }
+    if (!response.ok) return handleErrorResponse(response);
+    const json = (await response.json().catch(() => null)) as {
+      version?: number;
+    } | null;
+    return json?.version !== undefined ? { version: json.version } : {};
+  });
+}
+
+/**
+ * Images this canvas generated successfully that no element shows any more.
+ * See apps/server/src/features/canvas/canvas-recovery.ts for how that happens.
+ */
+export async function fetchRecoverableArtifacts(
+  accessToken: string,
+  canvasId: string,
+): Promise<RecoverableArtifact[]> {
   const response = await fetch(
-    `${getServerBaseUrl()}/api/canvases/${canvasId}`,
-    {
-      method: "PUT",
-      headers: authJsonHeaders(accessToken),
-      body: JSON.stringify({ content }),
-    },
+    `${getServerBaseUrl()}/api/canvases/${canvasId}/recoverable`,
+    { headers: authHeaders(accessToken) },
   );
   if (!response.ok) return handleErrorResponse(response);
+  const json = (await response.json()) as { artifacts: RecoverableArtifact[] };
+  return json.artifacts;
+}
+
+export async function recoverArtifacts(
+  accessToken: string,
+  canvasId: string,
+  jobIds: string[],
+): Promise<{ recovered: number; skipped: string[]; version?: number }> {
+  return withFreshToken(accessToken, async (token) => {
+    const response = await fetch(
+      `${getServerBaseUrl()}/api/canvases/${canvasId}/recover`,
+      {
+        method: "POST",
+        headers: authJsonHeaders(token),
+        body: JSON.stringify({ jobIds }),
+      },
+    );
+    if (!response.ok) return handleErrorResponse(response);
+    return (await response.json()) as {
+      recovered: number;
+      skipped: string[];
+      version?: number;
+    };
+  });
 }
 
 export async function uploadThumbnail(
@@ -430,6 +564,19 @@ export type ImageModelInfo = {
   creditCost?: number;
   accessible?: boolean;
   minTier?: string;
+  /**
+   * What the model accepts, declared server-side per model. Optional because an
+   * older server build may not send it.
+   *
+   * `maxInputImages: "unbounded"` means several references are accepted but no
+   * documented cap was found — treat it as "no client-side limit", not as a
+   * number.
+   */
+  limits?: {
+    maxInputImages: number | "unbounded";
+    allowedAspectRatios?: string[];
+    supportsOutputFormat: boolean;
+  };
 };
 
 export async function fetchImageModels(): Promise<{
@@ -509,6 +656,22 @@ export async function generateImageDirect(
   return (await response.json()) as GenerateImageResponse;
 }
 
+/**
+ * The fields a finished job is guaranteed to expose to a waiter, whichever way
+ * it learned the job finished. Deliberately narrower than shared's
+ * `BackgroundJob`: awaitJobCompletion can settle from a `job.progress` socket
+ * event, which carries the status and result but not the full row. Widening this
+ * to BackgroundJob would claim fields that path does not have.
+ */
+export type JobRecord = {
+  id: string;
+  status: string;
+  job_type?: string;
+  result?: Record<string, unknown> | null;
+  error_code?: string | null;
+  error_message?: string | null;
+};
+
 export type GenerateVideoResponse = {
   url: string;
   assetId: string;
@@ -519,7 +682,22 @@ export type GenerateVideoResponse = {
   durationSeconds: number;
 };
 
-export async function generateVideoDirect(
+/** 202 body of POST /api/agent/generate-video — the work is accepted, not done. */
+export type SubmitVideoResponse = {
+  jobId: string;
+  status: string;
+  prompt: string;
+};
+
+/**
+ * Submits a video generation job and returns immediately (HTTP 202).
+ *
+ * Renamed from `generateVideoDirect` because it no longer generates anything by
+ * the time it returns — waiting for the outcome is `awaitJobCompletion`'s job.
+ * The old name promised a finished video and would have made the caller's `await`
+ * look correct while silently doing something else.
+ */
+export async function submitVideoJob(
   accessToken: string,
   prompt: string,
   options?: {
@@ -529,7 +707,7 @@ export async function generateVideoDirect(
     aspectRatio?: string;
     inputImages?: string[];
   },
-): Promise<GenerateVideoResponse> {
+): Promise<SubmitVideoResponse> {
   const response = await fetch(
     `${getServerBaseUrl()}/api/agent/generate-video`,
     {
@@ -548,7 +726,7 @@ export async function generateVideoDirect(
     },
   );
   if (!response.ok) return handleErrorResponse(response);
-  return (await response.json()) as GenerateVideoResponse;
+  return (await response.json()) as SubmitVideoResponse;
 }
 
 // --- Jobs API ---

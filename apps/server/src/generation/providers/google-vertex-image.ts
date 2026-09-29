@@ -3,8 +3,8 @@ import { GoogleGenAI } from "@google/genai";
 import type {
   GeneratedImage,
   ImageGenerateParams,
+  ImageModelInfo,
   ImageProvider,
-  ModelInfo,
 } from "../types.js";
 import { aspectRatioToDimensions, fetchAsBase64, GenerationError } from "../utils.js";
 
@@ -27,27 +27,39 @@ const MODEL_MAP: Record<string, string> = {
     "gemini-3-pro-image-preview",
 };
 
-const GOOGLE_VERTEX_IMAGE_MODELS: readonly ModelInfo[] = [
+/** Same Gemini models as the direct API, so the same operation and limits. */
+const GEMINI_IMAGE_DEFAULTS = {
+  operation: "generate",
+  limits: {
+    maxInputImages: 14,
+    supportsOutputFormat: false,
+  },
+} as const;
+
+const GOOGLE_VERTEX_IMAGE_MODELS: readonly ImageModelInfo[] = [
   {
     id: "google-vertex/gemini-3-pro-image-preview",
     displayName: "Nano Banana Pro (Vertex)",
     description:
-      "Google Gemini 3 Pro image generation & editing preview via Vertex AI. Image input: up to 14 images. Up to 4K resolution. Best quality with advanced reasoning.",
+      "Google Gemini 3 Pro image generation & editing preview via Vertex AI. Up to 4K resolution. Best quality with advanced reasoning.",
     iconUrl: ICON_GOOGLE,
+    ...GEMINI_IMAGE_DEFAULTS,
   },
   {
     id: "google-vertex/gemini-3.1-flash-image-preview",
     displayName: "Nano Banana 2 (Vertex)",
     description:
-      "Google Gemini 3.1 image generation & editing preview via Vertex AI. Image input: up to 14 images. Faster generation, newest capabilities.",
+      "Google Gemini 3.1 image generation & editing preview via Vertex AI. Faster generation, newest capabilities.",
     iconUrl: ICON_GOOGLE,
+    ...GEMINI_IMAGE_DEFAULTS,
   },
   {
     id: "google-vertex/gemini-2.5-flash-image",
     displayName: "Nano Banana (Vertex)",
     description:
-      "Google Gemini native image generation & editing via Vertex AI. Image input: up to 14 images. Best balance of speed and quality.",
+      "Google Gemini native image generation & editing via Vertex AI. Best balance of speed and quality.",
     iconUrl: ICON_GOOGLE,
+    ...GEMINI_IMAGE_DEFAULTS,
   },
 ];
 

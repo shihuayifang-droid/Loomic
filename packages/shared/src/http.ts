@@ -107,6 +107,16 @@ export const applicationErrorCodeSchema = z.enum([
   "marketplace_search_failed",
   "marketplace_detail_failed",
   "marketplace_install_failed",
+  // LOCAL FORK: these three were being sent by the server but were absent here,
+  // so applicationErrorResponseSchema.parse() threw inside the error path and the
+  // client received Fastify's generic zod dump instead of the intended response —
+  // the real cause was replaced by noise. Found while verifying the P0-2 refund
+  // fix: /api/agent/generate-image's "No provider registered" branch had never
+  // once produced its intended reply.
+  // Widening an enum is backward compatible, so adding them is safe.
+  "invalid_request",
+  "provider_not_configured",
+  "service_unavailable",
   "insufficient_credits",
   "credit_query_failed",
   "credit_claim_failed",
@@ -134,11 +144,83 @@ export const canvasGetResponseSchema = z.object({
 
 export const canvasSaveRequestSchema = z.object({
   content: canvasContentSchema,
+  /**
+   * The version this content was built from. Omit only from clients that predate
+   * optimistic concurrency; the write is then unconditional and can still lose a
+   * concurrent update.
+   */
+  baseVersion: z.number().int().nonnegative().optional(),
 });
 
 export const canvasSaveResponseSchema = z.object({
   ok: z.literal(true),
+  /** The version after this save. Clients must keep it for their next save. */
+  version: z.number().int().nonnegative().optional(),
 });
+
+/**
+ * 409 body. Carries the server's current state so the client can merge instead of
+ * having to re-fetch, and so a `beforeunload` save (which has no chance to do a
+ * round trip) still leaves enough information in the response for diagnosis.
+ */
+export const canvasConflictResponseSchema = z.object({
+  error: z.object({
+    code: z.literal("canvas_version_conflict"),
+    message: z.string(),
+  }),
+  currentVersion: z.number().int().nonnegative(),
+  currentContent: canvasContentSchema,
+});
+
+/**
+ * A generation that succeeded and whose file is still in Storage, but which no
+ * element on the canvas references any more.
+ *
+ * This exists because the canvas layout (canvases.content) and the artifact
+ * record (background_jobs + asset_objects) are separate stores: before
+ * optimistic concurrency landed, a stale whole-content save could drop an
+ * element while the file itself stayed perfectly intact. Those images are still
+ * recoverable — nothing was ever deleted from Storage.
+ */
+export const recoverableArtifactSchema = z.object({
+  jobId: z.string().uuid(),
+  objectPath: z.string().min(1),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+  mimeType: z.string().min(1),
+  createdAt: z.string().min(1),
+  /** The prompt that produced it, so the user can tell which image this is. */
+  prompt: z.string().optional(),
+  /** Direct URL for a thumbnail, so the user can look before restoring. */
+  previewUrl: z.string().optional(),
+});
+
+export const canvasRecoverableResponseSchema = z.object({
+  artifacts: z.array(recoverableArtifactSchema),
+});
+
+export const canvasRecoverRequestSchema = z.object({
+  /**
+   * Which artifacts to put back. The server re-checks each one against current
+   * canvas content, so a stale list cannot cause duplicate inserts.
+   */
+  jobIds: z.array(z.string().uuid()).min(1),
+});
+
+export const canvasRecoverResponseSchema = z.object({
+  recovered: z.number().int().nonnegative(),
+  /** Ids that were asked for but were already on the canvas, or unusable. */
+  skipped: z.array(z.string().uuid()),
+  /** The version after the inserts, so the open editor can keep saving. */
+  version: z.number().int().nonnegative().optional(),
+});
+
+export type RecoverableArtifact = z.infer<typeof recoverableArtifactSchema>;
+export type CanvasRecoverableResponse = z.infer<
+  typeof canvasRecoverableResponseSchema
+>;
+export type CanvasRecoverRequest = z.infer<typeof canvasRecoverRequestSchema>;
+export type CanvasRecoverResponse = z.infer<typeof canvasRecoverResponseSchema>;
 
 export type HealthResponse = z.infer<typeof healthResponseSchema>;
 export type RunCancelResponse = z.infer<typeof runCancelResponseSchema>;

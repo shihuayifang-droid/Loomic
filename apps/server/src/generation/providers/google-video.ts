@@ -1,5 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 
+import type { CataloguedVideoModelId } from "@loomic/shared";
+
 import type {
   GeneratedVideo,
   VideoGenerateParams,
@@ -97,7 +99,10 @@ function deriveMaxResolution(resolutions: string[]): "480p" | "720p" | "1080p" |
 }
 
 function buildVideoModelInfo(
-  id: string,
+  // Narrowed against VIDEO_MODEL_CATALOG. As `string` this helper was a hole in
+  // the check: every model it built skipped the catalog constraint, which is how
+  // five of them ended up with no tier entry.
+  id: CataloguedVideoModelId,
   displayName: string,
   description: string,
   apiModelName: string,

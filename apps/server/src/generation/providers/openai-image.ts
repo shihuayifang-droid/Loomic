@@ -1,43 +1,366 @@
-import OpenAI from "openai";
+import type {
+  GeneratedImage,
+  ImageGenerateParams,
+  ImageModelInfo,
+  ImageProvider,
+} from "../types.js";
+import { fetchAsBase64, GenerationError } from "../utils.js";
 
-import type { GeneratedImage, ImageGenerateParams, ImageProvider } from "../types.js";
-import { aspectRatioToDimensions, GenerationError } from "../utils.js";
+// ── LOCAL FORK ───────────────────────────────────────────────────────────
+//
+// Upstream shipped this provider as a stub: `models = []` (so the model never
+// appeared in /api/image-models) plus three bugs that made it unusable against
+// a real gpt-image endpoint:
+//
+//   1. `quality` was never sent, but it is a REQUIRED parameter -> HTTP 400.
+//   2. It read `response.data[0].url`, but gpt-image returns `b64_json`, so the
+//      URL was always undefined and every call threw "no_output".
+//   3. `inputImages` was ignored entirely, i.e. no reference-image support.
+//
+// It also passed arbitrary WxH computed from the aspect ratio, but the endpoint
+// only accepts a fixed set of size strings, which is another guaranteed 400.
+//
+// This rewrite targets the kwjm (开物基模) gateway. It keeps the provider name
+// "openai" because that is the registry key and the wire format is the OpenAI
+// images API; only the base URL differs.
+//
+// Docs consulted:
+//   https://kwjm.com/docs/modelhub/openai/gpt-image-2-image-generations.html
+//   https://kwjm.com/docs/modelhub/openai/gpt-image-2-image-edit.html
+
+const PROVIDER_NAME = "openai";
+
+const ICON_OPENAI = "https://openai.com/favicon.ico";
+
+/** Internal model ID → gateway model name. Prefixed to avoid colliding with
+ * Replicate-hosted `openai/*` models.
+ *
+ * Note two internal ids map to the SAME gateway model: `-inpaint` is the same
+ * `gpt-image-2` driven through /images/edits with a `mask`. They are separate
+ * entries because the declared OPERATION differs, which is what lets the registry
+ * route by operation and the catalog price them independently. */
+const MODEL_MAP: Record<string, string> = {
+  "kwjm/gpt-image-2": "gpt-image-2",
+  "kwjm/gpt-image-1.5": "gpt-image-1.5",
+  "kwjm/gpt-image-2-inpaint": "gpt-image-2",
+};
+
+/**
+ * Both kwjm models take repeated `image[]` fields on /images/edits, so several
+ * references go in one request; the gateway docs state no cap, hence
+ * "unbounded" rather than an invented number.
+ *
+ * `supportsOutputFormat: false` describes THIS implementation: the endpoint
+ * always returns PNG base64 and `callGenerations`/`callEdits` never send an
+ * output-format field. Flip it here if that changes.
+ *
+ * Aspect ratio is unrestricted because SIZE_TABLE maps any ratio onto one of the
+ * accepted size strings via `orientationOf`.
+ */
+const KWJM_IMAGE_DEFAULTS = {
+  operation: "generate",
+  limits: {
+    maxInputImages: "unbounded",
+    supportsOutputFormat: false,
+  },
+} as const;
+
+const OPENAI_IMAGE_MODELS: readonly ImageModelInfo[] = [
+  {
+    id: "kwjm/gpt-image-2",
+    displayName: "GPT Image 2",
+    description:
+      "OpenAI gpt-image-2 via the kwjm gateway. Text-to-image and multi-reference image editing. Up to 4K. Good prompt adherence and text rendering.",
+    iconUrl: ICON_OPENAI,
+    ...KWJM_IMAGE_DEFAULTS,
+  },
+  {
+    id: "kwjm/gpt-image-1.5",
+    displayName: "GPT Image 1.5",
+    description:
+      "Previous-generation OpenAI image model via the kwjm gateway. Cheaper and faster than gpt-image-2, lower fidelity.",
+    iconUrl: ICON_OPENAI,
+    ...KWJM_IMAGE_DEFAULTS,
+  },
+  {
+    // P1-e stage 2: the first non-generate operation to be wired end to end.
+    //
+    // Chosen over upscale because kwjm has NO upscaler and no background-removal
+    // model (checked its /v1/models: 121 models, zero matches), while
+    // /images/edits does document a `mask` parameter — the standard inpaint
+    // interface. It is also the stricter test of the abstraction: it needs a new
+    // parameter, not just a different model id.
+    id: "kwjm/gpt-image-2-inpaint",
+    displayName: "GPT Image 2 (Inpaint)",
+    description:
+      "Repaints only the masked region of an image, leaving the rest untouched. Needs a source image plus a PNG mask whose transparent area marks what to replace.",
+    iconUrl: ICON_OPENAI,
+    operation: "inpaint",
+    limits: {
+      // Exactly one source image: /images/edits pairs a single `image[]` with a
+      // single `mask`, and a mask has no meaning against several sources.
+      maxInputImages: 1,
+      supportsOutputFormat: false,
+    },
+  },
+];
+
+/** Semantic quality → gateway `quality` enum (low | medium | high | auto). */
+const QUALITY_MAP: Record<string, string> = {
+  standard: "low",
+  hd: "medium",
+  ultra: "high",
+};
+
+type Orientation = "square" | "landscape" | "portrait";
+
+/**
+ * The endpoint accepts ONLY these size strings — arbitrary WxH is rejected:
+ *   1024x1024  1536x1024  1024x1536
+ *   2048x2048  2048x1152
+ *   3840x2160  2160x3840
+ *
+ * Not every (quality, orientation) pair has an exact match, so a few cells fall
+ * back to the nearest available size:
+ *   - hd/portrait  -> 1024x1536 (no 2K portrait exists)
+ *   - ultra/square -> 2048x2048 (no 4K square exists)
+ */
+const SIZE_TABLE: Record<string, Record<Orientation, string>> = {
+  standard: {
+    square: "1024x1024",
+    landscape: "1536x1024",
+    portrait: "1024x1536",
+  },
+  hd: {
+    square: "2048x2048",
+    landscape: "2048x1152",
+    portrait: "1024x1536",
+  },
+  ultra: {
+    square: "2048x2048",
+    landscape: "3840x2160",
+    portrait: "2160x3840",
+  },
+};
+
+function orientationOf(aspectRatio: string): Orientation {
+  const [wStr, hStr] = aspectRatio.split(":");
+  const w = Number(wStr);
+  const h = Number(hStr);
+  if (!w || !h) return "square";
+  const ratio = w / h;
+  // Deliberately wide dead-band so 4:3 and 3:4 do not get forced into the
+  // extreme 16:9 / 9:16 buckets.
+  if (ratio > 1.15) return "landscape";
+  if (ratio < 0.87) return "portrait";
+  return "square";
+}
+
+function resolveSize(aspectRatio: string, quality: string): string {
+  const tier = SIZE_TABLE[quality] ?? SIZE_TABLE.hd!;
+  return tier[orientationOf(aspectRatio)];
+}
+
+function parseSize(size: string): { width: number; height: number } {
+  const [w, h] = size.split("x").map(Number);
+  return { width: w ?? 1024, height: h ?? 1024 };
+}
+
+interface ImagesApiResponse {
+  data?: Array<{ b64_json?: string; url?: string }>;
+  error?: { message?: string };
+}
 
 export class OpenAIImageProvider implements ImageProvider {
-  readonly name = "openai";
-  // TODO: 补充 models 列表后前端 image-models API 才会展示 OpenAI 模型供用户选择
-  readonly models = [] as const;
-  private client: OpenAI;
+  readonly name = PROVIDER_NAME;
+  readonly models = OPENAI_IMAGE_MODELS;
+
+  private apiKey: string;
+  private baseURL: string;
 
   constructor(apiKey: string, baseURL?: string) {
-    this.client = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
+    this.apiKey = apiKey;
+    this.baseURL = (baseURL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
   }
 
   async generate(params: ImageGenerateParams): Promise<GeneratedImage> {
-    const { width, height } = aspectRatioToDimensions(params.aspectRatio ?? "1:1");
-    const size = `${width}x${height}`;
-
-    try {
-      const response = await this.client.images.generate({
-        model: params.model,
-        prompt: params.prompt,
-        size: size as "1024x1024",
-        n: 1,
-      });
-
-      const url = response.data?.[0]?.url;
-      if (!url) {
-        throw new GenerationError("openai", "no_output", "OpenAI returned no image URL");
-      }
-
-      return { url, mimeType: "image/png", width, height };
-    } catch (error) {
-      if (error instanceof GenerationError) throw error;
+    const apiModel = MODEL_MAP[params.model];
+    if (!apiModel) {
       throw new GenerationError(
-        "openai",
-        "api_error",
-        error instanceof Error ? error.message : "Unknown OpenAI error",
+        PROVIDER_NAME,
+        "model_not_found",
+        `Unknown image model: ${params.model}`,
       );
     }
+
+    const declared = OPENAI_IMAGE_MODELS.find((m) => m.id === params.model);
+    const operation = declared?.operation ?? "generate";
+
+    // Both directions are hard errors, never silent:
+    //   - an inpaint model without a mask would quietly regenerate the whole
+    //     image and look like a successful edit
+    //   - a mask sent to a generate model would be dropped, same illusion
+    if (operation === "inpaint") {
+      if (!params.mask) {
+        throw new GenerationError(
+          PROVIDER_NAME,
+          "invalid_input",
+          `${params.model} performs inpainting and requires a mask.`,
+        );
+      }
+      if (!params.inputImages?.length) {
+        throw new GenerationError(
+          PROVIDER_NAME,
+          "invalid_input",
+          `${params.model} requires the source image to edit.`,
+        );
+      }
+    } else if (params.mask) {
+      throw new GenerationError(
+        PROVIDER_NAME,
+        "invalid_input",
+        `${params.model} performs "${operation}" and cannot use a mask. ` +
+          `Use an inpaint model instead.`,
+      );
+    }
+
+    const qualityKey = params.quality ?? "hd";
+    const quality = QUALITY_MAP[qualityKey] ?? "medium";
+    const size = resolveSize(params.aspectRatio ?? "1:1", qualityKey);
+
+    const hasInputs = !!params.inputImages?.length;
+    const response = hasInputs
+      ? await this.callEdits(apiModel, params, size, quality)
+      : await this.callGenerations(apiModel, params, size, quality);
+
+    return this.toGeneratedImage(response, size);
+  }
+
+  /** Text-to-image: JSON body against /images/generations. */
+  private async callGenerations(
+    apiModel: string,
+    params: ImageGenerateParams,
+    size: string,
+    quality: string,
+  ): Promise<Response> {
+    return fetch(`${this.baseURL}/images/generations`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: apiModel,
+        prompt: params.prompt,
+        size,
+        quality,
+        n: 1,
+      }),
+    });
+  }
+
+  /**
+   * Image editing / reference images: multipart against /images/edits.
+   * The field name is `image[]` (repeated) so several references can be sent in
+   * one request. Content-Type is intentionally NOT set — fetch must generate the
+   * multipart boundary itself.
+   */
+  private async callEdits(
+    apiModel: string,
+    params: ImageGenerateParams,
+    size: string,
+    quality: string,
+  ): Promise<Response> {
+    const form = new FormData();
+    form.append("model", apiModel);
+    form.append("prompt", params.prompt);
+    form.append("size", size);
+    form.append("quality", quality);
+    form.append("n", "1");
+
+    const fetched = await Promise.all(
+      params.inputImages!.map((url) => fetchAsBase64(PROVIDER_NAME, url)),
+    );
+
+    fetched.forEach((img, i) => {
+      const bytes = Buffer.from(img.data, "base64");
+      const ext = img.mimeType.split("/")[1] ?? "png";
+      form.append(
+        "image[]",
+        new Blob([new Uint8Array(bytes)], { type: img.mimeType }),
+        `reference-${i}.${ext}`,
+      );
+    });
+
+    // Inpainting: the mask goes in the documented `mask` field. Its fully
+    // transparent pixels are the region to repaint, so it MUST stay PNG — a JPEG
+    // has no alpha channel and the whole image would be treated as editable.
+    if (params.mask) {
+      const maskImg = await fetchAsBase64(PROVIDER_NAME, params.mask);
+      if (!/png/i.test(maskImg.mimeType)) {
+        throw new GenerationError(
+          PROVIDER_NAME,
+          "invalid_input",
+          `Mask must be a PNG with an alpha channel, got ${maskImg.mimeType}.`,
+        );
+      }
+      const maskBytes = Buffer.from(maskImg.data, "base64");
+      form.append(
+        "mask",
+        new Blob([new Uint8Array(maskBytes)], { type: maskImg.mimeType }),
+        "mask.png",
+      );
+    }
+
+    return fetch(`${this.baseURL}/images/edits`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+      body: form,
+    });
+  }
+
+  private async toGeneratedImage(
+    response: Response,
+    size: string,
+  ): Promise<GeneratedImage> {
+    if (!response.ok) {
+      const body = (await response.json().catch(() => null)) as
+        | ImagesApiResponse
+        | null;
+      const detail = body?.error?.message ?? "Unknown error";
+
+      // The gateway documents 400 (not 503) as the content-policy status, so
+      // surface that as a safety filter rather than a generic API failure.
+      const code =
+        response.status === 400 && /polic|safety|content/i.test(detail)
+          ? "safety_filter"
+          : "api_error";
+
+      throw new GenerationError(
+        PROVIDER_NAME,
+        code,
+        `Image API error ${response.status}: ${detail}`,
+      );
+    }
+
+    const body = (await response.json()) as ImagesApiResponse;
+    const first = body.data?.[0];
+
+    // gpt-image returns base64, not a URL. Keep the URL branch as a fallback so
+    // an OpenAI-compatible endpoint that does return URLs still works.
+    const url = first?.b64_json
+      ? `data:image/png;base64,${first.b64_json}`
+      : first?.url;
+
+    if (!url) {
+      throw new GenerationError(
+        PROVIDER_NAME,
+        "no_output",
+        "Image API returned neither b64_json nor url",
+      );
+    }
+
+    const { width, height } = parseSize(size);
+    return { url, mimeType: "image/png", width, height };
   }
 }

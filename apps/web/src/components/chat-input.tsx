@@ -1,6 +1,13 @@
 "use client";
 
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 
 import type { MessageMention } from "@loomic/shared";
 import type { ImageAttachmentState } from "../hooks/use-image-attachments";
@@ -9,10 +16,37 @@ import { useImageModelPreference } from "../hooks/use-image-model-preference";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
 import { AgentModelSelector } from "./agent-model-selector";
 import { ImageAttachmentBar } from "./image-attachment-bar";
+import {
+  ChatComposer,
+  type ChatComposerHandle,
+  type ComposerChip,
+} from "./chat-composer";
 import { ImageModelPreferencePopover } from "./image-model-preference";
 
+/**
+ * A canvas image referenced inline in the message, in document order.
+ *
+ * `url` is full resolution (it is what the model receives); `thumbnailUrl` is the
+ * downscaled variant used for on-screen pills. They are carried separately so the
+ * message bubble never has to decode a multi-megabyte original to draw a 16px pill.
+ */
+export type CanvasImageRef = {
+  refId: string;
+  url: string;
+  thumbnailUrl?: string;
+};
+
 type ChatInputProps = {
-  onSend: (message: string) => void;
+  /**
+   * `canvasRefs` are the images the message actually points at, read from the
+   * chips before the box is cleared.
+   *
+   * They are passed out with the message rather than looked up afterwards because
+   * the canvas selection is NOT a reliable source: clicking a second image
+   * replaces the selection, so by send time the canvas may only know about the
+   * last image while the sentence still references three.
+   */
+  onSend: (message: string, canvasRefs: CanvasImageRef[]) => void;
   disabled?: boolean;
   attachments?: ImageAttachmentState[];
   onAddFiles?: (files: File[]) => void;
@@ -28,6 +62,16 @@ type ChatInputProps = {
 export type ChatInputHandle = {
   /** Remove the @query text from input after picker selection */
   clearAtQuery: () => void;
+  /** Drop an inline image reference at the caret. */
+  insertImageChip: (chip: ComposerChip) => void;
+  /**
+   * Confirm the references currently previewing the canvas selection.
+   *
+   * Called when the user turns their attention to the chat panel. After this the
+   * references stay put even if the canvas selection is cleared — see the
+   * preview/confirm note on the selection effect below.
+   */
+  commitCanvasRefs: () => void;
 };
 
 export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput({
@@ -43,80 +87,105 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
   onRemoveMention,
   selectedCanvasElements,
 }, ref) {
-  const [value, setValue] = useState("");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // `isEmpty` is the ONLY editor state React holds. The text itself lives in the
+  // contenteditable DOM and is read on demand — see chat-composer.tsx for why
+  // per-keystroke state would break Chinese input.
+  const [isEmpty, setIsEmpty] = useState(true);
+  const composerRef = useRef<ChatComposerHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { preference } = useImageModelPreference();
   const { preference: videoPreference } = useVideoModelPreference();
   const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
   const modelBtnRef = useRef<HTMLButtonElement>(null);
 
+  /**
+   * refIds that are only *previewing* the canvas selection, not yet confirmed.
+   *
+   * Declared above the imperative handle because `commitCanvasRefs` empties it.
+   */
+  const pendingRefIdsRef = useRef<Set<string>>(new Set());
+
+  /** The canvas selection as of the previous effect run — see the effect below. */
+  const prevSelectedIdsRef = useRef<Set<string>>(new Set());
+
   useImperativeHandle(ref, () => ({
     clearAtQuery() {
-      setValue((prev) => {
-        const lastAtIdx = prev.lastIndexOf("@");
-        if (lastAtIdx === -1) return prev;
-        return prev.slice(0, lastAtIdx);
-      });
+      composerRef.current?.clearAtQuery();
+    },
+    insertImageChip(chip: ComposerChip) {
+      composerRef.current?.insertChip(chip);
+    },
+    commitCanvasRefs() {
+      pendingRefIdsRef.current.clear();
     },
   }));
 
-  const handleSubmit = useCallback(() => {
-    const trimmed = value.trim();
-    if ((!trimmed && (!attachments || attachments.length === 0)) || disabled || isUploading) return;
-    onSend(trimmed);
-    setValue("");
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
-  }, [value, disabled, isUploading, onSend, attachments]);
-
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      // Ignore Enter during IME composition (e.g. Chinese input confirming a candidate)
-      if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-        e.preventDefault();
-        handleSubmit();
-      }
-    },
-    [handleSubmit],
+  /**
+   * refId -> URLs, remembered when a chip is created.
+   *
+   * Both variants are kept: `full` goes to the model, `thumb` is what the sent
+   * message bubble renders.
+   */
+  const canvasRefUrlsRef = useRef<Map<string, { full: string; thumb?: string }>>(
+    new Map(),
   );
 
-  // Auto-resize textarea when value changes
-  useEffect(() => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
-    textarea.style.height = "auto";
-    const maxH = 240; // max-h-60
-    textarea.style.height = `${Math.min(textarea.scrollHeight, maxH)}px`;
-    textarea.style.overflowY = textarea.scrollHeight > maxH ? "auto" : "hidden";
-  }, [value]);
+  const handleSubmit = useCallback(() => {
+    const composer = composerRef.current;
+    const trimmed = composer?.getText().trim() ?? "";
+    if ((!trimmed && (!attachments || attachments.length === 0)) || disabled || isUploading) return;
 
-  const handleChange = useCallback(
-    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      const newValue = e.target.value;
-      setValue(newValue);
+    // Read the chips BEFORE clearing: after clear() there is nothing to read.
+    const canvasRefs: CanvasImageRef[] = (composer?.getChipRefIds() ?? [])
+      .map((refId) => {
+        const urls = canvasRefUrlsRef.current.get(refId);
+        if (!urls) return null;
+        return {
+          refId,
+          url: urls.full,
+          ...(urls.thumb ? { thumbnailUrl: urls.thumb } : {}),
+        };
+      })
+      .filter((r): r is CanvasImageRef => r !== null);
 
+    onSend(trimmed, canvasRefs);
+    composer?.clear();
+    // clear() wiped the chips, so nothing is pending any more. Without this the
+    // next canvas deselection would try to withdraw chips that no longer exist.
+    pendingRefIdsRef.current.clear();
+  }, [disabled, isUploading, onSend, attachments]);
+
+  /**
+   * Mention detection now runs on the text BEFORE THE CARET rather than the whole
+   * value. With a caret that can sit anywhere between chips, "the last @ in the
+   * document" is the wrong anchor — it would reopen the picker when the user
+   * edits earlier text.
+   */
+  const handleTextBeforeCaret = useCallback(
+    (textBeforeCaret: string) => {
       if (!onAtQuery) return;
 
-      // Find last @ in text to detect mention mode
-      const lastAtIdx = newValue.lastIndexOf("@");
+      const lastAtIdx = textBeforeCaret.lastIndexOf("@");
       if (lastAtIdx === -1) {
-        onAtQuery(null); // close picker
-        return;
-      }
-
-      // Only trigger if @ is at start or preceded by whitespace
-      const charBefore = lastAtIdx > 0 ? newValue[lastAtIdx - 1] : " ";
-      if (charBefore !== " " && charBefore !== "\n" && lastAtIdx !== 0) {
         onAtQuery(null);
         return;
       }
 
-      // Extract query after @
-      const query = newValue.slice(lastAtIdx + 1);
-      // Close if user typed a space after query (finished mentioning)
-      if (query.includes(" ") || query.includes("\n")) {
+      // Only trigger if @ is at start or preceded by whitespace
+      const charBefore = lastAtIdx > 0 ? textBeforeCaret[lastAtIdx - 1] : " ";
+      if (
+        charBefore !== " " &&
+        charBefore !== "\n" &&
+        charBefore !== "\u00A0" &&
+        lastAtIdx !== 0
+      ) {
+        onAtQuery(null);
+        return;
+      }
+
+      const query = textBeforeCaret.slice(lastAtIdx + 1);
+      // Close once the mention run is finished
+      if (/[\s\u00A0]/.test(query)) {
         onAtQuery(null);
         return;
       }
@@ -155,35 +224,75 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
     e.preventDefault();
   }, []);
 
-  const handlePaste = useCallback(
-    (e: React.ClipboardEvent) => {
-      if (!onAddFiles) return;
-      const files = Array.from(e.clipboardData.items)
-        .filter((item) => item.type.startsWith("image/"))
-        .map((item) => item.getAsFile())
-        .filter((f): f is File => f !== null);
-      if (files.length > 0) {
-        e.preventDefault();
-        onAddFiles(files);
-      }
-    },
-    [onAddFiles],
-  );
+  // Image paste is handled inside ChatComposer, which also has to sanitise
+  // pasted markup — keeping a second paste handler here would double-fire.
 
-  const hasContent = value.trim().length > 0 || (attachments && attachments.length > 0);
+  const hasContent = !isEmpty || (attachments && attachments.length > 0);
 
-  // Memoize canvas selection summary -- selectedCanvasElements changes on every
-  // canvas interaction, but the counts only change when the selection actually differs
-  const selectionSummary = useMemo(() => {
-    const imageCount = selectedCanvasElements?.filter((el) => el.type === "image").length ?? 0;
-    const totalCount = selectedCanvasElements?.length ?? 0;
-    return {
-      selectionImageCount: imageCount,
-      selectionShapeCount: totalCount - imageCount,
-      hasSelection: totalCount > 0,
-    };
+  /**
+   * Selecting an image on the canvas drops it into the sentence, at the caret.
+   *
+   * WHY the chip and not a thumbnail strip above the box: with several images in
+   * one prompt ("put a caterpillar on THIS apple, in the style of THIS one") the
+   * reference only means something at a position in the sentence. A strip above
+   * the input can say *which* images are involved but never *where* each one
+   * belongs, and it costs an extra click to boot.
+   *
+   * ── Reacting to changes, not to state ──
+   * A chip is inserted for an image that JUST ENTERED the selection, which is why
+   * the previous selection is kept. Asking instead "is this image selected and
+   * missing a chip?" reads as equivalent but is not: after the user deletes a chip
+   * by hand the image is usually still selected, so the next re-render puts the
+   * chip straight back and the reference looks undeletable.
+   *
+   * ── Preview, then confirm ──
+   * A freshly selected image is only a PREVIEW: it is tracked in
+   * `pendingRefIdsRef` and is withdrawn again as soon as it leaves the canvas
+   * selection. Clicking empty canvas therefore cancels, which is what selecting
+   * something and changing your mind should do — the earlier behaviour glued the
+   * chip in on first sight and left deleting it by hand as the only way out.
+   *
+   * Attention moving to the chat panel confirms the preview
+   * (`commitCanvasRefs`): from then on the reference survives the canvas
+   * selection being cleared, because the user has moved on to writing the
+   * sentence that points at it.
+   */
+  useEffect(() => {
+    const composer = composerRef.current;
+    if (!composer) return;
+
+    const images = (selectedCanvasElements ?? []).filter(
+      (el) => el.type === "image" && (el.thumbnailUrl || el.storageUrl || el.dataUrl),
+    );
+    const selectedIds = new Set(images.map((el) => el.id));
+    const previouslySelected = prevSelectedIdsRef.current;
+    prevSelectedIdsRef.current = selectedIds;
+
+    // Withdraw previews that just left the selection. Confirmed references are
+    // not in this set, so they are left alone.
+    for (const refId of Array.from(pendingRefIdsRef.current)) {
+      if (selectedIds.has(refId)) continue;
+      composer.removeChip(refId);
+      pendingRefIdsRef.current.delete(refId);
+    }
+
+    const alreadyReferenced = new Set(composer.getChipRefIds());
+
+    for (const el of images) {
+      if (previouslySelected.has(el.id)) continue;
+      // Also referenced via @mention: one chip per image is enough.
+      if (alreadyReferenced.has(el.id)) continue;
+      const thumb = el.thumbnailUrl || el.storageUrl || el.dataUrl;
+      const full = el.storageUrl || el.dataUrl;
+      if (!thumb || !full) continue;
+      composer.insertChip({ refId: el.id, thumbnailUrl: thumb, label: "图片" });
+      canvasRefUrlsRef.current.set(el.id, {
+        full,
+        ...(thumb !== full ? { thumb } : {}),
+      });
+      pendingRefIdsRef.current.add(el.id);
+    }
   }, [selectedCanvasElements]);
-  const { selectionImageCount, selectionShapeCount, hasSelection } = selectionSummary;
 
   return (
     <div className="px-2 pb-2">
@@ -192,34 +301,6 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
         onDrop={handleDrop}
         onDragOver={handleDragOver}
       >
-        {hasSelection && (
-          <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground bg-muted/50 rounded-lg">
-            <div className="flex items-center gap-1.5 min-w-0">
-              {selectionImageCount > 0 && (
-                <span className="flex items-center gap-1">
-                  <svg className="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
-                    <rect x="3" y="3" width="18" height="18" rx="2" />
-                    <circle cx="8.5" cy="8.5" r="1.5" />
-                    <path d="m21 15-5-5L5 21" />
-                  </svg>
-                  {selectionImageCount} {selectionImageCount === 1 ? "image" : "images"}
-                </span>
-              )}
-              {selectionImageCount > 0 && selectionShapeCount > 0 && (
-                <span className="text-muted-foreground/40">&middot;</span>
-              )}
-              {selectionShapeCount > 0 && (
-                <span className="flex items-center gap-1">
-                  <svg className="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5}>
-                    <rect x="3" y="3" width="18" height="18" rx="2" />
-                  </svg>
-                  {selectionShapeCount} {selectionShapeCount === 1 ? "shape" : "shapes"}
-                </span>
-              )}
-              <span className="text-[10px] text-muted-foreground/60">selected on canvas</span>
-            </div>
-          </div>
-        )}
         {attachments && onRemoveAttachment && (
           <ImageAttachmentBar
             attachments={attachments}
@@ -254,18 +335,14 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
             ))}
           </div>
         )}
-        <textarea
-          ref={textareaRef}
-          data-chat-input
-          value={value}
-          onChange={handleChange}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
+        <ChatComposer
+          ref={composerRef}
           placeholder='Start with an idea, or type "@" to mention'
-          aria-label="输入消息"
-          rows={1}
-          style={{ scrollbarWidth: "none" }}
-          className="min-h-[48px] max-h-60 resize-none bg-transparent px-1 text-sm leading-[1.8] text-foreground placeholder:text-muted-foreground focus:outline-none [&::-webkit-scrollbar]:hidden"
+          {...(disabled ? { disabled } : {})}
+          onSubmit={handleSubmit}
+          onTextBeforeCaretChange={handleTextBeforeCaret}
+          onEmptyChange={setIsEmpty}
+          {...(onAddFiles ? { onPasteFiles: onAddFiles } : {})}
         />
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-1">

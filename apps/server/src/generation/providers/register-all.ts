@@ -38,9 +38,16 @@ export function registerAllProviders(env: ServerEnv): void {
     registerVideoProvider(new ReplicateVideoProvider(env.replicateApiToken));
   }
 
-  // Google Developer API — image + video
+  // Google Developer API — image + video.
+  // googleApiBase lets this point at a Gemini-compatible gateway (e.g. kwjm)
+  // instead of generativelanguage.googleapis.com. Going through the native
+  // Gemini endpoint rather than the gateway's OpenAI-style image API preserves
+  // multi-reference-image input (up to 14 on Gemini 3 Pro), aspect ratio and
+  // 1K/2K/4K sizing, none of which the OpenAI-style path supports here.
   if (env.googleApiKey) {
-    registerImageProvider(new GoogleImageProvider(env.googleApiKey));
+    registerImageProvider(
+      new GoogleImageProvider(env.googleApiKey, env.googleApiBase),
+    );
     registerVideoProvider(new GoogleVideoProvider(env.googleApiKey));
   }
 

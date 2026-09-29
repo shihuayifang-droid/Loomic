@@ -8,6 +8,7 @@ import {
   BootstrapError,
   type ViewerService,
 } from "../bootstrap/ensure-user-foundation.js";
+import { withTransportRetry } from "../../supabase/transport-retry.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -281,13 +282,49 @@ export function createProjectService(options: {
       const client = options.createUserClient(user.accessToken);
 
       // Resolve workspace_id — RLS requires first path segment to be the workspace UUID
-      const { data: proj } = await client
-        .from("projects")
-        .select("workspace_id")
-        .eq("id", projectId)
-        .single();
+      //
+      // LOCAL FORK: `error` used to be discarded here, so EVERY failure became
+      // "Project not found." with a 404. A transport failure (the Supabase host
+      // resolves through a local proxy, which intermittently resets the TLS
+      // handshake) therefore reported that the project did not exist -- observed
+      // in the logs as a 404 with responseTime=5003ms that succeeded on the very
+      // next attempt. That answer sends whoever is debugging to look at project
+      // rows and permissions, which are fine.
+      //
+      // PGRST116 is PostgREST's "single() matched no rows"; that alone is a real
+      // 404. Anything else means the question never got answered, which is a 503.
+      //
+      // …and it is now RETRIED rather than merely reported. It is a plain SELECT, so
+      // replaying it cannot do damage, and without the retry one proxy blip made the
+      // whole thumbnail upload answer 503 after a 5-second stall (observed
+      // 2026-09-15). The throw inside is what the retry sees — supabase-js returns
+      // `{data, error}` and never rejects, so a wrapper around the raw call would
+      // never fire.
+      let proj: { workspace_id: string } | null;
+      try {
+        proj = await withTransportRetry(
+          "projects.select(workspace_id)",
+          async () => {
+            const { data, error } = await client
+              .from("projects")
+              .select("workspace_id")
+              .eq("id", projectId)
+              .single();
+            if (error && error.code !== "PGRST116") throw error;
+            return (data as { workspace_id: string } | null) ?? null;
+          },
+        );
+      } catch (error) {
+        const e = error as { code?: string; message?: string };
+        throw new ProjectServiceError(
+          "project_query_failed",
+          `Could not look up project ${projectId}: ${e.message}` +
+            (e.code ? ` (code ${e.code})` : ""),
+          503,
+        );
+      }
       if (!proj) {
-        throw new ProjectServiceError("project_create_failed", "Project not found.", 404);
+        throw new ProjectServiceError("project_not_found", "Project not found.", 404);
       }
 
       const ext = mimeType === "image/webp" ? "webp" : "png";

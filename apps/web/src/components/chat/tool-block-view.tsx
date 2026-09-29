@@ -6,6 +6,7 @@ import { createPortal } from "react-dom";
 
 import type { ToolBlock } from "@loomic/shared";
 import { ChatImage } from "./image-lightbox";
+import { GenerationShimmer } from "../media/generation-shimmer";
 import {
   formatModelDisplayName,
   formatOutputPreview,
@@ -212,8 +213,8 @@ export const ToolBlockView = React.memo(function ToolBlockView({
 
       {/* Layer 2a: Media generation shimmer placeholder */}
       {isMediaTool && !isCompleted && (
-        <MediaShimmer
-          isVideoTool={isVideoTool}
+        <GenerationShimmer
+          kind={isVideoTool ? "video" : "image"}
           aspectRatio={aspectRatio}
           modelName={modelName}
         />
@@ -292,71 +293,6 @@ export const ToolBlockView = React.memo(function ToolBlockView({
           />,
           document.body,
         )}
-    </div>
-  );
-});
-
-/* ------------------------------------------------------------------ */
-/*  MediaShimmer — shimmer placeholder during media generation         */
-/* ------------------------------------------------------------------ */
-
-const MediaShimmer = React.memo(function MediaShimmer({
-  isVideoTool,
-  aspectRatio,
-  modelName,
-}: {
-  isVideoTool: boolean;
-  aspectRatio: string;
-  modelName: string | undefined;
-}) {
-  return (
-    <div className="rounded-xl border-[0.5px] border-border overflow-hidden">
-      <div
-        className="relative w-full max-h-[280px] overflow-hidden"
-        style={{ aspectRatio: aspectRatio.replace(":", " / ") }}
-      >
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-muted">
-          {isVideoTool ? (
-            <svg
-              className="h-10 w-10 text-muted-foreground/50"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={1.5}
-            >
-              <path d="m15.75 10.5 4.72-4.72a.75.75 0 0 1 1.28.53v11.38a.75.75 0 0 1-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 0 0 2.25-2.25v-9a2.25 2.25 0 0 0-2.25-2.25h-9A2.25 2.25 0 0 0 2.25 7.5v9a2.25 2.25 0 0 0 2.25 2.25Z" />
-            </svg>
-          ) : (
-            <svg
-              className="h-10 w-10 text-muted-foreground/50"
-              viewBox="0 0 24 24"
-              fill="currentColor"
-            >
-              <path d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 0 0 1.5-1.5V6a1.5 1.5 0 0 0-1.5-1.5H3.75A1.5 1.5 0 0 0 2.25 6v12a1.5 1.5 0 0 0 1.5 1.5Zm10.5-11.25h.008v.008h-.008V8.25Zm.375 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Z" />
-            </svg>
-          )}
-        </div>
-        {/* Shimmer scan effect */}
-        <div className="absolute inset-0 animate-shimmer-scan">
-          <div
-            className="h-full w-1/2"
-            style={{
-              background:
-                "linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.5) 50%, transparent 100%)",
-            }}
-          />
-        </div>
-      </div>
-      <div className="px-3 py-2">
-        <div className="text-[12px] font-medium text-muted-foreground/70">
-          {isVideoTool ? "\u89c6\u9891\u751f\u6210\u4e2d..." : "\u56fe\u7247\u751f\u6210\u4e2d..."}
-        </div>
-        {modelName && (
-          <div className="mt-0.5 text-[11px] text-muted-foreground truncate">
-            {formatModelDisplayName(modelName)}
-          </div>
-        )}
-      </div>
     </div>
   );
 });

@@ -1,4 +1,4 @@
-import type { GeneratedImage, ImageGenerateParams, ImageProvider, ModelInfo } from "../types.js";
+import type { GeneratedImage, ImageGenerateParams, ImageModelInfo, ImageProvider } from "../types.js";
 import { aspectRatioToDimensions, GenerationError } from "../utils.js";
 
 const REPLICATE_API_BASE = "https://api.replicate.com/v1";
@@ -10,6 +10,16 @@ const REPLICATE_API_BASE = "https://api.replicate.com/v1";
  * - `input_image`  (single URL string)  → Flux Kontext family
  * - `input_images` (array of URL strings) → OpenAI GPT Image
  * - `image_input`  (array of URL strings) → Google Nano Banana, ByteDance Seedream (default)
+ */
+/**
+ * This set is about the WIRE FORMAT (`input_image` takes one URL string, not an
+ * array), which is why it is not derived from `limits`. But the two must agree:
+ * a model listed here can only ever send one reference, so its declared
+ * `maxInputImages` must be 1 — otherwise the tool advertises a capacity that
+ * this method silently truncates. `_image-limits-audit.ts` checks that.
+ *
+ * flux-1.1-pro and flux-pro are not in REPLICATE_IMAGE_MODELS; they are kept
+ * here so the mapping stays correct if they are ever declared.
  */
 const SINGLE_IMAGE_INPUT_MODELS = new Set([
   "black-forest-labs/flux-kontext-pro",
@@ -24,15 +34,6 @@ const INPUT_IMAGES_MODELS = new Set([
 ]);
 
 /**
- * Models that don't support any image input.
- */
-const TEXT_ONLY_MODELS = new Set([
-  "google/imagen-4",
-  "google/imagen-3",
-  "recraft-ai/recraft-v3",
-]);
-
-/**
  * Recraft uses `size` (e.g. "1024x1024") instead of `aspect_ratio`.
  */
 const RECRAFT_MODELS = new Set(["recraft-ai/recraft-v3"]);
@@ -43,79 +44,117 @@ const ICON_BFL = "https://tjzk.replicate.delivery/models_organizations_avatar/01
 const ICON_BYTEDANCE = "https://github.com/bytedance.png";
 const ICON_RECRAFT = "https://github.com/recraft-ai.png";
 
-const REPLICATE_IMAGE_MODELS: readonly ModelInfo[] = [
+/**
+ * Reference-image counts below come from what the code already encoded:
+ * the "up to 14" figures were in these descriptions, `1` came from
+ * SINGLE_IMAGE_INPUT_MODELS, and `0` from the former TEXT_ONLY_MODELS set.
+ * "multiple" had no number anywhere, so it is recorded as "unbounded" instead of
+ * being guessed at.
+ */
+const REPLICATE_IMAGE_MODELS: readonly ImageModelInfo[] = [
   // Google
   {
     id: "google/nano-banana-pro",
     displayName: "Nano Banana Pro",
-    description: "Google's SOTA image generation & editing model. Image input: up to 14 images. Up to 4K resolution. Best for multi-reference editing.",
+    description: "Google's SOTA image generation & editing model. Up to 4K resolution. Best for multi-reference editing.",
     iconUrl: ICON_GOOGLE,
+    operation: "generate",
+    limits: { maxInputImages: 14, supportsOutputFormat: true },
   },
   {
     id: "google/nano-banana-2",
     displayName: "Nano Banana 2",
-    description: "Fast image generation with conversational editing and character consistency. Image input: up to 14 images. Good for multi-image fusion.",
+    description: "Fast image generation with conversational editing and character consistency. Good for multi-image fusion.",
     iconUrl: ICON_GOOGLE,
+    operation: "generate",
+    limits: { maxInputImages: 14, supportsOutputFormat: true },
   },
   {
     id: "google/nano-banana",
     displayName: "Nano Banana",
-    description: "Google's image editing model in Gemini 2.5. Image input: up to 14 images. Best for editing & transformation tasks.",
+    description: "Google's image editing model in Gemini 2.5. Best for editing & transformation tasks.",
     iconUrl: ICON_GOOGLE,
+    operation: "generate",
+    limits: { maxInputImages: 14, supportsOutputFormat: true },
   },
   {
     id: "google/imagen-4",
     displayName: "Imagen 4",
-    description: "Google's Imagen 4 flagship text-to-image model. Image input: NONE (text-only). Best pure text-to-image quality.",
+    description: "Google's Imagen 4 flagship text-to-image model. Best pure text-to-image quality.",
     iconUrl: ICON_GOOGLE,
+    operation: "generate",
+    limits: { maxInputImages: 0, supportsOutputFormat: true },
   },
   // OpenAI
   {
     id: "openai/gpt-image-1.5",
     displayName: "GPT Image 1.5",
-    description: "OpenAI's latest image model with better instruction following. Image input: multiple images. Supports background transparency.",
+    description: "OpenAI's latest image model with better instruction following. Supports background transparency.",
     iconUrl: ICON_OPENAI,
+    operation: "generate",
+    limits: {
+      maxInputImages: "unbounded",
+      allowedAspectRatios: ["1:1", "3:2", "2:3"],
+      supportsOutputFormat: true,
+    },
   },
   // Black Forest Labs
   {
     id: "black-forest-labs/flux-kontext-max",
     displayName: "Flux Kontext Max",
-    description: "Premium text-based image editing with maximum performance and improved typography. Image input: 1 image only. Best for single-image editing.",
+    description: "Premium text-based image editing with maximum performance and improved typography. Best for single-image editing.",
     iconUrl: ICON_BFL,
+    operation: "generate",
+    limits: { maxInputImages: 1, supportsOutputFormat: true },
   },
   {
     id: "black-forest-labs/flux-kontext-pro",
     displayName: "Flux Kontext Pro",
-    description: "SOTA text-based image editing with excellent prompt following and consistent results. Image input: 1 image only. Best for single-image editing.",
+    description: "SOTA text-based image editing with excellent prompt following and consistent results. Best for single-image editing.",
     iconUrl: ICON_BFL,
+    operation: "generate",
+    limits: { maxInputImages: 1, supportsOutputFormat: true },
   },
   // ByteDance
   {
     id: "bytedance/seedream-5-lite",
     displayName: "Seedream 5.0 Lite",
-    description: "Image generation with built-in reasoning and example-based editing. Image input: multiple images. Up to 3K resolution.",
+    description: "Image generation with built-in reasoning and example-based editing. Up to 3K resolution.",
     iconUrl: ICON_BYTEDANCE,
+    operation: "generate",
+    limits: { maxInputImages: "unbounded", supportsOutputFormat: true },
   },
   {
     id: "bytedance/seedream-4.5",
     displayName: "Seedream 4.5",
-    description: "Upgraded ByteDance model with stronger spatial understanding. Image input: multiple images. Up to 4K resolution.",
+    description: "Upgraded ByteDance model with stronger spatial understanding. Up to 4K resolution.",
     iconUrl: ICON_BYTEDANCE,
+    operation: "generate",
+    limits: { maxInputImages: "unbounded", supportsOutputFormat: false },
   },
   {
     id: "bytedance/seedream-4",
     displayName: "Seedream 4",
-    description: "Unified text-to-image generation and precise editing. Image input: multiple images. Up to 4K resolution.",
+    description: "Unified text-to-image generation and precise editing. Up to 4K resolution.",
     iconUrl: ICON_BYTEDANCE,
+    operation: "generate",
+    limits: { maxInputImages: "unbounded", supportsOutputFormat: false },
   },
   // Recraft
   {
     id: "recraft-ai/recraft-v3",
     displayName: "Recraft V3",
-    description: "SOTA text-to-image with long text rendering and wide style variety. Image input: NONE (text-only). #1 by Artificial Analysis benchmark.",
+    description: "SOTA text-to-image with long text rendering and wide style variety. #1 by Artificial Analysis benchmark.",
     iconUrl: ICON_RECRAFT,
+    operation: "generate",
+    limits: { maxInputImages: 0, supportsOutputFormat: false },
   },
 ];
+
+/** Model id → its declared limits, for the parameter-building helpers below. */
+const LIMITS_BY_ID = new Map(
+  REPLICATE_IMAGE_MODELS.map((m) => [m.id as string, m.limits] as const),
+);
 
 // ── Quality → model-specific resolution translation ──────────────────────
 
@@ -196,15 +235,6 @@ function applyQuality(
 
 // ── Aspect ratio normalization ────────────────────────────────────────────
 
-/**
- * Models with restricted aspect_ratio support.
- * Models NOT listed here accept all ratios the tool exposes.
- */
-const MODEL_ASPECT_RATIOS: Record<string, string[]> = {
-  "openai/gpt-image-1.5": ["1:1", "3:2", "2:3"],
-  "openai/gpt-image-1":   ["1:1", "3:2", "2:3"],
-};
-
 function parseRatio(ratio: string): number {
   const [w, h] = ratio.split(":").map(Number);
   return (w && h) ? w / h : 1;
@@ -215,7 +245,7 @@ function parseRatio(ratio: string): number {
  * e.g. "16:9" (1.78) → "3:2" (1.5) for GPT Image.
  */
 function normalizeAspectRatio(model: string, ratio: string): string {
-  const supported = MODEL_ASPECT_RATIOS[model];
+  const supported = LIMITS_BY_ID.get(model)?.allowedAspectRatios;
   if (!supported || supported.includes(ratio)) return ratio;
 
   const target = parseRatio(ratio);
@@ -234,19 +264,15 @@ function normalizeAspectRatio(model: string, ratio: string): string {
 
 // ── Output format translation ────────────────────────────────────────────
 
-/** Models that don't accept output_format */
-const NO_OUTPUT_FORMAT_MODELS = new Set([
-  "bytedance/seedream-4.5",
-  "bytedance/seedream-4",
-  "recraft-ai/recraft-v3",
-]);
-
 function applyOutputFormat(
   input: Record<string, unknown>,
   model: string,
   format: string | undefined,
 ): void {
-  if (!format || NO_OUTPUT_FORMAT_MODELS.has(model)) return;
+  if (!format) return;
+  // Unknown ids keep the old permissive behaviour: forward the parameter and let
+  // Replicate reject it, rather than silently dropping it.
+  if (LIMITS_BY_ID.get(model)?.supportsOutputFormat === false) return;
   input.output_format = format;
 }
 
@@ -277,8 +303,11 @@ export class ReplicateImageProvider implements ImageProvider {
       input.aspect_ratio = aspectRatio;
     }
 
-    // Image input — parameter name varies by model
-    if (params.inputImages?.length && !TEXT_ONLY_MODELS.has(params.model)) {
+    // Image input — parameter name varies by model. Text-only models (declared
+    // maxInputImages: 0) get references dropped instead of a hard error, which is
+    // the behaviour the former TEXT_ONLY_MODELS set had.
+    const isTextOnly = LIMITS_BY_ID.get(params.model)?.maxInputImages === 0;
+    if (params.inputImages?.length && !isTextOnly) {
       if (SINGLE_IMAGE_INPUT_MODELS.has(params.model)) {
         input.input_image = params.inputImages[0];
       } else if (INPUT_IMAGES_MODELS.has(params.model)) {

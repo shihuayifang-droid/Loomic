@@ -9,12 +9,26 @@ import { MarkdownRenderer } from "./chat/markdown-renderer";
 import { MentionPill } from "./chat/mention-pill";
 import { ThinkingBlockView } from "./chat/thinking-block-view";
 import { ToolBlockView } from "./chat/tool-block-view";
+import { isToolVisible } from "./chat/utils";
 
 // Re-export types for backward compatibility with existing consumers
 export type { ContentBlock, ToolArtifact };
 
 /** @deprecated Use ToolBlock from @loomic/shared instead */
 export type ToolActivity = ToolBlock;
+
+/**
+ * Which URL an inline image pill should load.
+ *
+ * A pill is ~16px tall, so it must not pull the full-resolution original: canvas
+ * images routinely run several megabytes, and the browser decodes the whole thing
+ * before scaling it down. `thumbnailUrl` is absent on messages written before it
+ * existed and on plain uploads, hence the fallback.
+ */
+function pillSrc(block: ContentBlock): string {
+  const b = block as { url: string; thumbnailUrl?: string };
+  return b.thumbnailUrl ?? b.url;
+}
 
 /* ------------------------------------------------------------------ */
 /*  ChatMessage                                                        */
@@ -99,6 +113,67 @@ const UserMessage = React.memo(function UserMessage({
     };
   }, [contentBlocks]);
 
+  /**
+   * Render the composer's `[图片:<refId>]` tokens as inline image pills.
+   *
+   * The composer writes those tokens so the reference keeps its POSITION in the
+   * sentence ("put a caterpillar on THIS apple, like THIS one"). Printing them
+   * raw threw that away twice over: the reader saw a machine token instead of the
+   * picture, and the same image then appeared AGAIN as a pill after the text.
+   *
+   * A token whose image is missing from the blocks is left as-is rather than
+   * dropped — better a visible oddity than a sentence that silently loses a
+   * reference it was built around.
+   */
+  const { inlineNodes, consumedAssetIds } = useMemo(() => {
+    const consumed = new Set<string>();
+    if (!text) return { inlineNodes: null, consumedAssetIds: consumed };
+
+    const byAssetId = new Map<string, ContentBlock>();
+    for (const block of imageBlocks) {
+      const id = (block as { assetId?: string }).assetId;
+      if (id) byAssetId.set(id, block);
+    }
+
+    const nodes: React.ReactNode[] = [];
+    const re = /\[图片:([^\]]+)\]/g;
+    let cursor = 0;
+    let found = false;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(text)) !== null) {
+      found = true;
+      if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+      const refId = match[1] ?? "";
+      const block = byAssetId.get(refId);
+      if (block) {
+        consumed.add(refId);
+        nodes.push(
+          <ImagePill
+            key={`ref-${refId}-${match.index}`}
+            src={pillSrc(block)}
+            name="图片"
+          />,
+        );
+      } else {
+        nodes.push(match[0]);
+      }
+      cursor = match.index + match[0].length;
+    }
+    if (!found) return { inlineNodes: null, consumedAssetIds: consumed };
+    if (cursor < text.length) nodes.push(text.slice(cursor));
+    return { inlineNodes: nodes, consumedAssetIds: consumed };
+  }, [text, imageBlocks]);
+
+  // Images already shown inline must not be repeated after the sentence.
+  const trailingImageBlocks = useMemo(
+    () =>
+      imageBlocks.filter(
+        (block) =>
+          !consumedAssetIds.has((block as { assetId?: string }).assetId ?? ""),
+      ),
+    [imageBlocks, consumedAssetIds],
+  );
+
   return (
     <motion.div
       initial={{ opacity: 0, x: 12 }}
@@ -109,7 +184,7 @@ const UserMessage = React.memo(function UserMessage({
       {text && (
         <div className="inline-block rounded-xl bg-muted px-3 py-2.5 whitespace-pre-wrap break-words text-sm font-medium leading-6 text-foreground">
           <span className="cursor-text select-text [word-break:break-word]">
-            {text}
+            {inlineNodes ?? text}
           </span>
           {mentionBlocks.length > 0 && (
             <span className="inline">
@@ -128,12 +203,12 @@ const UserMessage = React.memo(function UserMessage({
               ))}
             </span>
           )}
-          {imageBlocks.length > 0 && (
+          {trailingImageBlocks.length > 0 && (
             <span className="inline">
-              {imageBlocks.map((block, idx) => (
+              {trailingImageBlocks.map((block, idx) => (
                 <ImagePill
                   key={idx}
-                  src={(block as { url: string }).url}
+                  src={pillSrc(block)}
                   name={
                     (block as { name?: string }).name ??
                     `image-${idx + 1}`
@@ -162,7 +237,7 @@ const UserMessage = React.memo(function UserMessage({
           {imageBlocks.map((block, idx) => (
             <ImagePill
               key={idx}
-              src={(block as { url: string }).url}
+              src={pillSrc(block)}
               name={
                 (block as { name?: string }).name ?? `image-${idx + 1}`
               }
@@ -256,6 +331,9 @@ const AssistantMessage = React.memo(function AssistantMessage({
         }
 
         if (block.type === "tool") {
+          // Internal tools (canvas reads, brand-kit lookups, searches) are not
+          // shown; only artifact-producing calls appear in the transcript.
+          if (!isToolVisible(block.toolName)) return null;
           return (
             <ToolBlockView key={block.toolCallId} block={block} />
           );

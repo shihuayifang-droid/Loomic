@@ -26,7 +26,13 @@ export type CanvasImageRef = {
 /** A fully-uploaded attachment ready to be sent, including its origin source. */
 export type ReadyAttachment = {
   assetId: string;
+  /** Full resolution — this is the URL handed to the model. */
   url: string;
+  /**
+   * Downscaled variant for on-screen rendering. Absent for plain uploads, where
+   * no smaller variant exists yet; renderers fall back to `url`.
+   */
+  thumbnailUrl?: string;
   mimeType: string;
   source: "upload" | "canvas-ref";
   name?: string;
@@ -203,7 +209,10 @@ export function useImageAttachments(accessToken: string, projectId?: string) {
 
   const isUploading = attachments.some((a) => a.uploading);
 
-  const readyAttachments = attachments
+  // Annotated rather than inferred: the inferred object literal type silently
+  // omits optional fields nothing in this file sets (thumbnailUrl), which then
+  // makes them unassignable at the consumer even though ReadyAttachment has them.
+  const readyAttachments: ReadyAttachment[] = attachments
     .filter((a) => a.assetId && a.url && !a.error)
     .map((a) => ({
       assetId: a.assetId!,

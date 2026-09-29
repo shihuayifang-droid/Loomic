@@ -1,6 +1,8 @@
 // @credits-system — Shared types, configs, and cost tables for the credits/billing system
 import { z } from "zod";
 
+import { IMAGE_MODEL_CATALOG, VIDEO_MODEL_CATALOG } from "./model-catalog.js";
+
 // ── Plan types ───────────────────────────────────────────────
 
 export const subscriptionPlanSchema = z.enum([
@@ -127,56 +129,11 @@ export const PLAN_CONFIGS: Record<SubscriptionPlan, PlanConfig> = {
 };
 
 // ── Model access tiers ───────────────────────────────────────
+// Type-only cycle: model-catalog.ts imports types from here, this imports values
+// from there. `import type` is erased at compile time, so there is no runtime
+// cycle.
 
-/**
- * Minimum plan required to use each model.
- * Models not listed here default to "pro" access.
- */
-export const MODEL_MIN_TIER: Record<string, SubscriptionPlan> = {
-  // ── Image models ──
-  // Free tier (basic 3)
-  "google-official/gemini-2.5-flash-image": "free",
-  "google-official/gemini-3.1-flash-image-preview": "free",
-  "google/nano-banana": "free",
-  // Starter tier
-  "google/nano-banana-pro": "starter",
-  "google/nano-banana-2": "starter",
-  "google/imagen-4": "starter",
-  "openai/gpt-image-1.5": "starter",
-  "black-forest-labs/flux-kontext-pro": "starter",
-  "bytedance/seedream-5-lite": "starter",
-  "bytedance/seedream-4.5": "starter",
-  "bytedance/seedream-4": "starter",
-  "recraft-ai/recraft-v3": "starter",
-  // Pro tier
-  "black-forest-labs/flux-kontext-max": "pro",
-
-  // ── Video models ──
-  // Starter tier (basic 2: Kling 2.6 + Wan 2.6)
-  "kwaivgi/kling-v2.6": "starter",
-  "wan-video/wan-2.6": "starter",
-  "metaso/minimax-h3": "starter",
-  // Pro tier
-  "google-official/veo-3.1-generate-preview": "pro",
-  // Google Vertex AI video models
-  "google-vertex/veo-3.1-generate-001": "pro",
-  "google-vertex/veo-3.1-fast-generate-001": "pro",
-  "google-vertex/veo-3.1-lite-generate-001": "starter",
-  "google-vertex/veo-3.0-generate-001": "pro",
-  "google-vertex/veo-3.0-fast-generate-001": "pro",
-  "google-vertex/veo-2.0-generate-001": "starter",
-  "kwaivgi/kling-v3-video": "pro",
-  "kwaivgi/kling-v3-omni-video": "pro",
-  "kwaivgi/kling-o1": "pro",
-  "bytedance/seedance-1.5-pro": "pro",
-  "openai/sora-2": "pro",
-  "openai/sora-2-pro": "ultra",
-  "google/veo-3": "pro",
-  "google/veo-3.1": "pro",
-  "google/veo-3.1-fast": "pro",
-  "minimax/hailuo-2.3": "starter",
-};
-
+/** Plans in ascending order of entitlement, used for tier comparisons. */
 const PLAN_ORDER: SubscriptionPlan[] = [
   "free",
   "starter",
@@ -190,6 +147,10 @@ export function canAccessModel(
   userPlan: SubscriptionPlan,
   modelId: string,
 ): boolean {
+  // The `?? "pro"` only applies to ids that are not in the catalog at all. Every
+  // model any provider exposes is catalogued, so this is reached only for a bogus
+  // or retired id — not for a real model that someone forgot to register, which
+  // is what used to happen.
   const minTier = MODEL_MIN_TIER[modelId] ?? "pro";
   return PLAN_ORDER.indexOf(userPlan) >= PLAN_ORDER.indexOf(minTier);
 }
@@ -226,37 +187,6 @@ export type VideoModelCost =
  * Credit costs per image generation, by model and quality.
  * Models not listed default to { standard: 5, hd: 10, ultra: 20 }.
  */
-export const IMAGE_MODEL_COSTS: Record<string, ImageModelCost> = {
-  // Google Official
-  "google-official/gemini-2.5-flash-image": {
-    standard: 5,
-    hd: 10,
-    ultra: 20,
-  },
-  "google-official/gemini-3.1-flash-image-preview": {
-    standard: 5,
-    hd: 10,
-    ultra: 20,
-  },
-  // Replicate — Google models
-  "google/nano-banana-pro": { standard: 6, hd: 10, ultra: 18 },
-  "google/nano-banana-2": { standard: 4, hd: 8, ultra: 12 },
-  "google/nano-banana": { standard: 5, hd: 10, ultra: 20 },
-  "google/imagen-4": { standard: 5, hd: 10, ultra: 20 },
-  "google/imagen-3": { standard: 5, hd: 10, ultra: 20 },
-  // Replicate — OpenAI
-  "openai/gpt-image-1.5": { standard: 4, hd: 8, ultra: 16 },
-  // Replicate — BFL
-  "black-forest-labs/flux-kontext-pro": { standard: 8, hd: 12, ultra: 20 },
-  "black-forest-labs/flux-kontext-max": { standard: 12, hd: 18, ultra: 30 },
-  // Replicate — ByteDance
-  "bytedance/seedream-5-lite": { standard: 3, hd: 6, ultra: 10 },
-  "bytedance/seedream-4.5": { standard: 3, hd: 5, ultra: 8 },
-  "bytedance/seedream-4": { standard: 2, hd: 4, ultra: 8 },
-  // Replicate — Recraft
-  "recraft-ai/recraft-v3": { standard: 5, hd: 10, ultra: 18 },
-};
-
 const DEFAULT_IMAGE_COST: ImageModelCost = {
   standard: 5,
   hd: 10,
@@ -268,52 +198,42 @@ const DEFAULT_IMAGE_COST: ImageModelCost = {
  * Base cost is for the cheapest configuration; actual cost scales with
  * duration and resolution.
  */
-export const VIDEO_MODEL_COSTS: Record<string, VideoModelCost> = {
-  // Google Official (direct API — supports higher resolutions than Replicate)
-  "google-official/veo-3.1-generate-preview": basePlusDuration(80, 15, 2, 4),
-  "google-official/veo-3.1-fast-generate-preview": basePlusDuration(
-    60,
-    10,
-    2,
-    4,
-  ),
-  "google-official/veo-3.1-lite-generate-preview": basePlusDuration(30, 5, 2),
-  "google-official/veo-3.0-generate-001": basePlusDuration(70, 12, 2, 4),
-  "google-official/veo-3.0-fast-generate-001": basePlusDuration(50, 8, 2, 4),
-  "google-official/veo-2.0-generate-001": basePlusDuration(20, 3),
-  // Google Vertex AI (same pricing as google-official equivalents)
-  "google-vertex/veo-3.1-generate-001": basePlusDuration(80, 15, 2, 4),
-  "google-vertex/veo-3.1-fast-generate-001": basePlusDuration(60, 10, 2, 4),
-  "google-vertex/veo-3.1-lite-generate-001": basePlusDuration(30, 5, 2),
-  "google-vertex/veo-3.0-generate-001": basePlusDuration(70, 12, 2, 4),
-  "google-vertex/veo-3.0-fast-generate-001": basePlusDuration(50, 8, 2, 4),
-  "google-vertex/veo-2.0-generate-001": basePlusDuration(20, 3),
-  // Replicate — Kling
-  "kwaivgi/kling-v3-video": basePlusDuration(50, 10),
-  "kwaivgi/kling-v3-omni-video": basePlusDuration(40, 8),
-  "kwaivgi/kling-v2.6": basePlusDuration(25, 5),
-  "kwaivgi/kling-o1": basePlusDuration(30, 6),
-  // Replicate — ByteDance
-  "bytedance/seedance-1.5-pro": basePlusDuration(25, 5),
-  // Replicate — Wan
-  "wan-video/wan-2.6": basePlusDuration(25, 5),
-  // Replicate — OpenAI
-  "openai/sora-2": basePlusDuration(40),
-  "openai/sora-2-pro": basePlusDuration(120),
-  // Replicate — Google
-  "google/veo-3": basePlusDuration(100),
-  "google/veo-3.1": basePlusDuration(100),
-  "google/veo-3.1-fast": basePlusDuration(40),
-  // Replicate — MiniMax
-  "minimax/hailuo-2.3": basePlusDuration(20, 4),
-  // Metaso — provider H3 points are the Loomic credit meter for this model.
-  "metaso/minimax-h3": {
-    calculation: "per_second",
-    rates: { "720p": 10.2, "1080p": 17 },
-  },
-};
-
 const DEFAULT_VIDEO_COST: VideoModelCost = basePlusDuration(80);
+
+// ── Catalog-derived tables ──────────────────────────────────
+//
+// These replace the three hand-maintained tables above. The catalog
+// (model-catalog.ts) is now the single place a model's plan and price are
+// declared, so a model can no longer be present in one table and missing from
+// another — which is what produced 17 silent fallbacks, including the only image
+// model actually in use billing at an invented default.
+//
+// Derived at module load rather than written out again, so there is exactly one
+// copy of each value.
+
+export const MODEL_MIN_TIER: Record<string, SubscriptionPlan> =
+  Object.fromEntries([
+    ...Object.entries(IMAGE_MODEL_CATALOG).map(
+      ([id, entry]) => [id, entry.minTier] as const,
+    ),
+    ...Object.entries(VIDEO_MODEL_CATALOG).map(
+      ([id, entry]) => [id, entry.minTier] as const,
+    ),
+  ]);
+
+export const IMAGE_MODEL_COSTS: Record<string, ImageModelCost> =
+  Object.fromEntries(
+    Object.entries(IMAGE_MODEL_CATALOG).map(
+      ([id, entry]) => [id, entry.cost] as const,
+    ),
+  );
+
+export const VIDEO_MODEL_COSTS: Record<string, VideoModelCost> =
+  Object.fromEntries(
+    Object.entries(VIDEO_MODEL_CATALOG).map(
+      ([id, entry]) => [id, entry.cost] as const,
+    ),
+  );
 
 /** Calculate the credit cost for an image generation. */
 export function getImageCreditCost(

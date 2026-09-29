@@ -29,6 +29,7 @@ import { fetchBrandKit } from "../lib/brand-kit-api";
 import { claimDailyCredits } from "../lib/credits-api";
 import { fetchImageModels, fetchWorkspaceSkills, saveMessage } from "../lib/server-api";
 import type { CanvasSelectedElement } from "./canvas-editor";
+import type { CanvasImageRef } from "./chat-input";
 import {
   type BrandKitMentionItem,
   type CanvasImageItem,
@@ -63,6 +64,8 @@ type ChatSidebarProps = {
   currentBrandKitId?: string | null;
   ws: WebSocketHandle;
   selectedCanvasElements?: CanvasSelectedElement[];
+  /** Pan the canvas to one of the selected elements. */
+  onFocusCanvasElement?: (elementId: string) => void;
 };
 
 export function ChatSidebar({
@@ -81,6 +84,7 @@ export function ChatSidebar({
   currentBrandKitId,
   ws,
   selectedCanvasElements,
+  onFocusCanvasElement,
 }: ChatSidebarProps) {
   const breakpoint = useBreakpoint();
   const isOverlay = breakpoint !== "desktop";
@@ -365,30 +369,51 @@ export function ChatSidebar({
       attachmentsOverride?: ReadyAttachment[],
       imageGenerationPreferenceOverride?: ImageGenerationPreference,
       mentionsOverride?: MessageMention[],
+      /**
+       * Canvas images the message references, taken from the composer's chips.
+       *
+       * An EMPTY array is meaningful and is honoured: it says the user removed the
+       * chips, so those images must not be attached. `undefined` means the caller
+       * has no composer (chat skills, programmatic sends) and the older
+       * "whatever is selected on the canvas" behaviour applies.
+       */
+      canvasRefsOverride?: CanvasImageRef[],
     ) => {
       const currentSessionId = activeSessionIdRef.current;
       if (streaming || !currentSessionId) return;
 
-      // Merge explicitly-attached images with auto-sensed canvas selection images
+      // Merge explicitly-attached images with the canvas images the message refers
+      // to. The chips are the source of truth when they exist: selecting a second
+      // image on the canvas REPLACES the selection, so a sentence referencing three
+      // images would otherwise ship only the last one.
       let currentAttachments = attachmentsOverride ?? readyAttachments;
-      const selectedEls = selectedCanvasElementsRef.current ?? [];
-      const selectedImageEls = selectedEls.filter(
-        (el) =>
-          el.type === "image" && el.fileId && (el.storageUrl || el.dataUrl),
-      );
-      if (selectedImageEls.length > 0 && !attachmentsOverride) {
+      if (!attachmentsOverride) {
+        const canvasImages: CanvasImageRef[] =
+          canvasRefsOverride ??
+          (selectedCanvasElementsRef.current ?? [])
+            .filter(
+              (el) =>
+                el.type === "image" && el.fileId && (el.storageUrl || el.dataUrl),
+            )
+            .map((el) => ({
+              refId: el.id,
+              url: el.storageUrl ?? el.dataUrl!,
+              ...(el.thumbnailUrl ? { thumbnailUrl: el.thumbnailUrl } : {}),
+            }));
+
         const existingIds = new Set(currentAttachments.map((a) => a.assetId));
-        const selectionAttachments: ReadyAttachment[] = selectedImageEls
-          .filter((el) => !existingIds.has(el.id))
-          .map((el) => ({
-            assetId: el.id,
-            url: el.storageUrl ?? el.dataUrl!,
+        const refAttachments: ReadyAttachment[] = canvasImages
+          .filter((ref) => !existingIds.has(ref.refId))
+          .map((ref) => ({
+            assetId: ref.refId,
+            url: ref.url,
+            ...(ref.thumbnailUrl ? { thumbnailUrl: ref.thumbnailUrl } : {}),
             mimeType: "image/png",
             source: "canvas-ref" as const,
-            name: `Canvas selection ${el.id.slice(0, 6)}`,
+            name: `Canvas ${ref.refId.slice(0, 6)}`,
           }));
-        if (selectionAttachments.length > 0) {
-          currentAttachments = [...currentAttachments, ...selectionAttachments];
+        if (refAttachments.length > 0) {
+          currentAttachments = [...currentAttachments, ...refAttachments];
         }
       }
       const currentImageGenerationPreference =
@@ -403,6 +428,7 @@ export function ChatSidebar({
         type: "image" as const,
         assetId: a.assetId,
         url: a.url,
+        ...(a.thumbnailUrl ? { thumbnailUrl: a.thumbnailUrl } : {}),
         mimeType: a.mimeType,
         source: a.source,
         ...(a.name ? { name: a.name } : {}),
@@ -440,14 +466,37 @@ export function ChatSidebar({
       };
       updateSessionMessages(currentSessionId, (prev) => [...prev, userMsg]);
 
-      // Persist user message (fire-and-forget)
+      // Persist user message (fire-and-forget).
+      //
+      // Image BYTES must never reach chat_messages.content_blocks. A single
+      // base64 canvas image produced a 6.5MB row, and because listMessages reads
+      // the whole conversation, that one row made the entire history time out
+      // (504) — and it could not be repaired from the client, since every write
+      // that would shrink it has to carry the same oversized payload.
+      //
+      // The in-memory blocks above keep the data URL, so the image still shows
+      // for the rest of this session; only the durable copy drops it. A dropped
+      // block leaves its `[图片:id]` token visible in history rather than
+      // silently rewriting the sentence.
+      const persistedBlocks = imageBlocks.filter((block) => {
+        const url = (block as { url?: string }).url ?? "";
+        if (!url.startsWith("data:")) return true;
+        console.warn(
+          "[chat] dropping inline image bytes from the saved message:",
+          {
+            assetId: (block as { assetId?: string }).assetId,
+            bytes: url.length,
+          },
+        );
+        return false;
+      });
       saveMessage(accessTokenRef.current, currentSessionId, {
         role: "user",
         content: text,
         contentBlocks: [
           { type: "text" as const, text },
           ...mentionBlocks,
-          ...imageBlocks,
+          ...persistedBlocks,
         ],
       }).catch((err) =>
         console.error("[chat] Failed to save user message:", err),
@@ -480,7 +529,11 @@ export function ChatSidebar({
         const runIdRef = { current: "" };
 
         const cleanup = ws.onEvent((event) => {
-          if (!runIdRef.current || event.runId !== runIdRef.current) return;
+          // Not every event belongs to a run: `job.progress` reports a background
+          // job and carries no runId, so the field has to be narrowed before it
+          // can be compared. An event without one is never this stream's.
+          const eventRunId = "runId" in event ? event.runId : undefined;
+          if (!runIdRef.current || eventRunId !== runIdRef.current) return;
           if (abortRef.current) {
             resolveStream();
             return;
@@ -825,7 +878,9 @@ export function ChatSidebar({
 
           // Reuse the shared stream event handler — eliminates ~70 lines of duplication
           const unsub = ws.onEvent((evt) => {
-            if (evt.runId !== activeRunId) return;
+            // See the note above: run-less events (job.progress) have no runId.
+            const evtRunId = "runId" in evt ? evt.runId : undefined;
+            if (evtRunId !== activeRunId) return;
 
             applyStreamEvent(evt, assistantId, sessionId);
             onStreamEvent?.(evt);
@@ -915,6 +970,19 @@ export function ChatSidebar({
     onCut: (e: React.ClipboardEvent) => e.stopPropagation(),
     onPaste: (e: React.ClipboardEvent) => e.stopPropagation(),
     onWheel: (e: React.WheelEvent) => e.stopPropagation(),
+  };
+
+  // Attention moving to the chat panel confirms the canvas references that are
+  // currently only previewing the selection — see the preview/confirm note in
+  // chat-input. Both signals mean the same thing and neither covers the other:
+  // focus catches Tab and clicks that land on a control, pointerdown catches
+  // clicks on inert areas like the message list. Capture phase so an inner
+  // control that stops propagation cannot swallow them.
+  // Spread alongside eventIsolationProps on both render paths.
+  const commitCanvasRefs = () => chatInputRef.current?.commitCanvasRefs();
+  const chatAttentionProps = {
+    onPointerDownCapture: commitCanvasRefs,
+    onFocusCapture: commitCanvasRefs,
   };
 
   // The inner panel content is shared across all breakpoints.
@@ -1010,7 +1078,9 @@ export function ChatSidebar({
         )}
         <ChatInput
           ref={chatInputRef}
-          onSend={handleSend}
+          onSend={(text, canvasRefs) =>
+            void handleSend(text, undefined, undefined, undefined, canvasRefs)
+          }
           disabled={streaming || sessionsLoading}
           attachments={imageAttachments}
           onAddFiles={addFiles}
@@ -1058,6 +1128,7 @@ export function ChatSidebar({
               : "fixed inset-y-0 right-0 z-50 flex w-[400px] flex-col border-l border-border bg-card shadow-2xl animate-in slide-in-from-right duration-250"
           }
           {...eventIsolationProps}
+          {...chatAttentionProps}
         >
           {panelContent}
         </div>
@@ -1072,6 +1143,7 @@ export function ChatSidebar({
       className="flex h-full shrink-0"
       style={{ width: sidebarWidth }}
       {...eventIsolationProps}
+      {...chatAttentionProps}
     >
       {/* Resize handle -- supports mouse, touch, and keyboard (ArrowLeft/ArrowRight) */}
       <div

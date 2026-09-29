@@ -62,8 +62,13 @@ export type CreditService = {
   refundCredits(
     workspaceId: string,
     userId: string,
+    // LOCAL FORK: was `jobId: string` (required), which contradicted both its own
+    // implementation (`p_job_id: jobId ?? null`) and deductCredits' `jobId?`.
+    // Refunds are not always tied to a job -- the synchronous
+    // /api/agent/generate-image route deducts without creating one -- and the
+    // required signature was pushing callers toward inventing a fake id.
     amount: number,
-    jobId: string,
+    jobId?: string,
     description?: string,
   ): Promise<string>;
   claimDailyCredits(
@@ -157,8 +162,10 @@ export function createCreditService(options: {
         p_workspace_id: workspaceId,
         p_user_id: userId,
         p_amount: amount,
-        p_job_id: jobId ?? null,
-        p_description: description ?? null,
+        // The generated RPC types declare these as non-nullable strings even
+        // though the SQL functions accept NULL. Same cast as deductCredits above.
+        p_job_id: (jobId ?? null) as string,
+        p_description: (description ?? null) as string,
       });
 
       if (error) {

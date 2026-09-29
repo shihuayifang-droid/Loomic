@@ -2,12 +2,12 @@ import type { BaseCheckpointSaver, BaseStore } from "@langchain/langgraph-checkp
 import type { BaseLanguageModel } from "@langchain/core/language_models/base";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatVertexAI } from "@langchain/google-vertexai";
-import { ChatOpenAI } from "@langchain/openai";
 import { createDeepAgent } from "deepagents";
 
 import { DEFAULT_AGENT_MODEL, DEFAULT_GOOGLE_AGENT_MODEL, type ServerEnv } from "../config/env.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
 import { createAgentBackend, type AgentBackendResult } from "./backends/index.js";
+import { ChatOpenAIImageUrlCompat } from "./openai-image-url-compat.js";
 import { LOOMIC_SYSTEM_PROMPT } from "./prompts/loomic-main.js";
 import { createVideoSubAgent } from "./sub-agents.js";
 import { createMainAgentTools } from "./tools/index.js";
@@ -107,7 +107,11 @@ export function createLoomicDeepAgent(options: {
     model: resolvedModel,
     name: "loomic",
     ...(options.store ? { store: options.store } : {}),
-    subagents: [createVideoSubAgent()],
+    // Registered only with a job channel — without one the sub-agent's tool
+    // would bill nothing. See sub-agents.ts.
+    subagents: options.submitVideoJob
+      ? [createVideoSubAgent({ submitVideoJob: options.submitVideoJob })]
+      : [],
     systemPrompt,
     tools: createMainAgentTools(backendResult.factory, {
       createUserClient,
@@ -130,6 +134,14 @@ export function createLoomicDeepAgent(options: {
  *   around the one-api proxy stripping `delta.role` from chunks.
  * - `google` — uses ChatGoogleGenerativeAI (Google AI Studio, API Key) or
  *   ChatVertexAI (Vertex AI, service account) depending on available config.
+ * - `deepseek` — DeepSeek's own OpenAI-compatible endpoint, deliberately kept
+ *   separate from `openai` so it bypasses the shared gateway. Measured
+ *   2026-09-14 with an identical request: `deepseek-v4-flash` took 1926ms direct
+ *   versus 12354ms through the kwjm gateway, i.e. the gateway added ~10.4s. Image
+ *   generation still has to go through the gateway, so both must coexist.
+ * - `aether` — an OpenAI-compatible gateway on the LAN (10.210.134.15:18085).
+ *   Same reasoning as `deepseek`: kept separate from `openai` so chat can leave
+ *   the kwjm gateway while image generation stays on it.
  */
 function createStreamingChatModel(specifier: string): BaseLanguageModel {
   const colonIdx = specifier.indexOf(":");
@@ -146,6 +158,20 @@ function createStreamingChatModel(specifier: string): BaseLanguageModel {
     provider = "openai";
     modelName = DEFAULT_AGENT_MODEL;
   }
+  if (provider === "deepseek" && !process.env.DEEPSEEK_API_KEY) {
+    console.warn(
+      `[model] DeepSeek unavailable (no DEEPSEEK_API_KEY), falling back to OpenAI for: ${specifier}`,
+    );
+    provider = "openai";
+    modelName = DEFAULT_AGENT_MODEL;
+  }
+  if (provider === "aether" && !process.env.AETHER_API_KEY) {
+    console.warn(
+      `[model] Aether unavailable (no AETHER_API_KEY), falling back to OpenAI for: ${specifier}`,
+    );
+    provider = "openai";
+    modelName = DEFAULT_AGENT_MODEL;
+  }
   if (provider === "openai" && !process.env.OPENAI_API_KEY && hasGoogle) {
     console.warn(`[model] OpenAI unavailable (no OPENAI_API_KEY), falling back to Google for: ${specifier}`);
     provider = "google";
@@ -153,6 +179,30 @@ function createStreamingChatModel(specifier: string): BaseLanguageModel {
   }
 
   switch (provider) {
+    case "aether":
+      // Same rationale as `deepseek` below: explicit apiKey/baseURL so this
+      // does not disturb the OPENAI_* env that image generation depends on.
+      return new ChatOpenAIImageUrlCompat({
+        model: modelName,
+        streaming: true,
+        streamUsage: false,
+        apiKey: process.env.AETHER_API_KEY!,
+        configuration: {
+          baseURL: process.env.AETHER_API_BASE ?? "http://10.210.134.15:18085/v1",
+        },
+      });
+    case "deepseek":
+      // Explicit apiKey/baseURL rather than the OPENAI_* process env, which is
+      // pointed at the gateway for image generation and must stay that way.
+      return new ChatOpenAIImageUrlCompat({
+        model: modelName,
+        streaming: true,
+        streamUsage: false,
+        apiKey: process.env.DEEPSEEK_API_KEY!,
+        configuration: {
+          baseURL: process.env.DEEPSEEK_API_BASE ?? "https://api.deepseek.com/v1",
+        },
+      });
     case "google":
       // Prefer Vertex AI (service account) when configured; fall back to Developer API key
       if (hasVertexAI) {
@@ -177,7 +227,7 @@ function createStreamingChatModel(specifier: string): BaseLanguageModel {
       });
     case "openai":
     default:
-      return new ChatOpenAI({
+      return new ChatOpenAIImageUrlCompat({
         model: modelName,
         streaming: true,
         streamUsage: false,
@@ -187,6 +237,12 @@ function createStreamingChatModel(specifier: string): BaseLanguageModel {
 
 /** Known model-name prefixes that map to Google Gemini. */
 const GOOGLE_MODEL_PREFIXES = ["gemini-"];
+/**
+ * Bare `deepseek-*` names route to DeepSeek's own endpoint, because the gateway
+ * copy of the same model measured ~10.4s slower. To deliberately use the gateway
+ * copy instead, write the prefix out: `openai:deepseek-v4-flash`.
+ */
+const DEEPSEEK_MODEL_PREFIXES = ["deepseek-"];
 
 export function createDefaultModelSpecifier(
   env: Pick<ServerEnv, "agentModel">,
@@ -197,6 +253,8 @@ export function createDefaultModelSpecifier(
   // Auto-detect Google models by name prefix.
   if (GOOGLE_MODEL_PREFIXES.some((p) => model.startsWith(p)))
     return `google:${model}`;
+  if (DEEPSEEK_MODEL_PREFIXES.some((p) => model.startsWith(p)))
+    return `deepseek:${model}`;
   return `openai:${model}`;
 }
 

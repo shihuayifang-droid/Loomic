@@ -6,8 +6,44 @@ import type {
   Json,
 } from "@loomic/shared";
 
+import { randomUUID } from "node:crypto";
+
+import { isTransportFailure } from "../../supabase/transport-retry.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 import type { ThreadService } from "./thread-service.js";
+
+/**
+ * Drop image blocks that carry their bytes inline as a `data:` URL.
+ *
+ * A chat message row is read back in full every time the conversation loads, so
+ * embedding image bytes there scales the cost of *every* history fetch by the size
+ * of the largest image ever attached. One 6.5MB base64 block was enough to make
+ * listMessages exceed the statement timeout and return 504 for the whole session.
+ *
+ * Enforced server-side rather than only in the composer: this is the single write
+ * path shared by the HTTP route and the WebSocket handler, so a guard here cannot
+ * be bypassed by a client that forgets.
+ */
+function stripInlineImageBytes(
+  blocks: ContentBlock[],
+  context: { sessionId: string; role: string },
+): ContentBlock[] {
+  return blocks.filter((block) => {
+    if ((block as { type?: string }).type !== "image") return true;
+    const url = (block as { url?: string }).url ?? "";
+    if (!url.startsWith("data:")) return true;
+    console.log(
+      "[chat.createMessage] refused to persist inline image bytes",
+      JSON.stringify({
+        sessionId: context.sessionId,
+        role: context.role,
+        assetId: (block as { assetId?: string }).assetId,
+        bytes: url.length,
+      }),
+    );
+    return false;
+  });
+}
 
 export class ChatServiceError extends Error {
   readonly statusCode: number;
@@ -155,6 +191,18 @@ export function createChatService(options: {
         .order("created_at", { ascending: true });
 
       if (error) {
+        // Log the driver's own error before wrapping it. ChatServiceError keeps
+        // only a fixed sentence, so the postgres code/message that says WHY —
+        // statement timeout, row too large, RLS refusal — was being thrown away,
+        // leaving "Failed to list messages." as the only evidence anywhere.
+        console.log(
+          "[chat-service] listMessages failed",
+          "sessionId=" + sessionId,
+          "code=" + String((error as { code?: string }).code ?? ""),
+          "message=" + String((error as { message?: string }).message ?? ""),
+          "details=" + String((error as { details?: string }).details ?? ""),
+          "hint=" + String((error as { hint?: string }).hint ?? ""),
+        );
         throw new ChatServiceError("chat_error", "Failed to list messages.", 500);
       }
 
@@ -189,23 +237,96 @@ export function createChatService(options: {
 
     async createMessage(user, sessionId, input) {
       const client = options.createUserClient(user.accessToken);
-      const { data, error } = await client
-        .from("chat_messages")
-        .insert({
-          session_id: sessionId,
-          role: input.role,
-          content: input.content,
-          ...(input.toolActivities
-            ? { tool_activities: input.toolActivities as unknown as Json }
-            : {}),
-          ...(input.contentBlocks
-            ? { content_blocks: input.contentBlocks as unknown as Json }
-            : {}),
-        })
-        .select("id, role, content, tool_activities, content_blocks, created_at")
-        .single();
+      const safeBlocks = input.contentBlocks
+        ? stripInlineImageBytes(input.contentBlocks, {
+            sessionId,
+            role: input.role,
+          })
+        : null;
+
+      const RETURNING =
+        "id, role, content, tool_activities, content_blocks, created_at";
+
+      // WHY THIS ONE DOES NOT USE withTransportRetry
+      //
+      // A proxy blip here cost a real assistant reply: the generated image was on
+      // the canvas but the message row was never written, so after a reload the
+      // conversation showed the picture with no text and no way to get it back
+      // (observed 2026-09-15, `TypeError: fetch failed` / TLS ECONNRESET).
+      //
+      // But this is an INSERT, and `fetch failed` also covers a response lost on the
+      // way BACK — in which case the row DID land. Blindly replaying would then post
+      // the assistant's reply twice, which is a worse bug than the one being fixed.
+      //
+      // So the id is generated HERE instead of by the database. That turns "did it
+      // land?" from unknowable into a lookup: before replaying, ask for that exact
+      // id. The insert stays a plain insert, so no UPDATE policy is needed (an
+      // upsert would have required one, and RLS on chat_messages grants insert).
+      const messageId = randomUUID();
+
+      const attemptInsert = async () =>
+        await client
+          .from("chat_messages")
+          .insert({
+            id: messageId,
+            session_id: sessionId,
+            role: input.role,
+            content: input.content,
+            ...(input.toolActivities
+              ? { tool_activities: input.toolActivities as unknown as Json }
+              : {}),
+            ...(safeBlocks ? { content_blocks: safeBlocks as unknown as Json } : {}),
+          })
+          .select(RETURNING)
+          .single();
+
+      let { data, error } = await attemptInsert();
+
+      if (error && isTransportFailure(error)) {
+        console.log(
+          "[chat.createMessage] transport failure, checking whether the row landed",
+          JSON.stringify({ sessionId, messageId, message: error.message }),
+        );
+        await new Promise((r) => setTimeout(r, 400));
+
+        const existing = await client
+          .from("chat_messages")
+          .select(RETURNING)
+          .eq("id", messageId)
+          .maybeSingle();
+
+        if (existing.data) {
+          // The first attempt did reach Postgres; only its answer was lost.
+          console.log(
+            "[chat.createMessage] row had landed, reusing it",
+            JSON.stringify({ sessionId, messageId }),
+          );
+          data = existing.data;
+          error = null;
+        } else if (!existing.error) {
+          // Confirmed absent, so the statement never executed — safe to replay.
+          ({ data, error } = await attemptInsert());
+        }
+        // If the CHECK itself failed we cannot tell, and inserting again risks a
+        // duplicate. Fall through to the error path: losing one message is
+        // recoverable by the user re-asking; two identical assistant replies in the
+        // transcript are not.
+      }
 
       if (error || !data) {
+        // Log the driver's own reason. Collapsing every failure into one generic
+        // sentence is what turned a statement timeout into a multi-hour hunt.
+        console.log(
+          "[chat.createMessage] insert failed",
+          JSON.stringify({
+            sessionId,
+            messageId,
+            code: error?.code,
+            message: error?.message,
+            details: error?.details,
+            hint: error?.hint,
+          }),
+        );
         throw new ChatServiceError("chat_error", "Failed to save message.", 500);
       }
 

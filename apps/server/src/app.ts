@@ -76,6 +76,7 @@ import { registerCanvasRoutes } from "./http/canvases.js";
 import { registerChatRoutes } from "./http/chat.js";
 import { registerGenerateRoutes } from "./http/generate.js";
 import { registerHealthRoutes } from "./http/health.js";
+import { registerDevClientErrorRoutes } from "./http/dev-client-errors.js";
 import { registerImageProxyRoute } from "./http/image-proxy.js";
 import { registerModelRoutes } from "./http/models.js";
 import { registerImageModelRoutes } from "./http/image-models.js";
@@ -259,6 +260,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   });
 
   void registerHealthRoutes(app, env);
+  // Dev-only: no-ops itself in production. See dev-client-errors.ts.
+  void registerDevClientErrorRoutes(app);
   void registerFontsRoutes(app, { env });
   void registerImageProxyRoute(app);
   void registerRunRoutes(app, agentRuns, {
@@ -310,6 +313,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     viewerService,
     ...(jobService ? { jobService } : {}),
     ...(tierGuard ? { tierGuard } : {}),
+    // Lets the video route push job.progress instead of holding the request open.
+    ...(connectionManager ? { connectionManager } : {}),
   });
   void registerCreditRoutes(app, { auth, creditService, viewerService });
   if (jobService) {

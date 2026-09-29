@@ -1,4 +1,5 @@
 import { registerExecutor, type ExecutorContext } from "../job-executor.js";
+import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateVideo } from "../../../generation/video-generation.js";
 import { resolveVideoProviderName } from "../../../generation/providers/registry.js";
 
@@ -39,12 +40,12 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
   const model = payload.model ?? "wan-video/wan-2.6";
   const providerName = resolveVideoProviderName(model);
 
-  // Renew VT every 120s (roughly half of the 300s video queue VT) to prevent
-  // the message from becoming visible during long video generation.
-  const VIDEO_VT_SECONDS = 300;
+  // VT and heartbeat interval both derived from JOB_TYPE_REGISTRY — see the
+  // longer note in the image executor. Was a hard-coded 300 plus 120_000 here.
+  const VT_SECONDS = JOB_TYPE_REGISTRY.video_generation.visibilityTimeoutSeconds;
   const heartbeatTimer = setInterval(() => {
-    ctx.renewVt(VIDEO_VT_SECONDS);
-  }, 120_000);
+    ctx.renewVt(VT_SECONDS);
+  }, (VT_SECONDS / 2) * 1000);
 
   try {
     lap("replicate_call_start");

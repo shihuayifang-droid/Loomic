@@ -382,6 +382,21 @@
   animation: shimmer-scan 1.5s ease-in-out infinite;
 }
 
+/* Chat composer (contenteditable) — a textarea's placeholder and empty-state
+   behaviour have to be recreated by hand. */
+.chat-composer:empty::before,
+.chat-composer:has(> br:only-child)::before {
+  content: attr(data-placeholder);
+  color: var(--muted-foreground);
+  pointer-events: none;
+}
+
+/* Chrome leaves a stray <br> behind after the last character is deleted, which
+   would otherwise keep the placeholder hidden on an visually empty editor. */
+.chat-composer > br:only-child {
+  display: none;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
    Landing page keyframes
    Consolidated from inline <style> tags across landing components.

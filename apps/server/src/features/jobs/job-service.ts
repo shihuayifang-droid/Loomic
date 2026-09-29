@@ -11,12 +11,7 @@ import type {
   UserSupabaseClient,
 } from "../../supabase/user.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
-
-// Queue name mapping
-const QUEUE_MAP: Record<BackgroundJobType, string> = {
-  image_generation: "image_generation_jobs",
-  video_generation: "video_generation_jobs",
-};
+import { queueForJobType } from "./job-registry.js";
 
 export class JobServiceError extends Error {
   readonly statusCode: number;
@@ -105,7 +100,7 @@ export function createJobService(options: {
   return {
     async createJob(user, input) {
       const client = options.createUserClient(user.accessToken);
-      const queueName = QUEUE_MAP[input.jobType];
+      const queueName = queueForJobType(input.jobType);
 
       const { data: job, error } = await client
         .from("background_jobs")

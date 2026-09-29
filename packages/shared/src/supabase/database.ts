@@ -303,6 +303,9 @@ export type Database = {
         Relationships: []
       }
       canvases: {
+        // `version` added by hand alongside migration
+        // 20260404000000_canvas_optimistic_version.sql, same as credit_balances
+        // below. Re-running `supabase gen types` will produce it too.
         Row: {
           content: Json
           created_at: string
@@ -312,6 +315,7 @@ export type Database = {
           name: string
           project_id: string
           updated_at: string
+          version: number
         }
         Insert: {
           content?: Json
@@ -322,6 +326,7 @@ export type Database = {
           name: string
           project_id: string
           updated_at?: string
+          version?: number
         }
         Update: {
           content?: Json
@@ -332,6 +337,7 @@ export type Database = {
           name?: string
           project_id?: string
           updated_at?: string
+          version?: number
         }
         Relationships: [
           {

@@ -313,3 +313,50 @@ function generateId(): string {
     Math.random().toString(36).slice(2)
   ).slice(0, 20);
 }
+
+/**
+ * Slots the backend reserves while a generation job runs carry
+ * `customData.generating === true` (see the server's insertImagePlaceholder).
+ * The flag is stripped when the real image is written into the same slot.
+ */
+export function findGeneratingElements(elements: readonly any[]): any[] {
+  return elements.filter(
+    (el) => el && !el.isDeleted && el.customData?.generating === true,
+  );
+}
+
+/**
+ * Pan/zoom the viewport onto generation slots the user has not been shown yet.
+ *
+ * Lovart moves the canvas to wherever it is about to draw, so the user never has
+ * to hunt for the new image. We mirror that, but only once per slot: a batch
+ * generation fires one canvas.sync per image, and re-focusing on every sync
+ * would keep yanking the viewport away from whatever the user is doing.
+ *
+ * @param seen ids already focused. Mutated in place by this call.
+ * @returns whether the viewport was moved.
+ */
+export function focusGeneratingSlots(
+  api: any,
+  elements: readonly any[],
+  seen: Set<string>,
+): boolean {
+  if (typeof api?.scrollToContent !== "function") return false;
+  const slots = findGeneratingElements(elements);
+  if (slots.length === 0) return false;
+  // Every slot has already been revealed — leave the viewport alone.
+  if (slots.every((el) => seen.has(String(el.id)))) return false;
+  for (const el of slots) seen.add(String(el.id));
+
+  api.scrollToContent(slots, {
+    fitToViewport: true,
+    // Leave breathing room so neighbouring images stay in frame; a full-bleed
+    // fit turns the canvas into a single-image viewer.
+    viewportZoomFactor: 0.6,
+    // Never zoom past 1:1 — a small slot would otherwise fill the screen.
+    maxZoom: 1,
+    animate: true,
+    duration: 450,
+  });
+  return true;
+}

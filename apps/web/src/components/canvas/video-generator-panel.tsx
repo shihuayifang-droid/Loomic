@@ -12,7 +12,9 @@ import {
   updateVideoGeneratorElement,
 } from "../../lib/canvas-video-generator";
 import type { VideoModelInfo } from "../../lib/server-api";
-import { fetchVideoModels, generateVideoDirect } from "../../lib/server-api";
+import { fetchVideoModels, submitVideoJob } from "../../lib/server-api";
+import { awaitJobCompletion } from "../../lib/await-job";
+import type { WebSocketHandle } from "../../hooks/use-websocket";
 // No longer needs poster frame extraction -- videos use embeddable elements
 
 type VideoGeneratorPanelProps = {
@@ -23,6 +25,11 @@ type VideoGeneratorPanelProps = {
   accessToken: string;
   canvasScrollZoom: { scrollX: number; scrollY: number; zoom: number };
   onClose: () => void;
+  /**
+   * Used to receive `job.progress`. Optional: without it the slow poll in
+   * awaitJobCompletion still delivers the result, just a few seconds later.
+   */
+  ws?: WebSocketHandle;
 };
 
 const ASPECT_RATIOS = ["16:9", "9:16"] as const;
@@ -46,6 +53,7 @@ export function VideoGeneratorPanel({
   accessToken,
   canvasScrollZoom,
   onClose,
+  ws,
 }: VideoGeneratorPanelProps) {
   const [prompt, setPrompt] = useState(data.prompt);
   const [model, setModel] = useState(data.model);
@@ -251,7 +259,11 @@ export function VideoGeneratorPanel({
       if (firstFrame) inputImages.push(firstFrame.dataUrl);
       if (lastFrame) inputImages.push(lastFrame.dataUrl);
 
-      const result = await generateVideoDirect(
+      // Two steps now: submit returns a jobId at once (HTTP 202), then we wait
+      // for job.progress over the WebSocket with a slow poll as the safety net.
+      // Previously this was one request held open for up to 300s, which any proxy
+      // or sleeping laptop would kill — losing the result of a paid generation.
+      const submitted = await submitVideoJob(
         accessTokenRef.current,
         prompt.trim(),
         {
@@ -262,9 +274,46 @@ export function VideoGeneratorPanel({
           ...(inputImages.length ? { inputImages } : {}),
         },
       );
+      if (controller.signal.aborted) return;
+
+      const job = await awaitJobCompletion(
+        accessTokenRef.current,
+        submitted.jobId,
+        {
+          ws,
+          signal: controller.signal,
+          onProgress: ({ status, elapsedMs }) => {
+            updateVideoGeneratorElement(excalidrawApi, elementId, {
+              status: "generating",
+              prompt: prompt.trim(),
+              model,
+              aspectRatio,
+              duration,
+              resolution,
+              ...(elapsedMs != null ? { elapsedMs } : {}),
+              jobStatus: status,
+            } as any);
+          },
+        },
+      );
 
       // Check if this generation was cancelled while awaiting
       if (controller.signal.aborted) return;
+
+      // The worker writes these into background_jobs.result.
+      const jobResult = (job.result ?? {}) as {
+        signed_url?: string;
+        mime_type?: string;
+        duration_seconds?: number;
+      };
+      if (!jobResult.signed_url) {
+        throw new Error("Job succeeded but carried no video URL");
+      }
+      const result = {
+        url: jobResult.signed_url,
+        mimeType: jobResult.mime_type ?? "video/mp4",
+        durationSeconds: jobResult.duration_seconds ?? duration,
+      };
 
       // Create embeddable element for inline video playback on canvas.
       // Dynamic import -- excalidraw is client-only.

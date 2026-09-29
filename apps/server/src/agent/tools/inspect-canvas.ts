@@ -1,6 +1,11 @@
 import { tool } from "langchain";
 import { z } from "zod";
 
+import {
+  CanvasUnavailableError,
+  readCanvasSnapshot,
+} from "../../features/canvas/canvas-version.js";
+
 const inspectCanvasSchema = z.object({
   detail_level: z
     .enum(["summary", "full"])
@@ -166,23 +171,36 @@ export function createInspectCanvasTool(deps: {
       }
 
       const client = deps.createUserClient(accessToken);
-      const { data, error } = await client
-        .from("canvases")
-        .select("content")
-        .eq("id", canvasId)
-        .single();
 
-      if (error || !data) {
+      // Reads the row through the one reader that distinguishes "no such canvas"
+      // from "the database did not answer". This used to be a local `.single()`
+      // that reported a dropped connection as canvas_not_found, which sent the
+      // agent off telling the user their canvas was inaccessible — and, worse,
+      // invited it to re-create content that was in fact still there.
+      let content: {
+        elements?: CanvasElement[];
+        appState?: Record<string, unknown>;
+      };
+      try {
+        const snapshot = await readCanvasSnapshot(client, canvasId);
+        content = snapshot.content as {
+          elements?: CanvasElement[];
+          appState?: Record<string, unknown>;
+        };
+      } catch (e) {
+        if (e instanceof CanvasUnavailableError) {
+          return JSON.stringify({
+            error: "canvas_unavailable",
+            message:
+              "The canvas store did not respond. This is transient — retry the " +
+              "same call. Do NOT assume the canvas is empty or missing.",
+          });
+        }
         return JSON.stringify({
           error: "canvas_not_found",
           message: "Canvas not found or access denied.",
         });
       }
-
-      const content = data.content as {
-        elements?: CanvasElement[];
-        appState?: Record<string, unknown>;
-      };
 
       const elements = (content.elements ?? []).filter(
         (el) => !el.isDeleted,

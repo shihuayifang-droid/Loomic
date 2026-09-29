@@ -9,8 +9,42 @@ import {
   resolveImageProviderName,
   type AvailableModel,
 } from "../../generation/providers/registry.js";
+import type { ImageModelLimits } from "../../generation/types.js";
 
 const DEFAULT_MODEL = "black-forest-labs/flux-kontext-pro";
+
+/** Short human phrase for a model's reference-image capacity. */
+function refImageLabel(max: ImageModelLimits["maxInputImages"]): string {
+  if (max === 0) return "text-only, no reference images";
+  if (max === "unbounded") return "multiple reference images";
+  return max === 1 ? "1 reference image only" : `up to ${max} reference images`;
+}
+
+/**
+ * Groups models by reference-image capacity so the LLM gets the real per-model
+ * limits instead of a hand-maintained sentence. The previous hard-coded text
+ * ("Google models accept up to 14, Flux models accept 1. Imagen 4 and Recraft V3
+ * are text-only.") covered only the Replicate models and never mentioned the
+ * kwjm ones that are actually in use.
+ */
+function describeRefImageLimits(models: AvailableModel[]): string {
+  const base =
+    "Reference image URLs for editing/transformation. Ignored by text-only models.";
+  if (!models.length) return base;
+
+  const groups = new Map<string, string[]>();
+  for (const m of models) {
+    const label = refImageLabel(m.limits.maxInputImages);
+    const ids = groups.get(label);
+    if (ids) ids.push(m.id);
+    else groups.set(label, [m.id]);
+  }
+
+  const detail = [...groups.entries()]
+    .map(([label, ids]) => `${label}: ${ids.join(", ")}`)
+    .join("; ");
+  return `${base} Per-model limits — ${detail}.`;
+}
 
 /**
  * Build the zod schema dynamically from the models available in the registry.
@@ -23,7 +57,12 @@ function buildImageGenerateSchema(models: AvailableModel[]) {
     : modelIds[0] ?? DEFAULT_MODEL;
 
   const modelDescription = models.length
-    ? `Model to use. Available:\n${models.map((m) => `- ${m.id}: ${m.displayName} — ${m.description}`).join("\n")}`
+    ? `Model to use. Available:\n${models
+        .map(
+          (m) =>
+            `- ${m.id}: ${m.displayName} — ${m.description} (${refImageLabel(m.limits.maxInputImages)})`,
+        )
+        .join("\n")}`
     : "Model identifier (no providers currently registered)";
 
   // z.enum needs [string, ...string[]], but we may have 0 models at test time.
@@ -63,9 +102,7 @@ function buildImageGenerateSchema(models: AvailableModel[]) {
     inputImages: z
       .array(z.string())
       .optional()
-      .describe(
-        "Reference image URLs for editing/transformation. Google models accept up to 14, Flux models accept 1. Imagen 4 and Recraft V3 are text-only.",
-      ),
+      .describe(describeRefImageLimits(models)),
     placementX: z
       .number()
       .optional()
@@ -250,7 +287,7 @@ export async function runImageGenerate(
   // Direct generation: resolve provider from model ID via registry
   try {
     lap("direct_generate_start", { model: input.model });
-    const providerName = resolveImageProviderName(input.model);
+    const providerName = resolveImageProviderName(input.model, "generate");
     const result = await generateImage(providerName, {
       prompt: input.prompt,
       model: input.model,
@@ -266,8 +303,30 @@ export async function runImageGenerate(
       try {
         imageUrl = await persistImage(result.url, result.mimeType, input.prompt);
         lap("persist_image_done");
-      } catch {
-        // Fall back to ephemeral URL if upload fails
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.error(`[generate_image] persistImage FAILED: ${reason}`);
+
+        // LOCAL FORK: upstream silently fell back to `result.url` here.
+        // That is safe when the provider hands back a real http(s) URL
+        // (Replicate does), but catastrophic when it hands back a base64 data
+        // URI (Google and gpt-image both do): the image then gets embedded in
+        // the canvas document itself. One 1024x1024 PNG measured 7 MB, and
+        // because the client re-uploads the whole document on every canvas
+        // change, saves started timing out with "Unable to save canvas" and
+        // the retry storm exhausted the database connection pool — which in
+        // turn made persistImage time out too, a self-reinforcing loop.
+        //
+        // So: only fall back when the URL is actually a remote reference.
+        if (result.url.startsWith("data:")) {
+          return {
+            summary:
+              `Image was generated successfully but could not be saved to storage (${reason}). ` +
+              `It was NOT placed on the canvas, because embedding the raw image data would make the canvas unsaveable. ` +
+              `Ask the user to retry — this is usually a transient storage timeout.`,
+            error: `storage_upload_failed: ${reason}`,
+          };
+        }
       }
     }
 
@@ -297,13 +356,35 @@ export async function runImageGenerate(
   }
 }
 
-export function createImageGenerateTool(deps?: {
+export function createImageGenerateTool(deps: {
   persistImage?: PersistImageFn;
   submitImageJob?: SubmitImageJobFn;
   /** Override for testing — defaults to querying the provider registry. */
   availableModels?: AvailableModel[];
-}) {
-  const models = deps?.availableModels ?? getAvailableImageModels();
+  /**
+   * Acknowledge that this instance will call providers directly, with NO job
+   * record, NO credit deduction and NO tier check. Tests only.
+   */
+  allowUnbilledDirect?: boolean;
+} = {}) {
+  // LOCAL FORK: same guard as createVideoGenerateTool -- see the longer comment
+  // there. runImageGenerate falls through to an unbilled direct provider call
+  // when submitImageJob is absent, and the deps chain that carries it
+  // (runtime -> deep-agent -> createMainAgentTools -> here) was optional at
+  // every hop, so one missing argument anywhere handed out free generations
+  // silently.
+  if (!deps.submitImageJob && !deps.allowUnbilledDirect) {
+    throw new Error(
+      "createImageGenerateTool: submitImageJob is required. Without it the tool " +
+        "calls the provider directly, bypassing the job queue, credit deduction " +
+        "and tier checks. If there is no job channel available, do not register " +
+        "this tool at all. Pass allowUnbilledDirect: true only in tests.",
+    );
+  }
+
+  // Only text-to-image models. Listing an upscaler or background remover here
+  // would let the LLM pick a model that ignores the prompt entirely.
+  const models = deps.availableModels ?? getAvailableImageModels("generate");
 
   const modelSummary = models.length
     ? models.map((m) => `${m.displayName} (${m.id})`).join(", ")
@@ -316,8 +397,8 @@ export function createImageGenerateTool(deps?: {
           Record<string, string> | undefined;
       return await runImageGenerate(
         input,
-        deps?.persistImage,
-        deps?.submitImageJob,
+        deps.persistImage,
+        deps.submitImageJob,
         attachmentMap,
       );
     },
