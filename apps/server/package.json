@@ -30,6 +30,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
     "@loomic/config": "workspace:*",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.13.10",
