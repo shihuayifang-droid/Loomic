@@ -17,6 +17,7 @@ import {
   type CanvasService,
 } from "../features/canvas/canvas-service.js";
 import { CanvasVersionConflictError } from "../features/canvas/canvas-version.js";
+import type { TeamAdminService } from "../features/team/team-admin.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 
 export async function registerCanvasRoutes(
@@ -24,6 +25,7 @@ export async function registerCanvasRoutes(
   options: {
     auth: RequestAuthenticator;
     canvasService: CanvasService;
+    teamAdminService: TeamAdminService;
   },
 ) {
   app.get<{ Params: { canvasId: string } }>(
@@ -36,6 +38,23 @@ export async function registerCanvasRoutes(
           user,
           request.params.canvasId,
         );
+
+        // PJ-07 验收 4 — see projects.ts for the ordering rationale.
+        try {
+          await options.teamAdminService.recordForeignRead(user.id, "canvas", {
+            canvasId: request.params.canvasId,
+          });
+        } catch {
+          return reply.code(503).send(
+            applicationErrorResponseSchema.parse({
+              error: {
+                code: "application_error",
+                message: "Unable to record this access.",
+              },
+            }),
+          );
+        }
+
         return reply
           .code(200)
           .send(canvasGetResponseSchema.parse({ canvas }));

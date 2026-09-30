@@ -43,6 +43,10 @@ import {
   type SettingsService,
 } from "./features/settings/settings-service.js";
 import {
+  createTeamAdminService,
+  type TeamAdminService,
+} from "./features/team/team-admin.js";
+import {
   createTeamMembershipService,
   type TeamMembershipService,
 } from "./features/team/team-membership.js";
@@ -75,6 +79,7 @@ import { registerPaymentWebhookRoute } from "./http/payments-webhook.js";
 import { registerCreditRoutes } from "./http/credits.js";
 import { registerFontsRoutes } from "./http/fonts.js";
 import { registerJobRoutes } from "./http/jobs.js";
+import { registerAdminTeamRoutes } from "./http/admin-team.js";
 import { registerBrandKitRoutes } from "./http/brand-kits.js";
 import { registerCanvasRoutes } from "./http/canvases.js";
 import { registerChatRoutes } from "./http/chat.js";
@@ -122,6 +127,7 @@ export type BuildAppOptions = {
   mockEventDelayMs?: number;
   projectService?: ProjectService;
   settingsService?: SettingsService;
+  teamAdminService?: TeamAdminService;
   teamMembershipService?: TeamMembershipService;
   threadService?: ThreadService;
   viewerService?: ViewerService;
@@ -166,6 +172,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const teamMembershipService =
     options.teamMembershipService ??
     createTeamMembershipService({ getAdminClient });
+  const teamAdminService =
+    options.teamAdminService ??
+    createTeamAdminService({ getAdminClient, teamMembership: teamMembershipService });
   const viewerService =
     options.viewerService ??
     createViewerService({ getAdminClient, teamMembership: teamMembershipService });
@@ -299,13 +308,20 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     auth,
     brandKitService,
   });
+  void registerAdminTeamRoutes(app, {
+    auth,
+    teamAdminService,
+    teamMembership: teamMembershipService,
+  });
   void registerProjectRoutes(app, {
     auth,
     projectService,
+    teamAdminService,
   });
   void registerCanvasRoutes(app, {
     auth,
     canvasService,
+    teamAdminService,
   });
   void registerSettingsRoutes(app, {
     auth,
@@ -318,6 +334,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerChatRoutes(app, {
     auth,
     chatService,
+    teamAdminService,
   });
   void registerUploadRoutes(app, {
     auth,

@@ -14,6 +14,36 @@ export type Database = {
   }
   public: {
     Tables: {
+      admin_audit_log: {
+        Row: {
+          action: string
+          actor_user_id: string
+          created_at: string
+          detail: Json
+          id: string
+          target_project_id: string | null
+          target_user_id: string | null
+        }
+        Insert: {
+          action: string
+          actor_user_id: string
+          created_at?: string
+          detail?: Json
+          id?: string
+          target_project_id?: string | null
+          target_user_id?: string | null
+        }
+        Update: {
+          action?: string
+          actor_user_id?: string
+          created_at?: string
+          detail?: Json
+          id?: string
+          target_project_id?: string | null
+          target_user_id?: string | null
+        }
+        Relationships: []
+      }
       agent_runs: {
         Row: {
           completed_at: string | null
@@ -933,6 +963,33 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      add_team_member: {
+        Args: {
+          p_user_id: string
+          p_role: Database["public"]["Enums"]["workspace_member_role"]
+        }
+        Returns: boolean
+      }
+      admin_add_team_member: {
+        Args: {
+          p_actor: string
+          p_user_id: string
+          p_role: Database["public"]["Enums"]["workspace_member_role"]
+        }
+        Returns: boolean
+      }
+      admin_remove_team_member: {
+        Args: { p_actor: string; p_user_id: string }
+        Returns: Json
+      }
+      admin_set_team_member_role: {
+        Args: {
+          p_actor: string
+          p_user_id: string
+          p_role: Database["public"]["Enums"]["workspace_member_role"]
+        }
+        Returns: boolean
+      }
       bootstrap_viewer: {
         Args: { p_email: string; p_user_id: string; p_user_meta: Json }
         Returns: string
@@ -970,6 +1027,31 @@ export type Database = {
           p_description?: string | null
         }
         Returns: string
+      }
+      ensure_team_workspace: {
+        Args: { p_owner_user_id: string; p_name: string }
+        Returns: string
+      }
+      record_foreign_read: {
+        Args: {
+          p_actor: string
+          p_via: string
+          p_project_id?: string | null
+          p_canvas_id?: string | null
+          p_session_id?: string | null
+        }
+        Returns: boolean
+      }
+      remove_team_member: {
+        Args: { p_user_id: string; p_actor_user_id: string }
+        Returns: Json
+      }
+      set_team_member_role: {
+        Args: {
+          p_user_id: string
+          p_role: Database["public"]["Enums"]["workspace_member_role"]
+        }
+        Returns: boolean
       }
     }
     Enums: {

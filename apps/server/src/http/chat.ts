@@ -14,6 +14,7 @@ import {
   ChatServiceError,
   type ChatService,
 } from "../features/chat/chat-service.js";
+import type { TeamAdminService } from "../features/team/team-admin.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 
 export async function registerChatRoutes(
@@ -21,6 +22,7 @@ export async function registerChatRoutes(
   options: {
     auth: RequestAuthenticator;
     chatService: ChatService;
+    teamAdminService: TeamAdminService;
   },
 ) {
   // List sessions for a canvas
@@ -35,6 +37,22 @@ export async function registerChatRoutes(
           user,
           request.params.canvasId,
         );
+
+        // PJ-07 验收 4 — see projects.ts for the ordering rationale.
+        try {
+          await options.teamAdminService.recordForeignRead(user.id, "sessions", {
+            canvasId: request.params.canvasId,
+          });
+        } catch {
+          return reply.code(503).send(
+            applicationErrorResponseSchema.parse({
+              error: {
+                code: "application_error",
+                message: "Unable to record this access.",
+              },
+            }),
+          );
+        }
 
         return reply
           .code(200)
@@ -125,6 +143,22 @@ export async function registerChatRoutes(
           user,
           request.params.sessionId,
         );
+
+        // PJ-07 验收 4 — see projects.ts for the ordering rationale.
+        try {
+          await options.teamAdminService.recordForeignRead(user.id, "messages", {
+            sessionId: request.params.sessionId,
+          });
+        } catch {
+          return reply.code(503).send(
+            applicationErrorResponseSchema.parse({
+              error: {
+                code: "application_error",
+                message: "Unable to record this access.",
+              },
+            }),
+          );
+        }
 
         request.log.info(
           { sessionId: request.params.sessionId, count: messages.length },

@@ -9,8 +9,11 @@ import {
   modelInfoSchema,
   projectSummarySchema,
   runIdSchema,
+  timestampSchema,
+  userIdSchema,
   viewerProfileSchema,
   workspaceMembershipSchema,
+  workspaceRoleSchema,
   workspaceSettingsSchema,
   workspaceSummarySchema,
 } from "./contracts.js";
@@ -62,6 +65,49 @@ export const projectCreateRequestSchema = z.object({
 
 export const projectCreateResponseSchema = z.object({
   project: projectSummarySchema,
+});
+
+// --- AD-08 §3 team member administration -----------------------------------
+//
+// `role` never accepts "owner" on the wire: the team owner is fixed by
+// `ensure_team_workspace` and the database refuses to assign the role anyway.
+
+export const teamMemberSchema = z.object({
+  userId: userIdSchema,
+  email: z.string(),
+  displayName: z.string().nullable(),
+  role: workspaceRoleSchema,
+  joinedAt: timestampSchema,
+});
+
+export const teamMemberListResponseSchema = z.object({
+  members: z.array(teamMemberSchema),
+});
+
+export const teamMemberAddRequestSchema = z.object({
+  email: z.string().trim().min(1),
+  role: z.enum(["member", "admin"]),
+});
+
+export const teamMemberAddResponseSchema = z.object({
+  added: z.boolean(),
+});
+
+export const teamMemberRoleRequestSchema = z.object({
+  role: z.enum(["member", "admin"]),
+});
+
+export const teamMemberRoleResponseSchema = z.object({
+  changed: z.boolean(),
+});
+
+export const teamMemberRemoveResponseSchema = z.object({
+  removed: z.literal(1),
+  transferred: z.object({
+    projects: z.number().int(),
+    assets: z.number().int(),
+    objects: z.number().int(),
+  }),
 });
 
 export const unauthenticatedErrorResponseSchema = z.object({
@@ -138,6 +184,10 @@ export const applicationErrorCodeSchema = z.enum([
   // AD-08 / PJ-11: the team-member gate rejects a valid token that is not in the
   // HaHart team workspace. Client must be able to tell this apart from 401.
   "not_team_member",
+  // AD-08 §3 admin surface: the caller is a team member but not an admin/owner.
+  "forbidden",
+  // Member administration addresses people by email; unknown address.
+  "user_not_found",
 ]);
 
 export const applicationErrorResponseSchema = z.object({
@@ -238,6 +288,15 @@ export type ViewerResponse = z.infer<typeof viewerResponseSchema>;
 export type ProjectListResponse = z.infer<typeof projectListResponseSchema>;
 export type ProjectCreateRequest = z.infer<typeof projectCreateRequestSchema>;
 export type ProjectCreateResponse = z.infer<typeof projectCreateResponseSchema>;
+export type TeamMember = z.infer<typeof teamMemberSchema>;
+export type TeamMemberListResponse = z.infer<typeof teamMemberListResponseSchema>;
+export type TeamMemberAddRequest = z.infer<typeof teamMemberAddRequestSchema>;
+export type TeamMemberAddResponse = z.infer<typeof teamMemberAddResponseSchema>;
+export type TeamMemberRoleRequest = z.infer<typeof teamMemberRoleRequestSchema>;
+export type TeamMemberRoleResponse = z.infer<typeof teamMemberRoleResponseSchema>;
+export type TeamMemberRemoveResponse = z.infer<
+  typeof teamMemberRemoveResponseSchema
+>;
 export type UnauthenticatedErrorResponse = z.infer<
   typeof unauthenticatedErrorResponseSchema
 >;

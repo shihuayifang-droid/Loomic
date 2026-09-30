@@ -13,6 +13,7 @@ import {
   ProjectServiceError,
   type ProjectService,
 } from "../features/projects/project-service.js";
+import type { TeamAdminService } from "../features/team/team-admin.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 
 export async function registerProjectRoutes(
@@ -20,6 +21,7 @@ export async function registerProjectRoutes(
   options: {
     auth: RequestAuthenticator;
     projectService: ProjectService;
+    teamAdminService: TeamAdminService;
   },
 ) {
   app.get("/api/projects/:projectId", async (request, reply) => {
@@ -39,6 +41,27 @@ export async function registerProjectRoutes(
 
       const { projectId } = request.params as { projectId: string };
       const project = await options.projectService.getProject(user, projectId);
+
+      // PJ-07 验收 4: an admin reading someone else's project leaves a trail.
+      // Recorded through the database function (never a direct table write), and
+      // only AFTER the read succeeded — auditing a failed read would leak
+      // whether the id exists. If the audit cannot be written we do not return
+      // the data: the trail is the condition for the access.
+      try {
+        await options.teamAdminService.recordForeignRead(user.id, "project", {
+          projectId,
+        });
+      } catch {
+        return reply.code(503).send(
+          applicationErrorResponseSchema.parse({
+            error: {
+              code: "application_error",
+              message: "Unable to record this access.",
+            },
+          }),
+        );
+      }
+
       return reply.code(200).send({ project });
     } catch (error) {
       return sendProjectError(error, reply, "project_query_failed");
