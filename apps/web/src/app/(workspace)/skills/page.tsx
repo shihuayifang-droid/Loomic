@@ -8,7 +8,6 @@ import type { SkillCategory, SkillDetail, SkillListItem } from "@loomic/shared";
 
 import { SkillCard } from "@/components/skills/skill-card";
 import { CreateSkillDialog } from "@/components/skills/create-skill-dialog";
-import { ImportPanel } from "@/components/skills/import-panel";
 import { MarketplacePanel } from "@/components/skills/marketplace-panel";
 import { SkillDetailDialog } from "@/components/skills/skill-detail-dialog";
 import { SkillsSkeleton } from "@/components/skeletons/skills-skeleton";
@@ -45,7 +44,8 @@ const TAB_LABELS: Record<SkillsTab, string> = {
   import: "导入",
 };
 
-const TABS: SkillsTab[] = ["installed", "marketplace", "import"];
+// SK-16: link import is disabled in this release, so the tab is not offered.
+const TABS: SkillsTab[] = ["installed", "marketplace"];
 
 // ---------------------------------------------------------------------------
 // Category filter options
@@ -524,14 +524,7 @@ export default function SkillsPage() {
         />
       )}
 
-      {/* === Import Tab === */}
-      {activeTab === "import" && (
-        <ImportPanel
-          accessToken={getToken}
-          onImported={handleExternalInstall}
-          onSwitchToInstalled={switchToInstalled}
-        />
-      )}
+      {/* === Import Tab === removed in this release (SK-16) */}
 
       {/* Dialogs (installed tab only, but keep mounted for animation) */}
       <CreateSkillDialog

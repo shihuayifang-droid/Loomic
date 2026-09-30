@@ -188,6 +188,8 @@ export const applicationErrorCodeSchema = z.enum([
   "forbidden",
   // Member administration addresses people by email; unknown address.
   "user_not_found",
+  // SK-16: the endpoint exists but is deliberately switched off in this release.
+  "feature_disabled",
 ]);
 
 export const applicationErrorResponseSchema = z.object({

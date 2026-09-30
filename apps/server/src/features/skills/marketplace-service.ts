@@ -24,6 +24,7 @@ import {
   type ImportedSkill,
   SkillImportError,
 } from "./skill-import-service.js";
+import { safeFetch } from "./safe-fetch.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -77,10 +78,13 @@ export interface MarketplaceSkillDetail extends MarketplaceSkill {
 // ── Internal Helpers ───────────────────────────────────────────────────────
 
 async function registryFetch(url: string): Promise<Response> {
-  const response = await fetch(url, {
-    headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
+  const response = await safeFetch(
+    url,
+    { headers: { "User-Agent": USER_AGENT, Accept: "application/json" } },
+    // Same 15 s budget as before, but now as ONE deadline over every hop and
+    // the body read instead of one timer per request.
+    { timeoutMs: FETCH_TIMEOUT_MS },
+  );
   if (response.status === 404) {
     throw new MarketplaceError("package_not_found", `Package not found: ${url}`);
   }
@@ -334,10 +338,11 @@ async function trySkillsShDownload(repoUrl: string): Promise<ImportedSkill | nul
   console.log(`[marketplace] Trying skills.sh download: ${downloadUrl}`);
 
   try {
-    const response = await fetch(downloadUrl, {
-      headers: { "User-Agent": USER_AGENT },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
+    const response = await safeFetch(
+      downloadUrl,
+      { headers: { "User-Agent": USER_AGENT } },
+      { timeoutMs: FETCH_TIMEOUT_MS },
+    );
 
     if (!response.ok) {
       console.log(`[marketplace] skills.sh returned ${response.status} for ${downloadUrl}`);

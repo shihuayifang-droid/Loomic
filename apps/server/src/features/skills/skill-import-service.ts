@@ -11,6 +11,8 @@
 import yaml from "js-yaml";
 import { Parser as TarParser } from "tar";
 
+import { safeFetch } from "./safe-fetch.js";
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 /** Parsed YAML frontmatter from SKILL.md */
@@ -341,7 +343,7 @@ function parseGitHubUrl(url: string): GitHubUrlInfo {
 async function githubApiFetch(url: string): Promise<Response> {
   console.log(`[skill-import] GitHub API request: ${url}`);
 
-  const response = await fetch(url, {
+  const response = await safeFetch(url, {
     headers: {
       Accept: "application/vnd.github.v3+json",
       "User-Agent": "Loomic-Skill-Importer/1.0",
@@ -408,7 +410,7 @@ async function listGitHubDirectory(
  * Download a file's text content from its download_url.
  */
 async function downloadGitHubFile(downloadUrl: string): Promise<string> {
-  const response = await fetch(downloadUrl, {
+  const response = await safeFetch(downloadUrl, {
     headers: { "User-Agent": "Loomic-Skill-Importer/1.0" },
   });
 
@@ -647,7 +649,7 @@ async function extractTarballEntries(buffer: Buffer): Promise<TarballEntry[]> {
 export async function importFromTarballUrl(url: string): Promise<ImportedSkill> {
   console.log(`[skill-import] Downloading tarball: ${url}`);
 
-  const response = await fetch(url, {
+  const response = await safeFetch(url, {
     headers: { "User-Agent": "Loomic-Skill-Importer/1.0" },
   });
 
