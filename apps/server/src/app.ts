@@ -338,6 +338,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   });
   void registerUploadRoutes(app, {
     auth,
+    teamAdminService,
     uploadService,
     viewerService,
   });

@@ -27,6 +27,7 @@ const TOKEN = "admin-token";
 const PROJECT_ID = "p-1";
 const CANVAS_ID = "c-1";
 const SESSION_ID = "s-1";
+const ASSET_ID = "asset-1";
 
 type AuditCall = {
   userId: string;
@@ -90,6 +91,12 @@ const canvasService = {
     }
     return CANVAS;
   },
+  async listRecoverableArtifacts() {
+    if (readsFail) {
+      throw new CanvasServiceError("canvas_not_found", "Canvas not found.", 404);
+    }
+    return [];
+  },
 } as unknown as CanvasService;
 
 const chatService = {
@@ -141,7 +148,10 @@ const uploadService = {
     throw new Error("not used");
   },
   async getAssetUrl() {
-    return "";
+    if (readsFail) {
+      throw new Error("asset not found");
+    }
+    return "https://signed.example.invalid/asset-1";
   },
   async deleteAsset() {},
 } as unknown as UploadService;
@@ -261,5 +271,46 @@ describe("admin foreign-read auditing", () => {
     expect(response.json().error.code).toBe("application_error");
     expect(response.body).not.toContain("Secret Project Alpha");
     expect(response.json().project).toBeUndefined();
+  });
+
+  it("case 7: GET /api/canvases/:canvasId/recoverable audits as 'recoverable'", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/canvases/${CANVAS_ID}/recoverable`,
+      headers,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(auditCalls).toEqual([
+      { userId: ADMIN_ID, via: "recoverable", target: { canvasId: CANVAS_ID } },
+    ]);
+  });
+
+  it("case 8: GET /api/uploads/:assetId/url audits as 'asset'", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/uploads/${ASSET_ID}/url`,
+      headers,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(auditCalls).toEqual([
+      { userId: ADMIN_ID, via: "asset", target: { assetId: ASSET_ID } },
+    ]);
+  });
+
+  it("case 9: a failed asset audit is a 503 that returns no url", async () => {
+    auditFails = true;
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/uploads/${ASSET_ID}/url`,
+      headers,
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error.code).toBe("application_error");
+    expect(response.body).not.toContain("signed.example.invalid");
+    expect(response.json().url).toBeUndefined();
   });
 });

@@ -12,6 +12,7 @@ import {
   type UploadService,
 } from "../features/uploads/upload-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
+import type { TeamAdminService } from "../features/team/team-admin.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 
 const ALLOWED_MIME_TYPES = new Set([
@@ -26,6 +27,7 @@ export async function registerUploadRoutes(
   app: FastifyInstance,
   options: {
     auth: RequestAuthenticator;
+    teamAdminService: TeamAdminService;
     uploadService: UploadService;
     viewerService: ViewerService;
   },
@@ -117,6 +119,22 @@ export async function registerUploadRoutes(
           user,
           request.params.assetId,
         );
+
+        // PJ-07 验收 4 — see projects.ts for the ordering rationale.
+        try {
+          await options.teamAdminService.recordForeignRead(user.id, "asset", {
+            assetId: request.params.assetId,
+          });
+        } catch {
+          return reply.code(503).send(
+            applicationErrorResponseSchema.parse({
+              error: {
+                code: "application_error",
+                message: "Unable to record this access.",
+              },
+            }),
+          );
+        }
 
         return reply
           .code(200)

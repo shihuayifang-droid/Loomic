@@ -229,6 +229,19 @@ describe("createTeamAdminService", () => {
     ]);
   });
 
+  it("case 6b: an asset target goes through record_foreign_asset_read", async () => {
+    const { service, rpcs } = makeHarness();
+
+    await service.recordForeignRead(ACTOR_ID, "asset", { assetId: "asset-1" });
+
+    expect(rpcs).toEqual([
+      {
+        name: "record_foreign_asset_read",
+        params: { p_actor: ACTOR_ID, p_asset_id: "asset-1" },
+      },
+    ]);
+  });
+
   it("case 7: a failing recordForeignRead throws instead of being swallowed", async () => {
     const { service } = makeHarness({
       rpcError: { message: "connection terminated unexpectedly" },

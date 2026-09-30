@@ -138,6 +138,23 @@ export async function registerCanvasRoutes(
           user,
           request.params.canvasId,
         );
+
+        // PJ-07 验收 4 — see projects.ts for the ordering rationale.
+        try {
+          await options.teamAdminService.recordForeignRead(user.id, "recoverable", {
+            canvasId: request.params.canvasId,
+          });
+        } catch {
+          return reply.code(503).send(
+            applicationErrorResponseSchema.parse({
+              error: {
+                code: "application_error",
+                message: "Unable to record this access.",
+              },
+            }),
+          );
+        }
+
         return reply
           .code(200)
           .send(canvasRecoverableResponseSchema.parse({ artifacts }));

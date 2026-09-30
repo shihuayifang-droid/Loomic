@@ -6,7 +6,16 @@ import type { TeamMembershipService } from "./team-membership.js";
 export type ForeignReadTarget =
   | { projectId: string }
   | { canvasId: string }
-  | { sessionId: string };
+  | { sessionId: string }
+  | { assetId: string };
+
+export type ForeignReadVia =
+  | "project"
+  | "canvas"
+  | "sessions"
+  | "messages"
+  | "recoverable"
+  | "asset";
 
 export type TeamAdminService = {
   listMembers(): Promise<TeamMember[]>;
@@ -29,7 +38,7 @@ export type TeamAdminService = {
   /** 成功读取之后调用；读的是别人的项目才写审计。出错必须抛。 */
   recordForeignRead(
     actorId: string,
-    via: "project" | "canvas" | "sessions" | "messages",
+    via: ForeignReadVia,
     target: ForeignReadTarget,
   ): Promise<void>;
 };
@@ -254,13 +263,22 @@ export function createTeamAdminService(options: {
     async recordForeignRead(actorId, via, target) {
       const admin = options.getAdminClient();
 
-      const { error } = await admin.rpc("record_foreign_read", {
-        p_actor: actorId,
-        p_via: via,
-        p_project_id: "projectId" in target ? target.projectId : null,
-        p_canvas_id: "canvasId" in target ? target.canvasId : null,
-        p_session_id: "sessionId" in target ? target.sessionId : null,
-      });
+      // Assets are addressed by their own id (GET /api/uploads/:assetId/url) and
+      // that id does not resolve to a project for project-less assets, so they
+      // go through a dedicated function. Everything else shares one.
+      const { error } =
+        "assetId" in target
+          ? await admin.rpc("record_foreign_asset_read", {
+              p_actor: actorId,
+              p_asset_id: target.assetId,
+            })
+          : await admin.rpc("record_foreign_read", {
+              p_actor: actorId,
+              p_via: via,
+              p_project_id: "projectId" in target ? target.projectId : null,
+              p_canvas_id: "canvasId" in target ? target.canvasId : null,
+              p_session_id: "sessionId" in target ? target.sessionId : null,
+            });
 
       if (error) {
         throw mapDatabaseError(error);

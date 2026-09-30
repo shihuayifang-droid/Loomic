@@ -1042,6 +1042,14 @@ export type Database = {
         }
         Returns: boolean
       }
+      record_foreign_asset_read: {
+        Args: { p_actor: string; p_asset_id: string }
+        Returns: boolean
+      }
+      migrate_personal_projects_to_team: {
+        Args: Record<string, never>
+        Returns: Json
+      }
       remove_team_member: {
         Args: { p_user_id: string; p_actor_user_id: string }
         Returns: Json
