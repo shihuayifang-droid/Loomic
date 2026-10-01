@@ -321,10 +321,6 @@ export default function SkillsPage() {
     await loadSkills();
   }, [loadSkills]);
 
-  const switchToInstalled = useCallback(() => {
-    setActiveTab("installed");
-  }, []);
-
   // ---------------------------------------------------------------------------
   // Loading
   // ---------------------------------------------------------------------------
