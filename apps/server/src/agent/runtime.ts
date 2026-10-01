@@ -816,23 +816,13 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               };
             }
 
-            if (current.status === "dead_letter" || current.status === "canceled") {
+            // `failed` is terminal now (a retryable failure is written as
+            // `retrying`), so there is nothing to wait for beyond these two.
+            if (current.status === "failed" || current.status === "canceled") {
               jobLap("job_poll_done", { pollCount, status: current.status });
               return {
                 jobId: job.id,
                 error: current.error_message ?? `Job ${current.status}`,
-              };
-            }
-
-            // "failed" with attempts exhausted
-            if (
-              current.status === "failed" &&
-              current.attempt_count >= current.max_attempts
-            ) {
-              jobLap("job_poll_done", { pollCount, status: "failed_max_retries" });
-              return {
-                jobId: job.id,
-                error: current.error_message ?? "Job failed after max retries",
               };
             }
           }
@@ -843,9 +833,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             error: `Job timed out after ${MAX_WAIT / 1000}s`,
           };
           } finally {
-            // Covers every exit path — failure, dead_letter, timeout, and the
-            // abort throw — so a slot that will never be filled does not stay on
-            // the canvas as a permanently empty frame.
+            // Covers every exit path — failure, timeout, and the abort throw —
+            // so a slot that will never be filled does not stay on the canvas as
+            // a permanently empty frame.
             if (canvasId && placeholderElementId && !placeholderFilled) {
               try {
                 await removeCanvasElement(
@@ -1025,22 +1015,13 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               };
             }
 
-            if (current.status === "dead_letter" || current.status === "canceled") {
+            // `failed` is terminal now (a retryable failure is written as
+            // `retrying`), so there is nothing to wait for beyond these two.
+            if (current.status === "failed" || current.status === "canceled") {
               jobLap("job_poll_done", { pollCount, status: current.status });
               return {
                 jobId: job.id,
                 error: current.error_message ?? `Job ${current.status}`,
-              };
-            }
-
-            if (
-              current.status === "failed" &&
-              current.attempt_count >= current.max_attempts
-            ) {
-              jobLap("job_poll_done", { pollCount, status: "failed_max_retries" });
-              return {
-                jobId: job.id,
-                error: current.error_message ?? "Job failed after max retries",
               };
             }
           }

@@ -129,7 +129,7 @@ export const jobProgressEventSchema = z.object({
   type: z.literal("job.progress"),
   jobId: z.string().uuid(),
   jobType: z.string(),
-  /** queued | running | succeeded | failed | dead_letter | canceled */
+  /** queued | running | retrying | succeeded | failed | canceled */
   status: z.string(),
   timestamp: timestampSchema,
   /** Milliseconds since the job started running. Absent while still queued. */

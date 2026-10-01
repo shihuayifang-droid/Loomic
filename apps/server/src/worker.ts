@@ -12,8 +12,9 @@ if (process.env.GLOBAL_AGENT_HTTP_PROXY) {
 
 import { randomUUID } from "node:crypto";
 import { loadServerEnv } from "./config/env.js";
-import { createPgmqClient, type PgmqMessage } from "./queue/pgmq-client.js";
+import { createPgmqClient } from "./queue/pgmq-client.js";
 import { createJobService } from "./features/jobs/job-service.js";
+import { processJobMessage } from "./features/jobs/process-job-message.js";
 import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
 import { getExecutor, type ExecutorContext } from "./features/jobs/job-executor.js";
 import {
@@ -61,7 +62,7 @@ async function main() {
   const jobService = createJobService({ createUserClient, getAdminClient, pgmq });
   const creditService = createCreditService({ getAdminClient });
 
-  // Base context — per-message fields (queue, msgId, renewVt) are added in processMessage
+  // Base context — per-message fields (queue, msgId, renewVt) are added per message below
   const baseCtx = {
     jobService,
     pgmq,
@@ -134,8 +135,16 @@ async function main() {
                 catch (e) { console.warn(`[renewVt] failed for msg ${msg.msg_id}:`, e); }
               },
             };
-            const task = processMessage(queue, jobType, msg, ctx, creditService, tag)
-            .finally(() => inFlight.delete(task));
+            const task = processJobMessage(
+              {
+                jobService,
+                pgmq,
+                getExecutor,
+                refundJob: (jobId) => refundJob(jobId, ctx, creditService, tag),
+                log: (message) => console.log(`${tag} ${message}`),
+              },
+              { queue, queueJobType: jobType, msg, ctx },
+            ).finally(() => inFlight.delete(task));
           inFlight.add(task);
         }
       } catch (err) {
@@ -145,87 +154,16 @@ async function main() {
   }
 }
 
-async function processMessage(
-  queue: string,
-  /** The type this queue serves, per JOB_TYPE_REGISTRY — used when the message
-   * itself does not carry job_type. Replaces the old QUEUE_TO_TYPE lookup. */
-  queueJobType: BackgroundJobType,
-  msg: PgmqMessage,
-  ctx: ExecutorContext,
-  creditService: CreditService,
-  tag: string,
-) {
-  const jobId = msg.message.job_id as string;
-  const jobType = (msg.message.job_type as BackgroundJobType) ?? queueJobType;
-
-  if (!jobId || !jobType) {
-    console.error(`${tag} Invalid message in ${queue}:`, msg.message);
-    await ctx.pgmq.archive(queue, msg.msg_id);
-    return;
-  }
-
-  // Extract traceability context from PGMQ message (if present)
-  const sessionShort = typeof msg.message.session_id === "string"
-    ? msg.message.session_id.slice(0, 8)
-    : undefined;
-  const startTime = Date.now();
-  console.log(`${tag} Processing job ${jobId} (${jobType})${sessionShort ? ` session:${sessionShort}` : ""}`);
-
-  const executor = getExecutor(jobType);
-  if (!executor) {
-    console.error(`${tag} No executor for job type: ${jobType}`);
-    await ctx.jobService.markFailed(jobId, "no_executor", `No executor registered for ${jobType}`);
-    await ctx.pgmq.archive(queue, msg.msg_id);
-    return;
-  }
-
-  // Increment attempt count
-  const { attempt_count, max_attempts } = await ctx.jobService.incrementAttempt(jobId);
-
-  // Mark running
-  await ctx.jobService.markRunning(jobId);
-
-  try {
-    const result = await executor(jobId, msg.message as Record<string, unknown>, ctx);
-    await ctx.jobService.markSucceeded(jobId, result);
-    await ctx.pgmq.deleteMsg(queue, msg.msg_id);
-    console.log(`${tag} Job ${jobId} succeeded +${Date.now() - startTime}ms`);
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    const errorCode = (err as { code?: string })?.code ?? "executor_error";
-
-    // Non-retryable errors: retrying with the same input will always fail.
-    // Dead-letter immediately so the caller (agent polling) gets fast feedback.
-    const NON_RETRYABLE_CODES = new Set([
-      "invalid_input",
-      "model_not_found",
-      "provider_not_found",
-      "safety_filter",
-    ]);
-    const shouldDeadLetter =
-      attempt_count >= max_attempts || NON_RETRYABLE_CODES.has(errorCode);
-
-    if (shouldDeadLetter) {
-      await ctx.jobService.markDeadLetter(jobId, errorCode, errorMessage);
-      await ctx.pgmq.archive(queue, msg.msg_id);
-
-      // Auto-refund credits for dead-lettered jobs
-      await refundDeadLetteredJob(jobId, ctx, creditService, tag);
-
-      console.error(`${tag} Job ${jobId} dead-lettered after ${attempt_count} attempts +${Date.now() - startTime}ms: ${errorMessage}`);
-    } else {
-      await ctx.jobService.markFailed(jobId, errorCode, errorMessage);
-      // Message will re-appear after VT expires for retry
-      console.warn(`${tag} Job ${jobId} failed (attempt ${attempt_count}/${max_attempts}) +${Date.now() - startTime}ms: ${errorMessage}`);
-    }
-  }
-}
+/**
+ * Per-message handling lives in `process-job-message.ts` (testable without a
+ * worker). This file only wires the real collaborators into it.
+ */
 
 /**
- * Refund credits for a dead-lettered job if credits were deducted.
- * Only dead-lettered (permanently failed) jobs get refunds — not cancelled jobs.
+ * Refund credits for a terminally failed job if credits were deducted.
+ * Only terminally failed jobs get refunds — not cancelled jobs.
  */
-async function refundDeadLetteredJob(
+async function refundJob(
   jobId: string,
   ctx: ExecutorContext,
   creditService: CreditService,

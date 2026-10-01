@@ -1066,6 +1066,7 @@ export type Database = {
       background_job_status:
         | "queued"
         | "running"
+        | "retrying"
         | "succeeded"
         | "failed"
         | "canceled"
@@ -1214,6 +1215,7 @@ export const Constants = {
       background_job_status: [
         "queued",
         "running",
+        "retrying",
         "succeeded",
         "failed",
         "canceled",

@@ -98,7 +98,9 @@ export function createTierGuard(options: {
         .from("background_jobs")
         .select("id", { count: "exact", head: true })
         .eq("workspace_id", workspaceId)
-        .in("status", ["queued", "running"]);
+        // A retrying job still holds its slot (and its pre-charged credits), so
+        // it has to count towards concurrency too.
+        .in("status", ["queued", "running", "retrying"]);
 
       if (error) {
         // Log but don't block — fail open on query errors

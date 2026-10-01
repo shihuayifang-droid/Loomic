@@ -89,7 +89,7 @@ beforeAll(async () => {
 describe("migration harness", () => {
   it("loads every migration in supabase/migrations", () => {
     const files = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith(".sql"));
-    expect(applied.length).toBe(34);
+    expect(applied.length).toBe(35);
     expect(applied.length).toBe(files.length);
   });
 

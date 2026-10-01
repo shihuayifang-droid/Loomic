@@ -22,7 +22,9 @@ export interface JobWatcherDeps {
   connectionManager?: ConnectionManager;
 }
 
-const TERMINAL = new Set(["succeeded", "failed", "dead_letter", "canceled"]);
+// `retrying` is deliberately absent: the job is still alive, so the watcher
+// keeps polling and the client keeps waiting.
+const TERMINAL = new Set(["succeeded", "failed", "canceled"]);
 
 /**
  * Polls `jobId` until it reaches a terminal state, pushing a `job.progress` event

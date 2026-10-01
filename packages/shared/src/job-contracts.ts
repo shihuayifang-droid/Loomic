@@ -5,9 +5,15 @@ import { z } from "zod";
 export const backgroundJobStatusSchema = z.enum([
   "queued",
   "running",
+  // GN-30: "this attempt failed but another one is coming". Written by the
+  // worker instead of "failed" so a still-retrying job is not shown as terminal.
+  "retrying",
   "succeeded",
   "failed",
   "canceled",
+  // Legacy value: kept so historical rows and existing client string comparisons
+  // still parse, but the server never writes it and never returns it (rows read
+  // as "failed").
   "dead_letter",
 ]);
 export type BackgroundJobStatus = z.infer<typeof backgroundJobStatusSchema>;

@@ -2,6 +2,7 @@ import type {
   BackgroundJob,
   BackgroundJobStatus,
   BackgroundJobType,
+  Database,
   Json,
 } from "@loomic/shared";
 
@@ -12,6 +13,9 @@ import type {
 } from "../../supabase/user.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { queueForJobType } from "./job-registry.js";
+
+type BackgroundJobUpdate = Database["public"]["Tables"]["background_jobs"]["Update"];
+type BackgroundJobStatuses = BackgroundJob["status"][];
 
 export class JobServiceError extends Error {
   readonly statusCode: number;
@@ -53,13 +57,18 @@ export type JobService = {
   cancelJob(user: AuthenticatedUser, jobId: string): Promise<BackgroundJob>;
   getJobAdmin(jobId: string): Promise<BackgroundJob>;
 
-  // Admin-only methods (use admin client, no user auth)
+  // Admin-only methods (use admin client, no user auth).
+  //
+  // Every `mark*` returns whether it actually changed a row: `true` = the
+  // transition happened, `false` = the guard rejected it (wrong current state,
+  // or no such row). Callers use that to avoid double refunds and to skip work
+  // for jobs that were cancelled meanwhile.
   setCreditsInfo(jobId: string, creditsCost: number, transactionId: string): Promise<void>;
-  markRunning(jobId: string): Promise<void>;
-  markSucceeded(jobId: string, result: Record<string, unknown>): Promise<void>;
-  markFailed(jobId: string, errorCode: string, errorMessage: string): Promise<void>;
-  markDeadLetter(jobId: string, errorCode: string, errorMessage: string): Promise<void>;
-  incrementAttempt(jobId: string): Promise<{ attempt_count: number; max_attempts: number }>;
+  markRunning(jobId: string): Promise<boolean>;
+  markRetrying(jobId: string, errorCode: string, errorMessage: string): Promise<boolean>;
+  markSucceeded(jobId: string, result: Record<string, unknown>): Promise<boolean>;
+  markFailed(jobId: string, errorCode: string, errorMessage: string): Promise<boolean>;
+  incrementAttempt(jobId: string): Promise<{ attempt_count: number; max_attempts: number } | null>;
 };
 
 export function createJobService(options: {
@@ -77,7 +86,12 @@ export function createJobService(options: {
       thread_id: (row.thread_id as string) ?? null,
       queue_name: row.queue_name as string,
       job_type: row.job_type as BackgroundJob["job_type"],
-      status: row.status as BackgroundJob["status"],
+      // `dead_letter` is a legacy value: historical rows still carry it, but the
+      // worker never writes it any more and the server never exposes it — such a
+      // row is terminal-failed, so that is what callers see.
+      status: (row.status === "dead_letter"
+        ? "failed"
+        : row.status) as BackgroundJob["status"],
       payload: (row.payload as Record<string, unknown>) ?? {},
       result: (row.result as Record<string, unknown>) ?? null,
       error_code: (row.error_code as string) ?? null,
@@ -96,6 +110,35 @@ export function createJobService(options: {
 
   const SELECT_COLS =
     "id, workspace_id, project_id, canvas_id, session_id, thread_id, queue_name, job_type, status, payload, result, error_code, error_message, attempt_count, max_attempts, created_by, created_at, updated_at, started_at, completed_at, failed_at, canceled_at";
+
+  /**
+   * Guarded status transition: only a row whose current status is in `from` is
+   * updated, so a job that was cancelled (or already finished) cannot be
+   * rewritten by a late worker. Returns whether exactly one row changed.
+   */
+  async function transition(
+    jobId: string,
+    from: BackgroundJobStatuses,
+    patch: BackgroundJobUpdate,
+  ): Promise<boolean> {
+    const admin = options.getAdminClient();
+    const { data, error } = await admin
+      .from("background_jobs")
+      .update(patch)
+      .eq("id", jobId)
+      .in("status", from)
+      .select("id");
+
+    if (error) {
+      throw new JobServiceError(
+        "job_query_failed",
+        `Failed to update job ${jobId}: ${error.message}`,
+        500,
+      );
+    }
+
+    return (data?.length ?? 0) === 1;
+  }
 
   return {
     async createJob(user, input) {
@@ -174,7 +217,14 @@ export function createJobService(options: {
         .order("created_at", { ascending: false })
         .limit(50);
 
-      if (filters?.status) query = query.eq("status", filters.status);
+      if (filters?.status) {
+        // Filtering by "failed" must also surface legacy `dead_letter` rows,
+        // which are read as failed (see mapJobRow).
+        query =
+          filters.status === "failed"
+            ? query.in("status", ["failed", "dead_letter"])
+            : query.eq("status", filters.status);
+      }
       if (filters?.jobType) query = query.eq("job_type", filters.jobType);
 
       const { data: jobs, error } = await query;
@@ -240,50 +290,36 @@ export function createJobService(options: {
     },
 
     async markRunning(jobId) {
-      const admin = options.getAdminClient();
-      await admin
-        .from("background_jobs")
-        .update({ status: "running", started_at: new Date().toISOString() })
-        .eq("id", jobId)
-        .eq("status", "queued");
+      return transition(jobId, ["queued", "retrying"], {
+        status: "running",
+        started_at: new Date().toISOString(),
+      });
+    },
+
+    async markRetrying(jobId, errorCode, errorMessage) {
+      // Still retrying, so this is NOT a terminal failure: no failed_at.
+      return transition(jobId, ["running"], {
+        status: "retrying",
+        error_code: errorCode,
+        error_message: errorMessage,
+      });
     },
 
     async markSucceeded(jobId, result) {
-      const admin = options.getAdminClient();
-      await admin
-        .from("background_jobs")
-        .update({
-          status: "succeeded",
-          result: result as Json,
-          completed_at: new Date().toISOString(),
-        })
-        .eq("id", jobId);
+      return transition(jobId, ["running"], {
+        status: "succeeded",
+        result: result as Json,
+        completed_at: new Date().toISOString(),
+      });
     },
 
     async markFailed(jobId, errorCode, errorMessage) {
-      const admin = options.getAdminClient();
-      await admin
-        .from("background_jobs")
-        .update({
-          status: "failed",
-          error_code: errorCode,
-          error_message: errorMessage,
-          failed_at: new Date().toISOString(),
-        })
-        .eq("id", jobId);
-    },
-
-    async markDeadLetter(jobId, errorCode, errorMessage) {
-      const admin = options.getAdminClient();
-      await admin
-        .from("background_jobs")
-        .update({
-          status: "dead_letter",
-          error_code: errorCode,
-          error_message: errorMessage,
-          failed_at: new Date().toISOString(),
-        })
-        .eq("id", jobId);
+      return transition(jobId, ["queued", "running", "retrying"], {
+        status: "failed",
+        error_code: errorCode,
+        error_message: errorMessage,
+        failed_at: new Date().toISOString(),
+      });
     },
 
     async incrementAttempt(jobId) {
@@ -294,19 +330,25 @@ export function createJobService(options: {
       });
 
       if (error) {
-        console.error("[job-service] increment_job_attempt RPC failed:", error.message);
-        return { attempt_count: 1, max_attempts: 3 };
+        // Never invent a count here: a made-up attempt_count silently disables
+        // the retry limit (and the caller would archive a job that was paid for).
+        throw new JobServiceError(
+          "job_query_failed",
+          `increment_job_attempt failed for ${jobId}: ${error.message}`,
+          500,
+        );
       }
 
       const row = Array.isArray(data) ? data[0] : data;
       if (row && typeof row === "object") {
         return {
           attempt_count: (row as any).attempt_count as number,
-          max_attempts: ((row as any).max_attempts as number) ?? 3,
+          max_attempts: (row as any).max_attempts as number,
         };
       }
-      // Job not found — return safe defaults
-      return { attempt_count: 1, max_attempts: 3 };
+
+      // No such job row — the caller decides what that means.
+      return null;
     },
   };
 }
