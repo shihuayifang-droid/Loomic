@@ -144,7 +144,11 @@ async function main() {
                 log: (message) => console.log(`${tag} ${message}`),
               },
               { queue, queueJobType: jobType, msg, ctx },
-            ).finally(() => inFlight.delete(task));
+            )
+              .catch((err) =>
+                console.error(`${tag} processJobMessage crashed for msg ${msg.msg_id}:`, err),
+              )
+              .finally(() => inFlight.delete(task));
           inFlight.add(task);
         }
       } catch (err) {
