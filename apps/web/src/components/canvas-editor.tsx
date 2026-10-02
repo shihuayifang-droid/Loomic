@@ -26,7 +26,11 @@ import {
   rememberDocumentFiles,
   mergeFilesForSave,
 } from "../lib/canvas-files";
-import { isVideoUrl } from "../lib/canvas-elements";
+import {
+  getVideoElementSrc,
+  isVideoElement,
+  stripResolvedVideoUrls,
+} from "../lib/canvas-elements";
 import {
   writeCanvasDraft,
   readCanvasDraft,
@@ -859,7 +863,13 @@ export function CanvasEditor({
         };
       }
       return {
-        elements: sceneElements.filter((el: any) => !el.isDeleted),
+        // CV-01: drop read-time extras (customData.resolvedVideoUrl) — this PUT
+        // replaces the whole document, so anything left on an element here is
+        // stored permanently, and a stored URL is what the object-key change
+        // exists to prevent.
+        elements: stripResolvedVideoUrls(
+          sceneElements.filter((el: any) => !el.isDeleted),
+        ),
         appState: {
           viewBackgroundColor: appState.viewBackgroundColor,
           gridModeEnabled: appState.gridModeEnabled,
@@ -1063,11 +1073,16 @@ export function CanvasEditor({
         );
       }
 
-      const link = element?.link;
-      if (typeof link === "string" && isVideoUrl(link)) {
+      // CV-01: play the projected URL, whichever way the element was written —
+      // customData.resolvedVideoUrl from a marker, or link for pre-CV-01
+      // elements. `getVideoElementSrc` returns undefined for a marker that has
+      // not been projected, in which case Excalidraw's default takes over rather
+      // than a <video> pointed at an oss:// string.
+      const src = getVideoElementSrc(element);
+      if (src && isVideoElement(element)) {
         return (
           <VideoCanvasElement
-            src={link}
+            src={src}
             width={element.width ?? 640}
             height={element.height ?? 360}
           />

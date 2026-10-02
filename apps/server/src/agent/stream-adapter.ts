@@ -328,6 +328,9 @@ const ARTIFACT_KEYS = new Set([
   "imageUrl",
   "screenshotUrl",
   "videoUrl",
+  // CV-01: the video's storage object key travels on the artifact, so it is
+  // stripped from the passthrough output for the same reason as the others.
+  "objectPath",
   "durationSeconds",
   "mimeType",
   "width",
@@ -460,6 +463,11 @@ function extractArtifacts(output: unknown): ToolArtifact[] | undefined {
     };
     if (typeof record.durationSeconds === "number") {
       candidate.durationSeconds = record.durationSeconds;
+    }
+    // CV-01: keep the object key on the artifact. Without it the browser cannot
+    // build an `oss://` marker and would have to persist the public URL again.
+    if (typeof record.objectPath === "string" && record.objectPath.length > 0) {
+      candidate.objectPath = record.objectPath;
     }
     // Prefer LLM-authored title, then original prompt, then technical summary
     if (typeof record.title === "string" && record.title.length > 0) {

@@ -33,7 +33,7 @@ import {
   isVideoGeneratorElement,
   getVideoGeneratorData,
 } from "../../lib/canvas-video-generator";
-import { isVideoUrl } from "../../lib/canvas-elements";
+import { getVideoElementSrc, isVideoUrl } from "../../lib/canvas-elements";
 import type { WebSocketHandle } from "../../hooks/use-websocket";
 import { ImageGeneratorPanel } from "./image-generator-panel";
 import { VideoGeneratorPanel } from "./video-generator-panel";
@@ -140,7 +140,10 @@ export const GENERATOR_SPECS: GeneratorSpec[] = [
       el?.type === "embeddable" &&
       (isVideoUrl(el.link as string) || el.customData?.isVideo === true),
     getData: (el) => ({
-      videoUrl: el.link as string,
+      // CV-01: the playable URL lives on the read-time projection. `link` is
+      // still the fallback for elements written before object keys, and an
+      // unresolved marker deliberately resolves to nothing (see the helper).
+      videoUrl: getVideoElementSrc(el) ?? "",
       mimeType: (el.customData?.mimeType as string) ?? "video/mp4",
       ...(el.customData?.durationSeconds != null
         ? { durationSeconds: el.customData.durationSeconds as number }

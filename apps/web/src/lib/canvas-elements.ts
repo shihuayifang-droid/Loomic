@@ -6,6 +6,73 @@ import { getServerBaseUrl } from "./env";
 const VIDEO_EXTENSIONS = [".mp4", ".webm", ".ogg", ".mov"];
 
 /**
+ * Canvas media lives in Supabase Storage, and the canvas document references it
+ * by an `oss://<bucket>/<objectPath>` marker — the same format generated images
+ * already use in the files map (see the server's canvas-element-writer).
+ *
+ * LOCAL FORK (CV-01): a video element used to be persisted with the provider's
+ * public URL in `link`. That made every canvas video depend on the bucket
+ * staying public; X-52 flips it private, which would have broken all of them at
+ * once with nothing left to re-resolve from.
+ */
+const OSS_MARKER_PREFIX = "oss://";
+const CANVAS_FILES_BUCKET = "project-assets";
+
+/**
+ * Is this element a video?
+ *
+ * `customData.isVideo` is the authority. The URL-shape check cannot answer the
+ * question any more: once a video is keyed by its object, `link` is an `oss://`
+ * marker with no extension at all. The check stays as a fallback so canvases
+ * written before the flag meant anything keep rendering.
+ */
+export function isVideoElement(element: any): boolean {
+  if (element?.customData?.isVideo === true) return true;
+  return typeof element?.link === "string" && isVideoUrl(element.link);
+}
+
+/**
+ * The URL to actually load for a video element.
+ *
+ * `customData.resolvedVideoUrl` is the read-time projection the server attaches
+ * to a marker (canvas-service's resolveVideoElementsFromStorage). `link` is the
+ * fallback for elements written before CV-01, which held a real URL.
+ *
+ * An unresolved `oss://` marker is deliberately NOT returned: handing it to a
+ * <video> element produces a load error, and the callers would rather show
+ * nothing than fetch something that cannot work.
+ */
+export function getVideoElementSrc(element: any): string | undefined {
+  const resolved = element?.customData?.resolvedVideoUrl;
+  if (typeof resolved === "string" && resolved.length > 0) return resolved;
+
+  const link = element?.link;
+  if (typeof link !== "string" || link.length === 0) return undefined;
+  if (link.startsWith(OSS_MARKER_PREFIX)) return undefined;
+  return link;
+}
+
+/**
+ * Drop read-time extras from elements about to be saved.
+ *
+ * Every canvas save is a FULL REPLACE, so whatever sits on an element here is
+ * written to the database for good. `resolvedVideoUrl` is derived from the
+ * marker on each read and must never round-trip: if it did, the document would
+ * be holding a URL again, which is exactly what CV-01 removes.
+ *
+ * Returns copies and never mutates the live Excalidraw elements — Excalidraw
+ * hands out its own array, and writing through it corrupts the scene in place.
+ */
+export function stripResolvedVideoUrls(elements: readonly any[]): any[] {
+  return elements.map((element) => {
+    const customData = element?.customData;
+    if (!customData || customData.resolvedVideoUrl === undefined) return element;
+    const { resolvedVideoUrl: _resolvedVideoUrl, ...rest } = customData;
+    return { ...element, customData: rest };
+  });
+}
+
+/**
  * Check if a URL points to a video file based on extension or customData hint.
  * Used by canvas-editor (renderEmbeddable) and canvas-tool-menu (selection detection).
  */
@@ -227,6 +294,20 @@ export async function insertImageOnCanvas(
  * Insert a video artifact onto the Excalidraw canvas as an embeddable element.
  * Uses Excalidraw's native embeddable type with renderEmbeddable callback for inline playback.
  * No poster frame extraction needed -- the video plays directly on canvas.
+ *
+ * CV-01: the element is keyed on the artifact's `objectPath`, exactly like a
+ * generated image, and the playable URL is attached as `customData.resolvedVideoUrl`
+ * for the current session only — `buildSavePayload` strips it before every save.
+ *
+ * An artifact WITHOUT `objectPath` is REFUSED. The only alternative would be to
+ * persist `artifact.url`, and that is the thing this change exists to stop; a
+ * silent fallback here would quietly undo it on the one path that is easiest to
+ * overlook (this function is the browser's own insertion path, independent of
+ * the agent runtime).
+ *
+ * Only the direct-provider path — reachable in tests alone — can produce such an
+ * artifact today, so the refusal costs nothing in production but keeps a
+ * URL-backed element from ever being created again.
  */
 export async function insertVideoOnCanvas(
   api: {
@@ -239,6 +320,16 @@ export async function insertVideoOnCanvas(
   },
   artifact: VideoArtifact,
 ): Promise<void> {
+  const objectPath = artifact.objectPath;
+  if (typeof objectPath !== "string" || objectPath.length === 0) {
+    throw new Error(
+      "insertVideoOnCanvas: artifact has no objectPath, so it cannot be stored " +
+        "as an object marker. Persisting its public URL instead would put a URL " +
+        "whose lifetime we do not control into the canvas document (CV-01), so " +
+        "the insert is refused.",
+    );
+  }
+
   // Dynamic import — excalidraw is client-only and cannot be imported at module level
   const { convertToExcalidrawElements } = await import("@excalidraw/excalidraw");
 
@@ -285,7 +376,8 @@ export async function insertVideoOnCanvas(
   const newElements = convertToExcalidrawElements([
     {
       type: "embeddable",
-      link: artifact.url,
+      // The object marker is what gets persisted; see the guard above.
+      link: `${OSS_MARKER_PREFIX}${CANVAS_FILES_BUCKET}/${objectPath}`,
       x,
       y,
       width,
@@ -296,6 +388,8 @@ export async function insertVideoOnCanvas(
         durationSeconds: artifact.durationSeconds,
         title: artifact.title?.slice(0, 60),
         prompt: artifact.title,
+        // Read-time only. Stripped by stripResolvedVideoUrls on every save.
+        resolvedVideoUrl: artifact.url,
       },
     } as any, // ExcalidrawElementSkeleton includes IframeLikeElement but TS needs a nudge
   ]);

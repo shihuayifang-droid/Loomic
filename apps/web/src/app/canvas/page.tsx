@@ -120,7 +120,16 @@ function CanvasPageContent() {
     const api = excalidrawApiRef.current;
     if (!api) return;
     insertVideoOnCanvas(api, artifact).catch((err) => {
-      console.warn("Failed to insert video on canvas:", err);
+      // CV-01: warn only — never fall back to inserting the URL. A video that
+      // cannot be keyed on a stored object is dropped rather than persisted as a
+      // public URL, and the two causes are worth telling apart in the console:
+      // a missing objectPath means the server never recorded the stored object.
+      console.warn(
+        typeof artifact.objectPath === "string" && artifact.objectPath.length > 0
+          ? "Failed to insert video on canvas:"
+          : "Video artifact has no objectPath — refusing to insert a URL-backed element:",
+        err,
+      );
     });
   }, []);
 

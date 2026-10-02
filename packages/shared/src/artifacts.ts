@@ -22,6 +22,14 @@ export const videoArtifactSchema = z.object({
   type: z.literal("video"),
   title: z.string().optional(),
   url: z.string(),
+  /**
+   * Storage object key for the video (`<bucket>/<objectPath>` lives behind the
+   * `oss://` marker the canvas persists). Optional so artifacts produced before
+   * CV-01, and the direct-provider path used by tests, still parse — but only an
+   * artifact that carries it may be written onto a canvas, because `url` is a
+   * public URL that dies the moment the bucket goes private (X-52).
+   */
+  objectPath: z.string().optional(),
   mimeType: z.string(),
   width: z.number().int().positive(),
   height: z.number().int().positive(),

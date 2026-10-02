@@ -43,7 +43,17 @@ type PlaceholderInsertOpts = {
 
 type VideoInsertOpts = {
   canvasId: string;
-  signedUrl: string;        // Public URL for embeddable link
+  /**
+   * Storage path of the already-uploaded video, e.g. `<userId>/<jobId>.mp4`.
+   *
+   * LOCAL FORK (CV-01): this used to be the provider's public URL, and that URL
+   * was written straight into `link`. That made every canvas video depend on the
+   * bucket staying public — flipping it private (X-52) would have broken every
+   * existing video at once, with no way back, since the URL was the only record
+   * of where the object lived. The object key is the durable half, so it is what
+   * gets persisted.
+   */
+  objectPath: string;
   width: number;
   height: number;
   mimeType: string;
@@ -260,7 +270,7 @@ function buildVideoElement(
     versionNonce: Math.floor(Math.random() * 2_000_000_000),
     isDeleted: false,
     updated: Date.now(),
-    link: opts.signedUrl,
+    link: `${OSS_MARKER_PREFIX}${CANVAS_FILES_BUCKET}/${opts.objectPath}`,
     locked: false,
     customData: {
       isVideo: true,
@@ -516,7 +526,12 @@ export async function insertImageElement(
 
 /**
  * Insert a video element into a canvas. Videos use Excalidraw's `embeddable`
- * type with a link URL — no files map entry needed.
+ * type, carrying an `oss://` object marker in `link` — no files map entry
+ * needed, and no public URL in the persisted document (see VideoInsertOpts).
+ *
+ * The marker is resolved to a playable URL on read (see canvas-service's
+ * resolveVideoElementsFromStorage), so the stored document never pins a URL
+ * whose lifetime we do not control.
  */
 export async function insertVideoElement(
   client: { from: (table: string) => any; storage: { from: (bucket: string) => any } },

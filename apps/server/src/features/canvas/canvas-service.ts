@@ -113,11 +113,18 @@ export function createCanvasService(options: {
       // Resolve OSS-stored files back to base64 dataURLs for the frontend
       const resolvedContent = await resolveFilesFromStorage(client, content);
 
+      // CV-01: attach a playable URL for video markers. Read-time only — the
+      // persisted `link` keeps its oss:// marker (see the function's notes).
+      const projectedContent = await resolveVideoElementsFromStorage(
+        client,
+        resolvedContent,
+      );
+
       return {
         id: data.id,
         name: data.name,
         projectId: data.project_id,
-        content: resolvedContent,
+        content: projectedContent,
         // The client sends this back on save so a stale write is rejected rather
         // than silently overwriting newer content.
         version: (data.version as number) ?? 0,
@@ -563,6 +570,66 @@ async function resolveFilesFromStorage(
     ...content,
     files: updatedFiles,
   } as CanvasContent;
+}
+
+async function resolveVideoElementsFromStorage(
+  client: UserSupabaseClient,
+  content: CanvasContent,
+): Promise<CanvasContent> {
+  const elements = (content as { elements?: unknown }).elements;
+  if (!Array.isArray(elements) || elements.length === 0) return content;
+
+  let changed = false;
+
+  const updated = elements.map((raw) => {
+    if (!raw || typeof raw !== "object") return raw;
+    const element = raw as Record<string, unknown>;
+    if (element.type !== "embeddable") return raw;
+
+    const customData = element.customData as Record<string, unknown> | undefined;
+    if (customData?.isVideo !== true) return raw;
+
+    const link = element.link;
+    if (typeof link !== "string" || !link.startsWith(OSS_MARKER_PREFIX)) {
+      return raw;
+    }
+
+    const ref = link.slice(OSS_MARKER_PREFIX.length);
+    const slashIdx = ref.indexOf("/");
+    if (slashIdx <= 0 || slashIdx === ref.length - 1) {
+      // A broken marker is one element's problem. Throwing here would take the
+      // whole canvas down, including the images that are perfectly fine.
+      console.log(
+        `[canvas-service] malformed video marker left untouched ` +
+          `elementId=${String(element.id)}`,
+      );
+      return raw;
+    }
+
+    const bucket = ref.slice(0, slashIdx);
+    const objectPath = ref.slice(slashIdx + 1);
+
+    try {
+      const { data } = client.storage.from(bucket).getPublicUrl(objectPath);
+      changed = true;
+      return {
+        ...element,
+        customData: { ...customData, resolvedVideoUrl: data.publicUrl },
+      };
+    } catch (err) {
+      console.log(
+        `[canvas-service] video marker could not be resolved, left untouched ` +
+          `elementId=${String(element.id)} reason=${
+            err instanceof Error ? err.message : String(err)
+          }`,
+      );
+      return raw;
+    }
+  });
+
+  if (!changed) return content;
+
+  return { ...content, elements: updated } as CanvasContent;
 }
 
 // ---------------------------------------------------------------------------

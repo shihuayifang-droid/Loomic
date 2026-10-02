@@ -392,6 +392,90 @@ async function resolvePersonalWorkspaceId(
 
 export type AgentRunService = ReturnType<typeof createAgentRunService>;
 
+/** Fields a finished video job stores in `background_jobs.result`. */
+type VideoJobResultFields = {
+  signed_url?: string;
+  object_path?: string;
+  duration_seconds?: number;
+  width?: number;
+  height?: number;
+  mime_type?: string;
+};
+
+/** Placement/title fields the generate_video tool passes through. */
+type VideoPlacementInput = {
+  placementX?: number;
+  placementY?: number;
+  placementWidth?: number;
+  placementHeight?: number;
+  title?: string;
+};
+
+/**
+ * Persist the canvas element for a finished video job (CV-01).
+ *
+ * `objectPath` is the storage key the worker already uploaded and recorded in
+ * the job result. When it is missing, NOTHING is written and `undefined` comes
+ * back: the only other thing the result offers is `signed_url`, a public URL
+ * that stops resolving the moment the bucket is private (X-52), so persisting it
+ * would silently recreate the very dependency CV-01 removes. A missing key is a
+ * worker-side defect, hence a loud log instead of a fallback.
+ *
+ * Exported so a test can drive the real canvas writer with a fake client; the
+ * "never persist the URL" invariant is otherwise only observable by reading this
+ * function.
+ */
+export async function insertVideoElementForJobResult(args: {
+  client: UserSupabaseClient;
+  canvasId: string;
+  jobId: string;
+  objectPath: string | undefined;
+  result: VideoJobResultFields;
+  input: VideoPlacementInput;
+  prompt: string;
+}): Promise<string | undefined> {
+  const { client, canvasId, jobId, objectPath, result, input } = args;
+
+  if (!objectPath) {
+    console.error(
+      `[submitVideoJob] job ${jobId} succeeded without result.object_path — no ` +
+        `canvas element written for canvas ${canvasId}. Its video is reachable ` +
+        `only through a public URL, which X-52 will invalidate; the upload step ` +
+        `that records object_path needs to be re-run.`,
+    );
+    return undefined;
+  }
+
+  const explicitPlacement =
+    input.placementX != null && input.placementY != null
+      ? {
+          x: input.placementX,
+          y: input.placementY,
+          width: input.placementWidth ?? 640,
+          height: input.placementHeight ?? 360,
+        }
+      : undefined;
+
+  const insertResult = await insertVideoElement(
+    client,
+    {
+      canvasId,
+      objectPath,
+      width: result.width ?? 1280,
+      height: result.height ?? 720,
+      mimeType: result.mime_type ?? "video/mp4",
+      ...(result.duration_seconds != null
+        ? { durationSeconds: result.duration_seconds }
+        : {}),
+      ...(input.title != null ? { title: input.title } : {}),
+      prompt: args.prompt,
+    },
+    explicitPlacement,
+  );
+
+  return insertResult.elementId;
+}
+
 export function createAgentRunService(options: CreateAgentRuntimeOptions) {
   const now = options.now ?? (() => new Date().toISOString());
   const runs = new Map<string, RuntimeRunRecord>();
@@ -954,6 +1038,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             if (current.status === "succeeded" && current.result) {
               const result = current.result as {
                 signed_url?: string;
+                object_path?: string;
                 duration_seconds?: number;
                 width?: number;
                 height?: number;
@@ -961,43 +1046,39 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               };
               jobLap("job_poll_done", { pollCount, status: "succeeded" });
 
+              // CV-01: the storage key is the durable half of the result. It is
+              // what the canvas persists; signed_url is only what the client may
+              // fetch with *today*.
+              const objectPath =
+                typeof result.object_path === "string" &&
+                result.object_path.length > 0
+                  ? result.object_path
+                  : undefined;
+
               // Write element directly to canvas (backend-driven insertion)
               let elementId: string | undefined;
-              if (canvasId && result.signed_url) {
+              if (canvasId) {
                 try {
                   const writerClient = createClient(accessToken) as UserSupabaseClient;
-                  const explicitPlacement = (input as any).placementX != null && (input as any).placementY != null
-                    ? {
-                        x: (input as any).placementX,
-                        y: (input as any).placementY,
-                        width: (input as any).placementWidth ?? 640,
-                        height: (input as any).placementHeight ?? 360,
-                      }
-                    : undefined;
-
-                  const insertResult = await insertVideoElement(
-                    writerClient,
-                    {
-                      canvasId,
-                      signedUrl: result.signed_url,
-                      width: result.width ?? 1280,
-                      height: result.height ?? 720,
-                      mimeType: result.mime_type ?? "video/mp4",
-                      ...(result.duration_seconds != null ? { durationSeconds: result.duration_seconds } : {}),
-                      title: (input as any).title,
-                      prompt: input.prompt,
-                    },
-                    explicitPlacement,
-                  );
-                  elementId = insertResult.elementId;
-
-                  // Notify connected frontends to refresh canvas
-                  options.connectionManager?.pushToCanvas(canvasId, {
-                    type: "canvas.sync" as const,
-                    runId,
-                    timestamp: new Date().toISOString(),
+                  elementId = await insertVideoElementForJobResult({
+                    client: writerClient,
+                    canvasId,
+                    jobId: job.id,
+                    objectPath,
+                    result,
+                    input: input as VideoPlacementInput,
+                    prompt: input.prompt,
                   });
-                  jobLap("canvas_element_inserted", { elementId });
+
+                  if (elementId != null) {
+                    // Notify connected frontends to refresh canvas
+                    options.connectionManager?.pushToCanvas(canvasId, {
+                      type: "canvas.sync" as const,
+                      runId,
+                      timestamp: new Date().toISOString(),
+                    });
+                    jobLap("canvas_element_inserted", { elementId });
+                  }
                 } catch (insertErr) {
                   // Graceful degradation: log error but still return result
                   console.error("[submitVideoJob] canvas insert failed:", insertErr);
@@ -1008,6 +1089,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 jobId: job.id,
                 ...(elementId != null ? { elementId } : {}),
                 videoUrl: result.signed_url ?? "",
+                ...(objectPath != null ? { objectPath } : {}),
                 width: result.width ?? 1280,
                 height: result.height ?? 720,
                 mimeType: result.mime_type ?? "video/mp4",

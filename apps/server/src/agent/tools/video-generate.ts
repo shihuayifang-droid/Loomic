@@ -25,6 +25,14 @@ export type SubmitVideoJobFn = (input: {
   jobId: string;
   elementId?: string;
   videoUrl?: string;
+  /**
+   * Storage object key for the finished video (CV-01). Present on the async job
+   * path, which is the only path that uploads an object; the direct-provider
+   * path used by tests returns a provider URL and nothing to key on. Carried up
+   * so the canvas element can be persisted as an object marker instead of a
+   * public URL.
+   */
+  objectPath?: string;
   width?: number;
   height?: number;
   durationSeconds?: number;
@@ -144,6 +152,8 @@ type VideoGenerateResult = {
   prompt?: string;
   elementId?: string;
   videoUrl?: string;
+  /** Storage object key for the finished video (CV-01). See SubmitVideoJobFn. */
+  objectPath?: string;
   mimeType?: string;
   width?: number;
   height?: number;
@@ -246,6 +256,10 @@ export async function runVideoGenerate(
           : {}),
         mimeType: jobResult.mimeType ?? "video/mp4",
         ...(jobResult.videoUrl != null ? { videoUrl: jobResult.videoUrl } : {}),
+        // Carried through to the client so the artifact — and therefore the
+        // canvas element — can be keyed on the stored object instead of the
+        // public URL (CV-01).
+        ...(jobResult.objectPath != null ? { objectPath: jobResult.objectPath } : {}),
         ...(jobResult.width != null ? { width: jobResult.width } : {}),
         ...(jobResult.height != null ? { height: jobResult.height } : {}),
         ...(jobResult.durationSeconds != null
