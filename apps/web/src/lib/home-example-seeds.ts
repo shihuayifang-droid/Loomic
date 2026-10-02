@@ -34,54 +34,20 @@ export type HomeExampleSelection = {
 };
 
 // ---------------------------------------------------------------------------
-// Seed URLs live in their own public bucket (X-52 prep)
+// Seed URLs (X-52 prep)
 // ---------------------------------------------------------------------------
 
 /**
- * These seed images used to sit in the USER asset bucket (`project-assets`),
- * alongside real project files, and the fallbacks below hard-coded those public
- * URLs. X-52 has to make that bucket private — which would 403 every anonymous
- * home-page, example and discovery request at once. So the seeds move to a bucket
- * of their own, and every URL these modules emit is projected onto it.
+ * The seed literals below are written as `legacySeed(key)` instead of a full
+ * public URL: the key is the part that never changes, and which bucket serves it
+ * belongs to `home-seeds-url.ts`. It also means a seed cannot quietly point back
+ * at the user asset bucket — only the projection's output is ever exported.
  *
- * The literals below are written as `legacySeed(key)` instead of a full URL: the
- * key is the part that never changes, and which bucket serves it is a decision
- * this file owns. It also means a seed cannot quietly point back at the user
- * bucket — only the projection's output is ever exported.
+ * The helper lives in its own module because the discovery seed module needs it
+ * too, and importing it from HERE would drag all 185 examples (and their prompts)
+ * into the discovery page's bundle for the sake of two string functions.
  */
-const SEED_ORIGIN = "https://jmcrxgenontlkxktpihl.supabase.co";
-const PUBLIC_OBJECT_PATH = "/storage/v1/object/public/";
-/** The user asset bucket that held the seeds until the migration ran. */
-const LEGACY_ASSET_BUCKET = "project-assets";
-/** Public bucket created for seeds only (migration 20261002000001). */
-export const HOME_SEEDS_BUCKET = "home-seeds";
-/** Key prefix the seeds used to sit under inside the user bucket. */
-const LEGACY_SEED_PREFIX = `${HOME_SEEDS_BUCKET}/`;
-
-/**
- * Build the pre-migration public URL for a seed key.
- *
- * Exported only so the sibling discovery module can share the helper; the value
- * it returns is never rendered — it always goes through `toHomeSeedsPublicUrl`
- * on the way out (see the projection at the end of this file, and the one in
- * home-discovery-seeds.ts).
- */
-export function legacySeed(key: string): string {
-  return `${SEED_ORIGIN}${PUBLIC_OBJECT_PATH}${LEGACY_ASSET_BUCKET}/${LEGACY_SEED_PREFIX}${key}`;
-}
-
-/**
- * Project a seed URL onto the dedicated public bucket.
- *
- * Pure, and deliberately narrow: only the EXACT public seed prefix in the user
- * bucket is rewritten. A different bucket, a different prefix in the same bucket,
- * a signed URL or a plain link all come back byte-for-byte unchanged.
- */
-export function toHomeSeedsPublicUrl(url: string): string {
-  const from = `${SEED_ORIGIN}${PUBLIC_OBJECT_PATH}${LEGACY_ASSET_BUCKET}/${LEGACY_SEED_PREFIX}`;
-  const to = `${SEED_ORIGIN}${PUBLIC_OBJECT_PATH}${HOME_SEEDS_BUCKET}/`;
-  return url.split(from).join(to);
-}
+import { legacySeed, toHomeSeedsPublicUrl } from "./home-seeds-url";
 
 function projectCard(card: HomeExampleCard): HomeExampleCard {
   return {

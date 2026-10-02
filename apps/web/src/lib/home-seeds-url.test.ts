@@ -11,12 +11,9 @@
 // was added without going through the helper.
 import { describe, expect, it } from "vitest";
 
-import {
-  homeExampleSeedCategories,
-  legacySeed,
-  toHomeSeedsPublicUrl,
-} from "./home-example-seeds";
+import { homeExampleSeedCategories } from "./home-example-seeds";
 import { homeDiscoverySeedCategories } from "./home-discovery-seeds";
+import { legacySeed, toHomeSeedsPublicUrl } from "./home-seeds-url";
 
 const OLD_PREFIX = "/storage/v1/object/public/project-assets/home-seeds/";
 const NEW_PREFIX = "/storage/v1/object/public/home-seeds/";

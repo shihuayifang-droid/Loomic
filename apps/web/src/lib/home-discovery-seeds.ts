@@ -1,4 +1,4 @@
-import { legacySeed, toHomeSeedsPublicUrl } from "./home-example-seeds";
+import { legacySeed, toHomeSeedsPublicUrl } from "./home-seeds-url";
 
 export type HomeDiscoveryCase = {
   id: string;
