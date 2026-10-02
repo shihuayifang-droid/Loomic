@@ -22,8 +22,13 @@
  *     shape is ever used to derive an object path: hosts, path encodings and
  *     historical formats all differ, and a wrong guess silently points a canvas
  *     at somebody else's object.
- *   - One URL resolving to two different object paths is left alone and counted
- *     as ambiguous. Refusing to choose is the whole point.
+ *   - One URL resolving to two different object paths is left alone: the element
+ *     is NOT rewritten, because nothing this tool is allowed to use can choose
+ *     between them. It is listed in `legacyVideosUnmatched` like any other
+ *     unresolved element — by canvasId + elementId, so an operator can actually
+ *     find it — while the distinct count stays in `ambiguousJobUrls`.
+ *     (Listing only the count made a real dry run unclosable: the report said
+ *     "1 ambiguous URL" and gave nobody anything to act on. 工单8 检查 §5②)
  *   - Elements already holding an `oss://` marker are skipped; legacy URLs with
  *     no matching job are left untouched and reported.
  *   - `--apply` writes each canvas with an `id + version` optimistic lock. A
@@ -61,7 +66,13 @@ export type VideoBackfillReport = {
   canvasesUpdated: number;
   canvasesConflicted: string[];
   elementsUpdated: number;
+  /**
+   * Every video element this run could not rewrite: no matching job, or a URL
+   * that maps to more than one object. `link` is always `<redacted>`, so the way
+   * to find one is `canvasId` + `elementId`.
+   */
   legacyVideosUnmatched: Array<{ canvasId: string; elementId: string; link: string }>;
+  /** How many DISTINCT URLs were ambiguous. Aggregate only — no URL is printed. */
   ambiguousJobUrls: string[];
 };
 
@@ -252,7 +263,16 @@ export async function runVideoPointerBackfill(
       }
 
       if (paths.size > 1) {
+        // Ambiguous: one URL, two objects, and no rule this tool may apply can
+        // pick one. The element keeps its URL (nothing is written), but it MUST
+        // be listed by canvas + element id — the bare count left the operator
+        // with a number and no way to act on it (工单8 检查 §5②).
         ambiguousJobUrls.add(REDACTED);
+        report.legacyVideosUnmatched.push({
+          canvasId,
+          elementId: String(element.id ?? ""),
+          link: REDACTED,
+        });
         return raw;
       }
 

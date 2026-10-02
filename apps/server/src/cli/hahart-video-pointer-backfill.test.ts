@@ -223,6 +223,7 @@ describe("CV-01 video pointer backfill", () => {
     expect(report.legacyVideosUnmatched.map((entry) => entry.elementId).sort()).toEqual([
       "e3",
       "e5",
+      "e6",
     ]);
     // No URL may appear anywhere in the report.
     expect(JSON.stringify(report)).not.toContain("http");
@@ -264,6 +265,10 @@ describe("CV-01 video pointer backfill", () => {
     expect(report.legacyVideosUnmatched).toEqual([
       { canvasId: "canvas-a", elementId: "e3", link: "<redacted>" },
       { canvasId: "canvas-b", elementId: "e5", link: "<redacted>" },
+      // The ambiguous element is listed here too (工单8 检查 §5②): it has no
+      // matching job this tool may use, so from the operator's side it is the
+      // same kind of work item — find it and decide by hand.
+      { canvasId: "canvas-c", elementId: "e6", link: "<redacted>" },
     ]);
   });
 
@@ -275,6 +280,30 @@ describe("CV-01 video pointer backfill", () => {
     expect(elementsOf(stub, "canvas-c")[0].link).toBe(DUP_URL);
     expect(stub.writes.map((write) => write.id)).toEqual(["canvas-a"]);
     expect(report.ambiguousJobUrls).toHaveLength(1);
+  });
+
+  it("locates an ambiguous element by canvas + element id, still writing nothing", async () => {
+    // 工单8 检查 §5②: the bare count ("1 ambiguous URL") was unactionable — a real
+    // dry run could not be closed from it. The element must also be listed, while
+    // the URL stays out of the report and the canvas stays untouched.
+    const stub = standardStub();
+
+    const report = await runVideoPointerBackfill(stub.client, { apply: true });
+
+    expect(report.legacyVideosUnmatched).toContainEqual({
+      canvasId: "canvas-c",
+      elementId: "e6",
+      link: "<redacted>",
+    });
+    // The aggregate count survives as the "how many" summary.
+    expect(report.ambiguousJobUrls).toHaveLength(1);
+    // Nothing was chosen for it: the element keeps its URL and no write reaches
+    // canvas-c — and it never enters the "would change" count either.
+    expect(elementsOf(stub, "canvas-c")[0].link).toBe(DUP_URL);
+    expect(stub.writes.map((write) => write.id)).toEqual(["canvas-a"]);
+    expect(report.elementsUpdated).toBe(1);
+    // No URL anywhere in the report, ambiguous entries included.
+    expect(JSON.stringify(report)).not.toContain("http");
   });
 
   it("reports a version conflict instead of overwriting", async () => {
