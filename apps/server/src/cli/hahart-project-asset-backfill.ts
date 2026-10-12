@@ -424,6 +424,12 @@ export async function runProjectAssetBackfill(
     for (const plan of plans) {
       // Optimistic guard: the row must still look the way it did when the plan
       // was made, or a concurrent worker has already claimed the object.
+      //
+      // Compare the FULL ownership state, not just the project. A concurrent
+      // writer can move a row to another workspace while leaving `project_id`
+      // null — comparing only the project would call that "unchanged", and the
+      // RPC below would then write the planned workspace over it. That is the
+      // overwrite this guard exists to prevent.
       const { data: current } = await admin
         .from("asset_objects")
         .select("project_id, workspace_id")
@@ -431,10 +437,22 @@ export async function runProjectAssetBackfill(
         .eq("object_path", plan.objectPath)
         .maybeSingle();
 
-      const currentRow = current as { project_id: string | null } | null;
-      const expectedProject = plan.existing?.project_id ?? null;
+      const currentRow =
+        (current as { project_id: string | null; workspace_id: string | null } | null) ?? null;
+      const currentProject = currentRow?.project_id ?? null;
+      const currentWorkspace = currentRow?.workspace_id ?? null;
 
-      if ((currentRow?.project_id ?? null) !== expectedProject) {
+      const expectedProject = plan.existing?.project_id ?? null;
+      const expectedWorkspace = plan.existing?.workspace_id ?? null;
+
+      const unchanged =
+        plan.existing === null
+          ? // Nothing existed at plan time, so anything that exists now (a row
+            // with any value at all) is somebody else's write.
+            currentProject === null && currentWorkspace === null
+          : currentProject === expectedProject && currentWorkspace === expectedWorkspace;
+
+      if (!unchanged) {
         conflicts.push(plan.objectPath);
         continue;
       }

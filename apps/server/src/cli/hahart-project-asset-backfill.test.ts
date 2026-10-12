@@ -340,6 +340,30 @@ describe("project asset backfill", () => {
     expect(report.conflicts).toEqual([JOB_OBJECT]);
   });
 
+  it("case 10b: a workspace-only change since planning is dropped too", async () => {
+    // The object had no project at plan time, so the plan was to adopt it into
+    // PROJECT_A. In between, somebody moved the SAME row to another workspace
+    // while leaving project_id null. Comparing only the project would see
+    // null === null and call the plan safe — and the RPC would then write the
+    // planned workspace over the newer one. The whole ownership state is the
+    // guard, not just the project.
+    const admin = makeAdmin({
+      jobs: [job(JOB_OBJECT)],
+      canvases: [{ id: CANVAS_A, project_id: PROJECT_A, content: {}, created_by: USER }],
+      assets: [
+        { object_path: JOB_OBJECT, project_id: null, workspace_id: TEAM, created_by: USER },
+      ],
+      objects: [JOB_OBJECT],
+      guardRows: { [JOB_OBJECT]: { project_id: null, workspace_id: "ws-other" } },
+    });
+
+    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+
+    expect(admin.rpcs).toHaveLength(0);
+    expect(report.recorded).toBe(0);
+    expect(report.conflicts).toEqual([JOB_OBJECT]);
+  });
+
   it("case 11: an object nothing points at is left unmatched", async () => {
     const admin = makeAdmin({
       assets: [
