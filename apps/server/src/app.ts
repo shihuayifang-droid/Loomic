@@ -240,6 +240,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     agentRunMetadataService,
     connectionManager,
     createUserClient,
+    // X-52: the Agent-side persistence entry point records asset ownership
+    // through the service_role-only `record_project_asset`, so the runtime needs
+    // the same admin client every other feature already receives.
+    getAdminClient,
     ...(options.agentModel ? { model: options.agentModel } : {}),
     ...(options.mockEventDelayMs === undefined
       ? {}

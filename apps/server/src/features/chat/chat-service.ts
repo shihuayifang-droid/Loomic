@@ -10,7 +10,15 @@ import { randomUUID } from "node:crypto";
 
 import { isTransportFailure } from "../../supabase/transport-retry.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
+import { signProjectAssetUrls } from "../storage/project-asset-urls.js";
 import type { ThreadService } from "./thread-service.js";
+
+/**
+ * X-52: which fields identify media, and which are just this read's projection.
+ * A persisted message keeps the first group and never the second.
+ */
+const STABLE_ASSET_FIELDS = ["assetId", "objectPath", "mimeType", "source"] as const;
+const PROJECTED_URL_FIELDS = ["url", "thumbnailUrl"] as const;
 
 /**
  * Drop image blocks that carry their bytes inline as a `data:` URL.
@@ -44,6 +52,228 @@ function stripInlineImageBytes(
     return false;
   });
 }
+
+/**
+ * X-52: strip the read-time URL projection out of everything that is about to be
+ * written to JSONB, keeping only the stable identity.
+ *
+ * A signed URL lives about an hour. A chat row lives as long as the
+ * conversation. Persisting the first inside the second is how history ends up
+ * full of dead image links the server can no longer repair, because a URL is not
+ * something ownership can be re-derived from. So the write keeps
+ * `assetId/objectPath/mimeType/source` and `listMessages` re-signs on every read.
+ *
+ * Applies to both shapes that carry media:
+ *   * `image` blocks (the user's own attachments),
+ *   * `tool` blocks' `artifacts` (images and videos the Agent produced).
+ *
+ * A `data:` block is left for `stripInlineImageBytes` to reject outright — this
+ * function must not launder one into a block that merely looks tidy.
+ */
+function stripProjectedUrls(blocks: ContentBlock[]): ContentBlock[] {
+  return blocks.map((block) => {
+    const type = (block as { type?: string }).type;
+
+    if (type === "image") {
+      const image = block as unknown as Record<string, unknown>;
+      const url = typeof image.url === "string" ? image.url : "";
+      if (url.startsWith("data:")) return block;
+
+      const stable: Record<string, unknown> = { type: "image" };
+      for (const field of STABLE_ASSET_FIELDS) {
+        if (image[field] !== undefined) stable[field] = image[field];
+      }
+      // `name` is display metadata, not identity, and is safe to keep.
+      if (image.name !== undefined) stable.name = image.name;
+      return stable as unknown as ContentBlock;
+    }
+
+    if (type === "tool") {
+      const tool = block as unknown as Record<string, unknown>;
+      const artifacts = tool.artifacts;
+      if (!Array.isArray(artifacts) || artifacts.length === 0) return block;
+
+      return {
+        ...tool,
+        artifacts: artifacts.map((artifact) => {
+          if (!artifact || typeof artifact !== "object") return artifact;
+          const entry = artifact as Record<string, unknown>;
+          const cleaned: Record<string, unknown> = {};
+          for (const [key, value] of Object.entries(entry)) {
+            if ((PROJECTED_URL_FIELDS as readonly string[]).includes(key)) continue;
+            cleaned[key] = value;
+          }
+          return cleaned;
+        }),
+      } as unknown as ContentBlock;
+    }
+
+    return block;
+  });
+}
+
+/** Every asset id referenced by a set of blocks, in first-seen order. */
+function collectBlockAssetIds(blocks: ContentBlock[]): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (value: unknown) => {
+    if (typeof value !== "string" || value.length === 0) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    ids.push(value);
+  };
+
+  for (const block of blocks) {
+    const entry = block as unknown as Record<string, unknown>;
+    if (entry.type === "image") add(entry.assetId);
+
+    const artifacts = entry.artifacts;
+    if (Array.isArray(artifacts)) {
+      for (const artifact of artifacts) {
+        if (artifact && typeof artifact === "object") {
+          add((artifact as Record<string, unknown>).assetId);
+        }
+      }
+    }
+  }
+
+  return ids;
+}
+
+/**
+ * X-52: re-project a `url` onto every block that names an asset.
+ *
+ * The row is read through the CALLER's client, so RLS is what decides whether
+ * the asset may be seen at all — the same authorisation that governs the canvas.
+ *
+ * Two rules, and the second is the one that is easy to get wrong:
+ *   * an asset that resolves is signed fresh for this caller;
+ *   * an asset that does NOT resolve — invisible under RLS, gone, or refused by
+ *     the signer — leaves its block with NO url. The url already sitting in the
+ *     row is not a fallback: it is a token that used to work, and serving it
+ *     again is exactly the "回退旧URL" the ticket forbids. So it is removed
+ *     before the projection runs.
+ *
+ * A url-less block is the honest outcome. Showing no image is recoverable;
+ * showing one whose signature no longer stands is not.
+ */
+async function projectBlockUrls(
+  client: UserSupabaseClient,
+  blocks: ContentBlock[],
+  context: { sessionId: string },
+): Promise<ContentBlock[]> {
+  const assetIds = collectBlockAssetIds(blocks);
+
+  const dropUrl = (record: Record<string, unknown>): Record<string, unknown> => {
+    const { url: _url, thumbnailUrl: _thumbnailUrl, ...rest } = record;
+    return rest;
+  };
+
+  /** Blocks with identity but no signed url yet: the old url is cleared. */
+  const withoutProjection: ContentBlock[] = blocks.map((block) => {
+    const entry = block as unknown as Record<string, unknown>;
+
+    if (entry.type === "image" && entry.assetId) {
+      return dropUrl(entry) as unknown as ContentBlock;
+    }
+
+    const artifacts = entry.artifacts;
+    if (Array.isArray(artifacts)) {
+      return {
+        ...entry,
+        artifacts: artifacts.map((artifact) =>
+          artifact && typeof artifact === "object" && (artifact as Record<string, unknown>).assetId
+            ? dropUrl(artifact as Record<string, unknown>)
+            : artifact,
+        ),
+      } as unknown as ContentBlock;
+    }
+
+    return block;
+  });
+
+  if (assetIds.length === 0) return withoutProjection;
+
+  const { data, error } = await client
+    .from("asset_objects")
+    .select("id, object_path, bucket")
+    .in("id", assetIds);
+
+  if (error) {
+    // Safe log: the reason, never a URL — a signed URL is a bearer token.
+    console.log(
+      "[chat-service] asset lookup failed, returning blocks without urls",
+      JSON.stringify({ sessionId: context.sessionId, code: error.code }),
+    );
+    return withoutProjection;
+  }
+
+  const rows = (data ?? []) as Array<{
+    id: string;
+    object_path: string;
+    bucket: string;
+  }>;
+
+  // Sign each row with its own bucket; `signProjectAssetUrls` omits whatever it
+  // cannot sign and never falls back to a public URL.
+  const signedByAssetId = new Map<string, string>();
+  await Promise.all(
+    rows.map(async (row) => {
+      const signed = await signProjectAssetUrls(client, [row.object_path], {
+        bucket: row.bucket,
+      });
+      const url = signed.get(row.object_path);
+      if (url) signedByAssetId.set(row.id, url);
+    }),
+  );
+
+  return withoutProjection.map((block) => {
+    const entry = block as unknown as Record<string, unknown>;
+    const withUrl = (record: Record<string, unknown>): Record<string, unknown> => {
+      const url = signedByAssetId.get(String(record.assetId ?? ""));
+      return url ? { ...record, url } : record;
+    };
+
+    if (entry.type === "image" && entry.assetId) {
+      return withUrl(entry) as unknown as ContentBlock;
+    }
+
+    const artifacts = entry.artifacts;
+    if (Array.isArray(artifacts)) {
+      return {
+        ...entry,
+        artifacts: artifacts.map((artifact) =>
+          artifact && typeof artifact === "object"
+            ? withUrl(artifact as Record<string, unknown>)
+            : artifact,
+        ),
+      } as unknown as ContentBlock;
+    }
+
+    return block;
+  });
+}
+
+/**
+ * Legacy blocks: media whose only handle is a URL, written before X-52.
+ *
+ * They are READ as they always were — dropping the url would turn every old
+ * image in every old conversation into a blank — but they are never rewritten
+ * and the URL is never reverse-engineered into an object path or an owner.
+ * Guessing ownership from a URL string is how an object ends up authorised
+ * against the wrong project, which the ticket ranks as worse than a display
+ * failure. The real inventory and disposition of these rows is registered as
+ * T-23.
+ */
+function isLegacyUrlOnlyBlock(block: ContentBlock): boolean {
+  const entry = block as unknown as Record<string, unknown>;
+  if (entry.type === "image") {
+    return typeof entry.url === "string" && entry.url.length > 0 && !entry.assetId;
+  }
+  return false;
+}
+
 
 export class ChatServiceError extends Error {
   readonly statusCode: number;
@@ -225,23 +455,50 @@ export function createChatService(options: {
         };
       });
 
+      // X-52: re-sign every block that names an asset, for THIS caller. The
+      // stored rows carry no url at all for post-X-52 messages; the url below is
+      // a projection minted now, through the reader's own client, so RLS decides
+      // what they may see. Legacy url-only rows are counted, not repaired.
+      const projected = await Promise.all(
+        rows.map(async (message) => {
+          if (!message.contentBlocks) return message;
+          const legacyCount = message.contentBlocks.filter(isLegacyUrlOnlyBlock).length;
+          if (legacyCount > 0) {
+            console.log(
+              "[chat-service] legacy url-only blocks returned as stored (T-23)",
+              JSON.stringify({ sessionId, messageId: message.id, blocks: legacyCount }),
+            );
+          }
+          return {
+            ...message,
+            contentBlocks: await projectBlockUrls(
+              client,
+              message.contentBlocks,
+              { sessionId },
+            ),
+          };
+        }),
+      );
+
       // Deduplicate consecutive messages with same role + content
       // (caused by dual client+server save in earlier versions)
-      return rows.filter(
+      return projected.filter(
         (msg, i) =>
           i === 0 ||
-          msg.role !== rows[i - 1]!.role ||
-          msg.content !== rows[i - 1]!.content,
+          msg.role !== projected[i - 1]!.role ||
+          msg.content !== projected[i - 1]!.content,
       );
     },
 
     async createMessage(user, sessionId, input) {
       const client = options.createUserClient(user.accessToken);
       const safeBlocks = input.contentBlocks
-        ? stripInlineImageBytes(input.contentBlocks, {
-            sessionId,
-            role: input.role,
-          })
+        ? stripProjectedUrls(
+            stripInlineImageBytes(input.contentBlocks, {
+              sessionId,
+              role: input.role,
+            }),
+          )
         : null;
 
       const RETURNING =

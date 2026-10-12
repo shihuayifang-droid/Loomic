@@ -328,9 +328,13 @@ const ARTIFACT_KEYS = new Set([
   "imageUrl",
   "screenshotUrl",
   "videoUrl",
-  // CV-01: the video's storage object key travels on the artifact, so it is
-  // stripped from the passthrough output for the same reason as the others.
+  // X-52: a signed URL is a read-time projection, so it must not be duplicated
+  // into the tool's passthrough output. `assetId`/`objectPath` are the stable
+  // identity and are lifted onto the artifact, so they are stripped from the
+  // output for the same reason — the artifact is where a reader looks.
+  "assetId",
   "objectPath",
+  "screenshotAsset",
   "durationSeconds",
   "mimeType",
   "width",
@@ -395,29 +399,15 @@ function extractArtifacts(output: unknown): ToolArtifact[] | undefined {
   const artifacts: ToolArtifact[] = [];
   const record = unwrapped;
 
-  // New format: sub-agent structured response with url + placement
-  if (typeof record.url === "string" && record.url.length > 0) {
-    const candidate: Record<string, unknown> = {
-      type: "image" as const,
-      url: record.url,
-      mimeType: (record.mimeType as string) ?? "image/png",
-      width: (record.placement as any)?.width ?? 512,
-      height: (record.placement as any)?.height ?? 512,
-    };
-    if (typeof record.title === "string" && record.title.length > 0) {
-      candidate.title = record.title;
-    }
-    if (record.placement && typeof record.placement === "object") {
-      candidate.placement = record.placement;
-    }
-    const result = imageArtifactSchema.safeParse(candidate);
-    if (result.success) {
-      artifacts.push(result.data);
-    }
-  }
+  // X-52: which shape produced the artifact. The SPECIFIC keys are tried first
+  // and the generic `url` fallback last, so a result that merely happens to carry
+  // a `url` (persist_sandbox_file answers `{ url, mimeType: "application/pdf" }`)
+  // cannot be mistaken for an image artifact — a mistake that would both mislead
+  // the client and strip the url out of the model-visible output.
+  let artifactSource: string | undefined;
 
   // Legacy format: direct tool response with imageUrl
-  if (artifacts.length === 0 && typeof record.imageUrl === "string") {
+  if (typeof record.imageUrl === "string") {
     const candidate: Record<string, unknown> = {
       type: "image" as const,
       url: record.imageUrl,
@@ -431,14 +421,16 @@ function extractArtifacts(output: unknown): ToolArtifact[] | undefined {
     if (record.placement && typeof record.placement === "object") {
       candidate.placement = record.placement;
     }
+    carryStableIdentity(candidate, record);
     const result = imageArtifactSchema.safeParse(candidate);
     if (result.success) {
       artifacts.push(result.data);
+      artifactSource = "imageUrl";
     }
   }
 
-  // Screenshot format: tool response with screenshotUrl
-  if (artifacts.length === 0 && typeof record.screenshotUrl === "string") {
+  // Legacy format: screenshot tool response with a bare screenshotUrl
+  if (!artifactSource && typeof record.screenshotUrl === "string") {
     const candidate: Record<string, unknown> = {
       type: "image" as const,
       url: record.screenshotUrl,
@@ -449,6 +441,30 @@ function extractArtifacts(output: unknown): ToolArtifact[] | undefined {
     const result = imageArtifactSchema.safeParse(candidate);
     if (result.success) {
       artifacts.push(result.data);
+      artifactSource = "screenshotUrl";
+    }
+  }
+
+  // X-52 screenshot format: `screenshotAsset` carries the stable identity plus
+  // this turn's url. Both this and the legacy key above are read, so a transcript
+  // recorded before this change still yields its screenshot.
+  if (!artifactSource && isRecord(record.screenshotAsset)) {
+    const asset = record.screenshotAsset;
+    if (typeof asset.url === "string" && asset.url.length > 0) {
+      const candidate: Record<string, unknown> = {
+        type: "image" as const,
+        url: asset.url,
+        mimeType:
+          typeof asset.mimeType === "string" ? asset.mimeType : "image/png",
+        width: typeof record.width === "number" ? record.width : 1024,
+        height: typeof record.height === "number" ? record.height : 1024,
+      };
+      carryStableIdentity(candidate, asset);
+      const result = imageArtifactSchema.safeParse(candidate);
+      if (result.success) {
+        artifacts.push(result.data);
+        artifactSource = "screenshotAsset";
+      }
     }
   }
 
@@ -469,6 +485,10 @@ function extractArtifacts(output: unknown): ToolArtifact[] | undefined {
     if (typeof record.objectPath === "string" && record.objectPath.length > 0) {
       candidate.objectPath = record.objectPath;
     }
+    // X-52: and the asset id, so the video has an owner to authorise against.
+    if (typeof record.assetId === "string" && record.assetId.length > 0) {
+      candidate.assetId = record.assetId;
+    }
     // Prefer LLM-authored title, then original prompt, then technical summary
     if (typeof record.title === "string" && record.title.length > 0) {
       candidate.title = record.title.slice(0, 120);
@@ -483,10 +503,73 @@ function extractArtifacts(output: unknown): ToolArtifact[] | undefined {
     const result = videoArtifactSchema.safeParse(candidate);
     if (result.success) {
       artifacts.push(result.data);
+      artifactSource = "videoUrl";
+    }
+  }
+
+  // New format: sub-agent structured response with url + placement. LAST, so a
+  // plain `url` only counts when no specific key produced an artifact AND the
+  // result is actually an image: `persist_sandbox_file` answers `{ url, mimeType:
+  // "application/pdf", … }`, and minting that as a 512x512 image artifact would
+  // both mislead the client and strip the url out of the model-visible output.
+  const looksLikeImage =
+    record.mimeType === undefined ||
+    (typeof record.mimeType === "string" && record.mimeType.startsWith("image/"));
+
+  if (
+    !artifactSource &&
+    looksLikeImage &&
+    typeof record.url === "string" &&
+    record.url.length > 0
+  ) {
+    const candidate: Record<string, unknown> = {
+      type: "image" as const,
+      url: record.url,
+      mimeType: (record.mimeType as string) ?? "image/png",
+      width: (record.placement as any)?.width ?? 512,
+      height: (record.placement as any)?.height ?? 512,
+    };
+    if (typeof record.title === "string" && record.title.length > 0) {
+      candidate.title = record.title;
+    }
+    if (record.placement && typeof record.placement === "object") {
+      candidate.placement = record.placement;
+    }
+    // X-52: carry the stable identity alongside the URL, so a persisted artifact
+    // can be re-signed later instead of depending on a link that expires.
+    carryStableIdentity(candidate, record);
+    const result = imageArtifactSchema.safeParse(candidate);
+    if (result.success) {
+      artifacts.push(result.data);
+      artifactSource = "url";
     }
   }
 
   return artifacts.length > 0 ? artifacts : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Copy the stable identity (X-52) from a tool result onto an artifact candidate.
+ *
+ * Only non-empty strings are copied. Callers mint the candidate from a key they
+ * already found, so a candidate without a `url` never reaches here — an artifact
+ * whose identity is known but whose fetch URL is not would still be unrenderable
+ * this turn, and both artifact schemas require a url.
+ */
+function carryStableIdentity(
+  candidate: Record<string, unknown>,
+  source: Record<string, unknown>,
+): void {
+  if (typeof source.assetId === "string" && source.assetId.length > 0) {
+    candidate.assetId = source.assetId;
+  }
+  if (typeof source.objectPath === "string" && source.objectPath.length > 0) {
+    candidate.objectPath = source.objectPath;
+  }
 }
 
 /**

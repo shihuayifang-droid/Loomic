@@ -21,10 +21,18 @@ import { createPipelineLogger } from "../ws/logger.js";
 import type { AgentRunMetadataService } from "../features/agent-runs/agent-run-service.js";
 import type { JobService } from "../features/jobs/job-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
+import type { AdminSupabaseClient } from "../supabase/admin.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../supabase/user.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
+import {
+  createAgentProjectAssetService,
+} from "../features/storage/agent-project-assets.js";
+import {
+  PROJECT_ASSET_BUCKET,
+  signProjectAssetUrl,
+} from "../features/storage/project-asset-urls.js";
 // 一期关闭 execute（D-24，AG-39）：不注入、也不自定义任何代码执行工具
-import type { SubmitImageJobFn } from "./tools/image-generate.js";
+import type { PersistImageFn, SubmitImageJobFn } from "./tools/image-generate.js";
 import type { SubmitVideoJobFn } from "./tools/video-generate.js";
 import type { CreditService } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
@@ -239,6 +247,99 @@ export function buildAttachmentDataMap(
   return map;
 }
 
+/** What one round of attachment resolution produced. */
+export type ResolvedAttachments = {
+  /** Content parts for the model, in the order the attachments arrived. */
+  imageBlocks: Array<{ type: "image_url"; image_url: { url: string } }>;
+  /** The same bytes, for the tool-side map — NOT part of the checkpointed state. */
+  downloaded: Array<{ assetId: string; mimeType: string; base64: string }>;
+};
+
+/**
+ * Resolve the run's attachments to bytes the model can actually receive (X-52).
+ *
+ * The request carries an `assetId` AND a `url`. Only the `assetId` is input: the
+ * URL is the browser's own projection and is used for exactly one thing —
+ * proving the two agree, which catches a forged or stale URL before any bytes
+ * are fetched. Everything the model sees comes from the row behind the
+ * `assetId`, read with the CALLER's JWT (so RLS is the authority on whether they
+ * may use it at all) and signed by the ONE signing service.
+ *
+ * Three refusals, all before the model is called:
+ *   * the asset does not exist or the caller cannot see it,
+ *   * the caller's URL does not match the signed one,
+ *   * the bytes cannot be fetched from the signed URL.
+ *
+ * A refusal here is deliberate rather than lenient: falling back to the
+ * client-supplied URL would mean the model's input is chosen by the request body
+ * instead of by the database, which is the whole "客户端assetId配任意URL" trap in
+ * the ticket's §5. The error text never contains a URL — a signed URL is a
+ * bearer token.
+ */
+export async function resolveAttachmentContent(
+  client: UserSupabaseClient,
+  attachments: ImageAttachment[],
+): Promise<ResolvedAttachments> {
+  const imageBlocks: ResolvedAttachments["imageBlocks"] = [];
+  const downloaded: ResolvedAttachments["downloaded"] = [];
+
+  for (const [index, attachment] of attachments.entries()) {
+    const { data: assetRow, error: assetError } = await client
+      .from("asset_objects")
+      .select("bucket, object_path, mime_type")
+      .eq("id", attachment.assetId)
+      .maybeSingle();
+
+    if (assetError || !assetRow) {
+      // Which half failed is deliberately not disclosed: a row the caller cannot
+      // see and a row that does not exist must be indistinguishable, or the
+      // error becomes an existence oracle for other people's assets.
+      throw new Error(
+        `attachment ${index + 1} references an asset that is not available to this user`,
+      );
+    }
+
+    let signedUrl: string;
+    try {
+      signedUrl = await signProjectAssetUrl(client, assetRow.object_path, {
+        bucket: assetRow.bucket,
+      });
+    } catch {
+      throw new Error(
+        `attachment ${index + 1} could not be authorised for reading`,
+      );
+    }
+
+    if (signedUrl !== attachment.url) {
+      throw new Error(
+        `attachment ${index + 1} carries a URL that does not match its asset`,
+      );
+    }
+
+    const response = await fetch(signedUrl);
+    if (!response.ok) {
+      throw new Error(
+        `attachment ${index + 1} could not be fetched from storage (${response.status})`,
+      );
+    }
+
+    const mimeType =
+      attachment.mimeType ||
+      assetRow.mime_type ||
+      response.headers.get("content-type") ||
+      "image/png";
+    const base64 = Buffer.from(await response.arrayBuffer()).toString("base64");
+
+    downloaded.push({ assetId: attachment.assetId, mimeType, base64 });
+    imageBlocks.push({
+      type: "image_url",
+      image_url: { url: `data:${mimeType};base64,${base64}` },
+    });
+  }
+
+  return { imageBlocks, downloaded };
+}
+
 type RuntimeRunStatus =
   | "accepted"
   | "canceled"
@@ -263,6 +364,13 @@ type CreateAgentRuntimeOptions = {
   agentRunMetadataService?: AgentRunMetadataService;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => unknown;
+  /**
+   * Service-role client getter (X-52). Injected from app.ts so Agent-produced
+   * media can record its ownership through `record_project_asset`; without it
+   * the persist path has no way to write metadata and refuses instead of
+   * returning a URL with no owner.
+   */
+  getAdminClient?: () => AdminSupabaseClient;
   creditService?: CreditService;
   env: ServerEnv;
   eventDelayMs?: number;
@@ -535,6 +643,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         ...agentOptions,
         ...(options.createUserClient
           ? { createUserClient: options.createUserClient }
+          : {}),
+        ...(options.getAdminClient
+          ? { getAdminClient: options.getAdminClient }
           : {}),
       }));
 
@@ -1199,16 +1310,38 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             : createDefaultModelSpecifier({ agentModel: run.modelOverride }))
           : options.model;
 
-        // Build persistImage closure using the user's Supabase client.
-        // Client creation is deferred into the closure so it only runs
-        // when an image is actually generated (avoids throwing in tests
-        // that don't configure Supabase env vars).
-        let persistImage: ((url: string, mime: string, prompt: string) => Promise<string>) | undefined;
-        if (options.createUserClient && run.accessToken) {
+        // Build the persistImage closure (X-52).
+        //
+        // It downloads the provider's bytes and hands them to the ONE persistence
+        // entry point, which uploads with this user's JWT, records ownership from
+        // the CANVAS through the service role, and returns
+        // { assetId, objectPath, mimeType, byteSize, signedUrl }.
+        //
+        // Two things about the previous version are deliberately gone:
+        //   * the public-URL helper — a permanent, unauthenticated URL is exactly
+        //     what stops working the moment the bucket is private;
+        //   * the personal-workspace lookup used to BUILD the object path — the
+        //     job's billing workspace is not what authorises a project's media
+        //     (Q1). Ownership now comes from `record_project_asset(canvasId)`.
+        //
+        // Client creation is deferred into the closure so it only runs when an
+        // image is actually generated (avoids throwing in tests that do not
+        // configure Supabase env vars).
+        let persistImage: PersistImageFn | undefined;
+        if (
+          options.createUserClient &&
+          options.getAdminClient &&
+          run.accessToken &&
+          run.canvasId &&
+          run.userId
+        ) {
           const createClient = options.createUserClient;
+          const getAdminClient = options.getAdminClient;
           const accessToken = run.accessToken;
+          const canvasId = run.canvasId;
+          const createdBy = run.userId;
+
           persistImage = async (sourceUrl, mimeType, prompt) => {
-            const client = createClient(accessToken) as UserSupabaseClient;
             const response = await fetch(sourceUrl);
             if (!response.ok) throw new Error(`Download failed: ${response.status}`);
             const buffer = Buffer.from(await response.arrayBuffer());
@@ -1216,49 +1349,44 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             const slug = prompt.slice(0, 40).replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "");
             const fileName = `gen-${slug}-${Date.now()}.${ext}`;
 
-            // The RLS policy on storage.objects requires the FIRST path segment
-            // to be a workspace UUID the caller belongs to. Falling back to
-            // "default" would therefore always be rejected, so fail loudly here
-            // instead of building a path that cannot possibly work.
-            const { data: ws, error: wsError } = await client
-              .from("workspaces")
-              .select("id")
-              .eq("type", "personal")
-              .limit(1)
-              .single();
-            if (wsError || !ws?.id) {
-              throw new Error(
-                `Cannot resolve personal workspace for storage path: ${wsError?.message ?? "no row"}`,
-              );
-            }
-            const objectPath = `${ws.id}/${Date.now()}-${fileName}`;
+            const agentAssets = createAgentProjectAssetService({
+              createUserClient: (token) =>
+                createClient(token) as UserSupabaseClient,
+              getAdminClient,
+            });
 
-            // LOCAL FORK: retry the upload. Storage latency on a free instance
-            // (ours is ap-southeast-2) was measured swinging between 0.5s and
-            // 16s, and a single transient DatabaseTimeout used to fall through
-            // to the caller's fallback, which embedded the whole image as a
-            // base64 data URI in the canvas document.
+            // LOCAL FORK: retry. Storage latency on a free instance (ours is
+            // ap-southeast-2) was measured swinging between 0.5s and 16s, and a
+            // single transient DatabaseTimeout used to fall through to the
+            // caller's fallback, which embedded the whole image as a base64 data
+            // URI in the canvas document.
+            //
+            // The retry now wraps upload + metadata recording together. A metadata
+            // failure deletes the object it just uploaded, so re-running the whole
+            // step cannot accumulate unowned objects.
             const MAX_ATTEMPTS = 3;
             let lastError: unknown;
             for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-              const { error: uploadError } = await client.storage
-                .from("project-assets")
-                .upload(objectPath, buffer, {
-                  contentType: mimeType,
-                  upsert: false,
+              try {
+                return await agentAssets.persist({
+                  accessToken,
+                  canvasId,
+                  createdBy,
+                  content: buffer,
+                  mimeType,
+                  fileName,
+                  pathPrefix: "generated",
                 });
-              if (!uploadError) {
-                const { data: urlData } = client.storage
-                  .from("project-assets")
-                  .getPublicUrl(objectPath);
-                return urlData.publicUrl;
-              }
-              lastError = uploadError;
-              console.warn(
-                `[persistImage] upload attempt ${attempt}/${MAX_ATTEMPTS} failed: ${uploadError.message}`,
-              );
-              if (attempt < MAX_ATTEMPTS) {
-                await new Promise((r) => setTimeout(r, 1500 * attempt));
+              } catch (error) {
+                lastError = error;
+                console.warn(
+                  `[persistImage] attempt ${attempt}/${MAX_ATTEMPTS} failed: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+                );
+                if (attempt < MAX_ATTEMPTS) {
+                  await new Promise((r) => setTimeout(r, 1500 * attempt));
+                }
               }
             }
 
@@ -1270,6 +1398,22 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               }`,
             );
           };
+        }
+
+        if (
+          !persistImage &&
+          options.createUserClient &&
+          run.accessToken &&
+          (!options.getAdminClient || !run.canvasId || !run.userId)
+        ) {
+          // Stated rather than silent: without an admin client, a canvas and the
+          // acting user there is no owner to derive, so generated media cannot be
+          // filed as a project asset at all. `generate_image` says so instead of
+          // returning a URL that would die with the public bucket.
+          console.warn(
+            "[runtime] persistImage unavailable: needs getAdminClient, canvasId and userId " +
+              "(X-52: media with no derivable owner is not persisted)",
+          );
         }
 
         // Started above alongside persistence and the skills load.
@@ -1384,69 +1528,32 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         let attachmentDataMap: Record<string, string> = {};
 
         if (hasAttachments) {
-          // Download images and build parallel data structures:
-          // 1. imageBlocks: base64 content parts for LLM vision
-          // 2. downloaded: assetId → base64 mapping for tool resolution
-          const downloaded: Array<{ assetId: string; mimeType: string; base64: string }> = [];
-          const imageBlocks = await Promise.all(
-            run.attachments!.map(async (a) => {
-              // What goes into the message decides what gets CHECKPOINTED, and the
-              // message list is reloaded, re-sent and rewritten on every single
-              // turn. Inlining base64 here grew one thread's `messages` channel to
-              // 25.6 MB, which cost ~36s to load, ~40s to upload to the model and
-              // ~16s to write back — for a two-character reply. A URL is ~200 bytes
-              // and the gateway fetches the image itself (verified against kwjm).
-              //
-              // `project-assets` is a public bucket and generated images get
-              // permanent public URLs, so a URL stored in history keeps working on
-              // later turns.
-              const isHttpUrl = /^https?:\/\//.test(a.url);
+          // X-52: the bytes the model sees come from the `asset_objects` row
+          // behind each `assetId`, read with the caller's JWT and re-signed —
+          // NOT from the URL in the request. `resolveAttachmentContent` refuses
+          // (before the model is called) when the asset is absent, not visible to
+          // this user, or paired with a URL that does not match its signature.
+          //
+          // What goes into the message decides what gets CHECKPOINTED, and the
+          // message list is reloaded, re-sent and rewritten on every single turn.
+          // Inlining a user's uploaded bytes there grew one thread's `messages`
+          // channel to 25.6 MB, which cost ~36s to load, ~40s to upload and ~16s
+          // to write back — for a two-character reply. These are the caller's own
+          // bytes for one turn, so they go in as data URLs and are NOT persisted
+          // into chat history by this path.
+          if (!options.createUserClient) {
+            throw new Error(
+              "Cannot resolve image attachments without a user-scoped client.",
+            );
+          }
 
-              try {
-                let b64: string;
-                let mime: string;
+          const attachmentClient = options.createUserClient(
+            run.accessToken ?? "",
+          ) as UserSupabaseClient;
 
-                // Handle data URIs directly (canvas-ref images) — no fetch needed
-                const dataUriMatch = a.url.match(/^data:([^;]+);base64,(.+)$/);
-                if (dataUriMatch) {
-                  mime = dataUriMatch[1]!;
-                  b64 = dataUriMatch[2]!;
-                } else {
-                  const res = await fetch(a.url);
-                  const buf = Buffer.from(await res.arrayBuffer());
-                  mime = a.mimeType || res.headers.get("content-type") || "image/png";
-                  b64 = buf.toString("base64");
-                }
-
-                // The tool-side map is passed through `configurable`, which is NOT
-                // part of the checkpointed graph state — so tools keep their bytes
-                // without those bytes ending up in history.
-                downloaded.push({ assetId: a.assetId, mimeType: mime, base64: b64 });
-
-                // Use standard LangChain image_url format — works with both
-                // Google Gemini and OpenAI adapters. The Anthropic-style
-                // { type: "image", source_type: "base64" } format is NOT
-                // recognized by @langchain/google-genai and gets serialized
-                // as raw text, blowing past the token limit.
-                //
-                // `image_url` MUST be the `{ url }` object form, not a bare
-                // string. @langchain/openai passes unrecognized content parts
-                // through verbatim (converters/completions.ts: `return m`), so a
-                // string reaches the OpenAI-compatible gateway as-is and is
-                // rejected: `invalid type: string "data:image/webp;base64,…",
-                // expected struct OpenAICompletionImageUrl`. Gemini accepts both
-                // forms, which is why the string form went unnoticed.
-                return {
-                  type: "image_url" as const,
-                  image_url: { url: isHttpUrl ? a.url : `data:${mime};base64,${b64}` },
-                };
-              } catch {
-                return {
-                  type: "image_url" as const,
-                  image_url: { url: a.url },
-                };
-              }
-            }),
+          const { imageBlocks, downloaded } = await resolveAttachmentContent(
+            attachmentClient,
+            run.attachments!,
           );
 
           // Build XML text tags for LLM to reference by assetId
@@ -1459,7 +1566,10 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             canvasSummary,
           );
 
-          // Build assetId → data URI map for tool-level resolution
+          // Build assetId → data URI map for tool-level resolution. Passed
+          // through `configurable`, which is NOT part of the checkpointed graph
+          // state — so tools keep their bytes without those bytes ending up in
+          // history.
           attachmentDataMap = buildAttachmentDataMap(downloaded);
 
           userMessage = new HumanMessage({

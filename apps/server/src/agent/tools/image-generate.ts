@@ -3,6 +3,8 @@ import { z } from "zod";
 
 import { randomUUID } from "node:crypto";
 
+import type { AgentAssetReference } from "@loomic/shared";
+
 import { generateImage } from "../../generation/image-generation.js";
 import {
   getAvailableImageModels,
@@ -147,6 +149,14 @@ type ImageGenerateResult = {
   title?: string;
   elementId?: string;
   imageUrl?: string;
+  /**
+   * X-52: stable identity of the stored image, alongside `imageUrl`. Persisted
+   * records (chat blocks, artifacts) key off these; `imageUrl` alone becomes a
+   * broken link once the bucket stops serving public objects.
+   */
+  assetId?: string;
+  objectPath?: string;
+  bucket?: string;
   mimeType?: string;
   width?: number;
   height?: number;
@@ -157,14 +167,17 @@ type ImageGenerateResult = {
 };
 
 /**
- * Optional function to persist a generated image to OSS.
- * Accepts the ephemeral URL and returns a persistent signed URL.
+ * Optional function to persist a generated image to Storage.
+ *
+ * X-52: it returns the STABLE reference (`assetId` + `objectPath` + the mime
+ * type and size it actually wrote), not a URL string. `signedUrl` on the same
+ * object is this read's projection and expires; the identity does not.
  */
 export type PersistImageFn = (
   sourceUrl: string,
   mimeType: string,
   prompt: string,
-) => Promise<string>;
+) => Promise<AgentAssetReference>;
 
 /**
  * Submit an image generation job and wait for it to complete.
@@ -298,11 +311,17 @@ export async function runImageGenerate(
     });
     lap("direct_generate_done", { width: result.width, height: result.height });
 
+    // X-52: the persisted identity, when persistence succeeded. `imageUrl` stays
+    // for readers that only understand a URL, but the assetId/objectPath pair is
+    // what a chat block or artifact records.
+    let persisted: AgentAssetReference | undefined;
+
     let imageUrl = result.url;
     if (persistImage) {
       try {
-        imageUrl = await persistImage(result.url, result.mimeType, input.prompt);
-        lap("persist_image_done");
+        persisted = await persistImage(result.url, result.mimeType, input.prompt);
+        imageUrl = persisted.signedUrl ?? result.url;
+        lap("persist_image_done", { assetId: persisted.assetId });
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         console.error(`[generate_image] persistImage FAILED: ${reason}`);
@@ -334,9 +353,16 @@ export async function runImageGenerate(
       summary: `Generated image (${result.width}x${result.height}) via ${input.model}`,
       title: input.title,
       imageUrl,
-      mimeType: result.mimeType,
+      mimeType: persisted?.mimeType ?? result.mimeType,
       width: result.width,
       height: result.height,
+      ...(persisted
+        ? {
+            assetId: persisted.assetId,
+            objectPath: persisted.objectPath,
+            bucket: persisted.bucket,
+          }
+        : {}),
     };
     if (input.placementX != null && input.placementY != null) {
       directResult.placement = {

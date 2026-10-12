@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import type { ConnectionManager } from "../../ws/connection-manager.js";
 import type { PersistImageFn } from "./image-generate.js";
-import type { ScreenshotResult } from "@loomic/shared";
+import type { AgentAssetReference, ScreenshotResult } from "@loomic/shared";
 
 const screenshotCanvasSchema = z.object({
   mode: z
@@ -58,23 +58,28 @@ export function createScreenshotCanvasTool(deps: {
           timeout,
         );
 
-        // Upload screenshot to storage to get a short HTTPS URL.
-        // Returning the raw data: URI (~1-2 MB base64) in the ToolMessage
-        // would be serialized as text by LangChain adapters (Google Gemini,
-        // OpenAI) since tool responses only support string content — this
-        // causes the conversation to instantly exceed the model's token limit.
-        // Pattern: same as generate_image — short URL in JSON, stream-adapter
-        // extracts screenshotUrl as a frontend artifact.
-        let screenshotUrl: string | undefined;
+        // Upload the screenshot so it has a stable project-asset identity.
+        //
+        // Returning the raw data: URI (~1-2 MB base64) in the ToolMessage would
+        // be serialized as text by LangChain adapters (Google Gemini, OpenAI)
+        // since tool responses only support string content — this causes the
+        // conversation to instantly exceed the model's token limit.
+        //
+        // X-52: the JSON now carries `screenshotAsset` — the STABLE fields
+        // (assetId / objectPath / mimeType) plus this read's `url`. A bare
+        // `screenshotUrl` string was the old shape and could not survive the
+        // bucket going private: nothing in it could be authorised or re-signed.
+        let screenshotAsset: AgentAssetReference | undefined;
         if (deps.persistImage) {
           try {
-            screenshotUrl = await deps.persistImage(
+            screenshotAsset = await deps.persistImage(
               result.url,
               "image/png",
               `canvas-screenshot-${input.mode}`,
             );
           } catch {
-            // Non-fatal: fall back to text-only summary
+            // Non-fatal: fall back to a text-only summary. Deliberately NOT a
+            // fallback to the raw data URI — see above.
           }
         }
 
@@ -84,8 +89,19 @@ export function createScreenshotCanvasTool(deps: {
           height: result.height,
         };
 
-        if (screenshotUrl) {
-          output.screenshotUrl = screenshotUrl;
+        if (screenshotAsset) {
+          // `url` is the projection for this turn; the caller that persists the
+          // screenshot must keep assetId/objectPath instead.
+          output.screenshotAsset = {
+            assetId: screenshotAsset.assetId,
+            objectPath: screenshotAsset.objectPath,
+            bucket: screenshotAsset.bucket,
+            mimeType: screenshotAsset.mimeType,
+            byteSize: screenshotAsset.byteSize,
+            ...(screenshotAsset.signedUrl
+              ? { url: screenshotAsset.signedUrl }
+              : {}),
+          };
         }
 
         return JSON.stringify(output);

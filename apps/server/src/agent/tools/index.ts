@@ -1,6 +1,7 @@
 import type { StructuredTool } from "@langchain/core/tools";
 import type { BackendFactory, BackendProtocol } from "deepagents";
 
+import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { ConnectionManager } from "../../ws/connection-manager.js";
 import { createBrandKitTool } from "./brand-kit.js";
 import { createInspectCanvasTool } from "./inspect-canvas.js";
@@ -54,6 +55,12 @@ export function createMainAgentTools(
   backend: BackendProtocol | BackendFactory,
   deps: {
     createUserClient: (accessToken: string) => any;
+    /**
+     * Service-role client getter (X-52). Required so the sandbox-file producer
+     * can record asset ownership through the service_role-only
+     * `record_project_asset`; the user client cannot call it.
+     */
+    getAdminClient?: () => AdminSupabaseClient;
     brandKitId?: string | null;
     connectionManager?: ConnectionManager;
     persistImage?: PersistImageFn;
@@ -72,12 +79,21 @@ export function createMainAgentTools(
 
   // persist_sandbox_file 必须有沙箱根目录才有可校验的上传范围。
   // 没有 sandboxDir 就不注册这个工具，而不是注册一个不校验路径的版本。
-  if (deps.sandboxDir) {
+  // X-52 之后还有一个必要条件：没有 admin client 就记不了归属，
+  // 同样不注册 —— 而不是注册一个会写出无归属对象的版本。
+  if (deps.sandboxDir && deps.getAdminClient) {
     tools.push(
       createPersistSandboxFileTool({
         createUserClient: deps.createUserClient,
+        getAdminClient: deps.getAdminClient,
         sandboxDir: deps.sandboxDir,
       }),
+    );
+  } else if (deps.sandboxDir) {
+    console.warn(
+      "[tools] no getAdminClient — persist_sandbox_file will not be offered, " +
+        "because an upload without recorded ownership cannot be authorised once " +
+        "the bucket is private (X-52)",
     );
   }
 

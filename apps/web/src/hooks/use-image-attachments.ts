@@ -38,6 +38,42 @@ export type ReadyAttachment = {
   name?: string;
 };
 
+/**
+ * X-52: what the browser is allowed to submit is decided by `assetId` alone.
+ *
+ * A URL is a short-lived signature and, in this hook, only ever a PREVIEW — the
+ * object URL of the file being uploaded, or last read's signature for a canvas
+ * reference. A record whose only handle on its media is a URL must never become
+ * an attachment: the server would have nothing to authorise, and the run would
+ * be refused (or worse, would trust a URL the client chose).
+ *
+ * Kept as a free function, not inlined into the hook, so the rule is testable on
+ * its own rather than only through a rendered component.
+ */
+export function toReadyAttachments(
+  attachments: ImageAttachmentState[],
+): ReadyAttachment[] {
+  const ready: ReadyAttachment[] = [];
+
+  for (const attachment of attachments) {
+    // The identity, and nothing else, decides eligibility.
+    if (!attachment.assetId || attachment.error || attachment.uploading) continue;
+
+    ready.push({
+      assetId: attachment.assetId,
+      // A missing url is not disqualifying: the server re-signs from the assetId
+      // and its own copy of the URL must match what it mints. Sending an empty
+      // string here would only make the request fail its URL match.
+      url: attachment.url ?? "",
+      mimeType: attachment.mimeType,
+      source: attachment.source,
+      ...(attachment.name ? { name: attachment.name } : {}),
+    });
+  }
+
+  return ready;
+}
+
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
@@ -134,6 +170,9 @@ export function useImageAttachments(accessToken: string, projectId?: string) {
       ...prev,
       {
         id,
+        // X-52: the canvas read's signed URL is a PREVIEW for this session only.
+        // It is not the identity — `assetId` is, and a re-opened session or a new
+        // Agent run re-signs from it.
         preview: ref.url,
         uploading: false,
         assetId: ref.assetId,
@@ -212,15 +251,7 @@ export function useImageAttachments(accessToken: string, projectId?: string) {
   // Annotated rather than inferred: the inferred object literal type silently
   // omits optional fields nothing in this file sets (thumbnailUrl), which then
   // makes them unassignable at the consumer even though ReadyAttachment has them.
-  const readyAttachments: ReadyAttachment[] = attachments
-    .filter((a) => a.assetId && a.url && !a.error)
-    .map((a) => ({
-      assetId: a.assetId!,
-      url: a.url!,
-      mimeType: a.mimeType,
-      source: a.source,
-      ...(a.name ? { name: a.name } : {}),
-    }));
+  const readyAttachments: ReadyAttachment[] = toReadyAttachments(attachments);
 
   return {
     attachments,

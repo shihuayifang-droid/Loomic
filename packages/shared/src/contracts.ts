@@ -1,7 +1,19 @@
 import { z } from "zod";
 
-import { toolArtifactSchema } from "./artifacts.js";
+import {
+  agentAssetReferenceSchema,
+  toolArtifactSchema,
+  type AgentAssetReference,
+} from "./artifacts.js";
 import { brandKitAssetTypeSchema } from "./brand-kit-contracts.js";
+
+/**
+ * X-52: re-exported through the contract barrel so server and web agree on one
+ * definition of "a stable reference to a project asset" — `assetId` first,
+ * `objectPath` for diagnostics, `signedUrl` only as this read's projection.
+ */
+export { agentAssetReferenceSchema };
+export type { AgentAssetReference };
 
 export const identifierSchema = z.string().min(1);
 export const timestampSchema = z.string().datetime({ offset: true });
@@ -28,6 +40,14 @@ export const runStatusSchema = z.enum([
 
 export const imageAttachmentSchema = z.object({
   assetId: z.string().min(1),
+  /**
+   * X-52: a BROWSER PROJECTION for this request only — never the authority for
+   * what the model is shown. The runtime re-reads the `asset_objects` row behind
+   * `assetId` through the caller's JWT and re-signs it; the URL sent here must
+   * match that signature or the run is refused. Kept required so an older client
+   * still parses, and so a mismatched URL is detectably different from an absent
+   * one rather than silently ignored.
+   */
   url: z.string().url(),
   mimeType: z.string().min(1),
   name: z.string().min(1).optional(),

@@ -3,7 +3,15 @@ import { readFile, stat } from "node:fs/promises";
 import { basename, extname, isAbsolute, relative, resolve } from "node:path";
 import { tool } from "@langchain/core/tools";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { decodeJwt } from "jose";
 import { z } from "zod";
+
+import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type { UserSupabaseClient } from "../../supabase/user.js";
+import {
+  AgentProjectAssetError,
+  createAgentProjectAssetService,
+} from "../../features/storage/agent-project-assets.js";
 
 const MIME_MAP: Record<string, string> = {
   ".png": "image/png",
@@ -20,6 +28,17 @@ const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 const OUTSIDE_SANDBOX_ERROR =
   "Error: filePath must be inside the sandbox directory.";
 
+/**
+ * X-52: a sandbox file can only become a project asset if we know which canvas
+ * it belongs to. Without one there is no owner to derive, and the old behaviour
+ * — writing to an unowned `uploads/...` key — produced an object nobody could
+ * ever be authorised to read once the bucket is private. Refusing is the honest
+ * answer; inventing a path is not.
+ */
+const NO_CANVAS_ERROR =
+  "Error: no canvas context available, so this file cannot be persisted as a project asset. " +
+  "Ask the user to open the canvas this file belongs to.";
+
 const persistSandboxFileSchema = z.object({
   filePath: z
     .string()
@@ -34,6 +53,11 @@ const persistSandboxFileSchema = z.object({
 
 export type PersistSandboxFileDeps = {
   createUserClient: (accessToken: string) => SupabaseClient;
+  /**
+   * Service-role client getter. Required: ownership is recorded through the
+   * service_role-only `record_project_asset`, which the user client cannot call.
+   */
+  getAdminClient: () => AdminSupabaseClient;
   /**
    * Sandbox root. Required on purpose: without it there is no range we can
    * prove a path belongs to, and this tool reads a host file and uploads it.
@@ -56,7 +80,29 @@ function isInsideRoot(root: string, candidate: string): boolean {
   return true;
 }
 
+/**
+ * The `sub` claim of the caller's JWT — the user id every asset row is filed
+ * under. Local decode only: the token was already verified before the run was
+ * accepted, and re-verifying here would add a round trip to a tool call.
+ */
+function readSubject(accessToken: string): string | null {
+  try {
+    const payload = decodeJwt(accessToken);
+    return typeof payload.sub === "string" && payload.sub.length > 0
+      ? payload.sub
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
+  const agentAssets = createAgentProjectAssetService({
+    createUserClient: (accessToken) =>
+      deps.createUserClient(accessToken) as unknown as UserSupabaseClient,
+    getAdminClient: deps.getAdminClient,
+  });
+
   return tool(
     async (input, config) => {
       const accessToken = (config as any)?.configurable?.access_token as
@@ -68,6 +114,21 @@ export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
 
       if (!accessToken) {
         return "Error: No access token available. Cannot upload file.";
+      }
+
+      // `created_by` on the asset row. Taken from the caller's own token `sub`
+      // rather than a `configurable` field so it cannot disagree with the JWT
+      // that authorises the write, and without a second network round trip.
+      const createdBy = readSubject(accessToken);
+      if (!createdBy) {
+        return "Error: the access token carries no subject claim. Cannot record asset ownership.";
+      }
+
+      // Refused up front rather than after reading and uploading the file: see
+      // NO_CANVAS_ERROR. The canvas id is what `record_project_asset` derives
+      // the project and team workspace from.
+      if (!canvasId) {
+        return NO_CANVAS_ERROR;
       }
 
       const sandboxRoot = resolve(deps.sandboxDir);
@@ -116,50 +177,35 @@ export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
           ? `${safeTitle}${ext}`
           : basename(resolvedPath);
 
-        const client = deps.createUserClient(accessToken);
-
-        // Resolve workspace ID from canvas for Storage RLS compliance.
-        // RLS requires: storage.foldername(name)[1] = workspace_id
-        let workspaceId: string | null = null;
-        if (canvasId) {
-          const { data: canvas } = await client
-            .from("canvases")
-            .select("project:projects(workspace_id)")
-            .eq("id", canvasId)
-            .single();
-          workspaceId = (canvas?.project as any)?.workspace_id ?? null;
-        }
-
-        const storagePath = workspaceId
-          ? `${workspaceId}/generated/${Date.now()}-${fileName}`
-          : `uploads/${Date.now()}-${fileName}`;
-        const { data, error } = await client.storage
-          .from("project-assets")
-          .upload(storagePath, fileBuffer, {
-            contentType: mimeType,
-            upsert: false,
-          });
-
-        if (error) {
-          return `Error uploading file: ${error.message}`;
-        }
-
-        const signedResult = await client.storage
-          .from("project-assets")
-          .createSignedUrl(data.path, 3600);
-
-        if (signedResult.error || !signedResult.data) {
-          return `Error creating signed URL: ${signedResult.error?.message ?? "unknown"}`;
-        }
+        // The ONE persistence path (X-52): upload with the user's JWT, record
+        // ownership from the canvas through the service role, sign for this
+        // read. Nothing here builds a storage path of its own — an unowned
+        // `uploads/...` key is exactly what this ticket removes.
+        const asset = await agentAssets.persist({
+          accessToken,
+          canvasId,
+          createdBy,
+          content: fileBuffer,
+          mimeType,
+          fileName,
+          pathPrefix: "generated",
+        });
 
         return JSON.stringify({
           summary: `File uploaded successfully: ${fileName}`,
-          url: signedResult.data.signedUrl,
-          path: data.path,
-          mimeType,
-          size: fileBuffer.length,
+          // Stable fields first: they are what a persisted record keeps.
+          assetId: asset.assetId,
+          objectPath: asset.objectPath,
+          bucket: asset.bucket,
+          mimeType: asset.mimeType,
+          size: asset.byteSize,
+          // This read's projection only.
+          ...(asset.signedUrl ? { url: asset.signedUrl } : {}),
         });
       } catch (err: any) {
+        if (err instanceof AgentProjectAssetError) {
+          return `Error uploading file: ${err.message}`;
+        }
         return `Error reading or uploading file: ${err.message}`;
       }
     },
@@ -167,8 +213,8 @@ export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
       name: "persist_sandbox_file",
       description:
         "Upload a file the agent wrote into the sandbox (e.g., a PDF or PNG created with write_file) " +
-        "to persistent storage. Returns a signed URL the user can access. " +
-        "Pass the sandbox path you wrote to, e.g. /output.png.",
+        "to persistent project storage. Returns the asset's stable id (assetId/objectPath) and a " +
+        "short-lived URL for this turn. Pass the sandbox path you wrote to, e.g. /output.png.",
       schema: persistSandboxFileSchema,
     },
   );

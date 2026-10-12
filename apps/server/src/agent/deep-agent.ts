@@ -5,6 +5,7 @@ import { ChatVertexAI } from "@langchain/google-vertexai";
 import { createDeepAgent } from "deepagents";
 
 import { DEFAULT_AGENT_MODEL, DEFAULT_GOOGLE_AGENT_MODEL, type ServerEnv } from "../config/env.js";
+import type { AdminSupabaseClient } from "../supabase/admin.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
 import { createAgentBackend, type AgentBackendResult } from "./backends/index.js";
 import { ChatOpenAIImageUrlCompat } from "./openai-image-url-compat.js";
@@ -27,6 +28,8 @@ export type LoomicAgentFactory = (options: {
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => any;
+  /** Service-role getter for asset ownership recording (X-52). */
+  getAdminClient?: () => AdminSupabaseClient;
   env: ServerEnv;
   model?: BaseLanguageModel | string;
   persistImage?: PersistImageFn;
@@ -44,6 +47,7 @@ export function createLoomicDeepAgent(options: {
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => any;
+  getAdminClient?: () => AdminSupabaseClient;
   env: ServerEnv;
   model?: BaseLanguageModel | string;
   persistImage?: PersistImageFn;
@@ -115,6 +119,7 @@ export function createLoomicDeepAgent(options: {
     systemPrompt,
     tools: createMainAgentTools(backendResult.factory, {
       createUserClient,
+      ...(options.getAdminClient ? { getAdminClient: options.getAdminClient } : {}),
       ...(options.brandKitId != null ? { brandKitId: options.brandKitId } : {}),
       ...(options.connectionManager ? { connectionManager: options.connectionManager } : {}),
       ...(options.persistImage ? { persistImage: options.persistImage } : {}),

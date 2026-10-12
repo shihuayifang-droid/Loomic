@@ -18,12 +18,11 @@ vi.mock("./canvas-version.js", () => ({
   CanvasNotFoundError: class CanvasNotFoundError extends Error {},
   CanvasUnavailableError: class CanvasUnavailableError extends Error {},
 }));
-
 import type { CanvasContent } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
-import { replaceCanvasContent } from "./canvas-version.js";
+import { readCanvasRow, replaceCanvasContent } from "./canvas-version.js";
 import { createCanvasService } from "./canvas-service.js";
 
 const USER = {
@@ -100,6 +99,7 @@ function contentWithFiles(files: Record<string, unknown>): CanvasContent {
 }
 
 const replaceMock = vi.mocked(replaceCanvasContent);
+const readMock = vi.mocked(readCanvasRow);
 
 /**
  * The files as they were handed to the write. `saveCanvasContent` returns the
@@ -112,6 +112,10 @@ function savedFiles(): Record<string, { dataURL?: string }> {
 
 beforeEach(() => {
   replaceMock.mockClear();
+  // The read-path cases install their own `readCanvasRow`; clearing here (before
+  // each implementation is installed) keeps a stale canvas row from leaking into
+  // the save-path cases.
+  readMock.mockClear();
 });
 
 describe("canvas file extraction records asset metadata", () => {
@@ -217,5 +221,146 @@ describe("canvas file extraction records asset metadata", () => {
     const files = savedFiles();
     expect(files["file-1"]?.dataURL).toBe("https://cdn.test/legacy.png");
     expect(files["file-2"]?.dataURL).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// X-52 T3: the READ projection the browser uses as the Agent's attachment
+// identity.
+//
+// The canvas marker is `oss://project-assets/<objectPath>` — a path, not an id.
+// The browser used to make do with the Excalidraw element id, which is an
+// identity of the ELEMENT and has nothing to do with the stored object, so the
+// server now reports the real `assetId` next to the file.
+//
+// A file with no metadata row keeps NO assetId. Guessing one from the path is
+// the "把旧URL反解为objectPath" trap: authorising against a guessed owner is worse
+// than a file that cannot be attached.
+// ---------------------------------------------------------------------------
+
+type ReadStub = {
+  service: ReturnType<typeof createCanvasService>;
+  lookups: Array<{ bucket: string; paths: string[] }>;
+};
+
+function makeReadStub(options: {
+  /** `asset_objects` rows the caller can see. */
+  assets?: Array<{ id: string; object_path: string }>;
+  assetError?: { message: string } | null;
+  files: Record<string, unknown>;
+}): ReadStub {
+  const lookups: Array<{ bucket: string; paths: string[] }> = [];
+
+  const userClient = {
+    from(table: string) {
+      if (table === "asset_objects") {
+        const chain: Record<string, unknown> = {};
+        chain.select = () => chain;
+        chain.eq = (column: string, value: string) => {
+          chain.__bucket = value;
+          return chain;
+        };
+        chain.in = async (column: string, values: string[]) => {
+          lookups.push({ bucket: String(chain.__bucket ?? ""), paths: values });
+          if (options.assetError) return { data: null, error: options.assetError };
+          return { data: options.assets ?? [], error: null };
+        };
+        return chain;
+      }
+      // Any other table: no rows, no error.
+      const empty: Record<string, unknown> = {};
+      empty.select = () => empty;
+      empty.eq = () => empty;
+      empty.in = async () => ({ data: [], error: null });
+      return empty;
+    },
+    storage: {
+      from(bucket: string) {
+        return {
+          createSignedUrl: async (path: string) => ({
+            data: {
+              signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+            },
+            error: null,
+          }),
+        };
+      },
+    },
+  };
+
+  const readContent: CanvasContent = {
+    elements: [],
+    files: options.files,
+  } as unknown as CanvasContent;
+
+  vi.mocked(readCanvasRow).mockImplementation(async () => ({
+    id: "canvas-1",
+    name: "Canvas",
+    project_id: PROJECT,
+    content: readContent,
+    version: 3,
+  }));
+
+  const service = createCanvasService({
+    createUserClient: () => userClient as unknown as UserSupabaseClient,
+    getAdminClient: () =>
+      ({ rpc: async () => ({ data: null, error: null }) }) as unknown as AdminSupabaseClient,
+  });
+
+  return { service, lookups };
+}
+
+function readFiles(result: { content: CanvasContent }): Record<string, Record<string, unknown>> {
+  return result.content.files as unknown as Record<string, Record<string, unknown>>;
+}
+
+describe("canvas read projects the real assetId (X-52 T3)", () => {
+  it("case 1: an oss file gets its assetId from the exact (bucket, object_path) row", async () => {
+    const stub = makeReadStub({
+      files: {
+        "el-1": {
+          id: "el-1",
+          dataURL: "oss://project-assets/ws-team/canvas-1/pic.png",
+          mimeType: "image/png",
+        },
+      },
+      assets: [{ id: "asset-real-1", object_path: "ws-team/canvas-1/pic.png" }],
+    });
+
+    const result = await stub.service.getCanvas(USER, "canvas-1");
+    const files = readFiles(result);
+
+    expect(files["el-1"]?.assetId).toBe("asset-real-1");
+    // Looked up by bucket AND path — never by parsing the marker into a project.
+    expect(stub.lookups[0]?.bucket).toBe("project-assets");
+    expect(stub.lookups[0]?.paths).toEqual(["ws-team/canvas-1/pic.png"]);
+    // The marker itself is untouched: the id is a response projection only.
+    expect(files["el-1"]?.dataURL).toBe(
+      "oss://project-assets/ws-team/canvas-1/pic.png",
+    );
+  });
+
+  it("case 2: a legacy file with no metadata row gets NO assetId", async () => {
+    const stub = makeReadStub({
+      files: {
+        "el-legacy": {
+          id: "el-legacy",
+          dataURL: "oss://project-assets/ws-team/canvas-1/old.png",
+          mimeType: "image/png",
+        },
+      },
+      assets: [],
+    });
+
+    const result = await stub.service.getCanvas(USER, "canvas-1");
+    const files = readFiles(result);
+
+    expect(files["el-legacy"]?.assetId).toBeUndefined();
+    // Still readable — the marker and its signed URL survive. It simply cannot be
+    // sent as a persistent Agent attachment, which is the client's call to make.
+    expect(files["el-legacy"]?.dataURL).toBe(
+      "oss://project-assets/ws-team/canvas-1/old.png",
+    );
+    expect(String(files["el-legacy"]?.storageUrl)).toContain("token=sig");
   });
 });

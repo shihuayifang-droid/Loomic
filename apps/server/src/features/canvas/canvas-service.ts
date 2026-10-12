@@ -567,6 +567,23 @@ async function resolveFilesFromStorage(
     return content;
   }
 
+  // X-52 (T3): the RESPONSE field each file also carries — the real asset id of
+  // the object behind its marker.
+  //
+  // It is looked up by the exact `(bucket, object_path)` pair, through the
+  // CALLER's client, because `asset_objects` RLS is what says whether they may
+  // see this asset at all. Two things are deliberately absent:
+  //   * nothing here parses the marker's path to guess a project or workspace —
+  //     the row is the authority, the string is only a lookup key;
+  //   * this is a RESPONSE-only projection. It is never written into the canvas
+  //     JSON, so the document keeps carrying `oss://<bucket>/<path>` exactly as
+  //     before and no client can inject an id of its own choosing.
+  //
+  // A file with no row simply has no assetId: that is a legacy object (extracted
+  // before工单12/13), and T3's rule is that it cannot be sent as a persistent
+  // Agent attachment rather than that it should be guessed at.
+  const assetIdByMarker = await lookupAssetIds(client, ossEntries);
+
   // Resolve public URLs instead of downloading each file
   // Group by bucket (normally all in one bucket)
   const byBucket = new Map<string, typeof ossEntries>();
@@ -640,6 +657,12 @@ async function resolveFilesFromStorage(
         // and then working again minutes later. An optimisation must not be able
         // to cost the user their picture, so the plain object stays reachable.
         storageUrlOriginal: original,
+        // X-52 (T3): the stable identity the browser must use when it hands this
+        // file to the Agent. Absent for a legacy object with no metadata row —
+        // see below.
+        ...(assetIdByMarker.get(entry.objectPath)
+          ? { assetId: assetIdByMarker.get(entry.objectPath) }
+          : {}),
       };
     }
   }
@@ -648,6 +671,59 @@ async function resolveFilesFromStorage(
     ...content,
     files: updatedFiles,
   } as CanvasContent;
+}
+
+/**
+ * X-52 (T3): object path → asset id, for every marker on this canvas.
+ *
+ * Keyed by OBJECT PATH because that is what the canvas marker carries; the
+ * bucket is part of the `(bucket, object_path)` predicate so an object of the
+ * same name in another bucket cannot answer for this one.
+ *
+ * A failure or a missing row yields no entry rather than an error: an asset the
+ * caller may not read is indistinguishable from one that does not exist, and
+ * neither should stop the canvas from loading.
+ */
+async function lookupAssetIds(
+  client: UserSupabaseClient,
+  entries: ReadonlyArray<{ bucket: string; objectPath: string }>,
+): Promise<Map<string, string>> {
+  const byMarker = new Map<string, string>();
+  const buckets = [...new Set(entries.map((entry) => entry.bucket))];
+  const paths = [...new Set(entries.map((entry) => entry.objectPath))];
+
+  const results = await Promise.all(
+    buckets.map(async (bucket) => {
+      try {
+        const { data, error } = await client
+          .from("asset_objects")
+          .select("id, object_path, bucket")
+          .eq("bucket", bucket)
+          .in("object_path", paths);
+
+        if (error) {
+          console.log(
+            `[canvas-service] asset id lookup failed bucket=${bucket} reason=${error.message}`,
+          );
+          return [];
+        }
+        return (data ?? []) as Array<{ id: string; object_path: string }>;
+      } catch (error) {
+        console.log(
+          `[canvas-service] asset id lookup threw bucket=${bucket} reason=${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return [];
+      }
+    }),
+  );
+
+  for (const row of results.flat()) {
+    byMarker.set(row.object_path, row.id);
+  }
+
+  return byMarker;
 }
 
 async function resolveVideoElementsFromStorage(

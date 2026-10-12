@@ -268,32 +268,56 @@ function CanvasPageContent() {
     });
   }, []);
 
+  /**
+   * The canvas images the user may reference in a prompt (X-52 T3).
+   *
+   * `assetId` comes from the SERVER's file projection, which resolved it from
+   * the object's `asset_objects` row. It used to be `el.id` — the Excalidraw
+   * element's own id, which says nothing about the stored object — and that made
+   * every canvas attachment an un-authorisable reference: the runtime would look
+   * up an asset that does not exist and refuse the run.
+   *
+   * A file with no `assetId` is a pre-X-52 object whose owner cannot be
+   * established. It is left out of the picker rather than offered and then
+   * rejected: the ticket's rule is that such a file is NOT a valid persistent
+   * Agent attachment, and inventing an id from the element or the marker path
+   * would authorise it against a guess.
+   */
   const handleRequestCanvasImages = useCallback((): CanvasImageItem[] => {
     const api = excalidrawApiRef.current;
     if (!api) return [];
     const elements: any[] = api.getSceneElements() ?? [];
     const files: Record<string, any> = api.getFiles() ?? {};
     let idx = 0;
-    return elements
-      .filter((el: any) => el.type === "image" && !el.isDeleted && el.fileId)
-      .map((el: any) => {
-        idx++;
-        const file = files[el.fileId];
-        const dataURL = file?.dataURL ?? "";
-        const title =
-          el.customData?.title ||
-          el.customData?.label ||
-          `Image ${idx}`;
-        return {
-          kind: "canvas-image",
-          id: el.id,
-          name: title,
-          thumbnailUrl: dataURL,
-          assetId: el.id,
-          url: dataURL,
-          mimeType: file?.mimeType ?? "image/png",
-        };
+    const items: CanvasImageItem[] = [];
+    for (const el of elements) {
+      if (el.type !== "image" || el.isDeleted || !el.fileId) continue;
+      const file = files[el.fileId];
+      // The stable identity, and nothing else. `storageUrlOriginal` is the
+      // undownscaled object — the full-resolution URL is what the model gets.
+      const assetId = typeof file?.assetId === "string" ? file.assetId : undefined;
+      if (!assetId) continue;
+      const url =
+        (typeof file?.storageUrlOriginal === "string" && file.storageUrlOriginal) ||
+        (typeof file?.storageUrl === "string" && file.storageUrl) ||
+        (typeof file?.dataURL === "string" && !file.dataURL.startsWith("oss://")
+          ? file.dataURL
+          : "");
+      if (!url) continue;
+
+      idx++;
+      const title = el.customData?.title || el.customData?.label || `Image ${idx}`;
+      items.push({
+        kind: "canvas-image",
+        id: el.id,
+        name: title,
+        thumbnailUrl: url,
+        assetId,
+        url,
+        mimeType: file?.mimeType ?? "image/png",
       });
+    }
+    return items;
   }, []);
 
   // Only re-fetch when canvasId changes or on initial auth resolution.
