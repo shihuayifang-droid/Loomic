@@ -87,16 +87,22 @@ function CanvasPageContent() {
   // X-52: one dedupe instance for the whole page, so the same expired URL cannot
   // ask for a refresh twice (each ask is a full canvas read). A ref, not state:
   // a re-render must not hand the editor a brand new instance, which would let
-  // an element that keeps erroring refresh over and over.
+  // an element that keeps erroring refresh over and over. The budget that bounds
+  // the loop (5 real refreshes per page load) lives inside this instance and is
+  // charged only when a refresh actually starts — the page must NOT pre-deduct
+  // it, or repeating an already-known-bad URL would spend refreshes it never
+  // asked for.
   const mediaRefreshRef = useRef<CanvasMediaRefresh | null>(null);
   if (mediaRefreshRef.current === null) {
     mediaRefreshRef.current = createCanvasMediaRefresh();
   }
-  // How many signature refreshes this page load may still ask for. Small on
-  // purpose: a healthy canvas needs at most one per expiry, and this is the bound
-  // that stops the unbounded cycle described in handleStorageMediaError below —
-  // the refresher dedupes per URL string, and each re-read mints a NEW one.
-  const mediaRefreshBudgetRef = useRef(5);
+  // X-52: the canvas.sync path (WebSocket, job fallback, Chat) resolves the same
+  // storage URLs the first editor load does, so it has to reach the SAME refresh
+  // callback. handleCanvasSync is declared first and handleStorageMediaError is
+  // built on top of it, so the two would otherwise be circular; the ref breaks
+  // the cycle exactly the way canvas-editor does it, and keeps the callback
+  // current across re-renders.
+  const storageMediaErrorRef = useRef<((url: string) => void) | null>(null);
   // Generation slots we have already auto-focused. Keeps a batch of images from
   // repeatedly dragging the viewport back on every canvas.sync.
   const focusedSlotsRef = useRef<Set<string>>(new Set());
@@ -166,8 +172,14 @@ function CanvasPageContent() {
       // Excalidraw can draw them. Awaiting this BEFORE updateScene means the
       // element and its pixels land together, instead of flashing a
       // broken-image box.
+      //
+      // The failure callback goes with it: a sync that hands over a file whose
+      // signature has expired must be able to ask for a re-read, exactly like
+      // the first editor load does. Both paths share the one callback below.
       if (files && Object.keys(files).length > 0) {
-        await syncCanvasFilesIntoScene(api, files, elements, canvasData.id);
+        await syncCanvasFilesIntoScene(api, files, elements, canvasData.id, (url) => {
+          storageMediaErrorRef.current?.(url);
+        });
       }
 
       api.updateScene({ elements, captureUpdate: "IMMEDIATELY" });
@@ -181,22 +193,23 @@ function CanvasPageContent() {
     }
   }, [canvasData]);
 
-  // X-52: a canvas media element reports a load failure here. The refresh IS the
-  // existing sync above — re-reading the canvas through the API and pushing the
-  // resolved files back into the scene is the only flow that turns stored
-  // `oss://` markers into freshly signed URLs. Deliberately nothing else: no page
-  // reload, no retry of the dead URL, no public-URL fallback.
+  // X-52: a canvas media element reports a load failure here — from the first
+  // editor load and from every canvas.sync alike. The refresh IS the existing
+  // sync above — re-reading the canvas through the API and pushing the resolved
+  // files back into the scene is the only flow that turns stored `oss://` markers
+  // into freshly signed URLs. Deliberately nothing else: no page reload, no retry
+  // of the dead URL, no public-URL fallback.
   const handleStorageMediaError = useCallback(
     (url: string) => {
       // A provider CDN link that failed (pre-CV-01 video elements carry one) is
       // not something a re-read of the canvas can repair.
       if (!isStorageMediaUrl(url)) return;
 
-      // THE BOUND, see mediaRefreshBudgetRef. Once it runs out the element simply
-      // stays as it is: what loads, loads, and no request loop is sustained.
-      if (mediaRefreshBudgetRef.current <= 0) return;
-      mediaRefreshBudgetRef.current -= 1;
-
+      // No budget check here on purpose. The refresher dedupes the URL first and
+      // only then charges its 5-refresh bound, so an element that keeps reporting
+      // the same dead URL costs nothing; once the bound is reached it stops
+      // issuing requests by itself. Pre-deducting here is what let five reports of
+      // one broken image exhaust every future refresh.
       void mediaRefreshRef.current
         ?.reportFailure(url, handleCanvasSync)
         .then((outcome) => {
@@ -213,6 +226,8 @@ function CanvasPageContent() {
     },
     [handleCanvasSync],
   );
+  // Keep the ref current for the sync path declared above.
+  storageMediaErrorRef.current = handleStorageMediaError;
 
   // Fallback polling for timed-out generation jobs.
   // When the agent's tool times out but the worker eventually succeeds,

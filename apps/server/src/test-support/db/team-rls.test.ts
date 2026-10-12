@@ -681,4 +681,42 @@ describe("team workspace and owner-scoped project RLS", () => {
     expect(await canRead(USER_X, withoutMetadata)).toBe(0);
     expect(await canRead(null, withoutMetadata)).toBe(0);
   });
+
+  it("case 16: an owner-less object is readable only by the team admin or owner", async () => {
+    // 工单13 的第二个已确认例外：`owner is null and is_workspace_admin_or_owner(path 首段)`。
+    // 它镜像的是 UPDATE/DELETE 上已有的管理员清理权限 —— 无 owner 的遗留对象如果 SELECT
+    // 看不见，DELETE/UPDATE 就匹配不到行，等于永远清不掉。本用例证明这个例外没有顺带
+    // 把普通成员或外部用户放进来：它只认工作区管理员/owner，与 metadata 行、与是不是
+    // 项目作者都无关。
+    //
+    // 身份状态提醒：用例 12 已经把 USER_A 移出团队（其项目转给了 USER_M），所以这里
+    // USER_A 是「前成员 + 原项目作者」，而「在册普通成员」这一行由 USER_B 承担。
+    const ownerless = `${teamId}/generated/ownerless.png`;
+    await db.query("insert into storage.objects (bucket_id, name, owner) values ($1, $2, null)", [
+      "project-assets",
+      ownerless,
+    ]);
+
+    const canRead = async (userId: string | null): Promise<number> =>
+      asUser(db, userId, async (tx) =>
+        firstRow(
+          (
+            await tx.query<{ n: number }>(
+              "select count(*)::int as n from storage.objects where name = $1",
+              [ownerless],
+            )
+          ).rows,
+        ).n,
+      );
+
+    expect(await canRead(USER_M)).toBe(1);
+    expect(await canRead(USER_O)).toBe(1);
+
+    // USER_B 在册但只是 member：例外不放宽到普通成员；非成员与 anon 更不行。
+    expect(await canRead(USER_B)).toBe(0);
+    expect(await canRead(USER_X)).toBe(0);
+    expect(await canRead(null)).toBe(0);
+    // 原项目作者也不例外：这条路径上的授权只问「是不是管理员/owner」。
+    expect(await canRead(USER_A)).toBe(0);
+  });
 });

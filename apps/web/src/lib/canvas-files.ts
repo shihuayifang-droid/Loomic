@@ -222,6 +222,14 @@ export async function fetchPendingCanvasFiles(
  * Push a document's files into a live Excalidraw scene, fetching storage-backed
  * ones first.
  *
+ * `onFailure` must be forwarded rather than optional-by-accident: this is the
+ * canvas.sync path (WebSocket push, job fallback, chat), and a sync is exactly
+ * when a NEWLY generated image first appears — its signature is minted at read
+ * time, so this is where an expired one is most likely to be handed over. When
+ * the callback was not threaded through here, only the first editor load could
+ * ask for fresh URLs, and every image that arrived later stayed a broken box
+ * until the user reloaded the page.
+ *
  * NOTE: Excalidraw's addFiles only fills in ids the scene does not already know;
  * re-adding a known id is silently ignored. Content updates therefore have to
  * arrive under a new file id (which is what the server does when a generation
@@ -232,6 +240,7 @@ export async function syncCanvasFilesIntoScene(
   files: CanvasFileMap,
   elements: ReadonlyArray<Record<string, unknown>>,
   canvasId?: string,
+  onFailure?: CanvasMediaFailureHandler,
 ): Promise<void> {
   if (canvasId) rememberDocumentFiles(canvasId, files);
   // Elements come from the incoming document, not the live scene: this runs
@@ -245,7 +254,7 @@ export async function syncCanvasFilesIntoScene(
   if (inlineEntries.length > 0) api.addFiles(inlineEntries);
 
   if (pending.length === 0) return;
-  const fetched = await fetchPendingCanvasFiles(pending);
+  const fetched = await fetchPendingCanvasFiles(pending, onFailure);
   if (fetched.length > 0) api.addFiles(fetched);
 }
 
