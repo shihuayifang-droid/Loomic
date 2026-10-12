@@ -26,8 +26,16 @@ export type CanvasImageRef = {
 /** A fully-uploaded attachment ready to be sent, including its origin source. */
 export type ReadyAttachment = {
   assetId: string;
-  /** Full resolution — this is the URL handed to the model. */
-  url: string;
+  /**
+   * This session's PREVIEW of the media — the object URL of the file just
+   * uploaded, or the signature the canvas read happened to return. It is NOT the
+   * submission's authority and NOT the address the model is shown: the server
+   * re-signs from `assetId` and never reads this field (X-52, 工单14 fixup).
+   *
+   * Optional because a record that has an identity but no live projection is
+   * still submittable. Omitting the key is deliberate — see `toReadyAttachments`.
+   */
+  url?: string;
   /**
    * Downscaled variant for on-screen rendering. Absent for plain uploads, where
    * no smaller variant exists yet; renderers fall back to `url`.
@@ -62,9 +70,11 @@ export function toReadyAttachments(
     ready.push({
       assetId: attachment.assetId,
       // A missing url is not disqualifying: the server re-signs from the assetId
-      // and its own copy of the URL must match what it mints. Sending an empty
-      // string here would only make the request fail its URL match.
-      url: attachment.url ?? "",
+      // and IGNORES whatever url this request carries, so an absent projection is
+      // sent as an absent KEY. An empty string would be a fabricated URL — the
+      // exact confusion X-52 removes — and would fail `z.string().url()` at the
+      // request schema before the server ever saw the assetId.
+      ...(attachment.url ? { url: attachment.url } : {}),
       mimeType: attachment.mimeType,
       source: attachment.source,
       ...(attachment.name ? { name: attachment.name } : {}),

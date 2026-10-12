@@ -31,6 +31,7 @@ const TOKEN = "jwt-token";
 type UploadCall = { bucket: string; path: string; bytes: number; contentType?: string };
 type RemoveCall = { bucket: string; paths: string[] };
 type RpcCall = { name: string; params: Record<string, unknown> };
+type MetadataDeleteCall = { table: string; id: string };
 
 function makeHarness(options: {
   /** `record_project_asset` failure. */
@@ -40,6 +41,8 @@ function makeHarness(options: {
   uploadError?: { message: string } | null;
   signError?: { message: string } | null;
   removeError?: { message: string } | null;
+  /** The `asset_objects` delete issued while cleaning up a failed signing. */
+  metadataDeleteError?: { message: string } | null;
   /** Canvas read returns nothing, i.e. RLS hid it. */
   canvasHidden?: boolean;
   canvasError?: { message: string } | null;
@@ -47,6 +50,9 @@ function makeHarness(options: {
   const uploads: UploadCall[] = [];
   const removes: RemoveCall[] = [];
   const rpcs: RpcCall[] = [];
+  const metadataDeletes: MetadataDeleteCall[] = [];
+  /** Every side effect in the order it happened — the sequence IS the contract. */
+  const events: string[] = [];
   let signedPaths: string[] = [];
 
   const userClient = {
@@ -60,6 +66,15 @@ function makeHarness(options: {
           if (options.canvasHidden) return { data: null, error: null };
           return { data: { project: { workspace_id: WORKSPACE } }, error: null };
         },
+        // 工单14 fixup T3: cleanup deletes the row through the CALLER's client,
+        // so the harness has to observe which id was targeted and with whom.
+        delete: () => ({
+          eq: async (_column: string, value: string) => {
+            events.push("metadata_delete");
+            metadataDeletes.push({ table, id: value });
+            return { error: options.metadataDeleteError ?? null };
+          },
+        }),
       };
       return chain;
     },
@@ -72,6 +87,7 @@ function makeHarness(options: {
             uploadOptions?: { contentType?: string },
           ) => {
             if (options.uploadError) return { data: null, error: options.uploadError };
+            events.push("upload");
             uploads.push({
               bucket,
               path,
@@ -83,11 +99,16 @@ function makeHarness(options: {
             return { data: { path }, error: null };
           },
           remove: async (paths: string[]) => {
+            events.push("storage_remove");
             removes.push({ bucket, paths });
             return { data: null, error: options.removeError ?? null };
           },
           createSignedUrl: async (path: string) => {
-            if (options.signError) return { data: null, error: options.signError };
+            if (options.signError) {
+              events.push("sign_refused");
+              return { data: null, error: options.signError };
+            }
+            events.push("sign");
             signedPaths.push(path);
             return {
               data: { signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig` },
@@ -101,6 +122,7 @@ function makeHarness(options: {
 
   const adminClient = {
     rpc: async (name: string, params: Record<string, unknown>) => {
+      events.push("record_asset");
       rpcs.push({ name, params });
       if (options.rpcError) return { data: null, error: options.rpcError };
       return {
@@ -120,11 +142,29 @@ function makeHarness(options: {
     uploads,
     removes,
     rpcs,
+    metadataDeletes,
+    events,
     signedPaths: () => signedPaths,
   };
 }
 
 const PNG = Buffer.from("png-bytes", "utf-8");
+
+/**
+ * Await a persist that MUST reject, and hand the error back as the value under
+ * test. Written this way rather than with `.catch()`, so a persist that
+ * unexpectedly SUCCEEDS fails the case instead of quietly returning a reference.
+ */
+async function refusal(
+  promise: Promise<unknown>,
+): Promise<AgentProjectAssetError> {
+  try {
+    await promise;
+  } catch (error) {
+    return error as AgentProjectAssetError;
+  }
+  throw new Error("expected persist() to reject, but it resolved");
+}
 
 function persist(
   harness: ReturnType<typeof makeHarness>,
@@ -226,6 +266,76 @@ describe("agent project asset persistence (T1)", () => {
     expect((error as AgentProjectAssetError).code).toBe("sign_failed");
     expect(String((error as Error).message)).not.toContain("http");
     expect(String((error as Error).message)).not.toContain("data:");
+
+    // 工单14 fixup T3. By this point the object AND its metadata row both exist,
+    // so a refusal to sign has to undo BOTH: nothing downstream ever received an
+    // assetId, which makes either half left behind an orphan by construction.
+    expect(h.uploads).toHaveLength(1);
+    expect(h.removes).toHaveLength(1);
+    expect(h.removes[0]?.paths).toEqual([h.uploads[0]?.path]);
+    expect(h.metadataDeletes).toEqual([
+      { table: "asset_objects", id: "asset-1" },
+    ]);
+    // And the caller's failure carries no reference and no URL to hold on to.
+    expect(error).not.toHaveProperty("assetId");
+    expect(error).not.toHaveProperty("signedUrl");
+    expect(JSON.stringify({ ...(error as object) })).not.toContain("http");
+  });
+
+  it("case 9: a failed signing leaves NOTHING half-created, in metadata-then-object order", async () => {
+    const h = makeHarness({ signError: { message: "permission denied" } });
+
+    const error = await refusal(persist(h));
+
+    expect(error.code).toBe("sign_failed");
+
+    // The sequence IS the requirement: the row is deleted before the bytes, so
+    // the authoritative record never briefly outlives what it points at.
+    expect(h.events).toEqual([
+      "upload",
+      "record_asset",
+      "sign_refused",
+      "metadata_delete",
+      "storage_remove",
+    ]);
+    // The metadata row targeted is the one the RPC just minted; the object
+    // removed is the one that was uploaded.
+    expect(h.metadataDeletes[0]?.id).toBe("asset-1");
+    expect(h.removes[0]?.paths).toEqual([h.uploads[0]?.path]);
+    // No URL was ever produced, so none can be rolled back or returned.
+    expect(h.signedPaths()).toHaveLength(0);
+  });
+
+  it("case 10: cleanup that itself fails is named on the safe log, and never masks sign_failed", async () => {
+    const logged: string[] = [];
+    const spy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => {
+        logged.push(args.map(String).join(" "));
+      });
+
+    const h = makeHarness({
+      signError: { message: "permission denied" },
+      removeError: { message: "storage said no" },
+      metadataDeleteError: { message: "delete denied" },
+    });
+
+    const error = await refusal(persist(h));
+    spy.mockRestore();
+
+    // The reason the persist failed stays the reason reported.
+    expect(error.code).toBe("sign_failed");
+    expect(error.message).toContain("permission denied");
+
+    const text = logged.join("\n");
+    // What may have survived is named, or T-23's inventory can never find it.
+    expect(text).toContain("asset-1");
+    expect(text).toContain(h.uploads[0]!.path);
+    expect(text).toContain("delete denied");
+    expect(text).toContain("storage said no");
+    // Safe log: an object key is not a bearer token, a signed URL would be.
+    expect(text).not.toContain("token=");
+    expect(text).not.toContain("http");
   });
 
   it("case 8: the object key is sanitised into the workspace/canvas namespace", async () => {

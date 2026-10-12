@@ -5,8 +5,12 @@ import type { ZodType } from "zod";
 
 import {
   type Database,
+  contentBlockSchema,
   errorCodeValues,
   healthResponseSchema,
+  imageBlockSchema,
+  messageCreateResponseSchema,
+  messageListResponseSchema,
   runCancelResponseSchema,
   runCreateRequestSchema,
   runCreateResponseSchema,
@@ -583,3 +587,169 @@ function getExportedSchema(name: string): ZodType {
 
   return candidate as ZodType;
 }
+
+// ---------------------------------------------------------------------------
+// X-52 (工单14 fixup T2): a media block with an identity but no url is a LEGAL
+// response, and the HTTP contracts have to say so.
+//
+// `chat-service` strips the read-time url before writing and re-signs on every
+// read. When signing fails — invisible under RLS, object gone, storage refusing
+// — the honest answer is the block WITHOUT a url: the url already in the row is
+// a token that used to work, and re-serving it is the forbidden "回退旧URL".
+// With `url` required, that safe answer failed `messageListResponseSchema.parse`
+// and `messageCreateResponseSchema.parse`, so the route 500'd on a state it had
+// deliberately produced.
+//
+// These cases pin all three shapes the ticket names, plus the boundary that must
+// NOT move: optional is not the same as unvalidated.
+// ---------------------------------------------------------------------------
+describe("X-52 media block contracts (工单14 fixup T2)", () => {
+  const SIGNED =
+    "https://proj.test/storage/v1/object/sign/project-assets/ws-team/p/a.png?token=fresh";
+
+  it("shape 1: an image block WITH a url still parses (a live projection)", () => {
+    const parsed = imageBlockSchema.parse({
+      type: "image",
+      assetId: "asset-1",
+      url: SIGNED,
+      thumbnailUrl: SIGNED,
+      mimeType: "image/png",
+      source: "upload",
+      name: "a.png",
+    });
+
+    expect(parsed.url).toBe(SIGNED);
+    expect(parsed.thumbnailUrl).toBe(SIGNED);
+  });
+
+  it("shape 2: a stable image block with NO url parses — 'not projectable' is not malformed", () => {
+    const parsed = imageBlockSchema.parse({
+      type: "image",
+      assetId: "asset-1",
+      objectPath: "ws-team/p/a.png",
+      mimeType: "image/png",
+      source: "upload",
+    });
+
+    expect(parsed.url).toBeUndefined();
+    expect(parsed.thumbnailUrl).toBeUndefined();
+    // The identity survives the parse, so a client can still tell WHICH asset it
+    // could not project — and can retry once a signature is available.
+    expect(parsed.assetId).toBe("asset-1");
+    expect(parsed.objectPath).toBe("ws-team/p/a.png");
+    expect(parsed.source).toBe("upload");
+  });
+
+  it("shape 3: a historical URL-only image artifact still parses (pre-X-52 media)", () => {
+    // Tool artifacts are the one media shape that predates `assetId`: their
+    // schema declares the identity optional precisely so a row written before
+    // the cutover is still readable. Dropping the url there would blank every
+    // old generated image, so the compatibility strategy is "read it as stored".
+    const parsed = contentBlockSchema.parse({
+      type: "tool",
+      toolCallId: "call-1",
+      toolName: "generate_image",
+      status: "completed",
+      artifacts: [
+        {
+          type: "image",
+          url: "https://cdn.test/legacy.png",
+          mimeType: "image/png",
+          width: 1024,
+          height: 1024,
+        },
+      ],
+    });
+
+    expect(parsed.type).toBe("tool");
+    if (parsed.type !== "tool") throw new Error("expected a tool block");
+    expect(parsed.artifacts?.[0]).toMatchObject({
+      type: "image",
+      url: "https://cdn.test/legacy.png",
+    });
+  });
+
+  it("boundary: url became OPTIONAL, not unvalidated — an empty string is still rejected", () => {
+    // The browser hook used to stand in for a missing url with "", which is not
+    // a url at all. That is exactly the fabricated projection this ticket
+    // removes, so the field must not quietly start accepting it.
+    expect(
+      imageBlockSchema.safeParse({
+        type: "image",
+        assetId: "asset-1",
+        url: "",
+        mimeType: "image/png",
+        source: "upload",
+      }).success,
+    ).toBe(false);
+
+    expect(
+      imageBlockSchema.safeParse({
+        type: "image",
+        assetId: "asset-1",
+        url: "not-a-url",
+        mimeType: "image/png",
+        source: "upload",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("both message response contracts parse a url-less stable block", () => {
+    const message = {
+      id: "message-1",
+      role: "user" as const,
+      content: "look",
+      contentBlocks: [
+        {
+          type: "image" as const,
+          assetId: "asset-1",
+          objectPath: "ws-team/p/a.png",
+          mimeType: "image/png",
+          source: "upload" as const,
+        },
+      ],
+      createdAt: "2026-10-12T00:00:00.000Z",
+    };
+
+    // The two parses that used to turn a safe server-side outcome into a 500,
+    // on GET /api/sessions/:id/messages and on message creation respectively.
+    const list = messageListResponseSchema.parse({ messages: [message] });
+    const created = messageCreateResponseSchema.parse({ message });
+
+    const listBlock = list.messages[0]?.contentBlocks?.[0] as Record<string, unknown>;
+    const createdBlock = created.message.contentBlocks?.[0] as Record<string, unknown>;
+    expect(listBlock.url).toBeUndefined();
+    expect(listBlock.assetId).toBe("asset-1");
+    expect(createdBlock.url).toBeUndefined();
+    expect(createdBlock.assetId).toBe("asset-1");
+  });
+
+  it("the attachment contract no longer demands a url the server ignores", () => {
+    // 工单14 fixup T1: `assetId` is the authority, so a client that has an
+    // identity but no live projection must still be able to submit — and an
+    // absent url must not be confused with a mismatched one.
+    const parsed = runCreateRequestSchema.parse({
+      sessionId: "session-1",
+      conversationId: "conv-1",
+      prompt: "继续这个构图",
+      attachments: [
+        { assetId: "asset-1", mimeType: "image/png" },
+        { assetId: "asset-2", url: SIGNED, mimeType: "image/png", name: "b.png" },
+      ],
+    });
+
+    expect(parsed.attachments?.[0]?.assetId).toBe("asset-1");
+    expect(parsed.attachments?.[0]?.url).toBeUndefined();
+    // A url that IS present is still checked, so an older client is not silently
+    // accepted with a malformed one.
+    expect(parsed.attachments?.[1]?.url).toBe(SIGNED);
+    expect(
+      runCreateRequestSchema.safeParse({
+        sessionId: "session-1",
+        conversationId: "conv-1",
+        prompt: "x",
+        attachments: [{ assetId: "asset-1", url: "not-a-url", mimeType: "image/png" }],
+      }).success,
+    ).toBe(false);
+  });
+});

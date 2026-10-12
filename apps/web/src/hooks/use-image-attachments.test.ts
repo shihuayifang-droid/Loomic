@@ -7,10 +7,18 @@
 // submittable at all, whatever URL it carries — and the session-storage preview
 // is explicitly allowed to be stale.
 //
+// 工单14 fixup T1 adds the other half: the server no longer compares the client's
+// url against the signature it mints, because a rotated signature differs from a
+// stale one for reasons that have nothing to do with forgery. So a missing url is
+// submitted as a MISSING KEY rather than as "", and case 6 pins that the shape
+// the hook produces parses as the real request contract.
+//
 // Driven through the REAL hook with `renderHook`, so the cases exercise what the
 // hook actually submits rather than a copy of the rule.
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { runCreateRequestSchema } from "@loomic/shared";
 
 import {
   toReadyAttachments,
@@ -64,8 +72,10 @@ describe("toReadyAttachments uses assetId as the only identity (X-52)", () => {
       source: "upload",
       name: "a.png",
     });
-    // The url travels too — the server matches it against its own signature — but
-    // it is never what makes the record valid.
+    // The url travels as a PREVIEW for this request. It is never what makes the
+    // record valid, and the server does not read it (工单14 fixup T1): a rotation
+    // makes it differ from the server's own signature without anything being
+    // forged, so comparing the two would reject legitimate attachments.
     expect(ready[0]?.url).toBe(SIGNED);
   });
 
@@ -78,13 +88,17 @@ describe("toReadyAttachments uses assetId as the only identity (X-52)", () => {
     expect(ready).toHaveLength(0);
   });
 
-  it("case 3: the preview blob never becomes the submitted url", () => {
+  it("case 3: a missing url is submitted as an ABSENT key, never as a fabricated one", () => {
     const ready = toReadyAttachments([state({ assetId: "asset-1" })]);
 
-    // No url recorded means an empty url, not the local preview: sending
-    // `blob:` would make the request fail its URL match, and pretending the
-    // preview is the media's address is exactly the confusion X-52 removes.
-    expect(ready[0]?.url).toBe("");
+    // No url recorded means NO url key. Two wrong answers are ruled out here:
+    // sending the local `blob:` preview would pretend the preview is the media's
+    // address, and sending "" would fabricate a projection that is not a url —
+    // `z.string().url()` rejects it at the request schema, before the server ever
+    // read the assetId. The identity alone is what makes the record submittable.
+    expect(ready).toHaveLength(1);
+    expect(ready[0]?.assetId).toBe("asset-1");
+    expect(ready[0]).not.toHaveProperty("url");
   });
 
   it("case 4: a failed or in-flight upload is not submittable", () => {
@@ -106,6 +120,30 @@ describe("toReadyAttachments uses assetId as the only identity (X-52)", () => {
 
     expect(ready).toHaveLength(1);
     expect(ready[0]?.assetId).toBe("asset-1");
+  });
+
+  it("case 6: what the hook submits is accepted by the WIRE contract, url or no url", () => {
+    // The end of the chain, and the acceptance criterion: "URL可省略、assetId仍可提交".
+    // Parsing through the real request schema is what makes this more than a
+    // statement about a local type — it is the contract the server enforces.
+    const withUrl = runCreateRequestSchema.parse({
+      sessionId: "s1",
+      conversationId: "c1",
+      prompt: "看这张图",
+      attachments: toReadyAttachments([state({ assetId: "asset-1", url: SIGNED })]),
+    });
+    const withoutUrl = runCreateRequestSchema.parse({
+      sessionId: "s1",
+      conversationId: "c1",
+      prompt: "看这张图",
+      attachments: toReadyAttachments([state({ assetId: "asset-2" })]),
+    });
+
+    expect(withUrl.attachments?.[0]?.url).toBe(SIGNED);
+    // Omitted, not emptied: an empty string would fail `z.string().url()`.
+    expect(withoutUrl.attachments?.[0]?.url).toBeUndefined();
+    expect(withoutUrl.attachments?.[0]?.assetId).toBe("asset-2");
+    expect(withoutUrl.attachments?.[0]?.mimeType).toBe("image/png");
   });
 });
 

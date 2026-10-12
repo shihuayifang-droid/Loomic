@@ -18,7 +18,10 @@
 //      and never from the caller's personal billing workspace (Q1),
 //   4. if that record fails, DELETE the object just uploaded and throw,
 //   5. sign the object for THIS read,
-//   6. return { assetId, bucket, objectPath, mimeType, byteSize, signedUrl }.
+//   6. if that signing fails, DELETE the metadata row and then the object, and
+//      throw `sign_failed` — a failure must not leave a half-created asset that
+//      no caller was ever handed an id for (工单14 fixup T3),
+//   7. return { assetId, bucket, objectPath, mimeType, byteSize, signedUrl }.
 //
 // There is no fallback URL anywhere on this path. `getPublicUrl` is not called,
 // a provider URL is not returned, and a `data:` URL is not substituted: any of
@@ -210,6 +213,21 @@ export function createAgentProjectAssetService(options: {
           bucket: PROJECT_ASSET_BUCKET,
         });
       } catch (error) {
+        // 工单14 fixup T3. By the time signing runs, BOTH halves of the asset
+        // exist: the Storage object and the `asset_objects` row that names it.
+        // The caller is about to get an exception instead of a reference, so
+        // nobody will ever hold this asset's id — leaving either half behind
+        // creates precisely the un-referenceable orphan X-52 exists to remove.
+        //
+        // Both are therefore undone, metadata FIRST: the row is the
+        // authoritative record, and it must not outlive the bytes it points at.
+        // Each step is best-effort and neither can mask the original failure —
+        // what survives is named on the safe log (asset id + object key) so
+        // T-23's real inventory can find it. Nothing is logged or returned that
+        // contains a URL: a signed URL is a bearer token, and a failed signing
+        // has not produced one anyway. The URL is never rolled back to anything.
+        await removeRecordedAssetMetadata(client, assetId, objectPath);
+        await removeUploadedObject(client, objectPath, "sign_failed", assetId);
         throw new AgentProjectAssetError(
           "sign_failed",
           error instanceof ProjectAssetUrlError
@@ -269,6 +287,7 @@ async function removeUploadedObject(
   client: UserSupabaseClient,
   objectPath: string,
   reason: string | undefined,
+  assetId?: string,
 ): Promise<void> {
   try {
     const { error } = await client.storage
@@ -279,7 +298,40 @@ async function removeUploadedObject(
     console.error(
       `[agent-project-assets] cleanup of an unowned object FAILED ` +
         `bucket=${PROJECT_ASSET_BUCKET} path=${objectPath} ` +
+        `assetId=${assetId ?? "none"} ` +
         `recordReason=${reason ?? "unknown"} ` +
+        `cleanupReason=${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/**
+ * Undo the `asset_objects` row that `record_project_asset` just wrote.
+ *
+ * Deleted with the CALLER's client on purpose, even though the row was written
+ * through the service-role RPC: `asset_objects_delete_self` already authorises
+ * the creating user inside their own workspace, so the cleanup needs no
+ * privilege the write path did not have. Reaching for the admin client here
+ * would turn an error message into a way to delete rows user RLS protects.
+ *
+ * Best effort — a failure is reported on the safe log and never rethrown, so
+ * the `sign_failed` the caller sees remains the reason the persist failed.
+ */
+async function removeRecordedAssetMetadata(
+  client: UserSupabaseClient,
+  assetId: string,
+  objectPath: string,
+): Promise<void> {
+  try {
+    const { error } = await client
+      .from("asset_objects")
+      .delete()
+      .eq("id", assetId);
+    if (error) throw new Error(error.message);
+  } catch (error) {
+    console.error(
+      `[agent-project-assets] cleanup of a failed-to-sign metadata row FAILED ` +
+        `assetId=${assetId} bucket=${PROJECT_ASSET_BUCKET} path=${objectPath} ` +
         `cleanupReason=${error instanceof Error ? error.message : String(error)}`,
     );
   }

@@ -41,14 +41,22 @@ export const runStatusSchema = z.enum([
 export const imageAttachmentSchema = z.object({
   assetId: z.string().min(1),
   /**
-   * X-52: a BROWSER PROJECTION for this request only — never the authority for
-   * what the model is shown. The runtime re-reads the `asset_objects` row behind
-   * `assetId` through the caller's JWT and re-signs it; the URL sent here must
-   * match that signature or the run is refused. Kept required so an older client
-   * still parses, and so a mismatched URL is detectably different from an absent
-   * one rather than silently ignored.
+   * X-52 (工单14 fixup T1): a BROWSER PROJECTION that the server IGNORES.
+   *
+   * `assetId` is the only authority for what the model is shown: the runtime
+   * re-reads the `asset_objects` row behind it through the caller's JWT and
+   * re-signs it, and the bytes come from THAT signature. Because a signature is
+   * rotatable, the URL here cannot be compared against a freshly minted one —
+   * an expired or sessionStorage-restored preview differs from a new signature
+   * without anything being forged, so a byte-equality check rejects exactly the
+   * legitimate case it was meant to allow.
+   *
+   * Optional because a record with an identity but no live projection is still
+   * submittable, and an empty string is NOT an acceptable stand-in: it is not a
+   * URL and would fail `z.string().url()` before the assetId was ever read.
+   * Kept in the shape at all so an older client that still sends one parses.
    */
-  url: z.string().url(),
+  url: z.string().url().optional(),
   mimeType: z.string().min(1),
   name: z.string().min(1).optional(),
 });
@@ -227,10 +235,19 @@ export const imageBlockSchema = z.object({
   type: z.literal("image"),
   assetId: z.string().min(1),
   /**
-   * Full-resolution image. This is what gets sent to the model, so it must not
-   * be a downscaled variant.
+   * Full-resolution image. When present this is what gets sent to the model, so
+   * it must not be a downscaled variant.
+   *
+   * X-52 (工单14 fixup T2): OPTIONAL. A block that carries its identity but for
+   * which no signature could be minted on THIS read is a legal, complete answer
+   * — "currently not projectable" — not a malformed one. The safe outcome for a
+   * read the caller may not perform is the block WITHOUT a url; re-serving the
+   * url already in the row would hand back a token that used to work, and
+   * requiring the field here turned that safe outcome into a Zod failure, i.e. a
+   * 500 on `/api/sessions/:id/messages` and on message creation. A url, when
+   * present, is still a real url: the format check is unchanged.
    */
-  url: z.string().url(),
+  url: z.string().url().optional(),
   /**
    * Display-sized variant, used for the inline pill in the message bubble.
    * Optional because older rows predate it — renderers fall back to `url`.
@@ -240,6 +257,12 @@ export const imageBlockSchema = z.object({
    * draw a thumbnail.
    */
   thumbnailUrl: z.string().url().optional(),
+  /**
+   * X-52: the stored object key, alongside the identity. Optional — only blocks
+   * written after the storage cutover carry it — but declared here so a parsed
+   * response keeps the stable identity whole instead of silently stripping it.
+   */
+  objectPath: z.string().min(1).optional(),
   mimeType: z.string().min(1),
   source: z.enum(["upload", "canvas-ref"]),
   name: z.string().min(1).optional(),

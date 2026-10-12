@@ -258,16 +258,27 @@ export type ResolvedAttachments = {
 /**
  * Resolve the run's attachments to bytes the model can actually receive (X-52).
  *
- * The request carries an `assetId` AND a `url`. Only the `assetId` is input: the
- * URL is the browser's own projection and is used for exactly one thing —
- * proving the two agree, which catches a forged or stale URL before any bytes
- * are fetched. Everything the model sees comes from the row behind the
- * `assetId`, read with the CALLER's JWT (so RLS is the authority on whether they
- * may use it at all) and signed by the ONE signing service.
+ * The request carries an `assetId` and, from an older client, a `url`. Only the
+ * `assetId` is input. The URL is not read, not compared and not logged: it is
+ * the browser's own projection of a SIGNATURE, and a signature is rotatable, so
+ * "the client's URL differs from the one I just minted" proves nothing about
+ * whether the assetId is forged — an expired token, a sessionStorage-restored
+ * preview or a different signing clock all produce that difference for an asset
+ * the caller is fully entitled to. The authority is whether the CURRENT JWT can
+ * read the row at all, which is what the lookup below asks RLS.
+ *
+ * 工单14 fixup T1: the previous byte-equality check (`signedUrl !==
+ * attachment.url`) is removed. It rejected exactly the legitimate rotation it
+ * was meant to tolerate, and `use-image-attachments.test.ts` case 5 already
+ * declares a stale preview legal — the two could not both be true.
+ *
+ * The bytes the model sees therefore come from the row behind the `assetId`,
+ * read with the CALLER's JWT and signed by the ONE signing service — never from
+ * anything in the request body.
  *
  * Three refusals, all before the model is called:
  *   * the asset does not exist or the caller cannot see it,
- *   * the caller's URL does not match the signed one,
+ *   * the row cannot be signed for this caller,
  *   * the bytes cannot be fetched from the signed URL.
  *
  * A refusal here is deliberate rather than lenient: falling back to the
@@ -307,12 +318,6 @@ export async function resolveAttachmentContent(
     } catch {
       throw new Error(
         `attachment ${index + 1} could not be authorised for reading`,
-      );
-    }
-
-    if (signedUrl !== attachment.url) {
-      throw new Error(
-        `attachment ${index + 1} carries a URL that does not match its asset`,
       );
     }
 
@@ -1530,9 +1535,11 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         if (hasAttachments) {
           // X-52: the bytes the model sees come from the `asset_objects` row
           // behind each `assetId`, read with the caller's JWT and re-signed —
-          // NOT from the URL in the request. `resolveAttachmentContent` refuses
-          // (before the model is called) when the asset is absent, not visible to
-          // this user, or paired with a URL that does not match its signature.
+          // NOT from the URL in the request, which is not read at all.
+          // `resolveAttachmentContent` refuses (before the model is called) when
+          // the asset is absent, not visible to this user, or cannot be signed
+          // for them. A rotated or stale preview URL is NOT a refusal: the
+          // assetId is the authority and a signature is expected to rotate.
           //
           // What goes into the message decides what gets CHECKPOINTED, and the
           // message list is reloaded, re-sent and rewritten on every single turn.

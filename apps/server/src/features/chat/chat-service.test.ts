@@ -13,6 +13,11 @@
 // branches of that decision.
 import { describe, expect, it, vi } from "vitest";
 
+import {
+  messageCreateResponseSchema,
+  messageListResponseSchema,
+} from "@loomic/shared";
+
 import { createChatService } from "./chat-service.js";
 
 const USER = { accessToken: "t", id: "u1" } as never;
@@ -46,6 +51,13 @@ function fakeClient(script: {
   insertResults: Array<{ data?: unknown; error?: unknown }>;
   /** Result of the "did it land?" lookup, when one happens. */
   lookup?: { data?: unknown; error?: unknown };
+  /**
+   * Rows the caller may read from `asset_objects` (工单14 fixup T2: the create
+   * response is projected through the same signing path as the list response).
+   */
+  assets?: Array<{ id: string; object_path: string; bucket: string }>;
+  /** Object paths the storage API refuses to sign. */
+  unsignable?: ReadonlySet<string>;
 }) {
   const inserts: Array<Record<string, unknown>> = [];
   let lookups = 0;
@@ -53,6 +65,13 @@ function fakeClient(script: {
 
   const client = {
     from: (table: string) => {
+      if (table === "asset_objects") {
+        return {
+          select: () => ({
+            in: async () => ({ data: script.assets ?? [], error: null }),
+          }),
+        };
+      }
       if (table !== "chat_messages") {
         // chat_sessions updated_at touch — irrelevant here, must not blow up.
         return { update: () => ({ eq: async () => ({ error: null }) }) };
@@ -86,6 +105,19 @@ function fakeClient(script: {
           }),
         }),
       };
+    },
+    storage: {
+      from: (bucket: string) => ({
+        createSignedUrl: async (path: string) => {
+          if (script.unsignable?.has(path)) {
+            return { data: null, error: { message: "permission denied" } };
+          }
+          return {
+            data: { signedUrl: `${SIGNED}&bucket=${bucket}&path=${path}` },
+            error: null,
+          };
+        },
+      }),
     },
   };
 
@@ -427,5 +459,130 @@ describe("listMessages re-signs assets for the caller (X-52)", () => {
     // The reason is logged; the URL never is (a signed URL is a bearer token).
     expect(harness.logs.join("\n")).toContain("asset lookup failed");
     expect(harness.logs.join("\n")).not.toContain("token=");
+  });
+
+  it("case 5: a url-less list response parses — no-URL is a legal shape, not a 500", async () => {
+    const harness = fakeReadClient({
+      rows: [
+        rowWithBlocks([
+          {
+            type: "image",
+            assetId: "asset-locked",
+            objectPath: "ws-team/p/secret.png",
+            mimeType: "image/png",
+            source: "upload",
+          },
+        ]),
+      ],
+      assets: [
+        { id: "asset-locked", object_path: "ws-team/p/secret.png", bucket: "project-assets" },
+      ],
+      unsignable: new Set(["ws-team/p/secret.png"]),
+    });
+
+    const messages = await harness.service.listMessages(USER, SESSION);
+
+    // The route parses exactly this payload before answering.
+    const parsed = messageListResponseSchema.parse({ messages });
+    const block = parsed.messages[0]?.contentBlocks?.[0] as Record<string, unknown>;
+
+    expect(block.type).toBe("image");
+    expect(block.assetId).toBe("asset-locked");
+    expect(block.url).toBeUndefined();
+    // The stored identity survives the parse rather than being stripped, so a
+    // client can still tell WHICH asset could not be projected.
+    expect(block.objectPath).toBe("ws-team/p/secret.png");
+    expect(block.source).toBe("upload");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// X-52 (工单14 fixup T2): the CREATE response goes through the same projection.
+//
+// The row is written with stable identity only, so echoing it back handed the
+// client an image block with no url — a shape the response schema used to
+// reject, which turned a successful write into a 500 on the way out. The fix is
+// to project a url for this caller before answering; a signing failure is still
+// a legal answer (identity, no url), never a failure.
+// ---------------------------------------------------------------------------
+describe("createMessage projects urls for this caller (X-52 T2)", () => {
+  const REQUEST_URL = "https://proj.test/storage/v1/object/sign/project-assets/ws/a.png?token=from-the-request";
+
+  /** A user message carrying one image block, as the composer sends it. */
+  const IMAGE_INPUT = (assetId: string, objectPath: string) =>
+    ({
+      role: "user",
+      content: "look",
+      contentBlocks: [
+        {
+          type: "image",
+          assetId,
+          objectPath,
+          mimeType: "image/png",
+          source: "upload",
+          url: REQUEST_URL,
+        },
+      ],
+    }) as never;
+
+  it("case 1: the response carries a freshly signed url, and never the request's", async () => {
+    // `fakeReadClient` echoes the inserted row back, which is exactly what
+    // PostgREST does — so the response is built from the STORED (identity-only)
+    // blocks, not from anything the test handed in.
+    const f = fakeReadClient({
+      rows: [],
+      assets: [{ id: "asset-1", object_path: "ws-team/p/a.png", bucket: "project-assets" }],
+    });
+
+    const message = await f.service.createMessage(
+      USER,
+      SESSION,
+      IMAGE_INPUT("asset-1", "ws-team/p/a.png"),
+    );
+
+    // What was WRITTEN keeps identity only.
+    const stored = f.inserts[0]?.content_blocks as Array<Record<string, unknown>>;
+    expect(stored[0]).not.toHaveProperty("url");
+    expect(stored[0]).toMatchObject({ assetId: "asset-1", objectPath: "ws-team/p/a.png" });
+
+    // What was RETURNED carries a url the server minted FOR THIS CALLER. It is
+    // not the request's url echoed back: re-serving a caller-supplied projection
+    // is the "回退旧URL" the ticket forbids.
+    const blocks = message.contentBlocks as Array<Record<string, unknown>>;
+    expect(blocks[0]?.assetId).toBe("asset-1");
+    expect(String(blocks[0]?.url)).toContain("token=fresh");
+    expect(JSON.stringify(blocks)).not.toContain("from-the-request");
+
+    // And the route's own schema accepts it.
+    expect(() => messageCreateResponseSchema.parse({ message })).not.toThrow();
+  });
+
+  it("case 2: a signing failure returns a stable block with NO url, and the CREATE schema parses it", async () => {
+    const f = fakeReadClient({
+      rows: [],
+      assets: [
+        { id: "asset-locked", object_path: "ws-team/p/secret.png", bucket: "project-assets" },
+      ],
+      unsignable: new Set(["ws-team/p/secret.png"]),
+    });
+
+    const message = await f.service.createMessage(
+      USER,
+      SESSION,
+      IMAGE_INPUT("asset-locked", "ws-team/p/secret.png"),
+    );
+
+    const blocks = message.contentBlocks as Array<Record<string, unknown>>;
+    expect(blocks[0]?.assetId).toBe("asset-locked");
+    expect(blocks[0]?.url).toBeUndefined();
+    expect(JSON.stringify(blocks)).not.toContain("from-the-request");
+
+    // THE assertion of this block: the create response the route sends parses,
+    // so a signature that could not be minted is a display limitation rather
+    // than a 500 on a write that already succeeded.
+    const parsed = messageCreateResponseSchema.parse({ message });
+    const parsedBlock = parsed.message.contentBlocks?.[0] as Record<string, unknown>;
+    expect(parsedBlock.assetId).toBe("asset-locked");
+    expect(parsedBlock.url).toBeUndefined();
   });
 });

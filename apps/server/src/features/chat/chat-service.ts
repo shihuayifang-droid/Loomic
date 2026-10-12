@@ -593,13 +593,31 @@ export function createChatService(options: {
         .update({ updated_at: new Date().toISOString() })
         .eq("id", sessionId);
 
-      const contentBlocks =
+      const storedBlocks =
         Array.isArray(data.content_blocks) && data.content_blocks.length > 0
           ? (data.content_blocks as ContentBlock[])
           : synthesizeLegacyBlocks(
               data.content,
               data.tool_activities as unknown[] | null,
             );
+
+      // X-52 (工单14 fixup T2): project THIS read's urls onto what is returned,
+      // through the SAME function `listMessages` uses.
+      //
+      // The row was written with stable identity only (`stripProjectedUrls`), so
+      // echoing it verbatim handed the client an image block with no url at all.
+      // That is a legal answer — it is what `listMessages` returns when signing
+      // fails — but `imageBlockSchema` used to require the field, so the create
+      // response failed its own Zod parse and a successful write surfaced as a
+      // 500. Projecting here fixes the shape rather than the schema alone: the
+      // caller is handed a url the server minted FOR THEM, which is the whole
+      // point of not persisting the request's url. Should signing fail, the block
+      // keeps its identity and simply carries no url — never the stale one from
+      // the row, and never a 500.
+      const contentBlocks =
+        storedBlocks === null
+          ? null
+          : await projectBlockUrls(client, storedBlocks, { sessionId });
 
       return {
         id: data.id,
