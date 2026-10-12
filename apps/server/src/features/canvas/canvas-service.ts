@@ -3,6 +3,7 @@ import type { CanvasContent, CanvasDetail } from "@loomic/shared";
 import type { RecoverableArtifact } from "@loomic/shared";
 
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
+import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import {
   listRecoverableArtifacts as listRecoverable,
   recoverArtifacts as restoreArtifacts,
@@ -83,6 +84,7 @@ export type CanvasService = {
 
 export function createCanvasService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
+  getAdminClient: () => AdminSupabaseClient;
 }): CanvasService {
   return {
     async getCanvas(user, canvasId) {
@@ -135,7 +137,13 @@ export function createCanvasService(options: {
       const client = options.createUserClient(user.accessToken);
 
       // Extract base64 files to Storage, replacing dataURLs with oss:// markers
-      const leanContent = await extractFilesToStorage(client, canvasId, content);
+      const leanContent = await extractFilesToStorage(
+        client,
+        options.getAdminClient,
+        canvasId,
+        content,
+        user.id,
+      );
 
       // LOCAL FORK: retry transport-level failures.
       //
@@ -334,8 +342,10 @@ async function resolveWorkspaceId(
 
 async function extractFilesToStorage(
   client: UserSupabaseClient,
+  getAdminClient: () => AdminSupabaseClient,
   canvasId: string,
   content: CanvasContent,
+  createdBy: string,
 ): Promise<CanvasContent> {
   const files = (content as { files?: CanvasFileRecord }).files;
   if (!files || Object.keys(files).length === 0) {
@@ -400,6 +410,34 @@ async function extractFilesToStorage(
             `[canvas-service] file upload failed, keeping base64 fileId=${fileId} ` +
               `bucket=${CANVAS_FILES_BUCKET} path=${objectPath} ` +
               `bytes=${buffer.length} error=${uploadError.message}`,
+          );
+          updatedFiles[fileId] = fileData;
+          return;
+        }
+
+        // The object exists now, so record who owns it: a canvas file's project
+        // comes from the canvas itself, and an unregistered object has nobody to
+        // authorise it once the bucket is private (X-52).
+        //
+        // A failure here is treated like an upload failure rather than thrown:
+        // this path must not lose the user's canvas, and by NOT writing the
+        // oss:// marker we keep the base64, so the next save retries the upload
+        // (upsert) and the record (idempotent on bucket+path).
+        const { error: recordError } = await getAdminClient().rpc("record_project_asset", {
+          p_bucket: CANVAS_FILES_BUCKET,
+          p_object_path: objectPath,
+          p_created_by: createdBy,
+          p_fallback_workspace_id: workspaceId,
+          p_project_id: null,
+          p_canvas_id: canvasId,
+          p_mime_type: mimeType,
+          p_byte_size: buffer.length,
+        });
+
+        if (recordError) {
+          console.log(
+            `[canvas-service] asset metadata failed, keeping base64 fileId=${fileId} ` +
+              `path=${objectPath} error=${recordError.message}`,
           );
           updatedFiles[fileId] = fileData;
           return;

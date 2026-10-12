@@ -7,12 +7,14 @@ import { createJobService, type JobService } from "./job-service.js";
 
 type Op =
   | { kind: "update"; patch: Record<string, unknown> }
+  | { kind: "insert"; table: string; row: Record<string, unknown> }
   | { kind: "select"; columns: string | undefined }
   | { kind: "eq"; column: string; value: unknown }
   | { kind: "in"; column: string; values: unknown[] }
   | { kind: "order" }
   | { kind: "limit" }
-  | { kind: "maybeSingle" };
+  | { kind: "maybeSingle"; table: string }
+  | { kind: "single"; table: string };
 
 type HarnessConfig = {
   /** Rows the guarded update reports as changed. */
@@ -21,16 +23,28 @@ type HarnessConfig = {
   /** Row returned by `.maybeSingle()` (getJobAdmin). */
   jobRow?: Record<string, unknown> | null;
   rpc?: { data: unknown; error: { message: string } | null };
+  /** Row returned by `.maybeSingle()` on `canvases` / `projects` (createJob). */
+  canvasRow?: Record<string, unknown> | null;
+  projectRow?: Record<string, unknown> | null;
+  canvasError?: { code?: string; message: string } | null;
+  projectError?: { code?: string; message: string } | null;
+  /** Row the job insert reports back. */
+  insertedJob?: Record<string, unknown> | null;
+  insertError?: { message: string } | null;
 };
 
 function makeHarness(config: HarnessConfig = {}) {
   const ops: Op[] = [];
   const rpcCalls: Array<{ name: string; params: unknown }> = [];
 
-  function makeBuilder() {
+  function makeBuilder(table: string) {
     const builder = {
       update: (patch: Record<string, unknown>) => {
         ops.push({ kind: "update", patch });
+        return builder;
+      },
+      insert: (row: Record<string, unknown>) => {
+        ops.push({ kind: "insert", table, row });
         return builder;
       },
       select: (columns?: string) => {
@@ -54,8 +68,18 @@ function makeHarness(config: HarnessConfig = {}) {
         return builder;
       },
       maybeSingle: async () => {
-        ops.push({ kind: "maybeSingle" });
+        ops.push({ kind: "maybeSingle", table });
+        if (table === "canvases") {
+          return { data: config.canvasRow ?? null, error: config.canvasError ?? null };
+        }
+        if (table === "projects") {
+          return { data: config.projectRow ?? null, error: config.projectError ?? null };
+        }
         return { data: config.jobRow ?? null, error: null };
+      },
+      single: async () => {
+        ops.push({ kind: "single", table });
+        return { data: config.insertedJob ?? null, error: config.insertError ?? null };
       },
       then: (resolve: (value: unknown) => unknown) =>
         Promise.resolve({
@@ -67,8 +91,10 @@ function makeHarness(config: HarnessConfig = {}) {
     return builder;
   }
 
+  const sentMessages: Array<{ queue: string; message: unknown }> = [];
+
   const client = {
-    from: () => makeBuilder(),
+    from: (table: string) => makeBuilder(table),
     rpc: async (name: string, params: unknown) => {
       rpcCalls.push({ name, params });
       return config.rpc ?? { data: null, error: null };
@@ -78,14 +104,21 @@ function makeHarness(config: HarnessConfig = {}) {
   const service: JobService = createJobService({
     createUserClient: () => client as unknown as UserSupabaseClient,
     getAdminClient: () => client as unknown as AdminSupabaseClient,
-    pgmq: {} as PgmqClient,
+    pgmq: {
+      send: async (queue: string, message: unknown) => {
+        sentMessages.push({ queue, message });
+        return 1;
+      },
+    } as unknown as PgmqClient,
   });
 
   const inOp = () => ops.find((op): op is Extract<Op, { kind: "in" }> => op.kind === "in");
   const updateOp = () =>
     ops.find((op): op is Extract<Op, { kind: "update" }> => op.kind === "update");
+  const insertOp = () =>
+    ops.find((op): op is Extract<Op, { kind: "insert" }> => op.kind === "insert");
 
-  return { service, ops, rpcCalls, inOp, updateOp };
+  return { service, ops, rpcCalls, sentMessages, inOp, updateOp, insertOp };
 }
 
 describe("job service state guards", () => {
@@ -217,5 +250,121 @@ describe("job service state guards", () => {
     expect(
       harness.ops.some((op) => op.kind === "eq" && op.column === "status" && op.value === "retrying"),
     ).toBe(true);
+  });
+});
+
+// X-52 prep (T2): a job's PROJECT is derived from its canvas, not taken from the
+// caller. The worker records asset ownership from that project, so a job carrying
+// a project the canvas does not belong to (or none at all) produces media that a
+// private bucket cannot authorise for the project that asked for it.
+describe("createJob resolves the project from the canvas", () => {
+  const USER = { accessToken: "t", email: "a@t", id: "user-1", userMetadata: {} };
+  const jobRow = { id: "job-9", status: "queued", job_type: "image_generation" };
+
+  it("case 1: the canvas's project is written even when the caller omitted it", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: "project-from-canvas" },
+      insertedJob: jobRow,
+    });
+
+    await harness.service.createJob(USER, {
+      workspaceId: "ws-personal",
+      canvasId: "canvas-1",
+      jobType: "image_generation",
+      payload: { prompt: "x" },
+    });
+
+    expect(harness.insertOp()?.row.project_id).toBe("project-from-canvas");
+    expect(harness.insertOp()?.row.canvas_id).toBe("canvas-1");
+  });
+
+  it("case 2: a forged project that contradicts the canvas is refused, nothing is enqueued", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: "project-real" },
+      insertedJob: jobRow,
+    });
+
+    const error = await harness.service
+      .createJob(USER, {
+        workspaceId: "ws-personal",
+        projectId: "project-forged",
+        canvasId: "canvas-1",
+        jobType: "image_generation",
+        payload: { prompt: "x" },
+      })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as { statusCode?: number; message?: string });
+
+    expect(error?.statusCode).toBe(400);
+    expect(error?.message).toContain("do not match");
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+  });
+
+  it("case 3: an unreadable canvas is refused rather than guessed", async () => {
+    // RLS answers with no row for a canvas the caller cannot see.
+    const harness = makeHarness({ canvasRow: null, insertedJob: jobRow });
+
+    const error = await harness.service
+      .createJob(USER, {
+        workspaceId: "ws-personal",
+        canvasId: "canvas-of-someone-else",
+        jobType: "image_generation",
+        payload: { prompt: "x" },
+      })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as { statusCode?: number });
+
+    expect(error?.statusCode).toBe(403);
+    expect(harness.insertOp()).toBeUndefined();
+  });
+
+  it("case 4: a job with no canvas still works, with a null project", async () => {
+    const harness = makeHarness({ insertedJob: jobRow });
+
+    await harness.service.createJob(USER, {
+      workspaceId: "ws-personal",
+      jobType: "image_generation",
+      payload: { prompt: "x" },
+    });
+
+    expect(harness.insertOp()?.row.project_id).toBeNull();
+    expect(harness.sentMessages).toHaveLength(1);
+  });
+
+  it("case 5: a project-only job is verified against the caller's own client", async () => {
+    const harness = makeHarness({
+      projectRow: { id: "project-1" },
+      insertedJob: jobRow,
+    });
+
+    await harness.service.createJob(USER, {
+      workspaceId: "ws-team",
+      projectId: "project-1",
+      jobType: "image_generation",
+      payload: { prompt: "x" },
+    });
+
+    expect(harness.ops.some((op) => op.kind === "maybeSingle" && op.table === "projects")).toBe(
+      true,
+    );
+    expect(harness.insertOp()?.row.project_id).toBe("project-1");
+  });
+
+  it("case 6: an unreadable project is refused", async () => {
+    const harness = makeHarness({ projectRow: null, insertedJob: jobRow });
+
+    const error = await harness.service
+      .createJob(USER, {
+        workspaceId: "ws-team",
+        projectId: "project-of-someone-else",
+        jobType: "image_generation",
+        payload: { prompt: "x" },
+      })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as { statusCode?: number });
+
+    expect(error?.statusCode).toBe(403);
+    expect(harness.insertOp()).toBeUndefined();
   });
 });

@@ -142,6 +142,9 @@ describe("createProjectService with the team workspace", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
+      // X-52 工单12: the service now records asset metadata through the admin
+      // client. These cases exercise create/list only, so it is never called.
+      getAdminClient: () => client as unknown as never,
     });
 
     const project = await service.createProject(USER, { name: "My Project" });
@@ -176,6 +179,7 @@ describe("createProjectService with the team workspace", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
     });
 
     const projects = await service.listProjects(USER);
@@ -195,6 +199,7 @@ describe("createProjectService with the team workspace", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(null),
+      getAdminClient: () => client as unknown as never,
     });
 
     const error = await service

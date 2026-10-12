@@ -1046,6 +1046,19 @@ export type Database = {
         Args: { p_actor: string; p_asset_id: string }
         Returns: boolean
       }
+      record_project_asset: {
+        Args: {
+          p_bucket: string
+          p_object_path: string
+          p_created_by: string
+          p_fallback_workspace_id: string
+          p_project_id?: string | null
+          p_canvas_id?: string | null
+          p_mime_type?: string | null
+          p_byte_size?: number | null
+        }
+        Returns: Json
+      }
       migrate_personal_projects_to_team: {
         Args: Record<string, never>
         Returns: Json

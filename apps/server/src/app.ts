@@ -180,11 +180,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createViewerService({ getAdminClient, teamMembership: teamMembershipService });
   const projectService =
     options.projectService ??
-    createProjectService({ createUserClient, viewerService });
+    createProjectService({ createUserClient, viewerService, getAdminClient });
   const brandKitService =
     options.brandKitService ?? createBrandKitService({ createUserClient });
   const canvasService =
-    options.canvasService ?? createCanvasService({ createUserClient });
+    options.canvasService ??
+    createCanvasService({ createUserClient, getAdminClient });
   const threadService =
     options.threadService ?? createThreadService({ createUserClient });
   const chatService =
@@ -201,7 +202,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         defaultModel: resolveDefaultAgentModel(env),
       });
   const uploadService =
-    options.uploadService ?? createUploadService({ createUserClient });
+    options.uploadService ?? createUploadService({ createUserClient, getAdminClient });
   const pgmq = env.supabaseDbUrl
     ? createPgmqClient(env.supabaseDbUrl)
     : undefined;

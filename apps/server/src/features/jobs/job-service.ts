@@ -145,11 +145,74 @@ export function createJobService(options: {
       const client = options.createUserClient(user.accessToken);
       const queueName = queueForJobType(input.jobType);
 
+      // "Which project did this come from?" is not the caller's decision: the
+      // worker records asset ownership from the job's project, and a job whose
+      // project is wrong (or absent) produces media a private bucket can no
+      // longer authorise for the project that asked for it.
+      //
+      // The canvas is read through the CALLER's client, so the same query answers
+      // both "does this canvas exist" and "may this user use it" — RLS returns no
+      // row for a canvas they cannot see. Nothing is enqueued on rejection.
+      let projectId = input.projectId;
+
+      if (input.canvasId) {
+        const { data: canvas, error: canvasError } = await client
+          .from("canvases")
+          .select("project_id")
+          .eq("id", input.canvasId)
+          .maybeSingle();
+
+        if (canvasError) {
+          throw new JobServiceError(
+            "job_create_failed",
+            "Failed to verify the job canvas.",
+            500,
+          );
+        }
+        if (!canvas?.project_id) {
+          throw new JobServiceError(
+            "job_create_failed",
+            "Canvas not found or not accessible to this user.",
+            403,
+          );
+        }
+        if (projectId && projectId !== canvas.project_id) {
+          throw new JobServiceError(
+            "job_create_failed",
+            "Canvas and project do not match.",
+            400,
+          );
+        }
+
+        projectId = canvas.project_id;
+      } else if (projectId) {
+        const { data: project, error: projectError } = await client
+          .from("projects")
+          .select("id")
+          .eq("id", projectId)
+          .maybeSingle();
+
+        if (projectError) {
+          throw new JobServiceError(
+            "job_create_failed",
+            "Failed to verify the job project.",
+            500,
+          );
+        }
+        if (!project) {
+          throw new JobServiceError(
+            "job_create_failed",
+            "Project not found or not accessible to this user.",
+            403,
+          );
+        }
+      }
+
       const { data: job, error } = await client
         .from("background_jobs")
         .insert({
           workspace_id: input.workspaceId,
-          project_id: input.projectId ?? null,
+          project_id: projectId ?? null,
           canvas_id: input.canvasId ?? null,
           session_id: input.sessionId ?? null,
           thread_id: input.threadId ?? null,

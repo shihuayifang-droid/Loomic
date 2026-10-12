@@ -9,6 +9,7 @@ import {
   type ViewerService,
 } from "../bootstrap/ensure-user-foundation.js";
 import { withTransportRetry } from "../../supabase/transport-retry.js";
+import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -93,6 +94,7 @@ export class ProjectServiceError extends Error {
 export function createProjectService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   viewerService: ViewerService;
+  getAdminClient: () => AdminSupabaseClient;
 }): ProjectService {
   return {
     async archiveProject(user, projectId) {
@@ -348,6 +350,32 @@ export function createProjectService(options: {
         throw new ProjectServiceError(
           "project_create_failed",
           `Thumbnail upload failed: ${uploadError.message}`,
+          500,
+        );
+      }
+
+      // The thumbnail is a project asset like any other: once the bucket is
+      // private, an object with no asset row has no owner to authorise it.
+      // Recorded BEFORE the reference is saved, so a metadata failure cannot
+      // leave the project pointing at an object nobody owns.
+      const { error: recordError } = await options.getAdminClient().rpc(
+        "record_project_asset",
+        {
+          p_bucket: THUMBNAIL_BUCKET,
+          p_object_path: objectPath,
+          p_created_by: user.id,
+          p_fallback_workspace_id: proj.workspace_id,
+          p_project_id: projectId,
+          p_canvas_id: null,
+          p_mime_type: mimeType,
+          p_byte_size: buffer.length,
+        },
+      );
+
+      if (recordError) {
+        throw new ProjectServiceError(
+          "project_create_failed",
+          "Failed to record thumbnail metadata.",
           500,
         );
       }

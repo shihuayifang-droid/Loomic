@@ -9,7 +9,7 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
   const admin = ctx.getAdminClient();
   const { data: jobRow } = await admin
     .from("background_jobs")
-    .select("created_by, workspace_id, canvas_id, session_id, payload")
+    .select("created_by, workspace_id, canvas_id, project_id, session_id, payload")
     .eq("id", jobId)
     .single();
 
@@ -36,6 +36,18 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
   const createdBy: string | null = jobRow.created_by ?? null;
   const workspaceId: string = jobRow.workspace_id ?? jobId;
+
+  // OWNERSHIP vs BILLING — same split as the image executor: the job's workspace
+  // is the personal billing workspace (Q1), the project lives in the team
+  // workspace, and record_project_asset derives the latter from the canvas.
+  const canvasId: string | null = (jobRow.canvas_id as string | null) ?? null;
+  const projectId: string | null = (jobRow.project_id as string | null) ?? null;
+
+  if (!createdBy) {
+    throw new Error(
+      `Job ${jobId} has no created_by — refusing to generate an unattributable asset`,
+    );
+  }
 
   const model = payload.model ?? "wan-video/wan-2.6";
   const providerName = resolveVideoProviderName(model);
@@ -93,21 +105,26 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     }
     lap("storage_upload_done");
 
-    const { data: assetRow, error: assetError } = await admin
-      .from("asset_objects")
-      .insert({
-        workspace_id: workspaceId,
-        bucket: "project-assets",
-        object_path: objectPath,
-        mime_type: generated.mimeType ?? "video/mp4",
-        byte_size: buffer.length,
-        ...(createdBy ? { created_by: createdBy } : {}),
-      })
-      .select("id")
-      .single();
+    // See the image executor: ownership goes through record_project_asset, and a
+    // failure here must fail the job rather than leave an unowned object.
+    const { data: assetData, error: assetError } = await admin.rpc("record_project_asset", {
+      p_bucket: "project-assets",
+      p_object_path: objectPath,
+      p_created_by: createdBy,
+      p_fallback_workspace_id: workspaceId,
+      p_project_id: projectId,
+      p_canvas_id: canvasId,
+      p_mime_type: generated.mimeType ?? "video/mp4",
+      p_byte_size: buffer.length,
+    });
 
-    if (assetError || !assetRow) {
-      throw new Error(`Failed to create asset record: ${assetError?.message ?? "unknown error"}`);
+    if (assetError) {
+      throw new Error(`Failed to record asset ownership: ${assetError.message}`);
+    }
+
+    const assetId = (assetData as { asset_id?: string } | null)?.asset_id;
+    if (!assetId) {
+      throw new Error("Failed to record asset ownership: no asset id returned");
     }
     lap("asset_record_done");
 
@@ -117,7 +134,7 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
     lap("total");
     return {
-      asset_id: (assetRow as { id: string }).id,
+      asset_id: assetId,
       signed_url: urlData.publicUrl,
       object_path: objectPath,
       width: generated.width,

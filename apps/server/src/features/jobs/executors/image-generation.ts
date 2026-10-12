@@ -16,7 +16,7 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
   const admin = ctx.getAdminClient();
   const { data: jobRow } = await admin
     .from("background_jobs")
-    .select("created_by, workspace_id, canvas_id, session_id, payload")
+    .select("created_by, workspace_id, canvas_id, project_id, session_id, payload")
     .eq("id", jobId)
     .single();
 
@@ -40,6 +40,21 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
   const createdBy: string | null = jobRow.created_by ?? null;
   const workspaceId: string = jobRow.workspace_id ?? jobId;
+
+  // OWNERSHIP vs BILLING. `workspace_id` here is the PERSONAL billing workspace
+  // (Q1), while the project a canvas belongs to lives in the team workspace. The
+  // asset's ownership is derived from the project/canvas by record_project_asset,
+  // so the two must be passed separately and never conflated.
+  const canvasId: string | null = (jobRow.canvas_id as string | null) ?? null;
+  const projectId: string | null = (jobRow.project_id as string | null) ?? null;
+
+  if (!createdBy) {
+    // Fail before generating: an asset nobody created is an asset nobody can be
+    // authorised against once the bucket is private (X-52).
+    throw new Error(
+      `Job ${jobId} has no created_by — refusing to generate an unattributable asset`,
+    );
+  }
 
   // Resolve provider dynamically from model ID via registry
   const model = payload.model ?? "black-forest-labs/flux-kontext-pro";
@@ -129,24 +144,29 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     }
     lap("storage_upload_done");
 
-    // Insert asset_objects record — only include created_by if we have a valid user UUID
-    const { data: assetRow, error: assetError } = await admin
-      .from("asset_objects")
-      .insert({
-        workspace_id: workspaceId,
-        bucket: "project-assets",
-        object_path: objectPath,
-        mime_type: generated.mimeType ?? "image/png",
-        byte_size: buffer.length,
-        ...(createdBy ? { created_by: createdBy } : {}),
-      })
-      .select("id")
-      .single();
+    // Record ownership through the single service_role-only entry point. A
+    // direct insert here is what left generated media attached to the billing
+    // workspace with project_id null, which a private bucket then cannot
+    // authorise. If this fails the job must fail: an uploaded object with no
+    // metadata is exactly the "silent success" this ticket exists to remove.
+    const { data: assetData, error: assetError } = await admin.rpc("record_project_asset", {
+      p_bucket: "project-assets",
+      p_object_path: objectPath,
+      p_created_by: createdBy,
+      p_fallback_workspace_id: workspaceId,
+      p_project_id: projectId,
+      p_canvas_id: canvasId,
+      p_mime_type: generated.mimeType ?? "image/png",
+      p_byte_size: buffer.length,
+    });
 
-    if (assetError || !assetRow) {
-      throw new Error(
-        `Failed to create asset record: ${assetError?.message ?? "unknown error"}`,
-      );
+    if (assetError) {
+      throw new Error(`Failed to record asset ownership: ${assetError.message}`);
+    }
+
+    const assetId = (assetData as { asset_id?: string } | null)?.asset_id;
+    if (!assetId) {
+      throw new Error("Failed to record asset ownership: no asset id returned");
     }
 
     lap("asset_record_done");
@@ -158,7 +178,7 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
     lap("total");
     return {
-      asset_id: (assetRow as { id: string }).id,
+      asset_id: assetId,
       signed_url: urlData.publicUrl,
       object_path: objectPath,
       width: generated.width,

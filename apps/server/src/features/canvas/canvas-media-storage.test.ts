@@ -164,7 +164,12 @@ describe("CV-01 video object keys", () => {
         },
       ],
     });
-    const service = createCanvasService({ createUserClient: () => fake.client });
+    // X-52 工单12: the service records asset metadata through the admin client on
+    // the SAVE path; these cases read canvases, so it is never called.
+    const service = createCanvasService({
+      createUserClient: () => fake.client,
+      getAdminClient: () => fake.client as unknown as never,
+    });
 
     const detail = await service.getCanvas(USER, CANVAS_ID);
 
@@ -227,7 +232,12 @@ describe("CV-01 video object keys", () => {
       ...emptyCanvas(),
       elements: [legacy, nonVideo, emptyObjectPath, emptyBucket, noSlash, good],
     });
-    const service = createCanvasService({ createUserClient: () => fake.client });
+    // X-52 工单12: the service records asset metadata through the admin client on
+    // the SAVE path; these cases read canvases, so it is never called.
+    const service = createCanvasService({
+      createUserClient: () => fake.client,
+      getAdminClient: () => fake.client as unknown as never,
+    });
 
     // The response must still arrive: a bad marker is one element's problem.
     const detail = await service.getCanvas(USER, CANVAS_ID);

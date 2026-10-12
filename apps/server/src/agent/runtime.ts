@@ -390,6 +390,51 @@ async function resolvePersonalWorkspaceId(
   return ws.id;
 }
 
+/**
+ * The project a canvas belongs to, read through the caller's own client.
+ *
+ * The worker records asset ownership from the job's project, so a job that names
+ * a canvas has to carry the project that canvas belongs to. Two reasons this is
+ * resolved here rather than accepted from the caller:
+ *
+ *  - Ownership must follow the canvas/project source of truth. The job's own
+ *    workspace is the PERSONAL billing workspace (Q1), which is the wrong
+ *    workspace to authorise a team project's media against.
+ *  - Using the caller's client makes RLS part of the answer: a canvas they
+ *    cannot read returns no row, and the job is refused rather than created
+ *    against a guessed project.
+ */
+async function resolveCanvasProjectId(
+  client: UserSupabaseClient,
+  canvasId: string,
+  context: string,
+): Promise<string> {
+  const { data: canvas, error } = await client
+    .from("canvases")
+    .select("project_id")
+    .eq("id", canvasId)
+    .maybeSingle();
+
+  if (error) {
+    console.log(
+      `[${context}] canvas project lookup failed`,
+      JSON.stringify({ code: error.code, message: error.message }),
+    );
+    throw new Error(
+      `Canvas project lookup failed (${error.code ?? "no-code"}): ${error.message}`,
+    );
+  }
+  if (!canvas?.project_id) {
+    // No project means no way to authorise the generated asset later, so the
+    // run fails here — before credits are charged — instead of on the canvas.
+    console.log(`[${context}] canvas ${canvasId} has no readable project`);
+    throw new Error(
+      "Canvas not found or not accessible — refusing to create a job without its project",
+    );
+  }
+  return canvas.project_id;
+}
+
 export type AgentRunService = ReturnType<typeof createAgentRunService>;
 
 /** Fields a finished video job stores in `background_jobs.result`. */
@@ -716,6 +761,13 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           const workspaceId = await resolvePersonalWorkspaceId(client, "submitImageJob");
           jobLap("workspace_resolved", { workspaceId });
 
+          // Billing stays on the personal workspace above; the PROJECT comes from
+          // the canvas, so the generated asset can be authorised against the team
+          // project that asked for it.
+          const projectId = canvasId
+            ? await resolveCanvasProjectId(client, canvasId, "submitImageJob")
+            : undefined;
+
           const user: AuthenticatedUser = {
             id: userId,
             accessToken,
@@ -748,6 +800,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 },
                 refs: {
                   ...(canvasId ? { canvasId } : {}),
+                  ...(projectId ? { projectId } : {}),
                   ...(sessionId ? { sessionId } : {}),
                 },
               },
@@ -955,6 +1008,10 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           const workspaceId = await resolvePersonalWorkspaceId(client, "submitVideoJob");
           jobLap("workspace_resolved", { workspaceId });
 
+          const projectId = canvasId
+            ? await resolveCanvasProjectId(client, canvasId, "submitVideoJob")
+            : undefined;
+
           const user: AuthenticatedUser = {
             id: userId,
             accessToken,
@@ -989,6 +1046,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 },
                 refs: {
                   ...(canvasId ? { canvasId } : {}),
+                  ...(projectId ? { projectId } : {}),
                   ...(sessionId ? { sessionId } : {}),
                 },
               },
