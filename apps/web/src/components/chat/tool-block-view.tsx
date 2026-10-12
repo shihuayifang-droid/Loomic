@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import type { ToolBlock } from "@loomic/shared";
+import type { ImageArtifact, ToolBlock } from "@loomic/shared";
 import { ChatImage } from "./image-lightbox";
 import { GenerationShimmer } from "../media/generation-shimmer";
 import {
@@ -15,6 +15,27 @@ import {
   getToolConfig,
   isHumanReadable,
 } from "./utils";
+
+/* ------------------------------------------------------------------ */
+/*  X-52 artifact projections (工单14 fixup2)                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The url an artifact can actually be displayed with, or `null`.
+ *
+ * X-52 split an artifact into identity (`assetId` / `objectPath`, what is
+ * persisted) and `url` (this read's projection). The server re-signs on every
+ * read and — when the caller may not read the asset, or the signer refuses —
+ * answers with the stable artifact and NO url. That is a legal answer, so the
+ * view has to treat "no url" as a display limitation, not as a broken string:
+ * an `<img src={undefined}>` would either request the current page or render
+ * nothing, and falling back to a stale url is the one thing the ticket forbids.
+ * `assetId` is never substituted here — it is an identity, not a URL.
+ */
+function displayUrlOf(artifact: { url?: string | undefined }): string | null {
+  const url = artifact.url;
+  return typeof url === "string" && url.length > 0 ? url : null;
+}
 
 /* ------------------------------------------------------------------ */
 /*  ToolIcon                                                           */
@@ -166,6 +187,17 @@ export const ToolBlockView = React.memo(function ToolBlockView({
 
   // Extract artifacts for generate_image / generate_video inline preview
   const imageArtifact = block.artifacts?.find((a: { type: string }) => a.type === "image");
+  /**
+   * X-52 (工单14 fixup2): the image artifact that can actually be SHOWN. An
+   * image artifact with no url is a stable artifact this read could not project
+   * — the server's deliberate answer for an un-readable or un-signable asset —
+   * so it is displayed as "currently unavailable" rather than as a broken
+   * `<img>` whose `src` is undefined.
+   */
+  const displayableImageArtifact = block.artifacts?.find(
+    (artifact): artifact is ImageArtifact & { url: string } =>
+      artifact.type === "image" && displayUrlOf(artifact) !== null,
+  );
   const isImageTool = block.toolName === "generate_image";
   const isVideoTool = block.toolName === "generate_video";
   const isMediaTool = isImageTool || isVideoTool;
@@ -229,14 +261,19 @@ export const ToolBlockView = React.memo(function ToolBlockView({
       )}
 
       {/* Layer 2b: Image generation card with inline preview */}
-      {isImageTool && isCompleted && imageArtifact ? (
+      {isImageTool && isCompleted && displayableImageArtifact ? (
         <ImageArtifactCard
-          artifact={imageArtifact}
+          artifact={displayableImageArtifact}
           cardTitle={cardTitle}
           modelName={modelName}
           hasDetails={!!hasDetails}
           onOpenPanel={handleOpenPanel}
         />
+      ) : isImageTool && isCompleted && imageArtifact ? (
+        /* X-52: stable artifact, but no url could be projected for this read.
+           Saying so is the honest answer; there is no preview to build and no
+           stale url to fall back to. */
+        <UnavailableArtifactCard />
       ) : showCard ? (
         /* Layer 2: Generic output card (non-image tools) */
         <div className="rounded-xl border-[0.5px] border-border p-3">
@@ -298,6 +335,60 @@ export const ToolBlockView = React.memo(function ToolBlockView({
 });
 
 /* ------------------------------------------------------------------ */
+/*  UnavailableArtifactCard — stable artifact, no projection this read */
+/* ------------------------------------------------------------------ */
+
+/**
+ * X-52 (工单14 fixup2): shown when a media artifact exists but carries no url.
+ *
+ * The artifact's identity was persisted, so the picture is not lost — it simply
+ * could not be signed for this caller on this read (RLS refused the asset, the
+ * object is gone, or the signer errored). Rendering an `<img>` with an absent
+ * `src`, or reusing the url still sitting in the row, would both turn a
+ * recoverable display limitation into a broken or forged image.
+ */
+const UnavailableArtifactCard = React.memo(function UnavailableArtifactCard() {
+  return (
+    <div className="rounded-xl border-[0.5px] border-border bg-muted/40 p-3">
+      <div className="flex items-start gap-2.5">
+        <div className="mt-0.5 shrink-0 rounded-lg bg-muted p-1.5 text-muted-foreground">
+          <ToolIcon type="image" className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold text-foreground">
+            附件当前不可访问
+          </div>
+          <div className="mt-0.5 text-[12px] text-muted-foreground">
+            图片已保存，但本次没有取得可用的访问链接，下次打开会话时会重新尝试。
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+/* ------------------------------------------------------------------ */
+/*  UnavailableAttachment — panel-sized placeholder for a url-less item */
+/* ------------------------------------------------------------------ */
+
+/** Same verdict as `UnavailableArtifactCard`, sized for the panel's grid. */
+const UnavailableAttachment = React.memo(function UnavailableAttachment() {
+  return (
+    <div
+      className="flex h-20 w-[200px] flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-border bg-muted/40 px-3 text-center"
+      title="附件当前不可访问"
+    >
+      <span className="text-[12px] text-muted-foreground">
+        附件当前不可访问
+      </span>
+      <span className="text-[10px] text-muted-foreground/80">
+        本次未取得可用链接
+      </span>
+    </div>
+  );
+});
+
+/* ------------------------------------------------------------------ */
 /*  MediaErrorCard                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -346,7 +437,7 @@ const ImageArtifactCard = React.memo(function ImageArtifactCard({
   hasDetails,
   onOpenPanel,
 }: {
-  artifact: { url: string; title?: string; type: string };
+  artifact: { url: string; title?: string | undefined; type: string };
   cardTitle: string;
   modelName: string | undefined;
   hasDetails: boolean;
@@ -559,16 +650,23 @@ function ToolDetailPanel({
                 附件
               </div>
               <div className="flex flex-wrap gap-2">
-                {block.artifacts.map((artifact: { type: string; url: string; title?: string }) =>
-                  artifact.type === "image" ? (
+                {block.artifacts.map((artifact, index) => {
+                  if (artifact.type !== "image") return null;
+                  // X-52 (工单14 fixup2): an artifact with no url has nothing to
+                  // render and nothing to fetch — say so instead of building an
+                  // `<img>` out of an absent (or stale) url.
+                  const url = displayUrlOf(artifact);
+                  return url ? (
                     <ChatImage
-                      key={artifact.url}
-                      src={artifact.url}
+                      key={url}
+                      src={url}
                       alt={artifact.title ?? "Generated image"}
                       className="max-w-[200px] rounded-lg border border-border"
                     />
-                  ) : null,
-                )}
+                  ) : (
+                    <UnavailableAttachment key={`unavailable-${index}`} />
+                  );
+                })}
               </div>
             </div>
           )}

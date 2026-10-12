@@ -753,3 +753,210 @@ describe("X-52 media block contracts (工单14 fixup T2)", () => {
     ).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// X-52 (工单14 fixup2): a TOOL block's artifacts close the same hole the image
+// block closed in fixup T2.
+//
+// `chat-service.projectBlockUrls()` strips the url from an artifact that names
+// an asset and re-signs it on every read; when the caller may not read the asset
+// or the signer refuses, the artifact it returns deliberately has NO url. With
+// `url` required, `toolArtifactSchema` rejected that answer, so the block that
+// `listMessages` had just built failed the response parse — a 500 produced by
+// the very code path that exists to answer safely. These cases pin the three
+// shapes through `toolBlockSchema` and both message response contracts, plus
+// the boundary that must NOT move: no url is only legal with an identity.
+// ---------------------------------------------------------------------------
+describe("X-52 tool artifact contracts (工单14 fixup2)", () => {
+  const SIGNED =
+    "https://proj.test/storage/v1/object/sign/project-assets/ws-team/p/a.png?token=fresh";
+  const STALE =
+    "https://proj.test/storage/v1/object/sign/project-assets/ws-team/p/a.png?token=stale";
+
+  const toolBlock = (artifacts: unknown[]) => ({
+    type: "tool" as const,
+    toolCallId: "call-1",
+    toolName: "generate_image",
+    status: "completed" as const,
+    artifacts,
+  });
+
+  const message = (block: unknown) => ({
+    id: "message-1",
+    role: "assistant" as const,
+    content: "look",
+    contentBlocks: [block],
+    createdAt: "2026-10-12T00:00:00.000Z",
+  });
+
+  it("shape 1: an image tool artifact with a url still parses (a live projection)", () => {
+    const parsed = contentBlockSchema.parse(
+      toolBlock([
+        {
+          type: "image",
+          url: SIGNED,
+          assetId: "asset-1",
+          objectPath: "ws-team/p/a.png",
+          mimeType: "image/png",
+          width: 512,
+          height: 512,
+        },
+      ]),
+    );
+
+    expect(parsed.type).toBe("tool");
+    if (parsed.type !== "tool") throw new Error("expected a tool block");
+    expect(parsed.artifacts?.[0]).toMatchObject({
+      type: "image",
+      url: SIGNED,
+      assetId: "asset-1",
+    });
+  });
+
+  it("shape 2: a stable image artifact with NO url parses — and the stale url is not re-served", () => {
+    // Exactly what `projectBlockUrls` returns for an un-signable asset: the
+    // stored url is dropped rather than re-served.
+    const parsed = contentBlockSchema.parse(
+      toolBlock([
+        {
+          type: "image",
+          assetId: "asset-locked",
+          objectPath: "ws-team/p/secret.png",
+          mimeType: "image/png",
+          width: 512,
+          height: 512,
+        },
+      ]),
+    );
+
+    if (parsed.type !== "tool") throw new Error("expected a tool block");
+    const artifact = parsed.artifacts?.[0] as Record<string, unknown>;
+    expect(artifact.url).toBeUndefined();
+    expect(artifact.assetId).toBe("asset-locked");
+    expect(artifact.objectPath).toBe("ws-team/p/secret.png");
+    expect(JSON.stringify(parsed)).not.toContain("token=stale");
+  });
+
+  it("shape 3: a stable VIDEO tool artifact with NO url parses", () => {
+    const parsed = contentBlockSchema.parse({
+      type: "tool",
+      toolCallId: "call-2",
+      toolName: "generate_video",
+      status: "completed",
+      artifacts: [
+        {
+          type: "video",
+          assetId: "asset-locked-video",
+          objectPath: "ws-team/p/secret.mp4",
+          mimeType: "video/mp4",
+          width: 1280,
+          height: 720,
+          durationSeconds: 5,
+        },
+      ],
+    });
+
+    if (parsed.type !== "tool") throw new Error("expected a tool block");
+    const artifact = parsed.artifacts?.[0] as Record<string, unknown>;
+    expect(artifact.type).toBe("video");
+    expect(artifact.url).toBeUndefined();
+    expect(artifact.assetId).toBe("asset-locked-video");
+  });
+
+  it("shape 4: a historical URL-only tool artifact still parses (pre-X-52 media)", () => {
+    const parsed = contentBlockSchema.parse(
+      toolBlock([
+        {
+          type: "image",
+          url: STALE,
+          mimeType: "image/png",
+          width: 1024,
+          height: 1024,
+        },
+      ]),
+    );
+
+    if (parsed.type !== "tool") throw new Error("expected a tool block");
+    expect(parsed.artifacts?.[0]).toMatchObject({ type: "image", url: STALE });
+  });
+
+  it("boundary: no url AND no assetId is still refused, on every artifact type", () => {
+    // "Optional url" must not become "anything goes": without an assetId there
+    // is no identity left to re-derive a projection from on a later read.
+    expect(
+      contentBlockSchema.safeParse(
+        toolBlock([
+          { type: "image", mimeType: "image/png", width: 512, height: 512 },
+        ]),
+      ).success,
+    ).toBe(false);
+
+    expect(
+      contentBlockSchema.safeParse(
+        toolBlock([
+          { type: "video", mimeType: "video/mp4", width: 1280, height: 720 },
+        ]),
+      ).success,
+    ).toBe(false);
+
+    // And an empty string is not a url, with or without an identity.
+    expect(
+      contentBlockSchema.safeParse(
+        toolBlock([
+          {
+            type: "image",
+            url: "",
+            assetId: "asset-1",
+            mimeType: "image/png",
+            width: 512,
+            height: 512,
+          },
+        ]),
+      ).success,
+    ).toBe(false);
+  });
+
+  it("both message response contracts parse a url-less stable TOOL artifact", () => {
+    // The two parses that used to turn the safe server-side outcome into a 500,
+    // on GET /api/sessions/:id/messages and on message creation respectively —
+    // this time for artifacts rather than image blocks.
+    const block = message(
+      toolBlock([
+        {
+          type: "image",
+          assetId: "asset-locked",
+          objectPath: "ws-team/p/secret.png",
+          mimeType: "image/png",
+          width: 512,
+          height: 512,
+        },
+        {
+          type: "video",
+          assetId: "asset-locked-video",
+          objectPath: "ws-team/p/secret.mp4",
+          mimeType: "video/mp4",
+          width: 1280,
+          height: 720,
+        },
+      ]),
+    );
+
+    const list = messageListResponseSchema.parse({ messages: [block] });
+    const created = messageCreateResponseSchema.parse({ message: block });
+
+    const listArtifacts = (
+      list.messages[0]?.contentBlocks?.[0] as { artifacts?: Array<Record<string, unknown>> }
+    ).artifacts;
+    const createdArtifacts = (
+      created.message.contentBlocks?.[0] as { artifacts?: Array<Record<string, unknown>> }
+    ).artifacts;
+
+    expect(listArtifacts?.[0]?.url).toBeUndefined();
+    expect(listArtifacts?.[0]?.assetId).toBe("asset-locked");
+    expect(listArtifacts?.[1]?.url).toBeUndefined();
+    expect(listArtifacts?.[1]?.assetId).toBe("asset-locked-video");
+    expect(createdArtifacts?.[0]?.url).toBeUndefined();
+    expect(createdArtifacts?.[0]?.assetId).toBe("asset-locked");
+    expect(createdArtifacts?.[1]?.assetId).toBe("asset-locked-video");
+  });
+});

@@ -586,3 +586,189 @@ describe("createMessage projects urls for this caller (X-52 T2)", () => {
     expect(parsedBlock.url).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// X-52 (工单14 fixup2): the SAME projection rule, one level down — a tool
+// block's artifacts.
+//
+// fixup T2 closed this for `image` blocks; a tool block's `artifacts` carry the
+// identical identity/projection split, and `projectBlockUrls()` already strips
+// and re-signs them. But `toolArtifactSchema` still required `url`, so the
+// url-less artifact the projection deliberately produces failed the response
+// parse — a 500 on a state the server had just built on purpose. These cases
+// pin both reads (list and create) and both media types, ending in the parse
+// the route itself performs.
+// ---------------------------------------------------------------------------
+describe("tool block artifacts without a projection (X-52 fixup2)", () => {
+  const TOOL_STALE =
+    "https://proj.test/storage/v1/object/sign/project-assets/ws-team/p/secret.png?token=stale";
+
+  function toolBlock(artifacts: unknown[]): Record<string, unknown> {
+    return {
+      type: "tool",
+      toolCallId: "call-1",
+      toolName: "generate_image",
+      status: "completed",
+      artifacts,
+    };
+  }
+
+  function firstArtifact(blocks: unknown): Record<string, unknown> {
+    const list = blocks as Array<Record<string, unknown>>;
+    const artifacts = list[0]?.artifacts as Array<Record<string, unknown>>;
+    return artifacts[0] as Record<string, unknown>;
+  }
+
+  const LOCKED_IMAGE = {
+    type: "image",
+    assetId: "asset-locked",
+    objectPath: "ws-team/p/secret.png",
+    mimeType: "image/png",
+    width: 512,
+    height: 512,
+    // A stale url is NOT a fallback: it is a token that used to work.
+    url: TOOL_STALE,
+  };
+
+  it("case 1: an un-signable image artifact keeps its identity and loses the url", async () => {
+    const harness = fakeReadClient({
+      rows: [rowWithBlocks([toolBlock([LOCKED_IMAGE])])],
+      assets: [
+        { id: "asset-locked", object_path: "ws-team/p/secret.png", bucket: "project-assets" },
+      ],
+      unsignable: new Set(["ws-team/p/secret.png"]),
+    });
+
+    const messages = await harness.service.listMessages(USER, SESSION);
+    const artifact = firstArtifact(messages[0]?.contentBlocks);
+
+    expect(artifact.assetId).toBe("asset-locked");
+    expect(artifact.objectPath).toBe("ws-team/p/secret.png");
+    expect(artifact.url).toBeUndefined();
+    expect(JSON.stringify(messages)).not.toContain("token=stale");
+
+    // The parse the route performs before answering.
+    const parsed = messageListResponseSchema.parse({ messages });
+    const parsedArtifact = firstArtifact(
+      parsed.messages[0]?.contentBlocks,
+    );
+    expect(parsedArtifact.assetId).toBe("asset-locked");
+    expect(parsedArtifact.url).toBeUndefined();
+  });
+
+  it("case 2: an un-signable VIDEO artifact behaves the same way", async () => {
+    const harness = fakeReadClient({
+      rows: [
+        rowWithBlocks([
+          {
+            ...toolBlock([
+              {
+                type: "video",
+                assetId: "asset-locked-video",
+                objectPath: "ws-team/p/secret.mp4",
+                mimeType: "video/mp4",
+                width: 1280,
+                height: 720,
+                durationSeconds: 5,
+              },
+            ]),
+            toolName: "generate_video",
+          },
+        ]),
+      ],
+      assets: [
+        {
+          id: "asset-locked-video",
+          object_path: "ws-team/p/secret.mp4",
+          bucket: "project-assets",
+        },
+      ],
+      unsignable: new Set(["ws-team/p/secret.mp4"]),
+    });
+
+    const messages = await harness.service.listMessages(USER, SESSION);
+    const artifact = firstArtifact(messages[0]?.contentBlocks);
+
+    expect(artifact.type).toBe("video");
+    expect(artifact.assetId).toBe("asset-locked-video");
+    expect(artifact.url).toBeUndefined();
+
+    const parsed = messageListResponseSchema.parse({ messages });
+    const parsedArtifact = firstArtifact(parsed.messages[0]?.contentBlocks);
+    expect(parsedArtifact.type).toBe("video");
+    expect(parsedArtifact.assetId).toBe("asset-locked-video");
+    expect(parsedArtifact.url).toBeUndefined();
+  });
+
+  it("case 3: a signable artifact still gets a freshly signed url (behaviour unchanged)", async () => {
+    const harness = fakeReadClient({
+      rows: [
+        rowWithBlocks([
+          { ...toolBlock([{ ...LOCKED_IMAGE, assetId: "asset-1", objectPath: "ws-team/p/a.png" }]) },
+        ]),
+      ],
+      assets: [{ id: "asset-1", object_path: "ws-team/p/a.png", bucket: "project-assets" }],
+    });
+
+    const messages = await harness.service.listMessages(USER, SESSION);
+    const artifact = firstArtifact(messages[0]?.contentBlocks);
+
+    expect(artifact.assetId).toBe("asset-1");
+    expect(String(artifact.url)).toContain("token=fresh");
+    expect(messageListResponseSchema.parse({ messages })).toBeDefined();
+  });
+
+  it("case 4: the CREATE response parses for a url-less stable tool artifact", async () => {
+    // `fakeReadClient` echoes the inserted row back, exactly like PostgREST, so
+    // the response is built from the STORED (identity-only) artifacts — the same
+    // path the create route parses before answering.
+    const f = fakeReadClient({
+      rows: [],
+      assets: [
+        { id: "asset-locked", object_path: "ws-team/p/secret.png", bucket: "project-assets" },
+      ],
+      unsignable: new Set(["ws-team/p/secret.png"]),
+    });
+
+    const message = await f.service.createMessage(USER, SESSION, {
+      role: "assistant",
+      content: "here it is",
+      contentBlocks: [toolBlock([LOCKED_IMAGE])],
+    } as never);
+
+    // What was WRITTEN keeps identity only — the request's url is not persisted.
+    const stored = f.inserts[0]?.content_blocks as Array<Record<string, unknown>>;
+    const storedArtifact = firstArtifact(stored);
+    expect(storedArtifact).not.toHaveProperty("url");
+    expect(storedArtifact.assetId).toBe("asset-locked");
+
+    // What was RETURNED is the stable artifact with no url, and it parses.
+    const artifact = firstArtifact(message.contentBlocks);
+    expect(artifact.assetId).toBe("asset-locked");
+    expect(artifact.objectPath).toBe("ws-team/p/secret.png");
+    expect(artifact.url).toBeUndefined();
+    expect(JSON.stringify(message.contentBlocks)).not.toContain("token=stale");
+
+    const parsed = messageCreateResponseSchema.parse({ message });
+    expect(firstArtifact(parsed.message.contentBlocks).assetId).toBe(
+      "asset-locked",
+    );
+    expect(firstArtifact(parsed.message.contentBlocks).url).toBeUndefined();
+  });
+
+  it("case 5: a URL-less, identity-less tool artifact is still refused by the contract", () => {
+    // The boundary the server must keep even now that `url` is optional.
+    const message = {
+      id: "message-1",
+      role: "assistant" as const,
+      content: "x",
+      contentBlocks: [
+        toolBlock([{ type: "image", mimeType: "image/png", width: 512, height: 512 }]),
+      ],
+      createdAt: "2026-10-12T00:00:00.000Z",
+    };
+
+    expect(messageListResponseSchema.safeParse({ messages: [message] }).success).toBe(false);
+    expect(messageCreateResponseSchema.safeParse({ message }).success).toBe(false);
+  });
+});
