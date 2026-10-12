@@ -162,4 +162,23 @@ describe("CV-01 canvas video object keys", () => {
       "https://storage.test/project-assets/gen/a.mp4",
     );
   });
+
+  it("case 5: objectPath without a url for this session is refused (fixup3)", async () => {
+    const { api, scene, updates } = fakeApi();
+
+    // What a stored artifact whose signature could not be minted for this
+    // caller looks like: identity present, projection absent.
+    const artifact = { ...ARTIFACT } as Partial<VideoArtifact>;
+    delete artifact.url;
+
+    await expect(
+      insertVideoOnCanvas(api as any, artifact as VideoArtifact),
+    ).rejects.toThrow(/readable URL/);
+
+    // Nothing was written: no element carrying `resolvedVideoUrl: undefined`,
+    // and therefore nothing for a later save to strip. The chat keeps the
+    // attachment as inaccessible until a session read signs it again.
+    expect(updates).toHaveLength(0);
+    expect(scene.elements).toHaveLength(0);
+  });
 });

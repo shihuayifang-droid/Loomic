@@ -202,6 +202,19 @@ export async function fetchAsDataURL(url: string): Promise<string> {
 
 /**
  * Insert an image artifact onto the Excalidraw canvas.
+ *
+ * X-52 (工单14 fixup3): an artifact may legally carry `assetId` / `objectPath`
+ * and still have NO `url` — that is what a stored artifact whose signature could
+ * not be minted for this caller looks like (see the shared schema's
+ * `requireIdentityWithoutProjection`). Such an artifact cannot be drawn: the
+ * element would be built around `undefined`, `fetchAsDataURL` would request
+ * `/api/proxy-image?url=undefined`, and the failure would surface as a broken
+ * image instead of the chat's "附件当前不可访问" state.
+ *
+ * So the URL is checked BEFORE anything else happens. The identity fields are
+ * deliberately NOT a fallback: `assetId` is a row id and `objectPath` is a
+ * storage key, neither is fetchable, and turning one into a URL is the
+ * re-introduction of the derived URL that fixup2 removed.
  */
 export async function insertImageOnCanvas(
   api: {
@@ -217,7 +230,17 @@ export async function insertImageOnCanvas(
   },
   artifact: ImageArtifact,
 ): Promise<void> {
-  const dataURL = await fetchAsDataURL(artifact.url);
+  const url = artifact.url;
+  if (typeof url !== "string" || url.length === 0) {
+    throw new Error(
+      "cannot insert image artifact without a readable URL: the artifact for " +
+        "this session has no url projection, so there is nothing to fetch. It " +
+        "stays in the chat as an inaccessible attachment until a later session " +
+        "read signs it again.",
+    );
+  }
+
+  const dataURL = await fetchAsDataURL(url);
   const fileId = generateId();
 
   api.addFiles([
@@ -281,7 +304,10 @@ export async function insertImageOnCanvas(
     height,
     ...(artifact.title ? { title: artifact.title } : {}),
     source: "generated",
-    storageUrl: artifact.url,
+    // Only ever passed once the guard above has proven it is a string: under
+    // exactOptionalPropertyTypes an explicit `undefined` is not the same as an
+    // absent property, and this one is persisted with the element.
+    ...(typeof url === "string" && url.length > 0 ? { storageUrl: url } : {}),
   });
 
   api.updateScene({
@@ -308,6 +334,14 @@ export async function insertImageOnCanvas(
  * Only the direct-provider path — reachable in tests alone — can produce such an
  * artifact today, so the refusal costs nothing in production but keeps a
  * URL-backed element from ever being created again.
+ *
+ * X-52 (工单14 fixup3): the object marker is necessary but no longer sufficient.
+ * A stored artifact whose signature could not be minted for this caller carries
+ * `objectPath` and NO `url`; inserting it would write `resolvedVideoUrl:
+ * undefined` into a live element, which the renderer reads through
+ * `getVideoElementSrc` and the player panel through the generator registry. The
+ * element is refused here instead, so the video keeps its chat-side
+ * "不可访问" state and is inserted again once a session read re-signs it.
  */
 export async function insertVideoOnCanvas(
   api: {
@@ -327,6 +361,17 @@ export async function insertVideoOnCanvas(
         "as an object marker. Persisting its public URL instead would put a URL " +
         "whose lifetime we do not control into the canvas document (CV-01), so " +
         "the insert is refused.",
+    );
+  }
+
+  const url = artifact.url;
+  if (typeof url !== "string" || url.length === 0) {
+    throw new Error(
+      "insertVideoOnCanvas: artifact has no readable URL for this session, so " +
+        "it cannot be played. The object marker alone would leave " +
+        "resolvedVideoUrl undefined on a live element until the next save " +
+        "strips it, so the insert is refused and the attachment stays " +
+        "inaccessible in the chat.",
     );
   }
 
@@ -389,7 +434,8 @@ export async function insertVideoOnCanvas(
         title: artifact.title?.slice(0, 60),
         prompt: artifact.title,
         // Read-time only. Stripped by stripResolvedVideoUrls on every save.
-        resolvedVideoUrl: artifact.url,
+        // Never undefined: the guard above proved it is a non-empty string.
+        resolvedVideoUrl: url,
       },
     } as any, // ExcalidrawElementSkeleton includes IframeLikeElement but TS needs a nudge
   ]);
