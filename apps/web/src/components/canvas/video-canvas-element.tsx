@@ -7,6 +7,13 @@ type VideoCanvasElementProps = {
   src: string;
   width: number;
   height: number;
+  /**
+   * Fired when this `src` fails to load, with that src (X-52: a signed URL whose
+   * signature expired is the usual cause, and the caller answers it by re-reading
+   * the canvas for a fresh one). The element itself never retries: the same URL
+   * would fail identically, and the replacement arrives as a new `src` prop.
+   */
+  onError?: (src: string) => void;
 };
 
 /**
@@ -22,9 +29,16 @@ export function VideoCanvasElement({
   src,
   width,
   height,
+  onError,
 }: VideoCanvasElementProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [playing, setPlaying] = useState(false);
+
+  const handleLoadError = useCallback(() => {
+    // Never log the URL: it is a bearer token while its signature is valid.
+    console.warn("[video-canvas] canvas video failed to load");
+    onError?.(src);
+  }, [onError, src]);
 
   const play = useCallback(() => {
     const video = videoRef.current;
@@ -87,6 +101,7 @@ export function VideoCanvasElement({
         loop
         playsInline
         preload="metadata"
+        onError={handleLoadError}
         className="h-full w-full object-contain"
       />
 

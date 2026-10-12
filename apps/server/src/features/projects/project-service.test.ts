@@ -213,3 +213,91 @@ describe("createProjectService with the team workspace", () => {
     expect(rpcs.length).toBe(0);
   });
 });
+
+// X-52: a thumbnail URL is a project asset URL, so it is signed — and when it
+// cannot be signed the answer is an error, never a permanent public address.
+describe("saveThumbnail answers with a signed URL", () => {
+  function makeThumbnailService(options: { signError?: { message: string } | null }) {
+    const signedCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
+
+    const client = {
+      from(table: string) {
+        const chain = {
+          select: () => chain,
+          update: () => chain,
+          eq: () => chain,
+          single: async () => ({
+            data: table === "projects" ? { workspace_id: TEAM_ID } : null,
+            error: null,
+          }),
+          then: (resolve: (value: unknown) => unknown) =>
+            Promise.resolve({ data: null, error: null }).then(resolve),
+        };
+        return chain;
+      },
+      storage: {
+        from(bucket: string) {
+          return {
+            upload: async (path: string) => ({ data: { path }, error: null }),
+            createSignedUrl: async (path: string, expiresIn: number) => {
+              signedCalls.push({ bucket, path, expiresIn });
+              if (options.signError) return { data: null, error: options.signError };
+              return {
+                data: {
+                  signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+                },
+                error: null,
+              };
+            },
+            getPublicUrl: (path: string) => ({
+              data: { publicUrl: `https://cdn.test/${bucket}/${path}` },
+            }),
+          };
+        },
+      },
+      rpc: async () => ({ data: { asset_id: "asset-thumb" }, error: null }),
+    };
+
+    const service = createProjectService({
+      createUserClient: () => client as unknown as UserSupabaseClient,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+    });
+
+    return { service, signedCalls };
+  }
+
+  it("case 4: the thumbnail URL is a signature, not a public URL", async () => {
+    const stub = makeThumbnailService({});
+
+    const result = await stub.service.saveThumbnail(
+      USER,
+      "project-1",
+      Buffer.from("thumb"),
+      "image/png",
+    );
+
+    expect(result.thumbnailUrl).toContain("token=sig");
+    expect(result.thumbnailUrl).not.toContain("cdn.test");
+    expect(stub.signedCalls).toEqual([
+      {
+        bucket: "project-assets",
+        path: `${TEAM_ID}/project-1/thumbnail.png`,
+        expiresIn: 3600,
+      },
+    ]);
+  });
+
+  it("case 5: a signing failure is reported instead of falling back to a public URL", async () => {
+    const stub = makeThumbnailService({ signError: { message: "permission denied" } });
+
+    const error = await stub.service
+      .saveThumbnail(USER, "project-1", Buffer.from("thumb"), "image/png")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).not.toContain("http");
+  });
+});

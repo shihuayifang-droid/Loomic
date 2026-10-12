@@ -1,4 +1,5 @@
 import { registerExecutor, type ExecutorContext } from "../job-executor.js";
+import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateVideo } from "../../../generation/video-generation.js";
 import { resolveVideoProviderName } from "../../../generation/providers/registry.js";
@@ -128,14 +129,12 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     }
     lap("asset_record_done");
 
-    const { data: urlData } = admin.storage
-      .from("project-assets")
-      .getPublicUrl(objectPath);
+    const signedUrl = await signProjectAssetUrl(admin, objectPath);
 
     lap("total");
     return {
       asset_id: assetId,
-      signed_url: urlData.publicUrl,
+      signed_url: signedUrl,
       object_path: objectPath,
       width: generated.width,
       height: generated.height,

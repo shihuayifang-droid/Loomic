@@ -4,6 +4,7 @@ import type { RecoverableArtifact } from "@loomic/shared";
 
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import { signProjectAssetUrl } from "../storage/project-asset-urls.js";
 import {
   listRecoverableArtifacts as listRecoverable,
   recoverArtifacts as restoreArtifacts,
@@ -495,6 +496,25 @@ const CANVAS_DISPLAY_MAX_PX = 1024;
 const CANVAS_DISPLAY_FORMAT_QUERY = "format=webp";
 
 /**
+ * Ask the image renderer for WebP, on a signed display URL.
+ *
+ * The old public-URL path appended `&format=webp` by string concatenation, which
+ * only works because a public URL always has a query-free tail. A signed URL
+ * always carries `?token=...`, so the parameter is set through `URL` instead of
+ * being concatenated — and a URL that cannot be parsed is returned untouched
+ * rather than mangled.
+ */
+function withDisplayFormat(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.set("format", "webp");
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
  * Whether Supabase's image transformer can safely resize this mime type.
  *
  * Deliberately an allowlist. SVG has no raster size to resize and comes back
@@ -563,22 +583,42 @@ async function resolveFilesFromStorage(
           ? entry.fileData.mimeType
           : "";
       const transformable = canTransformOnTheFly(mimeType);
-      const original = client.storage.from(bucket).getPublicUrl(entry.objectPath)
-        .data.publicUrl;
-      let storageUrl = original;
-      if (transformable) {
-        const { data } = client.storage.from(bucket).getPublicUrl(
-          entry.objectPath,
-          {
-            transform: {
-              width: CANVAS_DISPLAY_MAX_PX,
-              height: CANVAS_DISPLAY_MAX_PX,
-              resize: "contain",
-            },
-          },
+
+      // SIGNED, not public (X-52): the caller's JWT decides whether this object
+      // may be read at all. The 1024px display projection is signed as a
+      // transform, so the downscaled variant is authorised the same way as the
+      // full-resolution original — no path where a display URL is merely "public
+      // because it is smaller".
+      let original: string;
+      let storageUrl: string;
+
+      try {
+        original = await signProjectAssetUrl(client, entry.objectPath, { bucket });
+        storageUrl = transformable
+          ? withDisplayFormat(
+              await signProjectAssetUrl(client, entry.objectPath, {
+                bucket,
+                transform: {
+                  width: CANVAS_DISPLAY_MAX_PX,
+                  height: CANVAS_DISPLAY_MAX_PX,
+                  resize: "contain",
+                },
+              }),
+            )
+          : original;
+      } catch (err) {
+        // Keep the marker and leave this file without a URL. The canvas must
+        // still load — one unrunnable signature is one file's problem — and a
+        // file that could not be signed must NEVER fall back to a public URL.
+        // Note the log carries the reason, not the URL: a signed URL is a token.
+        console.log(
+          `[canvas-service] file signing failed, marker kept fileId=${entry.fileId} ` +
+            `bucket=${bucket} reason=${err instanceof Error ? err.message : String(err)}`,
         );
-        storageUrl = `${data.publicUrl}&${CANVAS_DISPLAY_FORMAT_QUERY}`;
+        updatedFiles[entry.fileId] = { ...entry.fileData };
+        continue;
       }
+
       updatedFiles[entry.fileId] = {
         ...entry.fileData,
         // KEEP the oss:// marker. Replacing it with `dataURL: undefined` made the
@@ -619,7 +659,8 @@ async function resolveVideoElementsFromStorage(
 
   let changed = false;
 
-  const updated = elements.map((raw) => {
+  const updated = await Promise.all(
+    elements.map(async (raw) => {
     if (!raw || typeof raw !== "object") return raw;
     const element = raw as Record<string, unknown>;
     if (element.type !== "embeddable") return raw;
@@ -648,11 +689,15 @@ async function resolveVideoElementsFromStorage(
     const objectPath = ref.slice(slashIdx + 1);
 
     try {
-      const { data } = client.storage.from(bucket).getPublicUrl(objectPath);
+      // Signed, and nothing else: `resolvedVideoUrl` is a read-time projection
+      // that the client may play but never persists (the marker stays in `link`).
+      const resolvedVideoUrl = await signProjectAssetUrl(client, objectPath, {
+        bucket,
+      });
       changed = true;
       return {
         ...element,
-        customData: { ...customData, resolvedVideoUrl: data.publicUrl },
+        customData: { ...customData, resolvedVideoUrl },
       };
     } catch (err) {
       console.log(
@@ -663,7 +708,8 @@ async function resolveVideoElementsFromStorage(
       );
       return raw;
     }
-  });
+    }),
+  );
 
   if (!changed) return content;
 

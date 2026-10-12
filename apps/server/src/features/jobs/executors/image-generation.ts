@@ -1,5 +1,6 @@
 // @credits-system — Image generation executor: applies watermark for free-tier users
 import { registerExecutor, type ExecutorContext } from "../job-executor.js";
+import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateImage } from "../../../generation/image-generation.js";
 import { resolveImageProviderName } from "../../../generation/providers/registry.js";
@@ -171,15 +172,16 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
     lap("asset_record_done");
 
-    // Generate a public URL for the result consumer
-    const { data: urlData } = admin.storage
-      .from("project-assets")
-      .getPublicUrl(objectPath);
+    // A short-lived signature, not a permanent public URL (X-52). The worker uses
+    // its admin client: it just recorded ownership of this object itself, and the
+    // URL is a convenience for the job's consumer — `object_path` and `asset_id`
+    // remain the stable identity.
+    const signedUrl = await signProjectAssetUrl(admin, objectPath);
 
     lap("total");
     return {
       asset_id: assetId,
-      signed_url: urlData.publicUrl,
+      signed_url: signedUrl,
       object_path: objectPath,
       width: generated.width,
       height: generated.height,

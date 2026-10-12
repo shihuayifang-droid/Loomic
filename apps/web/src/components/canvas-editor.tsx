@@ -102,6 +102,14 @@ type CanvasEditorProps = {
    */
   initialVersion?: number;
   onApiReady?: (api: any) => void;
+  /**
+   * A storage-backed media URL (image file record, or a video element's
+   * projected src) failed to load. The page re-reads the canvas so the server
+   * mints fresh signatures for it.
+   *
+   * The URL is a bearer token: it is passed on, never logged.
+   */
+  onStorageMediaError?: (url: string) => void;
   ws?: WebSocketHandle;
   leftPanelOpen?: boolean;
   onSelectionChange?: (elements: CanvasSelectedElement[]) => void;
@@ -138,6 +146,7 @@ export function CanvasEditor({
   initialContent,
   initialVersion,
   onApiReady,
+  onStorageMediaError,
   ws,
   leftPanelOpen,
   onSelectionChange,
@@ -172,6 +181,12 @@ export function CanvasEditor({
   const prevSelectedIdsRef = useRef<string>("");
   const onSelectionChangeRef = useRef(onSelectionChange);
   onSelectionChangeRef.current = onSelectionChange;
+  // Read through a ref rather than the prop directly: the storage-URL resolve
+  // effect below must not re-run when the page hands down a new callback
+  // identity. Re-running it re-fetches images the scene already holds, and
+  // `addFiles` ignores known ids — so the download would be thrown away.
+  const onStorageMediaErrorRef = useRef(onStorageMediaError);
+  onStorageMediaErrorRef.current = onStorageMediaError;
   // Tracks whether the one-time normalization pass has already run
   const normalizedRef = useRef(false);
 
@@ -342,7 +357,14 @@ export function CanvasEditor({
     if (!excalidrawApi || pendingUrls.length === 0) return;
 
     async function resolveFiles() {
-      const resolved = await fetchPendingCanvasFiles(pendingUrls);
+      // A file record's `storageUrl` / `storageUrlOriginal` are read-time
+      // projections of an `oss://` marker, and their signatures expire. Telling
+      // the page about a file that could not be fetched is what gets the canvas
+      // re-read for a fresh one — otherwise the element stays a grey placeholder
+      // for the life of the tab, since nothing else re-fetches it.
+      const resolved = await fetchPendingCanvasFiles(pendingUrls, (url) => {
+        onStorageMediaErrorRef.current?.(url);
+      });
       if (mountedRef.current && resolved.length > 0) {
         excalidrawApi.addFiles(resolved);
         console.log(`[canvas-editor] Resolved ${resolved.length} storage files`);
@@ -1053,6 +1075,13 @@ export function CanvasEditor({
     };
   }, [hasUnsaved]);
 
+  // Stable identity on purpose: `renderEmbeddable` is handed to Excalidraw, and a
+  // new function there re-renders every embeddable on the canvas — the player
+  // would reload its video (and lose playback position) for nothing.
+  const handleVideoLoadError = useCallback((url: string) => {
+    onStorageMediaErrorRef.current?.(url);
+  }, []);
+
   // Render custom embeddable content for video elements on canvas.
   // Excalidraw calls this for every embeddable element; we intercept video URLs
   // and render an inline player, falling back to default for everything else.
@@ -1085,13 +1114,14 @@ export function CanvasEditor({
             src={src}
             width={element.width ?? 640}
             height={element.height ?? 360}
+            onError={handleVideoLoadError}
           />
         );
       }
       // Return null to let Excalidraw handle non-video embeddables with default behavior
       return null;
     },
-    [],
+    [handleVideoLoadError],
   );
 
   // Allow any URL as a valid embeddable so our video links are accepted

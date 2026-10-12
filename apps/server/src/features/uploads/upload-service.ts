@@ -5,9 +5,10 @@ import type {
   AuthenticatedUser,
   UserSupabaseClient,
 } from "../../supabase/user.js";
-
-/** Buckets configured as public in Supabase — use getPublicUrl instead of signed URLs */
-const PUBLIC_BUCKETS = new Set(["project-assets"]);
+import {
+  ProjectAssetUrlError,
+  signProjectAssetUrl,
+} from "../storage/project-asset-urls.js";
 
 export class UploadServiceError extends Error {
   readonly statusCode: number;
@@ -50,7 +51,6 @@ export type UploadService = {
   ): Promise<void>;
 };
 
-const SIGNED_URL_EXPIRY_SECONDS = 3600;
 
 export function createUploadService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
@@ -254,35 +254,28 @@ function buildObjectPath(
   return `${workspaceId}/${timestamp}-${safeName}`;
 }
 
+/**
+ * Every asset URL this service hands out is signed (X-52).
+ *
+ * `project-assets` used to be on a public allowlist, so an upload answered with a
+ * permanent, unauthenticated URL. That is exactly what the ticket removes: reads
+ * now go through the signing service, which authorises against the caller's JWT
+ * and refuses rather than degrading to a public URL.
+ */
 async function getAssetUrl(
   client: UserSupabaseClient,
   bucket: string,
   objectPath: string,
 ): Promise<string> {
-  if (PUBLIC_BUCKETS.has(bucket)) {
-    const { data } = client.storage.from(bucket).getPublicUrl(objectPath);
-    return data.publicUrl;
-  }
-  // Fallback for private buckets (e.g. user-avatars)
-  return createSignedUrl(client, bucket, objectPath);
-}
-
-async function createSignedUrl(
-  client: UserSupabaseClient,
-  bucket: string,
-  objectPath: string,
-): Promise<string> {
-  const { data, error } = await client.storage
-    .from(bucket)
-    .createSignedUrl(objectPath, SIGNED_URL_EXPIRY_SECONDS);
-
-  if (error || !data?.signedUrl) {
+  try {
+    return await signProjectAssetUrl(client, objectPath, { bucket });
+  } catch (error) {
     throw new UploadServiceError(
       "upload_failed",
-      "Failed to generate signed URL.",
+      error instanceof ProjectAssetUrlError
+        ? error.message
+        : "Failed to generate signed URL.",
       500,
     );
   }
-
-  return data.signedUrl;
 }

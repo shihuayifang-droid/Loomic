@@ -56,6 +56,7 @@ function makeAdmin(options: {
 }) {
   const rpcs: RpcCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
+  const signCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
 
   const client = {
     from(table: string) {
@@ -82,6 +83,14 @@ function makeAdmin(options: {
             uploads.push({ bucket, path, bytes: buffer.length });
             return { data: { path }, error: null };
           },
+          // X-52: the worker signs its result instead of handing out a public URL.
+          createSignedUrl: async (path: string, expiresIn: number) => {
+            signCalls.push({ bucket, path, expiresIn });
+            return {
+              data: { signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig` },
+              error: null,
+            };
+          },
           getPublicUrl: (path: string) => ({
             data: { publicUrl: `https://cdn.test/${bucket}/${path}` },
           }),
@@ -95,7 +104,7 @@ function makeAdmin(options: {
     },
   };
 
-  return { client: client as unknown as AdminSupabaseClient, rpcs, uploads };
+  return { client: client as unknown as AdminSupabaseClient, rpcs, uploads, signCalls };
 }
 
 function makeContext(client: AdminSupabaseClient): ExecutorContext {
@@ -180,6 +189,20 @@ describe("generation executors record project asset ownership", () => {
     expect(result.object_path).toBe(admin.uploads[0]?.path);
   });
 
+  it("case 1b: the job result carries a SIGNED url, never a public one", async () => {
+    const admin = makeAdmin({ job: jobRow() });
+
+    const result = await getExecutor("image_generation")!("job-1b", {}, makeContext(admin.client));
+
+    // X-52: the worker signs what it just recorded. A permanent public URL here
+    // would survive the bucket going private as a dead link.
+    expect(String(result.signed_url)).toContain("token=sig");
+    expect(String(result.signed_url)).not.toContain("cdn.test");
+    expect(admin.signCalls).toEqual([
+      { bucket: "project-assets", path: admin.uploads[0]?.path, expiresIn: 3600 },
+    ]);
+  });
+
   it("case 2: the video executor does the same for video objects", async () => {
     const admin = makeAdmin({
       job: jobRow({ payload: { prompt: "a clip", model: "test/video" } }),
@@ -187,7 +210,7 @@ describe("generation executors record project asset ownership", () => {
     const executor = getExecutor("video_generation");
     expect(executor).toBeDefined();
 
-    await executor!("job-2", {}, makeContext(admin.client));
+    const result = await executor!("job-2", {}, makeContext(admin.client));
 
     expect(admin.rpcs).toHaveLength(1);
     expect(admin.rpcs[0]?.params).toMatchObject({
@@ -198,6 +221,13 @@ describe("generation executors record project asset ownership", () => {
       p_mime_type: "video/mp4",
     });
     expect(admin.rpcs[0]?.params.p_object_path).toBe(admin.uploads[0]?.path);
+
+    // X-52: the video's job result is signed too — same rule as the image.
+    expect(String(result.signed_url)).toContain("token=sig");
+    expect(String(result.signed_url)).not.toContain("cdn.test");
+    expect(admin.signCalls).toEqual([
+      { bucket: "project-assets", path: admin.uploads[0]?.path, expiresIn: 3600 },
+    ]);
   });
 
   it("case 3: billing stays personal while ownership follows the team project", async () => {

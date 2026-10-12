@@ -151,12 +151,24 @@ async function fetchImageBlob(
 }
 
 /**
+ * Called with the storage URL of a file whose bytes could not be fetched at all.
+ *
+ * X-52: canvas media URLs are short-lived signatures, so "could not fetch" often
+ * means the signature expired while this document sat in the tab. The caller
+ * re-reads the canvas for a fresh projection; the URL itself is never retried
+ * and never replaced with a public address.
+ */
+export type CanvasMediaFailureHandler = (url: string) => void;
+
+/**
  * Fetch the bytes for storage-backed files and convert them to dataURLs.
  * Failures are skipped rather than thrown: one unreachable file should not stop
- * the rest of the canvas from rendering.
+ * the rest of the canvas from rendering. `onFailure`, when given, is told about
+ * each file that could not be resolved at all so the caller can refresh.
  */
 export async function fetchPendingCanvasFiles(
   pending: PendingCanvasFile[],
+  onFailure?: CanvasMediaFailureHandler,
 ): Promise<ExcalidrawFileEntry[]> {
   const resolved: ExcalidrawFileEntry[] = [];
 
@@ -165,7 +177,24 @@ export async function fetchPendingCanvasFiles(
       try {
         const candidates = fallbackUrl ? [url, fallbackUrl] : [url];
         const blob = await fetchImageBlob(fileId, candidates);
-        if (!blob) return;
+        if (!blob) {
+          // Reported only after EVERY candidate failed: a dead downscaled URL
+          // whose original still loads has already recovered, and re-reading the
+          // canvas for it would be work with nothing to fix. The primary
+          // `storageUrl` is what gets reported — a refresh re-signs both
+          // variants together.
+          try {
+            onFailure?.(url);
+          } catch (err) {
+            // A reporter that throws must not take the rest of the canvas with
+            // it: the images that did resolve are already on their way.
+            console.warn(
+              `[canvas-files] media failure handler threw for file ${fileId}:`,
+              err,
+            );
+          }
+          return;
+        }
         const dataURL = await blobToDataURL(blob);
         resolved.push({
           id: String(meta.id ?? fileId),

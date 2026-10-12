@@ -35,6 +35,10 @@ const LEGACY_POLICIES = [
   "project_assets_insert_admin",
   "project_assets_update_admin",
   "project_assets_delete_admin",
+  // X-52 工单13: the path-based storage SELECT policy. Superseded by
+  // `project_assets_select_metadata_reader`, which defers to asset_objects RLS
+  // instead of trusting the object path's first segment.
+  "project_assets_select_member",
 ];
 
 let db: PGlite;
@@ -624,5 +628,57 @@ describe("team workspace and owner-scoped project RLS", () => {
       )
     ).rows;
     expect(rows.map((row) => row.policyname)).toEqual([]);
+  });
+
+  it("case 15: storage reads follow asset metadata, not the object path", async () => {
+    // This case brings its own objects: case 10 deliberately deletes the shared
+    // `a.png` fixture, so reusing it here would measure whatever case 10 left.
+    const withMetadata = `${teamId}/${projectId}/read-with-metadata.png`;
+    const withoutMetadata = `${teamId}/${projectId}/read-without-metadata.png`;
+
+    for (const name of [withMetadata, withoutMetadata]) {
+      await db.query(
+        "insert into storage.objects (bucket_id, name, owner) values ($1, $2, $3)",
+        ["project-assets", name, USER_A],
+      );
+    }
+    await db.query(
+      `insert into public.asset_objects (workspace_id, project_id, bucket, object_path, created_by)
+       values ($1, $2, 'project-assets', $3, $4)`,
+      [teamId, projectId, withMetadata, USER_A],
+    );
+
+    const canRead = async (userId: string | null, name: string): Promise<number> =>
+      asUser(db, userId, async (tx) =>
+        firstRow(
+          (
+            await tx.query<{ n: number }>(
+              "select count(*)::int as n from storage.objects where name = $1",
+              [name],
+            )
+          ).rows,
+        ).n,
+      );
+
+    // The project's author, a team admin and the team owner may read it.
+    expect(await canRead(USER_A, withMetadata)).toBe(1);
+    expect(await canRead(USER_M, withMetadata)).toBe(1);
+    expect(await canRead(USER_O, withMetadata)).toBe(1);
+
+    // An unrelated member, a non-member and anon may not. The old path-based
+    // policy answered 1 for USER_B (a member of the workspace named in the path),
+    // which is exactly the leak this replaced.
+    expect(await canRead(USER_B, withMetadata)).toBe(0);
+    expect(await canRead(USER_X, withMetadata)).toBe(0);
+    expect(await canRead(null, withMetadata)).toBe(0);
+
+    // An object with no metadata row is readable only by the person who uploaded
+    // it — PostgreSQL checks the RETURNING row of an INSERT against the SELECT
+    // policies, so the uploader clause is what keeps `upload` itself working.
+    // Nobody else gets in.
+    expect(await canRead(USER_A, withoutMetadata)).toBe(1);
+    expect(await canRead(USER_B, withoutMetadata)).toBe(0);
+    expect(await canRead(USER_X, withoutMetadata)).toBe(0);
+    expect(await canRead(null, withoutMetadata)).toBe(0);
   });
 });

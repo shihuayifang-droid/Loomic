@@ -22,6 +22,11 @@ import {
 } from "../../lib/canvas-elements";
 import { syncCanvasFilesIntoScene } from "../../lib/canvas-files";
 import {
+  createCanvasMediaRefresh,
+  isStorageMediaUrl,
+  type CanvasMediaRefresh,
+} from "../../lib/canvas-media-refresh";
+import {
   fetchCanvas,
   fetchProject,
   ApiAuthError,
@@ -79,6 +84,19 @@ function CanvasPageContent() {
 
   const excalidrawApiRef = useRef<any>(null);
   const [excalidrawApi, setExcalidrawApi] = useState<any>(null);
+  // X-52: one dedupe instance for the whole page, so the same expired URL cannot
+  // ask for a refresh twice (each ask is a full canvas read). A ref, not state:
+  // a re-render must not hand the editor a brand new instance, which would let
+  // an element that keeps erroring refresh over and over.
+  const mediaRefreshRef = useRef<CanvasMediaRefresh | null>(null);
+  if (mediaRefreshRef.current === null) {
+    mediaRefreshRef.current = createCanvasMediaRefresh();
+  }
+  // How many signature refreshes this page load may still ask for. Small on
+  // purpose: a healthy canvas needs at most one per expiry, and this is the bound
+  // that stops the unbounded cycle described in handleStorageMediaError below —
+  // the refresher dedupes per URL string, and each re-read mints a NEW one.
+  const mediaRefreshBudgetRef = useRef(5);
   // Generation slots we have already auto-focused. Keeps a batch of images from
   // repeatedly dragging the viewport back on every canvas.sync.
   const focusedSlotsRef = useRef<Set<string>>(new Set());
@@ -162,6 +180,39 @@ function CanvasPageContent() {
       console.warn("Failed to sync canvas:", err);
     }
   }, [canvasData]);
+
+  // X-52: a canvas media element reports a load failure here. The refresh IS the
+  // existing sync above — re-reading the canvas through the API and pushing the
+  // resolved files back into the scene is the only flow that turns stored
+  // `oss://` markers into freshly signed URLs. Deliberately nothing else: no page
+  // reload, no retry of the dead URL, no public-URL fallback.
+  const handleStorageMediaError = useCallback(
+    (url: string) => {
+      // A provider CDN link that failed (pre-CV-01 video elements carry one) is
+      // not something a re-read of the canvas can repair.
+      if (!isStorageMediaUrl(url)) return;
+
+      // THE BOUND, see mediaRefreshBudgetRef. Once it runs out the element simply
+      // stays as it is: what loads, loads, and no request loop is sustained.
+      if (mediaRefreshBudgetRef.current <= 0) return;
+      mediaRefreshBudgetRef.current -= 1;
+
+      void mediaRefreshRef.current
+        ?.reportFailure(url, handleCanvasSync)
+        .then((outcome) => {
+          // Only the call that actually started a refresh warns, so an element
+          // that keeps erroring cannot flood the console; the module already
+          // ignores every repeat of the same failed URL. The URL is never logged
+          // — while its signature is valid it is a bearer token.
+          if (outcome === "refreshed") {
+            console.warn(
+              "[canvas] canvas media failed to load; re-reading the canvas for fresh URLs",
+            );
+          }
+        });
+    },
+    [handleCanvasSync],
+  );
 
   // Fallback polling for timed-out generation jobs.
   // When the agent's tool times out but the worker eventually succeeds,
@@ -370,6 +421,7 @@ function CanvasPageContent() {
             ? { initialVersion: canvasData.version }
             : {})}
           onApiReady={handleApiReady}
+          onStorageMediaError={handleStorageMediaError}
           ws={ws}
           leftPanelOpen={layersOpen || filesOpen}
           onSelectionChange={setSelectedCanvasElements}

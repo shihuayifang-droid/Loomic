@@ -10,6 +10,11 @@ import {
 } from "../bootstrap/ensure-user-foundation.js";
 import { withTransportRetry } from "../../supabase/transport-retry.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import {
+  ProjectAssetUrlError,
+  signProjectAssetUrl,
+  signProjectAssetUrls,
+} from "../storage/project-asset-urls.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -264,8 +269,8 @@ export function createProjectService(options: {
         canvases.map((canvas) => [canvas.project_id, canvas]),
       );
 
-      // Generate public thumbnail URLs for projects that have them
-      const thumbnailUrls = generateThumbnailUrls(
+      // Signed thumbnail URLs for projects that have them (X-52)
+      const thumbnailUrls = await generateThumbnailUrls(
         client,
         projects.filter((p) => p.thumbnail_path),
       );
@@ -393,11 +398,24 @@ export function createProjectService(options: {
         );
       }
 
-      const { data: urlData } = client.storage
-        .from(THUMBNAIL_BUCKET)
-        .getPublicUrl(objectPath);
+      // Signed like every other project asset (X-52). A failure here throws: the
+      // caller gets an error for the thumbnail, not a permanent public URL.
+      let thumbnailUrl: string;
+      try {
+        thumbnailUrl = await signProjectAssetUrl(client, objectPath, {
+          bucket: THUMBNAIL_BUCKET,
+        });
+      } catch (error) {
+        throw new ProjectServiceError(
+          "project_create_failed",
+          error instanceof ProjectAssetUrlError
+            ? error.message
+            : "Failed to sign the thumbnail URL.",
+          500,
+        );
+      }
 
-      return { thumbnailUrl: urlData.publicUrl };
+      return { thumbnailUrl };
     },
 
     async updateProject(user, projectId, input) {
@@ -555,19 +573,34 @@ function slugify(value: string) {
   return base ? `${base}-${suffix}` : `project-${suffix}`;
 }
 
-function generateThumbnailUrls(
+/**
+ * Signed thumbnail URLs for a project list (X-52).
+ *
+ * Signed in one batch, and a thumbnail that CANNOT be signed is simply absent
+ * from the map. That is the important half: the caller then reports no URL for
+ * that project rather than falling back to a public address the viewer may not be
+ * entitled to. One unreadable thumbnail must not cost the whole list either.
+ */
+async function generateThumbnailUrls(
   client: UserSupabaseClient,
   projects: Array<{ id: string; thumbnail_path: string | null }>,
-): Map<string, string> {
+): Promise<Map<string, string>> {
   const urlMap = new Map<string, string>();
-  if (projects.length === 0) return urlMap;
+  const withThumbnail = projects.filter(
+    (project): project is { id: string; thumbnail_path: string } =>
+      Boolean(project.thumbnail_path),
+  );
+  if (withThumbnail.length === 0) return urlMap;
 
-  for (const project of projects) {
-    if (!project.thumbnail_path) continue;
-    const { data } = client.storage
-      .from(THUMBNAIL_BUCKET)
-      .getPublicUrl(project.thumbnail_path);
-    urlMap.set(project.id, data.publicUrl);
+  const signed = await signProjectAssetUrls(
+    client,
+    withThumbnail.map((project) => project.thumbnail_path),
+    { bucket: THUMBNAIL_BUCKET },
+  );
+
+  for (const project of withThumbnail) {
+    const url = signed.get(project.thumbnail_path);
+    if (url) urlMap.set(project.id, url);
   }
 
   return urlMap;

@@ -35,6 +35,7 @@ function makeStubs(options: {
   const rpcs: RpcCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
   const removals: string[] = [];
+  const signedCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
 
   const userClient = {
     from(table: string) {
@@ -82,6 +83,17 @@ function makeStubs(options: {
             removals.push(...paths);
             return { data: null, error: null };
           },
+          // X-52: asset URLs are signed through this call. `getPublicUrl` is kept
+          // only so the stub would visibly explode if production code used it.
+          createSignedUrl: async (path: string, expiresIn: number) => {
+            signedCalls.push({ bucket, path, expiresIn });
+            return {
+              data: {
+                signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+              },
+              error: null,
+            };
+          },
           getPublicUrl: (path: string) => ({
             data: { publicUrl: `https://cdn.test/${bucket}/${path}` },
           }),
@@ -108,7 +120,7 @@ function makeStubs(options: {
     getAdminClient: () => adminClient as unknown as AdminSupabaseClient,
   });
 
-  return { service, rpcs, uploads, removals, userClient };
+  return { service, rpcs, uploads, removals, signedCalls, userClient };
 }
 
 const FILE = {
@@ -210,7 +222,12 @@ describe("uploadFile records project ownership", () => {
 
     expect(result.asset.id).toBe("asset-1");
     expect(result.asset.createdAt).toBe("2026-10-02T00:00:00.000Z");
-    expect(result.url).toContain("https://cdn.test/project-assets/");
+    // X-52: a short-lived signature, not a permanent public URL.
+    expect(result.url).toContain("token=sig");
+    expect(result.url).not.toContain("cdn.test");
+    expect(stub.signedCalls).toEqual([
+      { bucket: "project-assets", path: stub.uploads[0]?.path, expiresIn: 3600 },
+    ]);
   });
 
   it("case 7: the object path starts with the verified workspace", async () => {
@@ -254,6 +271,13 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
         from(bucket: string) {
           return {
             upload: async (path: string) => ({ data: { path }, error: null }),
+            // X-52: `saveThumbnail` answers with a signed URL too.
+            createSignedUrl: async (path: string) => ({
+              data: {
+                signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+              },
+              error: null,
+            }),
             getPublicUrl: (path: string) => ({
               data: { publicUrl: `https://cdn.test/${bucket}/${path}` },
             }),

@@ -48,6 +48,12 @@ function createFakeCanvasClient(initial: CanvasContentLike | null) {
   };
   const writes: Array<{ content: CanvasContentLike; version: number }> = [];
   const resolvedUrls: Array<{ bucket: string; objectPath: string }> = [];
+  const signedCalls: Array<{
+    bucket: string;
+    objectPath: string;
+    expiresIn: number;
+    transform: unknown;
+  }> = [];
 
   const client = {
     from(table: string) {
@@ -105,12 +111,28 @@ function createFakeCanvasClient(initial: CanvasContentLike | null) {
     storage: {
       from(bucket: string) {
         return {
-          getPublicUrl: (objectPath: string) => {
+          // X-52: the read-time projection signs each marker. The stub records the
+          // same (bucket, objectPath) pairs the old public-URL stub did, plus the
+          // transform, and returns a URL that is visibly a signature.
+          createSignedUrl: async (
+            objectPath: string,
+            expiresIn: number,
+            callOptions?: { transform?: unknown },
+          ) => {
             resolvedUrls.push({ bucket, objectPath });
+            signedCalls.push({ bucket, objectPath, expiresIn, transform: callOptions?.transform });
             return {
-              data: { publicUrl: `https://storage.test/${bucket}/${objectPath}` },
+              data: {
+                signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${objectPath}?token=sig`,
+              },
+              error: null,
             };
           },
+          // Present only so that a regression to a public URL would be caught by
+          // the assertions rather than silently working.
+          getPublicUrl: (objectPath: string) => ({
+            data: { publicUrl: `https://storage.test/${bucket}/${objectPath}` },
+          }),
         };
       },
     },
@@ -120,6 +142,7 @@ function createFakeCanvasClient(initial: CanvasContentLike | null) {
     client: client as unknown as UserSupabaseClient,
     writes,
     resolvedUrls,
+    signedCalls,
     state,
   };
 }
@@ -172,18 +195,64 @@ describe("CV-01 video object keys", () => {
     });
 
     const detail = await service.getCanvas(USER, CANVAS_ID);
-
     const element = (detail.content as unknown as CanvasContentLike).elements[0] as Record<string, any>;
     expect(element.link).toBe(MARKER);
-    expect(element.customData.resolvedVideoUrl).toBe(
-      "https://storage.test/project-assets/gen/v1.mp4",
-    );
+    // X-52: the projection is a SIGNATURE, not a public URL, and the marker in
+    // `link` is still the only thing the canvas stores.
+    expect(element.customData.resolvedVideoUrl).toContain("token=sig");
+    expect(element.customData.resolvedVideoUrl).not.toContain("storage.test");
+    expect(fake.signedCalls).toEqual([
+      { bucket: "project-assets", objectPath: "gen/v1.mp4", expiresIn: 3600, transform: undefined },
+    ]);
     expect(fake.resolvedUrls).toEqual([
       { bucket: "project-assets", objectPath: "gen/v1.mp4" },
     ]);
     // The read is a projection: nothing was written back.
     expect(fake.writes).toHaveLength(0);
     expect(fake.state.content?.elements[0]?.customData.resolvedVideoUrl).toBeUndefined();
+  });
+
+  it("case 2b: an image file is projected as a signed display URL plus the signed original", async () => {
+    const fake = createFakeCanvasClient({
+      ...emptyCanvas(),
+      files: {
+        "file-1": {
+          id: "file-1",
+          mimeType: "image/png",
+          dataURL: "oss://project-assets/ws-team/canvas-files/c1/file-1.png",
+        },
+      },
+    });
+    const service = createCanvasService({
+      createUserClient: () => fake.client,
+      getAdminClient: () => fake.client as unknown as never,
+    });
+
+    const detail = await service.getCanvas(USER, CANVAS_ID);
+    const file = (detail.content as unknown as CanvasContentLike).files["file-1"] as Record<string, any>;
+
+    // The display projection is the 1024px transform, signed; the original stays
+    // reachable and is signed too — neither is a public URL.
+    expect(file.storageUrl).toContain("token=sig");
+    expect(file.storageUrlOriginal).toContain("token=sig");
+    expect(file.storageUrl).not.toContain("storage.test");
+    expect(file.dataURL).toBe("oss://project-assets/ws-team/canvas-files/c1/file-1.png");
+
+    expect(fake.signedCalls).toEqual([
+      {
+        bucket: "project-assets",
+        objectPath: "ws-team/canvas-files/c1/file-1.png",
+        expiresIn: 3600,
+        transform: undefined,
+      },
+      {
+        bucket: "project-assets",
+        objectPath: "ws-team/canvas-files/c1/file-1.png",
+        expiresIn: 3600,
+        transform: { width: 1024, height: 1024, resize: "contain" },
+      },
+    ]);
+    expect(fake.writes).toHaveLength(0);
   });
 
   it("case 3: non-video, legacy URL and broken markers are left alone", async () => {
@@ -248,9 +317,7 @@ describe("CV-01 video object keys", () => {
     expect(elements[2]).toEqual(emptyObjectPath);
     expect(elements[3]).toEqual(emptyBucket);
     expect(elements[4]).toEqual(noSlash);
-    expect(elements[5]?.customData.resolvedVideoUrl).toBe(
-      "https://storage.test/project-assets/gen/v1.mp4",
-    );
+    expect(elements[5]?.customData.resolvedVideoUrl).toContain("token=sig");
     // Only the well-formed marker was ever handed to the storage API.
     expect(fake.resolvedUrls).toHaveLength(1);
   });
