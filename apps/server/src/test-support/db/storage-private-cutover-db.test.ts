@@ -51,6 +51,16 @@
 //     earlier statements really do land — which is what makes case 12's "nothing moved"
 //     a claim with teeth.
 //
+// FIXUP3 (工单18-fixup3, B1 -> P1) — the E1 gate must not be carried by a GLOBAL object:
+//   * P1: through fixup2 the expected expressions lived in two UNQUALIFIED composite types in
+//     the default schema (`drop type if exists zz_wo18_policy; create type zz_wo18_policy ...`),
+//     declared before the first preflight. On a database that already owns those names a
+//     successful apply DESTROYS the real object, and one that has dependents aborts the whole
+//     cutover. The carrier is a `jsonb` value now, which is not a schema object at all.
+//     Cases 34~36 pin the pre-existing OID and attribute list, the fact that no non-temp
+//     `zz_wo18*` object appears or disappears across apply/replay/failure, and the replayed
+//     fixup2 DDL as the counter-example that fails both of those.
+//
 // WHAT THIS CANNOT PROVE (do not claim otherwise in the 回传): PGlite is not the storage
 // API. Real public HTTP endpoints, real signed URLs, the owner column being written by
 // the storage API, CDN transforms, backups and true concurrency are all out of reach here.
@@ -737,11 +747,17 @@ describe("X-52 final private storage cutover (工单18)", () => {
     await db.exec(FAULT_UP);
     const before = await worldSnapshot();
 
-    // The splitter is not naive: the migration's two `do $$ ... $$;` guards contain semicolons
-    // and would be torn in half by a plain `split(";")`.
+    // The splitter is not naive: the migration's `do $$ ... $$;` guards contain semicolons
+    // and would be torn in half by a plain `split(";")`. fixup3 removed the four standalone
+    // `drop type` / `create type` statements that used to sit in front of the preflight block,
+    // so "some statement begins with `do $$`" no longer describes this file — the check is the
+    // direct one instead, and it is strictly harder to satisfy: every statement that opens a
+    // `do $$` block must also be the statement that closes it.
     const statements = splitStatements(CUTOVER_SQL);
     expect(statements.length).toBeGreaterThan(10);
-    expect(statements.some((s) => s.startsWith("do $$"))).toBe(true);
+    const doBlocks = statements.filter((statement) => statement.includes("do $$"));
+    expect(doBlocks.length).toBeGreaterThanOrEqual(5);
+    expect(doBlocks.every((statement) => statement.endsWith("end $$"))).toBe(true);
 
     let executed = 0;
     let failure: unknown;
@@ -755,8 +771,8 @@ describe("X-52 final private storage cutover (工单18)", () => {
       }
     }
 
-    // The fault is the SECOND bucket update, so the first five statements (both guards, the
-    // CHECK rewrite, and the `project-assets` update) all committed before it.
+    // The fault is the SECOND bucket update, so the four statements before it (both guards,
+    // the CHECK rewrite, and the `project-assets` update) all committed before it.
     expect(String(failure)).toMatch(/zz_wo18_fault: refusing to privatise canvases/);
 
     // E3's required assertion: the front of the batch landed. `project-assets` is private and
@@ -1402,6 +1418,262 @@ describe("X-52 cutover drift gates (工单18 fixup F2/F3/F4)", () => {
        drop table public._zz_wo18_assets_bak;`,
     );
     expect(await worldSnapshot()).toEqual(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fixup3 B1: the probe carrier must not occupy, replace or drop a GLOBAL object.
+//
+// fixup2 opened the migration with two UNQUALIFIED composite types in the default schema
+// (`drop type if exists zz_wo18_policy; create type zz_wo18_policy ...`) and dropped them
+// again after the preflight block. On a database that already owns those names that is either
+// a silent loss of a non-target object or an unexpected abort. The gate is the same migration
+// with a `jsonb` carrier; the counter-example is the fixup2 DDL, transcribed verbatim from
+// `git show e585fa8:supabase/migrations/20261013000002_hahart_storage_private_cutover.sql`.
+// ---------------------------------------------------------------------------
+
+/** The fixup2 (e585fa8) carrier, verbatim: unqualified DDL, before the first preflight. */
+const FIXUP2_PROBE_DDL = `drop type if exists zz_wo18_expect;
+drop type if exists zz_wo18_policy;
+create type zz_wo18_policy
+  as (p_name text, p_tail text, p_bucket text, p_cmd text);
+create type zz_wo18_expect
+  as (p_name text, p_bucket text, p_cmd text, p_expect_qual text, p_expect_wc text);`;
+
+/** The fixup2 file's own cleanup of those two types, after the preflight block. */
+const FIXUP2_PROBE_CLEANUP = `drop type zz_wo18_policy;
+drop type zz_wo18_expect;`;
+
+/**
+ * A pre-existing BUSINESS type of the same name, deliberately a DIFFERENT shape from the one
+ * fixup2 declares: a takeover then shows up in both the OID and the attribute list, which is
+ * what makes "the definition did not change" a claim with teeth.
+ */
+const PREEXISTING_TYPE_FIXTURE = `create type public.zz_wo18_policy
+  as (tenant_id uuid, policy_key text, revision integer);
+create type public.zz_wo18_expect
+  as (expect_id bigint, note text);`;
+const PREEXISTING_TYPE_DROP = `drop type public.zz_wo18_expect;
+drop type public.zz_wo18_policy;`;
+
+/** A business table that DEPENDS on both types: the state fixup2 cannot run in at all. */
+const PREEXISTING_TYPE_DEPENDENT = `create table public.zz_wo18_business (
+  id integer primary key,
+  payload public.zz_wo18_policy,
+  meta public.zz_wo18_expect
+);
+insert into public.zz_wo18_business (id, payload, meta)
+values (
+  1,
+  row('00000000-0000-0000-0000-0000000000a1'::uuid, 'canvases', 7)::public.zz_wo18_policy,
+  row(42::bigint, 'kept')::public.zz_wo18_expect
+);`;
+const PREEXISTING_TYPE_DEPENDENT_DROP = "drop table public.zz_wo18_business";
+
+type TypeAttribute = { attnum: number; name: string; type: string; notnull: boolean };
+type CompositeTypeState = { oid: string; name: string; attributes: TypeAttribute[] };
+type ProbeResidue = { types: string[]; relations: string[]; policies: string[] };
+
+const NO_RESIDUE: ProbeResidue = { types: [], relations: [], policies: [] };
+
+/** OID plus the full attribute list of a `public` composite type, or undefined when absent. */
+async function compositeTypeState(typeName: string): Promise<CompositeTypeState | undefined> {
+  const type = (
+    await db.query<{ oid: string; name: string }>(
+      `select t.oid::text as oid, t.typname as name
+         from pg_type t
+         join pg_namespace n on n.oid = t.typnamespace
+        where n.nspname = 'public' and t.typname = $1`,
+      [typeName],
+    )
+  ).rows[0];
+  if (type === undefined) return undefined;
+
+  const attributes = (
+    await db.query<TypeAttribute>(
+      `select a.attnum, a.attname as name,
+              format_type(a.atttypid, a.atttypmod) as type, a.attnotnull as notnull
+         from pg_attribute a
+         join pg_type t on t.typrelid = a.attrelid
+         join pg_namespace n on n.oid = t.typnamespace
+        where n.nspname = 'public' and t.typname = $1
+          and a.attnum > 0 and not a.attisdropped
+        order by a.attnum`,
+      [typeName],
+    )
+  ).rows;
+
+  return { oid: type.oid, name: type.name, attributes };
+}
+
+/** The dependent business row, rendered to text so a round trip can be compared exactly. */
+async function businessRowText(): Promise<string> {
+  return firstRow(
+    (
+      await db.query<{ business_row: string }>(
+        `select payload::text || '|' || meta::text as business_row
+           from public.zz_wo18_business where id = 1`,
+      )
+    ).rows,
+  ).business_row;
+}
+
+/**
+ * Every `zz_wo18*` object a migration could leak into a NON-temp schema — types, relations
+ * and policies. The cutover is allowed to own nothing outside its three buckets, one CHECK
+ * and the canvases policies, so a successful run, a replay and a rolled-back failure must
+ * all leave this set exactly as they found it.
+ */
+async function probeResidue(): Promise<ProbeResidue> {
+  const types = await db.query<{ name: string }>(
+    `select n.nspname || '.' || t.typname as name
+       from pg_type t
+       join pg_namespace n on n.oid = t.typnamespace
+      where t.typname like 'zz_wo18%'
+        and n.nspname not like 'pg_temp%'
+        and n.nspname not like 'pg_toast%'
+      order by 1`,
+  );
+  const relations = await db.query<{ name: string }>(
+    `select n.nspname || '.' || c.relname as name
+       from pg_class c
+       join pg_namespace n on n.oid = c.relnamespace
+      where c.relname like 'zz_wo18%'
+        and n.nspname not like 'pg_temp%'
+        and n.nspname not like 'pg_toast%'
+      order by 1`,
+  );
+  const policies = await db.query<{ name: string }>(
+    `select n.nspname || '.' || c.relname || '.' || p.polname as name
+       from pg_policy p
+       join pg_class c on c.oid = p.polrelid
+       join pg_namespace n on n.oid = c.relnamespace
+      where p.polname like 'zz_wo18%'
+      order by 1`,
+  );
+  return {
+    types: types.rows.map((row) => row.name),
+    relations: relations.rows.map((row) => row.name),
+    policies: policies.rows.map((row) => row.name),
+  };
+}
+
+describe("X-52 probe carrier must not touch global objects (工单18 fixup3 B1)", () => {
+  it("case 34: pre-existing public zz_wo18_* types with dependents keep their OID, attributes and data across apply and replay", async () => {
+    await db.exec(PREEXISTING_TYPE_FIXTURE);
+    await db.exec(PREEXISTING_TYPE_DEPENDENT);
+
+    const policyBefore = await compositeTypeState("zz_wo18_policy");
+    const expectBefore = await compositeTypeState("zz_wo18_expect");
+    const rowBefore = await businessRowText();
+    // The fixture really is a different shape from fixup2's carrier, and really holds data.
+    expect(policyBefore?.attributes.map((row) => row.name)).toEqual([
+      "tenant_id",
+      "policy_key",
+      "revision",
+    ]);
+    expect(expectBefore?.attributes.map((row) => row.name)).toEqual(["expect_id", "note"]);
+    expect(rowBefore).toContain("canvases");
+
+    // A REAL apply (from the legacy state), then a replay: both must be transparent to a
+    // database that already owns these names — fixup2 aborted on exactly this state.
+    await db.exec(ROLLBACK_SQL);
+    expect(await bucketStates()).toEqual(PRE_CUTOVER_BUCKETS);
+    await db.exec(CUTOVER_SQL);
+    expect(await bucketStates()).toEqual(TARGET_BUCKETS);
+
+    expect(await compositeTypeState("zz_wo18_policy")).toEqual(policyBefore);
+    expect(await compositeTypeState("zz_wo18_expect")).toEqual(expectBefore);
+    expect(await businessRowText()).toBe(rowBefore);
+
+    await db.exec(CUTOVER_SQL);
+    expect(await compositeTypeState("zz_wo18_policy")).toEqual(policyBefore);
+    expect(await compositeTypeState("zz_wo18_expect")).toEqual(expectBefore);
+    expect(await businessRowText()).toBe(rowBefore);
+
+    // The fixture leaves with this case.
+    await db.exec(PREEXISTING_TYPE_DEPENDENT_DROP);
+    await db.exec(PREEXISTING_TYPE_DROP);
+    expect(await compositeTypeState("zz_wo18_policy")).toBeUndefined();
+    expect(await compositeTypeState("zz_wo18_expect")).toBeUndefined();
+    expect(await probeResidue()).toEqual(NO_RESIDUE);
+  });
+
+  it("case 35: apply, replay and a rolled-back failure neither add nor remove a non-temp zz_wo18_* object", async () => {
+    await db.exec(PREEXISTING_TYPE_FIXTURE);
+
+    // The checker is not vacuous: it SEES the two pre-existing objects (a composite type also
+    // shows up in `pg_class` under its own name), and it sees no probe policy at rest.
+    const baseline = await probeResidue();
+    expect(baseline).toEqual({
+      types: ["public.zz_wo18_expect", "public.zz_wo18_policy"],
+      relations: ["public.zz_wo18_expect", "public.zz_wo18_policy"],
+      policies: [],
+    });
+
+    await db.exec(CUTOVER_SQL);
+    expect(await probeResidue()).toEqual(baseline);
+    await db.exec(CUTOVER_SQL);
+    expect(await probeResidue()).toEqual(baseline);
+
+    // The failure path: same entry point as case 12, from the legacy state, with the fault
+    // firing after the preflight has already created (and dropped) every probe policy.
+    await db.exec(ROLLBACK_SQL);
+    expect(await bucketStates()).toEqual(PRE_CUTOVER_BUCKETS);
+    await db.exec(FAULT_UP);
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /zz_wo18_fault: refusing to privatise canvases/,
+    );
+    await db.exec(FAULT_DOWN);
+    expect(await probeResidue()).toEqual(baseline);
+
+    // Back to the target, then the fixture leaves: what remains is exactly nothing.
+    await db.exec(CUTOVER_SQL);
+    expect(await bucketStates()).toEqual(TARGET_BUCKETS);
+    await db.exec(PREEXISTING_TYPE_DROP);
+    expect(await probeResidue()).toEqual(NO_RESIDUE);
+  });
+
+  it("case 36: the replayed fixup2 carrier destroys or collides with those same types — the jsonb carrier does not", async () => {
+    // (1) Counter-example, branch A — no dependents, so fixup2 TAKES THE NAME OVER.
+    await db.exec(PREEXISTING_TYPE_FIXTURE);
+    const before = await compositeTypeState("zz_wo18_policy");
+    expect(before?.oid).toBeTruthy();
+    await db.exec(FIXUP2_PROBE_DDL);
+    const takenOver = await compositeTypeState("zz_wo18_policy");
+    expect(takenOver?.oid).not.toBe(before?.oid);
+    expect(takenOver?.attributes.map((row) => row.name)).toEqual([
+      "p_name",
+      "p_tail",
+      "p_bucket",
+      "p_cmd",
+    ]);
+
+    // ... and the file's own post-preflight cleanup then deletes the replacement — which IS the
+    // pre-existing business type. A successful fixup2 apply loses a non-target object.
+    await db.exec(FIXUP2_PROBE_CLEANUP);
+    expect(await compositeTypeState("zz_wo18_policy")).toBeUndefined();
+    expect(await compositeTypeState("zz_wo18_expect")).toBeUndefined();
+
+    // (2) Branch B — with a dependent table the same DDL cannot even run, so the cutover aborts.
+    await db.exec(PREEXISTING_TYPE_FIXTURE);
+    await db.exec(PREEXISTING_TYPE_DEPENDENT);
+    const policyBefore = await compositeTypeState("zz_wo18_policy");
+    const expectTypeBefore = await compositeTypeState("zz_wo18_expect");
+    const rowBefore = await businessRowText();
+    await expect(db.exec(FIXUP2_PROBE_DDL)).rejects.toThrow(/cannot drop type/);
+    expect(await compositeTypeState("zz_wo18_policy")).toEqual(policyBefore);
+    expect(await compositeTypeState("zz_wo18_expect")).toEqual(expectTypeBefore);
+
+    // (3) The jsonb carrier on that very same fixture: applies and touches neither OID nor data.
+    await db.exec(CUTOVER_SQL);
+    expect(await compositeTypeState("zz_wo18_policy")).toEqual(policyBefore);
+    expect(await compositeTypeState("zz_wo18_expect")).toEqual(expectTypeBefore);
+    expect(await businessRowText()).toBe(rowBefore);
+
+    await db.exec(PREEXISTING_TYPE_DEPENDENT_DROP);
+    await db.exec(PREEXISTING_TYPE_DROP);
+    expect(await probeResidue()).toEqual(NO_RESIDUE);
   });
 });
 

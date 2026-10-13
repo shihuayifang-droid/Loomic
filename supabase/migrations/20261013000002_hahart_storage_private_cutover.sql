@@ -83,113 +83,120 @@ end $$;
 --     混搭 / 缺项 / 多项一律 RAISE。两种状态下被检查的集合不同（遗留态不检查尚未存在的
 --     reader，目标态不检查已被删除的两条），期望值由探针实时产生后再合并。
 -- ---------------------------------------------------------------------------
--- Two composite types rather than `text[][]`: a 2-D array row slice (`arr[i]`) loses its bounds
--- in PL/pgSQL and reads back NULL, and `record[]` is a pseudo-type that cannot be declared.
--- Both types are created and dropped inside this migration, which is a single transaction, so
--- neither survives a successful run nor a rolled-back one.
-drop type if exists zz_wo18_expect;
-drop type if exists zz_wo18_policy;
-create type zz_wo18_policy
-  as (p_name text, p_tail text, p_bucket text, p_cmd text);
-create type zz_wo18_expect
-  as (p_name text, p_bucket text, p_cmd text, p_expect_qual text, p_expect_wc text);
+-- fixup3 B1: the expected side is carried in a plain `jsonb` value (`jsonb_build_array` /
+-- `jsonb_build_object`), NOT in a composite type declared in the default schema.
+-- fixup2 opened this file with `drop type if exists zz_wo18_policy; create type zz_wo18_policy
+-- ...` — an UNQUALIFIED DDL against the default schema, executed before the first preflight.
+-- On a database that already has a business type of that name it either (a) silently DROPS the
+-- real object and replaces it with a throwaway that the migration drops again, or (b) aborts
+-- the whole cutover when that object has dependents. Neither is this migration's business: it
+-- is allowed to touch three bucket rows, one CHECK and the canvases policies — nothing else.
+--   * a `jsonb` value is not a schema object at all: there is no name to take over, no OID to
+--     change, nothing to leak into `public` on success, failure or replay;
+--   * `jsonb_build_object('p_expect_qual', NULL)` stores a JSON null and `->>'p_expect_qual'`
+--     reads it back as SQL NULL, so "this command has no USING side" still lands on the same
+--     side of the presence check exactly as the composite field did;
+--   * the only other helper this file uses is the throwaway probe policy below, whose name the
+--     whitelist above has already proven absent from `storage.objects`.
+-- (A 2-D `text[][]` was rejected earlier because `arr[i]` loses its bounds in PL/pgSQL and
+-- reads back NULL; jsonb has neither problem.)
 
 do $$
 declare
   -- (1) Every allowed policy: its name, the repository `create policy` tail, the bucket it
   --     belongs to, and the command it is created FOR.
-  c_reference constant zz_wo18_policy[] := array[
-    row(
-      'brand_kit_assets_insert',
-      ' for insert to authenticated with check (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text)',
-      'brand-kit-assets',
-      'INSERT'
-    )::zz_wo18_policy,
-    row(
-      'brand_kit_assets_select',
-      ' for select to authenticated using (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text)',
-      'brand-kit-assets',
-      'SELECT'
-    )::zz_wo18_policy,
-    row(
-      'brand_kit_assets_update',
-      ' for update to authenticated using (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text) with check (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text)',
-      'brand-kit-assets',
-      'UPDATE'
-    )::zz_wo18_policy,
-    row(
-      'brand_kit_assets_delete',
-      ' for delete to authenticated using (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text)',
-      'brand-kit-assets',
-      'DELETE'
-    )::zz_wo18_policy,
-    row(
-      'user_avatars_select_owner',
-      ' for select to authenticated using (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid()))',
-      'user-avatars',
-      'SELECT'
-    )::zz_wo18_policy,
-    row(
-      'user_avatars_insert_owner',
-      ' for insert to authenticated with check (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid()))',
-      'user-avatars',
-      'INSERT'
-    )::zz_wo18_policy,
-    row(
-      'user_avatars_update_owner',
-      ' for update to authenticated using (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid())) with check (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid()))',
-      'user-avatars',
-      'UPDATE'
-    )::zz_wo18_policy,
-    row(
-      'user_avatars_delete_owner',
-      ' for delete to authenticated using (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid()))',
-      'user-avatars',
-      'DELETE'
-    )::zz_wo18_policy,
-    row(
-      'project_assets_select_metadata_reader',
-      ' for select to authenticated using (bucket_id = ''project-assets'' and (owner = (select auth.uid()) or exists (select 1 from public.asset_objects a where a.bucket = storage.objects.bucket_id and a.object_path = storage.objects.name) or (owner is null and (select private.is_workspace_admin_or_owner(private.try_parse_uuid((storage.foldername(name))[1]))))))',
-      'project-assets',
-      'SELECT'
-    )::zz_wo18_policy,
-    row(
-      'project_assets_insert_member',
-      ' for insert to authenticated with check (bucket_id = ''project-assets'' and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))))',
-      'project-assets',
-      'INSERT'
-    )::zz_wo18_policy,
-    row(
-      'project_assets_update_owner',
-      ' for update to authenticated using (bucket_id = ''project-assets'' and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))) and (owner = (select auth.uid()) or (owner is null and (select private.is_workspace_admin_or_owner(private.try_parse_uuid((storage.foldername(name))[1])))))) with check (bucket_id = ''project-assets'' and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))))',
-      'project-assets',
-      'UPDATE'
-    )::zz_wo18_policy,
-    row(
-      'project_assets_delete_owner',
-      ' for delete to authenticated using (bucket_id = ''project-assets'' and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))) and (owner = (select auth.uid()) or (owner is null and (select private.is_workspace_admin_or_owner(private.try_parse_uuid((storage.foldername(name))[1]))))))',
-      'project-assets',
-      'DELETE'
-    )::zz_wo18_policy,
-    row(
-      'home_seeds_select_public',
-      ' for select to public using (bucket_id = ''home-seeds'')',
-      'home-seeds',
-      'SELECT'
-    )::zz_wo18_policy,
-    row(
-      'canvases_select_public',
-      ' for select to public using (bucket_id = ''canvases'')',
-      'canvases',
-      'SELECT'
-    )::zz_wo18_policy,
-    row(
-      'canvases_insert_authenticated',
-      ' for insert to authenticated with check (bucket_id = ''canvases'')',
-      'canvases',
-      'INSERT'
-    )::zz_wo18_policy
-  ];
+  c_reference constant jsonb := jsonb_build_array(
+    jsonb_build_object(
+      'p_name', 'brand_kit_assets_insert',
+      'p_tail', ' for insert to authenticated with check (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text)',
+      'p_bucket', 'brand-kit-assets',
+      'p_cmd', 'INSERT'
+    ),
+    jsonb_build_object(
+      'p_name', 'brand_kit_assets_select',
+      'p_tail', ' for select to authenticated using (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text)',
+      'p_bucket', 'brand-kit-assets',
+      'p_cmd', 'SELECT'
+    ),
+    jsonb_build_object(
+      'p_name', 'brand_kit_assets_update',
+      'p_tail', ' for update to authenticated using (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text) with check (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text)',
+      'p_bucket', 'brand-kit-assets',
+      'p_cmd', 'UPDATE'
+    ),
+    jsonb_build_object(
+      'p_name', 'brand_kit_assets_delete',
+      'p_tail', ' for delete to authenticated using (bucket_id = ''brand-kit-assets'' and (storage.foldername(name))[1] = auth.uid()::text)',
+      'p_bucket', 'brand-kit-assets',
+      'p_cmd', 'DELETE'
+    ),
+    jsonb_build_object(
+      'p_name', 'user_avatars_select_owner',
+      'p_tail', ' for select to authenticated using (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid()))',
+      'p_bucket', 'user-avatars',
+      'p_cmd', 'SELECT'
+    ),
+    jsonb_build_object(
+      'p_name', 'user_avatars_insert_owner',
+      'p_tail', ' for insert to authenticated with check (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid()))',
+      'p_bucket', 'user-avatars',
+      'p_cmd', 'INSERT'
+    ),
+    jsonb_build_object(
+      'p_name', 'user_avatars_update_owner',
+      'p_tail', ' for update to authenticated using (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid())) with check (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid()))',
+      'p_bucket', 'user-avatars',
+      'p_cmd', 'UPDATE'
+    ),
+    jsonb_build_object(
+      'p_name', 'user_avatars_delete_owner',
+      'p_tail', ' for delete to authenticated using (bucket_id = ''user-avatars'' and private.try_parse_uuid((storage.foldername(name))[1]) = (select auth.uid()))',
+      'p_bucket', 'user-avatars',
+      'p_cmd', 'DELETE'
+    ),
+    jsonb_build_object(
+      'p_name', 'project_assets_select_metadata_reader',
+      'p_tail', ' for select to authenticated using (bucket_id = ''project-assets'' and (owner = (select auth.uid()) or exists (select 1 from public.asset_objects a where a.bucket = storage.objects.bucket_id and a.object_path = storage.objects.name) or (owner is null and (select private.is_workspace_admin_or_owner(private.try_parse_uuid((storage.foldername(name))[1]))))))',
+      'p_bucket', 'project-assets',
+      'p_cmd', 'SELECT'
+    ),
+    jsonb_build_object(
+      'p_name', 'project_assets_insert_member',
+      'p_tail', ' for insert to authenticated with check (bucket_id = ''project-assets'' and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))))',
+      'p_bucket', 'project-assets',
+      'p_cmd', 'INSERT'
+    ),
+    jsonb_build_object(
+      'p_name', 'project_assets_update_owner',
+      'p_tail', ' for update to authenticated using (bucket_id = ''project-assets'' and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))) and (owner = (select auth.uid()) or (owner is null and (select private.is_workspace_admin_or_owner(private.try_parse_uuid((storage.foldername(name))[1])))))) with check (bucket_id = ''project-assets'' and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))))',
+      'p_bucket', 'project-assets',
+      'p_cmd', 'UPDATE'
+    ),
+    jsonb_build_object(
+      'p_name', 'project_assets_delete_owner',
+      'p_tail', ' for delete to authenticated using (bucket_id = ''project-assets'' and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))) and (owner = (select auth.uid()) or (owner is null and (select private.is_workspace_admin_or_owner(private.try_parse_uuid((storage.foldername(name))[1]))))))',
+      'p_bucket', 'project-assets',
+      'p_cmd', 'DELETE'
+    ),
+    jsonb_build_object(
+      'p_name', 'home_seeds_select_public',
+      'p_tail', ' for select to public using (bucket_id = ''home-seeds'')',
+      'p_bucket', 'home-seeds',
+      'p_cmd', 'SELECT'
+    ),
+    jsonb_build_object(
+      'p_name', 'canvases_select_public',
+      'p_tail', ' for select to public using (bucket_id = ''canvases'')',
+      'p_bucket', 'canvases',
+      'p_cmd', 'SELECT'
+    ),
+    jsonb_build_object(
+      'p_name', 'canvases_insert_authenticated',
+      'p_tail', ' for insert to authenticated with check (bucket_id = ''canvases'')',
+      'p_bucket', 'canvases',
+      'p_cmd', 'INSERT'
+    )
+  );
 
   -- The canvases metadata reader is the step-4 product, so it is probed separately (it only
   -- exists in the target state) rather than listed above.
@@ -205,11 +212,11 @@ declare
   v_legacy integer;
   v_target integer;
   v_mode text;
-  v_probe zz_wo18_policy;
+  v_ref jsonb;
   v_probe_name text;
-  v_expect zz_wo18_expect[] := array[]::zz_wo18_expect[];
+  v_expect jsonb := '[]'::jsonb;
   i integer;
-  r zz_wo18_expect;
+  r jsonb;
   v_found integer;
   v_cmd text;
   v_roles text[];
@@ -272,11 +279,11 @@ begin
   -- probe carries a zz_wo18_probe_ prefix so it can never collide with a real policy, and it
   -- is dropped again inside this block: nothing survives it, whether the block succeeds or
   -- raises (a raise rolls the whole batch back).
-  for i in 1 .. array_length(c_reference, 1) loop
-    v_probe := c_reference[i];
-    v_probe_name := 'zz_wo18_probe_' || v_probe.p_name;
+  for i in 1 .. jsonb_array_length(c_reference) loop
+    v_ref := c_reference -> (i - 1);
+    v_probe_name := 'zz_wo18_probe_' || (v_ref ->> 'p_name');
 
-    execute 'create policy "' || v_probe_name || '" on storage.objects' || v_probe.p_tail;
+    execute 'create policy "' || v_probe_name || '" on storage.objects' || (v_ref ->> 'p_tail');
     select pg_get_expr(pp.polqual, pp.polrelid), pg_get_expr(pp.polwithcheck, pp.polrelid)
       into v_pqual, v_pwc
       from pg_policy pp
@@ -286,18 +293,23 @@ begin
 
     if v_pqual is null and v_pwc is null then
       raise exception 'X-52 storage cutover preflight aborted: repository reference for policy % produced no expression',
-        v_probe.p_name using errcode = '42704';
+        (v_ref ->> 'p_name') using errcode = '42704';
     end if;
 
     -- The legacy canvases pair is only a legal state while the bucket is still legacy; in the
     -- target state those two names must be absent, and their absence is asserted by the
     -- `canvases` state check above plus the step-4 drops below.
-    if v_mode = 'target' and v_probe.p_name = any (c_legacy_names) then
+    if v_mode = 'target' and (v_ref ->> 'p_name') = any (c_legacy_names) then
       continue;
     end if;
 
     v_expect := v_expect
-      || array[row(v_probe.p_name, v_probe.p_bucket, v_probe.p_cmd, v_pqual, v_pwc)::zz_wo18_expect];
+      || jsonb_build_array(jsonb_build_object(
+           'p_name', v_ref ->> 'p_name',
+           'p_bucket', v_ref ->> 'p_bucket',
+           'p_cmd', v_ref ->> 'p_cmd',
+           'p_expect_qual', v_pqual,
+           'p_expect_wc', v_pwc));
   end loop;
 
   if v_mode = 'target' then
@@ -316,23 +328,29 @@ begin
     end if;
 
     v_expect := v_expect
-      || array[row(c_target_name, 'canvases', 'SELECT', v_pqual, v_pwc)::zz_wo18_expect];
+      || jsonb_build_array(jsonb_build_object(
+           'p_name', c_target_name,
+           'p_bucket', 'canvases',
+           'p_cmd', 'SELECT',
+           'p_expect_qual', v_pqual,
+           'p_expect_wc', v_pwc));
   end if;
 
   for r in
-    select * from unnest(v_expect) as t order by t.p_name
+    select e.value from jsonb_array_elements(v_expect) as e(value) order by e.value ->> 'p_name'
   loop
     select count(*) into v_found
       from pg_policies p
-     where p.schemaname = 'storage' and p.tablename = 'objects' and p.policyname = r.p_name;
+     where p.schemaname = 'storage' and p.tablename = 'objects'
+       and p.policyname = (r ->> 'p_name');
 
     if v_found = 0 then
-      raise exception 'X-52 storage cutover preflight aborted: required policy % is missing', r.p_name
+      raise exception 'X-52 storage cutover preflight aborted: required policy % is missing', (r ->> 'p_name')
         using errcode = '42704';
     end if;
 
     if v_found > 1 then
-      raise exception 'X-52 storage cutover preflight aborted: policy % appears % times', r.p_name, v_found
+      raise exception 'X-52 storage cutover preflight aborted: policy % appears % times', (r ->> 'p_name'), v_found
         using errcode = '42704';
     end if;
 
@@ -346,54 +364,55 @@ begin
       from pg_policy p
       join pg_class c on c.oid = p.polrelid
       join pg_namespace n on n.oid = c.relnamespace
-     where n.nspname = 'storage' and c.relname = 'objects' and p.polname = r.p_name;
+     where n.nspname = 'storage' and c.relname = 'objects' and p.polname = (r ->> 'p_name');
 
-    if v_cmd <> r.p_cmd then
+    if v_cmd <> (r ->> 'p_cmd') then
       raise exception 'X-52 storage cutover preflight aborted: policy % has cmd % (expected %)',
-        r.p_name, v_cmd, r.p_cmd using errcode = '42704';
+        (r ->> 'p_name'), v_cmd, (r ->> 'p_cmd') using errcode = '42704';
     end if;
 
-    if r.p_name in ('home_seeds_select_public', 'canvases_select_public') then
+    if (r ->> 'p_name') in ('home_seeds_select_public', 'canvases_select_public') then
       if not ('public' = any (v_roles)) or array_length(v_roles, 1) <> 1 then
         raise exception 'X-52 storage cutover preflight aborted: policy % has roles % (expected {public})',
-          r.p_name, v_roles using errcode = '42704';
+          (r ->> 'p_name'), v_roles using errcode = '42704';
       end if;
     else
       if not ('authenticated' = any (v_roles)) or array_length(v_roles, 1) <> 1 then
         raise exception 'X-52 storage cutover preflight aborted: policy % has roles % (expected {authenticated})',
-          r.p_name, v_roles using errcode = '42704';
+          (r ->> 'p_name'), v_roles using errcode = '42704';
       end if;
     end if;
 
     if v_permissive is distinct from true then
       raise exception 'X-52 storage cutover preflight aborted: policy % is RESTRICTIVE (expected PERMISSIVE)',
-        r.p_name using errcode = '42704';
+        (r ->> 'p_name') using errcode = '42704';
     end if;
 
-    if (v_qual is null) <> (r.p_expect_qual is null) then
+    if (v_qual is null) <> ((r ->> 'p_expect_qual') is null) then
       raise exception 'X-52 storage cutover preflight aborted: policy % USING side presence drifted from the repository definition (actual null=%, expected null=%)',
-        r.p_name, v_qual is null, r.p_expect_qual is null using errcode = '42704';
+        (r ->> 'p_name'), v_qual is null, (r ->> 'p_expect_qual') is null using errcode = '42704';
     end if;
 
-    if (v_wc is null) <> (r.p_expect_wc is null) then
+    if (v_wc is null) <> ((r ->> 'p_expect_wc') is null) then
       raise exception 'X-52 storage cutover preflight aborted: policy % WITH CHECK side presence drifted from the repository definition (actual null=%, expected null=%)',
-        r.p_name, v_wc is null, r.p_expect_wc is null using errcode = '42704';
+        (r ->> 'p_name'), v_wc is null, (r ->> 'p_expect_wc') is null using errcode = '42704';
     end if;
 
-    if v_qual is distinct from r.p_expect_qual then
+    if v_qual is distinct from (r ->> 'p_expect_qual') then
       raise exception 'X-52 storage cutover preflight aborted: policy % USING expression drifted from the repository definition. actual=[%] expected=[%]',
-        r.p_name, v_qual, r.p_expect_qual using errcode = '42704';
+        (r ->> 'p_name'), v_qual, (r ->> 'p_expect_qual') using errcode = '42704';
     end if;
 
-    if v_wc is distinct from r.p_expect_wc then
+    if v_wc is distinct from (r ->> 'p_expect_wc') then
       raise exception 'X-52 storage cutover preflight aborted: policy % WITH CHECK expression drifted from the repository definition. actual=[%] expected=[%]',
-        r.p_name, v_wc, r.p_expect_wc using errcode = '42704';
+        (r ->> 'p_name'), v_wc, (r ->> 'p_expect_wc') using errcode = '42704';
     end if;
   end loop;
 end $$;
 
-drop type zz_wo18_policy;
-drop type zz_wo18_expect;
+-- fixup3 B1: nothing to drop here any more. The expectations lived in a `jsonb` value inside
+-- the block above and the probe policies were dropped inside it too, so the migration leaves no
+-- object of its own behind — in `public` or anywhere else.
 
 -- 1. asset_objects.bucket CHECK 放开到 canvases —— **只动这一个约束**。
 --    旧约束是 foundation_v1 里的内联列约束（自动名 asset_objects_bucket_check）。
