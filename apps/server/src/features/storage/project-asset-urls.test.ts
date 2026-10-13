@@ -134,4 +134,27 @@ describe("project asset signed URLs", () => {
 
     expect(stub.calls[0]?.expiresIn).toBe(60);
   });
+
+  // X-52 stage 1C (工单18 T2): a mapped historical screenshot carries
+  // `asset_objects.bucket = 'canvases'`, and the read path must sign in THAT bucket.
+  // There is deliberately no second signing service and no bucket allowlist here:
+  // whatever bucket the metadata row names is handed to the SDK verbatim. This case
+  // pins the "verbatim" half; case 3 already pins the "no public fallback" half.
+  it("case 7: a canvases bucket override reaches the signing SDK unchanged", async () => {
+    const stub = makeClient({});
+
+    const url = await signProjectAssetUrl(stub.client, "canvases/team/p/legacy.png", {
+      bucket: "canvases",
+    });
+
+    expect(stub.calls).toEqual([
+      {
+        bucket: "canvases",
+        path: "canvases/team/p/legacy.png",
+        expiresIn: PROJECT_ASSET_URL_TTL_SECONDS,
+        options: undefined,
+      },
+    ]);
+    expect(url).toContain("/canvases/canvases/team/p/legacy.png?token=sig");
+  });
 });

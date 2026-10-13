@@ -329,3 +329,37 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
     expect(stub.updates).toHaveLength(0);
   });
 });
+
+// X-52 stage 1C (工单18 T2): `getAssetUrl` is the read path for a historical object
+// whose metadata row says `bucket = 'canvases'`. It must sign in that bucket — the
+// bucket comes from the row, never from a hardcoded default — and it must not degrade
+// to a public URL when the caller happens to be unable to read the object.
+describe("getAssetUrl signs the bucket the metadata row names (工单18)", () => {
+  it("case 10: a canvases asset is signed in canvases with no public fallback", async () => {
+    const stub = makeStubs({
+      assetRow: {
+        id: "asset-canvas-1",
+        bucket: "canvases",
+        object_path: "canvases/team-project/legacy.png",
+        mime_type: "image/png",
+        byte_size: 3,
+        workspace_id: TEAM_WORKSPACE,
+        project_id: PROJECT,
+        created_at: "2026-10-13T00:00:00.000Z",
+      },
+    });
+
+    const url = await stub.service.getAssetUrl(USER, "asset-canvas-1");
+
+    expect(stub.signedCalls).toEqual([
+      {
+        bucket: "canvases",
+        path: "canvases/team-project/legacy.png",
+        expiresIn: 3600,
+      },
+    ]);
+    expect(url).toContain("token=sig");
+    // The public-URL branch exists on the stub precisely so a fallback would be visible.
+    expect(url).not.toContain("cdn.test");
+  });
+});

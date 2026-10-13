@@ -5,6 +5,7 @@ import type { ZodType } from "zod";
 
 import {
   type Database,
+  assetBucketSchema,
   contentBlockSchema,
   errorCodeValues,
   healthResponseSchema,
@@ -958,5 +959,37 @@ describe("X-52 tool artifact contracts (工单14 fixup2)", () => {
     expect(createdArtifacts?.[0]?.url).toBeUndefined();
     expect(createdArtifacts?.[0]?.assetId).toBe("asset-locked");
     expect(createdArtifacts?.[1]?.assetId).toBe("asset-locked-video");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// X-52 stage 1C (工单18 T2): the legacy `canvases` bucket joins the asset bucket
+// contract.
+//
+// WHY: after the cutover migration, a historical screenshot object may carry a
+// precise `asset_objects` row with `bucket = 'canvases'`, and the read path signs
+// exactly what that row says. If the contract refused the value, `assetObjectSchema`
+// would reject the very rows the cutover creates — the signature path would be
+// unreachable through the shared types.
+//
+// THE BOUNDARY THAT MUST NOT MOVE: `canvases` is readable, not writable. The bucket
+// keeps no client INSERT policy after the cutover, so widening this enum cannot
+// reopen an upload entry point — and an unknown bucket is still rejected, so this
+// is an enumerated list, not a free-text field.
+// ---------------------------------------------------------------------------
+describe("X-52 asset bucket contract (工单18 T2)", () => {
+  it("accepts the legacy canvases bucket for reads while the two write buckets are unchanged", () => {
+    // The two pre-existing values must keep parsing (no silent rename).
+    expect(assetBucketSchema.parse("project-assets")).toBe("project-assets");
+    expect(assetBucketSchema.parse("user-avatars")).toBe("user-avatars");
+    // The added value, as the cutover migration records it.
+    expect(assetBucketSchema.parse("canvases")).toBe("canvases");
+    // And the enum stays closed: an unmapped bucket is not a valid asset row.
+    expect(assetBucketSchema.safeParse("home-seeds").success).toBe(false);
+    expect(assetBucketSchema.options).toEqual([
+      "project-assets",
+      "user-avatars",
+      "canvases",
+    ]);
   });
 });

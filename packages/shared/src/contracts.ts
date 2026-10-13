@@ -323,7 +323,16 @@ export const chatMessageCreateRequestSchema = z.object({
   contentBlocks: z.array(contentBlockSchema).nullable().optional(),
 });
 
-export const assetBucketSchema = z.enum(["project-assets", "user-avatars"]);
+// X-52 stage 1C (工单18 T2): `canvases` is the legacy screenshot bucket. It is added
+// to the READ contract so a mapped `asset_objects.bucket = 'canvases'` row parses and
+// is signed through the one existing signing service. It is deliberately NOT a new
+// upload entry point: the bucket keeps no client INSERT policy after the cutover
+// migration, so a write against it is refused by RLS rather than by this enum.
+export const assetBucketSchema = z.enum([
+  "project-assets",
+  "user-avatars",
+  "canvases",
+]);
 
 export const assetObjectSchema = z.object({
   id: identifierSchema,

@@ -9,9 +9,11 @@
 //     easy to get wrong: RLS denies by default, so "no policy" IS the write
 //     protection — but only as long as nobody later adds a broad policy. Pinning
 //     anon/authenticated INSERT being rejected is what makes that observable.
-//   * `project-assets` still public is the safety property of this whole ticket:
-//     while the seeds are only *copied*, the old bucket must keep serving them.
-//     A migration that flipped it private here would take the home page down.
+//   * `project-assets` was still public when this bucket was split out, and that was
+//     the safety property of 工单10: while the seeds were only *copied*, the old bucket
+//     had to keep serving them. 工单18 (X-52 stage 1C) is the ticket that finally flips
+//     it private — so case 5 now pins the flipped value, and `home-seeds` is the only
+//     bucket left carrying anonymous traffic.
 import { beforeAll, describe, expect, it } from "vitest";
 import type { PGlite, Transaction } from "@electric-sql/pglite";
 
@@ -145,7 +147,7 @@ describe("home-seeds bucket (X-52 prep)", () => {
     expect(uploaded.rows).toHaveLength(1);
   });
 
-  it("case 5: project-assets is untouched — still public, still the only copy", async () => {
+  it("case 5: project-assets is private since 工单18 — home-seeds is the public path", async () => {
     const bucket = firstRow(
       (
         await db.query<{ public: boolean }>(
@@ -153,7 +155,7 @@ describe("home-seeds bucket (X-52 prep)", () => {
         )
       ).rows,
     );
-    expect(bucket.public).toBe(true);
+    expect(bucket.public).toBe(false);
   });
 
   it("case 6: the migration is part of the applied set", () => {
