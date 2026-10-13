@@ -1,5 +1,5 @@
-// X-52 stage 1C (工单18 T1/T3/T4): the FINAL private storage target, and the rollback
-// that puts it back.
+// X-52 stage 1C (工单18 T1/T3/T4; fixup F1~F4): the FINAL private storage target, the
+// rollback that puts it back, and the drift gates that make both of them fail closed.
 //
 // WHAT THIS FILE PINS, AND WHY EACH PIECE IS HERE
 //   * The cutover migration must land as the 40th migration and stay in sync with the
@@ -18,9 +18,30 @@
 //     only, so every object and every metadata row must survive it, and re-applying the
 //     cutover afterwards must still work.
 //
+// FIXUP (工单18-fixup, B2/B3/B4 -> F1/F2/F3/F4) — the counter-examples below are the
+// reason this file exists in this shape:
+//   * F1: failure atomicity is proven at the SAME entry point the migration harness uses
+//     (`db.exec(CUTOVER_SQL)`, NO surrounding `db.transaction()`), with a fault injected
+//     in the MIDDLE of the batch, after `project-assets` and the CHECK have already been
+//     touched. Wrapping the probe in an outer transaction (what this case used to do)
+//     proves the test's transaction, not the runner's.
+//   * F2: the bucket CHECK is replaced BY NAME, only when it binds the `bucket` column
+//     alone and only for the two allowed value sets. An unrelated CHECK that merely
+//     mentions `bucket` must survive — the old `pg_get_constraintdef LIKE '%bucket%'`
+//     sweep deleted it.
+//   * F3: `storage.objects` policies are gated fail-closed BEFORE any change: unknown
+//     names, wrong cmd/roles, `USING(true)`, or a missing required policy abort the
+//     migration with the state untouched. Policies are OR-combined, so one extra
+//     `TO public USING (true)` row would silently defeat the strict reader below.
+//   * F4: the rollback refuses to run when a required bucket is missing, instead of
+//     "UPDATE 0 rows" and reporting a disaster recovery that never happened.
+//
 // WHAT THIS CANNOT PROVE (do not claim otherwise in the 回传): PGlite is not the storage
 // API. Real public HTTP endpoints, real signed URLs, the owner column being written by
 // the storage API, CDN transforms, backups and true concurrency are all out of reach here.
+// PGlite is also not the real Supabase migration runner: F1 pins the behaviour of the
+// same-shaped entry point (`db.exec` of one file, no outer transaction) and the
+// statement-by-statement counter-example, not the hosted runner itself.
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,6 +74,8 @@ const MAPPED_KEY = "canvases/team-project/mapped.png";
 const UNMAPPED_KEY = "canvases/team-project/unmapped.png";
 const SEED_KEY = "home-seeds/library/one.webp";
 
+const BUCKET_CHECK = "asset_objects_bucket_check";
+
 let db: PGlite;
 let applied: string[] = [];
 let teamWorkspace = "";
@@ -60,7 +83,22 @@ let projectId = "";
 
 type BucketState = { id: string; public: boolean };
 type Policy = { policyname: string; cmd: string; roles: string[] };
+type PolicyRow = {
+  policyname: string;
+  permissive: string;
+  cmd: string;
+  roles: string[];
+  qual: string;
+  with_check: string;
+};
+type CheckRow = { conname: string; conkey: string; def: string };
 type Counts = { objects: number; assets: number; canvasAssets: number };
+type World = {
+  buckets: BucketState[];
+  policies: PolicyRow[];
+  checks: CheckRow[];
+  counts: Counts & { buckets: number };
+};
 
 function firstRow<T>(rows: T[]): T {
   const row = rows[0];
@@ -89,6 +127,18 @@ async function bucketStates(): Promise<BucketState[]> {
   );
   return result.rows;
 }
+
+const TARGET_BUCKETS: BucketState[] = [
+  { id: "canvases", public: false },
+  { id: "home-seeds", public: true },
+  { id: "project-assets", public: false },
+];
+
+const PRE_CUTOVER_BUCKETS: BucketState[] = [
+  { id: "canvases", public: true },
+  { id: "home-seeds", public: true },
+  { id: "project-assets", public: true },
+];
 
 /** Every policy that mentions the `canvases` bucket, by name. */
 async function canvasesPolicies(): Promise<Policy[]> {
@@ -119,6 +169,133 @@ async function visibleNames(
 async function countRows(sql: string): Promise<number> {
   return firstRow((await db.query<{ n: number }>(sql)).rows).n;
 }
+
+async function constraintDef(conname: string): Promise<string> {
+  const result = await db.query<{ def: string }>(
+    `select pg_get_constraintdef(c.oid) as def
+       from pg_constraint c
+       join pg_class r on r.oid = c.conrelid
+       join pg_namespace n on n.oid = r.relnamespace
+      where n.nspname = 'public' and r.relname = 'asset_objects' and c.conname = $1`,
+    [conname],
+  );
+  return firstRow(result.rows).def;
+}
+
+/**
+ * Everything the cutover migration and the rollback are allowed to touch, plus the row
+ * counts they must never touch. A failed run must leave this byte-for-byte identical —
+ * that is the whole claim of F1/F2/F3/F4, so the counter-examples compare this object
+ * instead of one hand-picked column.
+ */
+async function worldSnapshot(): Promise<World> {
+  const buckets = (
+    await db.query<BucketState>("select id, public from storage.buckets order by id")
+  ).rows;
+  const policies = (
+    await db.query<PolicyRow>(
+      `select policyname, permissive, cmd, roles::text[] as roles,
+              coalesce(qual, '') as qual, coalesce(with_check, '') as with_check
+         from pg_policies
+        where schemaname = 'storage' and tablename = 'objects'
+        order by policyname`,
+    )
+  ).rows;
+  const checks = (
+    await db.query<CheckRow>(
+      `select c.conname, c.conkey::text as conkey, pg_get_constraintdef(c.oid) as def
+         from pg_constraint c
+         join pg_class r on r.oid = c.conrelid
+         join pg_namespace n on n.oid = r.relnamespace
+        where n.nspname = 'public' and r.relname = 'asset_objects' and c.contype = 'c'
+        order by c.conname`,
+    )
+  ).rows;
+
+  return {
+    buckets,
+    policies,
+    checks,
+    counts: {
+      buckets: await countRows("select count(*)::int as n from storage.buckets"),
+      objects: await countRows("select count(*)::int as n from storage.objects"),
+      assets: await countRows("select count(*)::int as n from public.asset_objects"),
+      canvasAssets: await countRows(
+        "select count(*)::int as n from public.asset_objects where bucket = 'canvases'",
+      ),
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures for the drift counter-examples: the exact shapes the migration is
+// allowed to accept, so a tamper can be undone without guessing.
+// ---------------------------------------------------------------------------
+const CHECK_NEW_SET =
+  `${BUCKET_CHECK} check (bucket in ('project-assets', 'user-avatars', 'canvases'))`;
+const CHECK_OLD_SET =
+  `${BUCKET_CHECK} check (bucket in ('project-assets', 'user-avatars'))`;
+const PROBE_CHECK = "asset_objects_wo18_probe_check";
+const PROBE_DENIED_KEY = "canvases/team-project/probe-denied.png";
+
+const RE_CANVASES_READER = `create policy "canvases_select_metadata_reader"
+  on storage.objects for select to authenticated
+  using (
+    bucket_id = 'canvases'
+    and exists (
+      select 1 from public.asset_objects a
+       where a.bucket = storage.objects.bucket_id and a.object_path = storage.objects.name
+    )
+  )`;
+const RE_PROJECT_ASSETS_UPDATE = `create policy "project_assets_update_owner"
+  on storage.objects for update to authenticated
+  using (bucket_id = 'project-assets'
+    and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1])))
+    and (owner = (select auth.uid())
+         or (owner is null and (select private.is_workspace_admin_or_owner(private.try_parse_uuid((storage.foldername(name))[1]))))))
+  with check (bucket_id = 'project-assets'
+    and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))))`;
+const RE_PROJECT_ASSETS_DELETE = `create policy "project_assets_delete_owner"
+  on storage.objects for delete to authenticated
+  using (bucket_id = 'project-assets'
+    and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1])))
+    and (owner = (select auth.uid())
+         or (owner is null and (select private.is_workspace_admin_or_owner(private.try_parse_uuid((storage.foldername(name))[1]))))))`;
+const RE_PROJECT_ASSETS_INSERT = `create policy "project_assets_insert_member"
+  on storage.objects for insert to authenticated
+  with check (bucket_id = 'project-assets'
+    and (select private.is_workspace_member(private.try_parse_uuid((storage.foldername(name))[1]))))`;
+const RE_PROJECT_ASSETS_READER = `create policy "project_assets_select_metadata_reader"
+  on storage.objects for select to authenticated
+  using (bucket_id = 'project-assets'
+    and (
+      owner = (select auth.uid())
+      or exists (
+        select 1 from public.asset_objects a
+         where a.bucket = storage.objects.bucket_id and a.object_path = storage.objects.name
+      )
+      or (
+        owner is null
+        and (select private.is_workspace_admin_or_owner(private.try_parse_uuid((storage.foldername(name))[1])))
+      )
+    ))`;
+const RE_HOME_SEEDS_PUBLIC = `create policy "home_seeds_select_public"
+  on storage.objects for select to public using (bucket_id = 'home-seeds')`;
+
+/** A fault injected INSIDE the migration batch: the third bucket update blows up. */
+const FAULT_UP = `
+create function public.zz_wo18_fault() returns trigger language plpgsql as $zz$
+begin
+  if old.public and not new.public and new.id = 'canvases' then
+    raise exception 'zz_wo18_fault: refusing to privatise canvases';
+  end if;
+  return new;
+end $zz$;
+create trigger zz_wo18_fault before update on storage.buckets
+  for each row execute function public.zz_wo18_fault();
+`;
+const FAULT_DOWN =
+  "drop trigger zz_wo18_fault on storage.buckets; drop function public.zz_wo18_fault();";
 
 beforeAll(async () => {
   const created = await createMigratedDb();
@@ -200,11 +377,7 @@ describe("X-52 final private storage cutover (工单18)", () => {
   });
 
   it("case 2: the three buckets carry the final public values", async () => {
-    expect(await bucketStates()).toEqual([
-      { id: "canvases", public: false },
-      { id: "home-seeds", public: true },
-      { id: "project-assets", public: false },
-    ]);
+    expect(await bucketStates()).toEqual(TARGET_BUCKETS);
   });
 
   it("case 3: project-assets keeps its reader policy, its three write policies and no public SELECT", async () => {
@@ -342,22 +515,43 @@ describe("X-52 final private storage cutover (工单18)", () => {
     expect(uploaded.rows).toHaveLength(1);
   });
 
-  it("case 12: a missing bucket aborts the migration instead of updating zero rows", async () => {
-    const before = await bucketStates();
+  it("case 12: a mid-batch failure leaves bucket, CHECK and policy state untouched without any outer transaction", async () => {
+    // Start from the pre-cutover state, so every step of the batch has something real to
+    // do before the injected fault fires — and so "nothing changed" is a claim with teeth.
+    await db.exec(ROLLBACK_SQL);
+    expect(await bucketStates()).toEqual(PRE_CUTOVER_BUCKETS);
 
-    await expect(
-      db.transaction(async (tx) => {
-        // The FK from storage.objects makes this order necessary inside the probe.
-        await tx.exec("delete from storage.objects where bucket_id = 'canvases'");
-        await tx.exec("delete from storage.buckets where id = 'canvases'");
-        await tx.exec(CUTOVER_SQL);
-      }),
-    ).rejects.toThrow(/required bucket\(s\) missing: canvases/);
+    // The CHECK goes back to the old value set as well. It is added NOT VALID because the
+    // suite already contains `canvases` metadata rows; the migration must still recognise
+    // it as the old set and rewrite it (that is F2's "only the old set is dropped").
+    await db.exec(
+      `alter table public.asset_objects drop constraint ${BUCKET_CHECK};
+       alter table public.asset_objects add constraint ${CHECK_OLD_SET} not valid;`,
+    );
+    expect(await constraintDef(BUCKET_CHECK)).toContain("NOT VALID");
 
-    // The aborted transaction rolled its own delete back too, so the probe is not
-    // destructive — and no bucket value moved before the RAISE.
-    expect(await bucketStates()).toEqual(before);
-    expect(await countRows("select count(*)::int as n from storage.buckets where id = 'canvases'")).toBe(1);
+    const before = await worldSnapshot();
+
+    // The fault fires on the THIRD bucket update, i.e. after the CHECK step and after
+    // `project-assets` has already been flipped to private. A runner that commits each
+    // statement separately would leave exactly those two changes behind.
+    await db.exec(FAULT_UP);
+
+    // THE POINT OF THIS CASE: no `db.transaction()` wrapper. `db.exec(sql)` is the same
+    // shaped entry point the migration harness uses for a single migration file.
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /zz_wo18_fault: refusing to privatise canvases/,
+    );
+
+    await db.exec(FAULT_DOWN);
+
+    expect(await worldSnapshot()).toEqual(before);
+
+    // The batch was not merely inert: with the fault removed the same file applies.
+    await db.exec(CUTOVER_SQL);
+    expect(await bucketStates()).toEqual(TARGET_BUCKETS);
+    expect(await constraintDef(BUCKET_CHECK)).toContain("canvases");
+    expect(await constraintDef(BUCKET_CHECK)).not.toContain("NOT VALID");
   });
 
   it("case 13: replaying the cutover migration is idempotent", async () => {
@@ -380,7 +574,7 @@ describe("X-52 final private storage cutover (工单18)", () => {
           and pg_get_constraintdef(c.oid) like '%bucket%'`,
     );
     expect(constraints.rows).toHaveLength(1);
-    expect(constraints.rows[0]?.conname).toBe("asset_objects_bucket_check");
+    expect(constraints.rows[0]?.conname).toBe(BUCKET_CHECK);
     expect(constraints.rows[0]?.def).toContain("canvases");
     expect(constraints.rows[0]?.def).toContain("project-assets");
     expect(constraints.rows[0]?.def).toContain("user-avatars");
@@ -431,11 +625,7 @@ describe("X-52 lossless rollback (工单18 T3)", () => {
   }, 60_000);
 
   it("case 14: rollback restores the pre-cutover public values and the two canvases policies", async () => {
-    expect(await bucketStates()).toEqual([
-      { id: "canvases", public: true },
-      { id: "home-seeds", public: true },
-      { id: "project-assets", public: true },
-    ]);
+    expect(await bucketStates()).toEqual(PRE_CUTOVER_BUCKETS);
 
     // The cutover-time policy is gone…
     expect(policiesBeforeRollback.map((row) => row.policyname)).toEqual([
@@ -483,11 +673,7 @@ describe("X-52 lossless rollback (工单18 T3)", () => {
   it("case 16: re-applying the cutover after a rollback still succeeds", async () => {
     await db.exec(CUTOVER_SQL);
 
-    expect(await bucketStates()).toEqual([
-      { id: "canvases", public: false },
-      { id: "home-seeds", public: true },
-      { id: "project-assets", public: false },
-    ]);
+    expect(await bucketStates()).toEqual(TARGET_BUCKETS);
     expect((await canvasesPolicies()).map((row) => row.policyname)).toEqual([
       "canvases_select_metadata_reader",
     ]);
@@ -500,5 +686,270 @@ describe("X-52 lossless rollback (工单18 T3)", () => {
       SEED_KEY,
       "home-seeds/op.webp",
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F2 (CHECK scope) / F3 (policy drift) / F4 (rollback fail-loud).
+//
+// Every counter-example is stated as: tamper -> the migration (or rollback) must abort ->
+// the WHOLE world snapshot must be identical to the tampered state (nothing was
+// half-applied) -> the tamper is undone and the snapshot returns to the reference state.
+// The last step is not decoration: it is what makes the next case's "nothing changed"
+// meaningful, and it proves the reference state itself is reachable.
+// ---------------------------------------------------------------------------
+describe("X-52 cutover drift gates (工单18 fixup F2/F3/F4)", () => {
+  it("case 17: a CHECK that merely mentions bucket survives the cutover and stays enforced", async () => {
+    const before = await worldSnapshot();
+
+    // Cross-column (bucket + object_path), and its definition text contains 'bucket' —
+    // exactly what the old `pg_get_constraintdef LIKE '%bucket%'` sweep used to delete.
+    await db.exec(
+      `alter table public.asset_objects add constraint ${PROBE_CHECK}
+         check (not (bucket = 'canvases' and object_path = '${PROBE_DENIED_KEY}'))`,
+    );
+    const injected = await worldSnapshot();
+    expect(injected.checks.map((row) => row.conname)).toContain(PROBE_CHECK);
+
+    await db.exec(CUTOVER_SQL);
+
+    expect(await worldSnapshot()).toEqual(injected);
+    expect((await constraintDef(PROBE_CHECK)).length).toBeGreaterThan(0);
+
+    // Still enforced, not just still present.
+    await expect(
+      db.query(
+        `insert into public.asset_objects (workspace_id, project_id, bucket, object_path, created_by)
+         values ($1, $2, 'canvases', $3, $4)`,
+        [teamWorkspace, projectId, PROBE_DENIED_KEY, AUTHOR],
+      ),
+    ).rejects.toThrow(new RegExp(PROBE_CHECK));
+
+    await db.exec(`alter table public.asset_objects drop constraint ${PROBE_CHECK}`);
+    expect(await worldSnapshot()).toEqual(before);
+  });
+
+  it("case 18: the named bucket CHECK is rewritten from the allowed old set, and only from it", async () => {
+    const before = await worldSnapshot();
+    expect(await constraintDef(BUCKET_CHECK)).toContain("canvases");
+
+    await db.exec(
+      `alter table public.asset_objects drop constraint ${BUCKET_CHECK};
+       alter table public.asset_objects add constraint ${CHECK_OLD_SET} not valid;`,
+    );
+
+    await db.exec(CUTOVER_SQL);
+
+    // Old set -> dropped and recreated as the new set (and now validated).
+    const rewritten = await constraintDef(BUCKET_CHECK);
+    expect(rewritten).toContain("canvases");
+    expect(rewritten).not.toContain("NOT VALID");
+    expect(await worldSnapshot()).toEqual(before);
+  });
+
+  it("case 19: an unexpected value set in the named CHECK aborts the cutover untouched", async () => {
+    const before = await worldSnapshot();
+
+    await db.exec(
+      `alter table public.asset_objects drop constraint ${BUCKET_CHECK};
+       alter table public.asset_objects add constraint ${BUCKET_CHECK}
+         check (bucket in ('project-assets', 'user-avatars', 'canvases', 'legacy-thumbs')) not valid;`,
+    );
+    const tampered = await worldSnapshot();
+    expect(tampered).not.toEqual(before);
+
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /unexpected asset_objects_bucket_check bucket set/,
+    );
+
+    expect(await worldSnapshot()).toEqual(tampered);
+
+    await db.exec(
+      `alter table public.asset_objects drop constraint ${BUCKET_CHECK};
+       alter table public.asset_objects add constraint ${CHECK_NEW_SET};`,
+    );
+    expect(await worldSnapshot()).toEqual(before);
+  });
+
+  it("case 20: missing, renamed-duplicate or multi-column bucket CHECKs abort the cutover", async () => {
+    const before = await worldSnapshot();
+
+    // (a) the named CHECK is bound to a second column as well.
+    await db.exec(
+      `alter table public.asset_objects drop constraint ${BUCKET_CHECK};
+       alter table public.asset_objects add constraint ${BUCKET_CHECK}
+         check (bucket in ('project-assets', 'user-avatars', 'canvases')
+                and object_path is not null);`,
+    );
+    let tampered = await worldSnapshot();
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /asset_objects_bucket_check is bound to columns/,
+    );
+    expect(await worldSnapshot()).toEqual(tampered);
+    await db.exec(
+      `alter table public.asset_objects drop constraint ${BUCKET_CHECK};
+       alter table public.asset_objects add constraint ${CHECK_NEW_SET};`,
+    );
+    expect(await worldSnapshot()).toEqual(before);
+
+    // (b) a second CHECK that constrains the bucket column alone, under another name.
+    await db.exec(
+      `alter table public.asset_objects add constraint asset_objects_wo18_dup_check
+         check (bucket in ('project-assets', 'user-avatars', 'canvases'));`,
+    );
+    tampered = await worldSnapshot();
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /CHECK constraints on asset_objects are bound to the bucket column alone/,
+    );
+    expect(await worldSnapshot()).toEqual(tampered);
+    await db.exec("alter table public.asset_objects drop constraint asset_objects_wo18_dup_check");
+    expect(await worldSnapshot()).toEqual(before);
+
+    // (c) the named CHECK is gone entirely.
+    await db.exec(`alter table public.asset_objects drop constraint ${BUCKET_CHECK}`);
+    tampered = await worldSnapshot();
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /CHECK asset_objects_bucket_check is missing/,
+    );
+    expect(await worldSnapshot()).toEqual(tampered);
+    await db.exec(
+      `alter table public.asset_objects add constraint ${CHECK_NEW_SET};`,
+    );
+    expect(await worldSnapshot()).toEqual(before);
+  });
+
+  it("case 21: an unknown policy on storage.objects aborts the cutover untouched", async () => {
+    const before = await worldSnapshot();
+
+    // No bucket literal anywhere in it, so "search the expressions for canvases" would
+    // miss it entirely — but PostgreSQL OR-combines permissive policies, so this single
+    // row would make every private-bucket read public.
+    await db.exec(
+      `create policy "rogue_storage_public" on storage.objects for select to public using (true)`,
+    );
+    const tampered = await worldSnapshot();
+    expect(tampered).not.toEqual(before);
+
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /unknown policy on storage.objects: rogue_storage_public/,
+    );
+
+    // The drift itself is left alone — no silent cleanup — and nothing else moved.
+    expect(await worldSnapshot()).toEqual(tampered);
+
+    await db.exec(`drop policy "rogue_storage_public" on storage.objects`);
+    expect(await worldSnapshot()).toEqual(before);
+  });
+
+  it("case 22: a known policy widened with USING(true) or a wrong role/cmd aborts the cutover", async () => {
+    const before = await worldSnapshot();
+
+    // (a) right name, right cmd, but opened to `public` with an unconditional true.
+    await db.exec(`drop policy "canvases_select_metadata_reader" on storage.objects`);
+    await db.exec(`create policy "canvases_select_metadata_reader" on storage.objects for select to public using (true)`);
+    let tampered = await worldSnapshot();
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /policy canvases_select_metadata_reader has roles/,
+    );
+    expect(await worldSnapshot()).toEqual(tampered);
+
+    // (b) right name and roles, unconditional true.
+    await db.exec(`drop policy "canvases_select_metadata_reader" on storage.objects`);
+    await db.exec(`create policy "canvases_select_metadata_reader" on storage.objects for select to authenticated using (true)`);
+    tampered = await worldSnapshot();
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /policy canvases_select_metadata_reader is unconditionally true/,
+    );
+    expect(await worldSnapshot()).toEqual(tampered);
+
+    // (c) right name and roles, wrong command.
+    await db.exec(`drop policy "canvases_select_metadata_reader" on storage.objects`);
+    await db.exec(`create policy "canvases_select_metadata_reader" on storage.objects for delete to authenticated using (bucket_id = 'canvases')`);
+    tampered = await worldSnapshot();
+    await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+      /policy canvases_select_metadata_reader has cmd DELETE/,
+    );
+    expect(await worldSnapshot()).toEqual(tampered);
+
+    await db.exec(`drop policy "canvases_select_metadata_reader" on storage.objects`);
+    await db.exec(RE_CANVASES_READER);
+    expect(await worldSnapshot()).toEqual(before);
+  });
+
+  it("case 23: a missing project-assets or home-seeds policy aborts the cutover untouched", async () => {
+    const before = await worldSnapshot();
+
+    const required: Array<[string, string]> = [
+      ["project_assets_insert_member", RE_PROJECT_ASSETS_INSERT],
+      ["project_assets_update_owner", RE_PROJECT_ASSETS_UPDATE],
+      ["project_assets_delete_owner", RE_PROJECT_ASSETS_DELETE],
+      ["project_assets_select_metadata_reader", RE_PROJECT_ASSETS_READER],
+      ["home_seeds_select_public", RE_HOME_SEEDS_PUBLIC],
+    ];
+
+    for (const [policy, restore] of required) {
+      await db.exec(`drop policy "${policy}" on storage.objects`);
+      const tampered = await worldSnapshot();
+      expect(tampered).not.toEqual(before);
+
+      await expect(db.exec(CUTOVER_SQL)).rejects.toThrow(
+        new RegExp(`required policy ${policy} is missing`),
+      );
+      expect(await worldSnapshot()).toEqual(tampered);
+
+      await db.exec(restore);
+      expect(await worldSnapshot()).toEqual(before);
+    }
+  });
+
+  it("case 24: the normal old-state apply and the target-state replay still pass", async () => {
+    const target = await worldSnapshot();
+
+    await db.exec(ROLLBACK_SQL);
+    expect(await bucketStates()).toEqual(PRE_CUTOVER_BUCKETS);
+    expect((await canvasesPolicies()).map((row) => row.policyname)).toEqual([
+      "canvases_insert_authenticated",
+      "canvases_select_public",
+    ]);
+
+    // Old state -> apply (the preflight must accept the pre-cutover canvases pair).
+    await db.exec(CUTOVER_SQL);
+    expect(await worldSnapshot()).toEqual(target);
+
+    // Target state -> replay (the preflight must accept the metadata reader).
+    await db.exec(CUTOVER_SQL);
+    expect(await worldSnapshot()).toEqual(target);
+  });
+
+  it("case 25: the rollback aborts loudly when a required bucket is missing", async () => {
+    const before = await worldSnapshot();
+
+    await db.exec("create table public._zz_wo18_buckets as select * from storage.buckets");
+    await db.exec("create table public._zz_wo18_objects as select * from storage.objects");
+
+    await db.exec("delete from storage.objects where bucket_id = 'home-seeds'");
+    await db.exec("delete from storage.buckets where id = 'home-seeds'");
+    const tampered = await worldSnapshot();
+    expect(tampered).not.toEqual(before);
+
+    await expect(db.exec(ROLLBACK_SQL)).rejects.toThrow(
+      /X-52 storage rollback aborted: required bucket\(s\) missing: home-seeds/,
+    );
+    // The rollback opens its own BEGIN, so an aborted run leaves the session in the
+    // aborted-transaction state until the caller rolls back — same as psql would.
+    await db.exec("rollback");
+
+    // "UPDATE 0 rows and commit" would have flipped the other two buckets to public and
+    // swapped the canvases policies. Nothing of that may survive.
+    expect(await worldSnapshot()).toEqual(tampered);
+
+    await db.exec(
+      "insert into storage.buckets select * from public._zz_wo18_buckets on conflict (id) do nothing",
+    );
+    await db.exec(
+      "insert into storage.objects select * from public._zz_wo18_objects on conflict (id) do nothing",
+    );
+    await db.exec("drop table public._zz_wo18_buckets, public._zz_wo18_objects");
+    expect(await worldSnapshot()).toEqual(before);
   });
 });
