@@ -480,6 +480,23 @@ const REFERENCE_KEYS = new Set([
   "filePath",
 ]);
 
+/**
+ * Keys that explicitly NAME a stored object. A name is a candidate reference
+ * whatever its shape — `render.png` is neither a URL nor a path — so these keys
+ * produce an `object_name` fingerprint without asking `fingerprintKindFor` first.
+ *
+ * The generic `name` key is deliberately absent: in this schema it holds model
+ * names, tool names and channel names far more often than object names, and
+ * treating it as a reference would manufacture noise instead of finding history.
+ */
+const OBJECT_NAME_KEYS = new Set([
+  "objectName",
+  "object_name",
+  "fileName",
+  "file_name",
+  "filename",
+]);
+
 const URL_LIKE = /^https?:\/\//i;
 const SCHEME_LIKE = /^(oss|s3|gs|storage):\/\//i;
 
@@ -505,6 +522,13 @@ function discoveryForEntry(key: string, value: unknown, pointer: string): Discov
   if (typeof value !== "string" || value.length === 0) return null;
   // Inline payloads are not references to a stored object.
   if (value.startsWith("data:")) return null;
+
+  // An explicit object-name key is a candidate on its own terms: a bare file name
+  // has no slash and no scheme, and only the key says what it is. The value still
+  // leaves this function as a truncated fingerprint and nothing else.
+  if (OBJECT_NAME_KEYS.has(key)) {
+    return { pointer, assetId: null, fingerprint: fingerprint(value), fingerprintKind: "object_name" };
+  }
 
   const kind = fingerprintKindFor(value);
   if (kind === null) return null;
@@ -587,14 +611,21 @@ export function toBytes(value: unknown): Uint8Array | null {
 /**
  * `json` — strict UTF-8, then `JSON.parse`. `empty` — nothing to read.
  * `bytes` — not guessed, not deep-imported: an explicit human item.
- * Anything else — the scan cannot be trusted to be complete.
+ *
+ * Anything else — including NULL, `undefined`, an empty string and a non-string —
+ * is an encoding this scan does not understand. It is deliberately NOT defaulted
+ * to `json`: bytes that happen to parse as JSON do not prove the serializer was
+ * JSON, and a payload that was only partly read must never be reported as complete.
  */
 export function decodeSerializedValue(serializer: unknown, blob: unknown): DecodeOutcome {
-  const type = typeof serializer === "string" && serializer.length > 0 ? serializer : "json";
+  if (typeof serializer !== "string" || !KNOWN_SERIALIZERS.has(serializer)) {
+    return { kind: "unsupported_encoding" };
+  }
 
-  if (!KNOWN_SERIALIZERS.has(type)) return { kind: "unsupported_encoding" };
-  if (type === "bytes") return { kind: "opaque_binary" };
-  if (type === "empty") return blob === null || blob === undefined ? { kind: "skipped" } : { kind: "decode_failure" };
+  if (serializer === "bytes") return { kind: "opaque_binary" };
+  if (serializer === "empty") {
+    return blob === null || blob === undefined ? { kind: "skipped" } : { kind: "decode_failure" };
+  }
 
   const bytes = toBytes(blob);
   if (bytes === null) return { kind: "decode_failure" };
@@ -740,6 +771,11 @@ type JobRow = {
 /**
  * Every clue a job carries must name the same project. `workspace_id` is never
  * selected: it is a personal billing workspace and says nothing about ownership.
+ *
+ * A clue that was PROVIDED but could not be resolved is not evidence of
+ * convergence. Dropping it would turn "project A plus something I cannot read"
+ * into a proven A — the exact mistake this gate exists to prevent — so any
+ * unresolved clue makes the whole job a relation conflict instead.
  */
 function resolveJobContainer(catalog: Catalog, job: JobRow): ContainerResolution {
   const clues: ContainerResolution[] = [];
@@ -758,13 +794,18 @@ function resolveJobContainer(catalog: Catalog, job: JobRow): ContainerResolution
   if (job.sessionId !== null) clues.push(resolveSessionContainer(catalog, job.sessionId));
   if (job.threadId !== null) clues.push(resolveThreadContainer(catalog, job.threadId));
 
+  // Approved scope: a job with NO clue at all is unresolved, not conflicted.
+  if (clues.length === 0) return unproven("unbound_thread");
+
   const projects = new Set<string>();
   for (const clue of clues) if (clue.projectId !== null) projects.add(clue.projectId);
 
-  if (projects.size > 1 || clues.some((clue) => clue.proof === "CONFLICT")) {
+  // An UNPROVEN or CONFLICT clue has no project id, and either one means this job
+  // did not converge. Two different project ids mean the same thing.
+  const unresolved = clues.some((clue) => clue.projectId === null);
+  if (unresolved || projects.size > 1) {
     return { proof: "CONFLICT", projectId: null, defect: "job_relation_conflict" };
   }
-  if (projects.size === 0) return unproven("unbound_thread");
 
   const projectId = [...projects][0] ?? null;
   const explicit = clues.some((clue) => clue.proof === "PROJECT_CHAIN_EXACT");
@@ -1191,11 +1232,13 @@ class InventoryRun {
           container,
         });
 
-        // `checkpoint` / `metadata` are JSONB and are walked as such. The row's
-        // declared serializer is still checked, because a `bytes` or unknown
-        // serializer means the JSON we can see may not be the whole payload.
-        const serializer = readText(row.type) ?? "json";
-        if (!KNOWN_SERIALIZERS.has(serializer)) {
+        // `checkpoint` / `metadata` are JSONB: the driver already decoded them, so
+        // what is visible here is real evidence and is walked either way. The row's
+        // declared serializer is still read as declared — never defaulted — because
+        // a NULL, `bytes` or unknown type means this row may hold more than the JSON
+        // we can see, and that gap has to be reported rather than guessed away.
+        const declaredSerializer = readText(row.type);
+        if (declaredSerializer === null || !KNOWN_SERIALIZERS.has(declaredSerializer)) {
           this.emitDecodeGap({
             sourceTable: "langgraph.checkpoints",
             sourceColumn: "checkpoint",
@@ -1203,7 +1246,7 @@ class InventoryRun {
             container,
             outcome: "unsupported_encoding",
           });
-        } else if (serializer === "bytes") {
+        } else if (declaredSerializer === "bytes") {
           this.emitDecodeGap({
             sourceTable: "langgraph.checkpoints",
             sourceColumn: "checkpoint",
@@ -1512,13 +1555,32 @@ function itemComparator(left: InventoryItem, right: InventoryItem): number {
   return 0;
 }
 
+/** Reasons that describe the CONTAINER, not a reference found inside it. */
+const CONTAINER_DEFECT_REASONS: readonly InventoryReason[] = [
+  "broken_container_chain",
+  "run_session_thread_mismatch",
+  "ambiguous_thread_binding",
+  "unbound_thread",
+  "job_relation_conflict",
+];
+
 export function buildReport(items: InventoryItem[]): InventoryReport {
-  // Two scans can discover the same container defect (a message is read once per
-  // physical column), and an identical item is the same fact. References from two
-  // columns differ in `sourceColumn`, so they can never collapse into one.
-  const unique = new Map<string, InventoryItem>();
-  for (const entry of items) unique.set(JSON.stringify(entry), entry);
-  const sorted = [...unique.values()].sort(itemComparator);
+  // Deduplication is limited to container defects. A chat message is read once per
+  // physical column, and its broken chain is one fact about one row, so reporting it
+  // twice would be double-counting. A REFERENCE is never merged — not even when two
+  // of them carry the same fingerprint — because two hits in two columns or at two
+  // pointers are two pieces of history, and collapsing them would hide exactly what
+  // this scan exists to find.
+  const kept: InventoryItem[] = [];
+  const containerDefects = new Map<string, InventoryItem>();
+  for (const entry of items) {
+    if (!CONTAINER_DEFECT_REASONS.includes(entry.reason)) {
+      kept.push(entry);
+      continue;
+    }
+    containerDefects.set(JSON.stringify(entry), entry);
+  }
+  const sorted = [...kept, ...containerDefects.values()].sort(itemComparator);
 
   const summary: InventorySummary = {
     referencesScanned: sorted.filter((item) => REFERENCE_REASONS.includes(item.reason)).length,

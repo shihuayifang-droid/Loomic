@@ -223,7 +223,8 @@ const hex = (value: string | Uint8Array): string =>
 async function makeBlob(options: {
   threadId: string;
   channel?: string;
-  type: string;
+  /** `null` is a real value here: `langgraph.checkpoints.type` is nullable. */
+  type: string | null;
   blob: string | Uint8Array | null;
 }): Promise<void> {
   await db.query(
@@ -241,7 +242,8 @@ async function makeBlob(options: {
 
 async function makeWrite(options: {
   threadId: string;
-  type: string;
+  /** `null` is a real value here: `langgraph.checkpoint_writes.type` is nullable. */
+  type: string | null;
   blob: string | Uint8Array;
 }): Promise<void> {
   await db.query(
@@ -517,14 +519,30 @@ describe("serializer decoding", () => {
       kind: "value",
       value: { a: 1 },
     });
-    expect(decodeSerializedValue(null, Buffer.from("[]", "utf8"))).toEqual({
-      kind: "value",
-      value: [],
-    });
     expect(decodeSerializedValue("empty", null)).toEqual({ kind: "skipped" });
     expect(decodeSerializedValue("bytes", Buffer.from([0x00, 0xff]))).toEqual({
       kind: "opaque_binary",
     });
+  });
+
+  it("case 18b: a serializer that is not an explicit json / empty / bytes is never guessed", () => {
+    // This assertion used to say the opposite (`null` type decoded as JSON). The
+    // ticket corrected it: bytes that happen to parse as JSON do not prove the
+    // serializer was JSON, so NULL / empty / non-string is `unsupported_encoding`.
+    for (const serializer of [null, undefined, "", 0, 42, {}, [], Buffer.from("json")]) {
+      expect(decodeSerializedValue(serializer, Buffer.from('{"a":1}', "utf8"))).toEqual({
+        kind: "unsupported_encoding",
+      });
+    }
+    expect(decodeSerializedValue("JSON", Buffer.from("[]", "utf8"))).toEqual({
+      kind: "unsupported_encoding",
+    });
+    expect(decodeSerializedValue("json", Buffer.from("[]", "utf8"))).toEqual({
+      kind: "value",
+      value: [],
+    });
+    expect(decodeSerializedValue("bytes", new Uint8Array([1]))).toEqual({ kind: "opaque_binary" });
+    expect(decodeSerializedValue("empty", null)).toEqual({ kind: "skipped" });
   });
 
   it("case 19: an unknown serializer is reported, never guessed", () => {
@@ -1287,5 +1305,493 @@ describe("history inventory against the migrated schema", () => {
     // The bucket constant is asserted here so the SQL literal cannot drift.
     expect(LEGACY_CANVASES_BUCKET).toBe("canvases");
     expect(executed.some((sql) => sql.includes("bucket_id = $1"))).toBe(true);
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* F1 — a job clue that cannot be resolved is not convergence        */
+  /* ---------------------------------------------------------------- */
+
+  it("case 60: a job with a resolved project and an unknown thread is a conflict", async () => {
+    // The counter-example the ticket named: before the fix this returned
+    // PROJECT_CHAIN_EXACT for the project and silently dropped the thread.
+    const project = await makeProject("w17-job-unknown-thread");
+    const jobId = await makeJob({
+      projectId: project.id,
+      threadId: `thread-${randomUUID()}`,
+      result: { url: URL_WITH_TOKEN },
+    });
+
+    const items = itemsOf(await inventory(), jobId);
+
+    expect(items.map((entry) => entry.reason).sort()).toEqual([
+      "asset_id_missing",
+      "job_relation_conflict",
+    ]);
+    const defect = items.find((entry) => entry.reason === "job_relation_conflict");
+    expect(defect).toMatchObject({
+      sourceTable: "public.background_jobs",
+      sourceColumn: "project_id",
+      pointer: null,
+      containerProof: "CONFLICT",
+      containerProjectId: null,
+      objectProof: "UNPROVEN",
+      action: "FIX_RELATIONSHIP",
+    });
+    // The reference is still reported — with a container that proves nothing.
+    expect(items.find((entry) => entry.reason === "asset_id_missing")).toMatchObject({
+      containerProof: "CONFLICT",
+      containerProjectId: null,
+      action: "REVIEW_REFERENCE",
+    });
+    const scoped = buildReport(items);
+    expect(scoped.summary.conflicts).toBeGreaterThan(0);
+    expect(exitCodeForReport(scoped)).toBe(1);
+  });
+
+  it("case 61: a job whose canvas cannot be resolved is a conflict, not a proven project", async () => {
+    const project = await makeProject("w17-job-blind-canvas");
+    const jobId = await makeJob({
+      projectId: project.id,
+      canvasId: project.canvasId,
+      result: { url: URL_WITH_TOKEN },
+    });
+
+    // The canvas row is hidden from the scan, so that clue cannot be resolved.
+    const blind: QueryExecutor = createReadOnlyExecutor({
+      query: async (sql, params) => {
+        const result = await baseExecutor.query(sql, params);
+        return sql.includes("from public.canvases") ? { rows: [] } : result;
+      },
+    });
+
+    const items = itemsOf(await runHistoryReferenceInventory(blind, {}), jobId);
+
+    expect(items.map((entry) => entry.reason).sort()).toEqual([
+      "asset_id_missing",
+      "job_relation_conflict",
+    ]);
+    expect(items.find((entry) => entry.reason === "job_relation_conflict")).toMatchObject({
+      containerProof: "CONFLICT",
+      containerProjectId: null,
+      action: "FIX_RELATIONSHIP",
+    });
+  });
+
+  it("case 62: a job whose session chain is broken is a conflict", async () => {
+    const project = await makeProject("w17-job-broken-session");
+    const session = await makeSession(project.canvasId, randomUUID());
+    const jobId = await makeJob({
+      projectId: project.id,
+      sessionId: session,
+      result: { url: URL_WITH_TOKEN },
+    });
+
+    const blind: QueryExecutor = createReadOnlyExecutor({
+      query: async (sql, params) => {
+        const result = await baseExecutor.query(sql, params);
+        return sql.includes("from public.canvases") ? { rows: [] } : result;
+      },
+    });
+
+    const items = itemsOf(await runHistoryReferenceInventory(blind, {}), jobId);
+
+    expect(items.map((entry) => entry.reason).sort()).toEqual([
+      "asset_id_missing",
+      "job_relation_conflict",
+    ]);
+    expect(items.find((entry) => entry.reason === "job_relation_conflict")).toMatchObject({
+      containerProof: "CONFLICT",
+      containerProjectId: null,
+      action: "FIX_RELATIONSHIP",
+    });
+  });
+
+  it("case 63: a job whose four clues all converge keeps the explicit proof", async () => {
+    const project = await makeProject("w17-job-converge");
+    const thread = randomUUID();
+    const session = await makeSession(project.canvasId, thread);
+    await makeRun(session, thread);
+    const jobId = await makeJob({
+      projectId: project.id,
+      canvasId: project.canvasId,
+      sessionId: session,
+      threadId: thread,
+      result: { url: URL_WITH_TOKEN },
+    });
+
+    const items = itemsOf(await inventory(), jobId);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      sourceColumn: "result",
+      pointer: "/url",
+      reason: "asset_id_missing",
+      containerProof: "PROJECT_CHAIN_EXACT",
+      containerProjectId: project.id,
+      objectProof: "UNPROVEN",
+    });
+  });
+
+  it("case 64: a job with no clue at all stays unbound instead of conflicted", async () => {
+    const jobId = await makeJob({ result: { url: URL_WITH_TOKEN } });
+
+    const items = itemsOf(await inventory(), jobId);
+
+    expect(items.map((entry) => entry.reason).sort()).toEqual([
+      "asset_id_missing",
+      "unbound_thread",
+    ]);
+    const defect = items.find((entry) => entry.reason === "unbound_thread");
+    expect(defect).toMatchObject({
+      pointer: null,
+      containerProof: "UNPROVEN",
+      containerProjectId: null,
+      action: "KEEP_UNRESOLVED",
+    });
+    expect(items.some((entry) => entry.reason === "job_relation_conflict")).toBe(false);
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* F2 — the declared serializer decides, and NULL is not json        */
+  /* ---------------------------------------------------------------- */
+
+  it("case 65: a checkpoint_writes row typed NULL is unsupported even when its blob is JSON", async () => {
+    const project = await makeProject("w17-writes-null-type");
+    const thread = randomUUID();
+    await makeSession(project.canvasId, thread);
+    const assetId = await makeAsset(project.id, `w17/${randomUUID()}.png`);
+    await makeWrite({
+      threadId: thread,
+      type: null,
+      blob: JSON.stringify({ output: { asset_id: assetId } }),
+    });
+
+    const report = await inventory();
+    const items = report.items.filter(
+      (entry) =>
+        entry.sourceTable === "langgraph.checkpoint_writes" && entry.rowId.includes(thread),
+    );
+
+    // The bytes happen to be readable JSON. That still proves nothing about the
+    // serializer, so no reference may be claimed out of them.
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      sourceColumn: "blob",
+      pointer: null,
+      assetId: null,
+      fingerprint: null,
+      reason: "unsupported_encoding",
+      action: "REVIEW_DECODER_GAP",
+      objectProof: "UNPROVEN",
+      containerProof: "THREAD_SESSION_EXACT",
+    });
+    const scoped = buildReport(items);
+    expect(scoped.summary.unsupportedEncodings).toBe(1);
+    expect(scoped.summary.referencesScanned).toBe(0);
+    expect(scoped.complete).toBe(false);
+    expect(exitCodeForReport(scoped)).toBe(2);
+    expect(report.complete).toBe(false);
+  });
+
+  it("case 66: a bytes-typed checkpoints row reports the gap and still walks its JSONB", async () => {
+    const project = await makeProject("w17-checkpoint-bytes-type");
+    const thread = randomUUID();
+    await makeSession(project.canvasId, thread);
+    const checkpointId = await makeCheckpoint({
+      threadId: thread,
+      type: "bytes",
+      checkpoint: { url: URL_WITH_TOKEN },
+    });
+
+    const report = await inventory();
+    const items = report.items.filter((entry) => entry.rowId.includes(checkpointId));
+
+    expect(items.map((entry) => entry.reason).sort()).toEqual([
+      "asset_id_missing",
+      "opaque_binary",
+    ]);
+    expect(items.find((entry) => entry.reason === "opaque_binary")).toMatchObject({
+      sourceColumn: "checkpoint",
+      pointer: null,
+      action: "REVIEW_DECODER_GAP",
+      containerProof: "THREAD_SESSION_EXACT",
+      containerProjectId: project.id,
+    });
+    // The visible JSONB is independent evidence and is still reported.
+    expect(items.find((entry) => entry.reason === "asset_id_missing")).toMatchObject({
+      sourceColumn: "checkpoint",
+      pointer: "/url",
+      containerProjectId: project.id,
+    });
+    const scoped = buildReport(items);
+    expect(scoped.summary.opaqueBinary).toBe(1);
+    expect(scoped.complete).toBe(true);
+    expect(exitCodeForReport(scoped)).toBe(1);
+  });
+
+  it("case 67: an unknown-typed checkpoints row reports the gap and stays incomplete", async () => {
+    const project = await makeProject("w17-checkpoint-unknown-type");
+    const thread = randomUUID();
+    await makeSession(project.canvasId, thread);
+    const checkpointId = await makeCheckpoint({
+      threadId: thread,
+      type: "msgpack",
+      checkpoint: { url: URL_WITH_TOKEN },
+    });
+
+    const report = await inventory();
+    const items = report.items.filter((entry) => entry.rowId.includes(checkpointId));
+
+    expect(items.map((entry) => entry.reason).sort()).toEqual([
+      "asset_id_missing",
+      "unsupported_encoding",
+    ]);
+    expect(items.find((entry) => entry.reason === "unsupported_encoding")).toMatchObject({
+      sourceColumn: "checkpoint",
+      pointer: null,
+      action: "REVIEW_DECODER_GAP",
+    });
+    expect(items.find((entry) => entry.reason === "asset_id_missing")).toMatchObject({
+      sourceColumn: "checkpoint",
+      pointer: "/url",
+      containerProjectId: project.id,
+    });
+    const scoped = buildReport(items);
+    expect(scoped.summary.unsupportedEncodings).toBe(1);
+    expect(scoped.complete).toBe(false);
+    expect(exitCodeForReport(scoped)).toBe(2);
+  });
+
+  it("case 68: a NULL-typed checkpoints row is unsupported and its JSONB is still walked", async () => {
+    const project = await makeProject("w17-checkpoint-null-type");
+    const thread = randomUUID();
+    await makeSession(project.canvasId, thread);
+    const checkpointId = await makeCheckpoint({
+      threadId: thread,
+      type: null,
+      checkpoint: { url: URL_WITH_TOKEN },
+    });
+
+    const report = await inventory();
+    const items = report.items.filter((entry) => entry.rowId.includes(checkpointId));
+
+    expect(items.map((entry) => entry.reason).sort()).toEqual([
+      "asset_id_missing",
+      "unsupported_encoding",
+    ]);
+    expect(items.find((entry) => entry.reason === "unsupported_encoding")).toMatchObject({
+      sourceColumn: "checkpoint",
+      pointer: null,
+      action: "REVIEW_DECODER_GAP",
+    });
+    expect(items.find((entry) => entry.reason === "asset_id_missing")?.pointer).toBe("/url");
+    const scoped = buildReport(items);
+    expect(scoped.complete).toBe(false);
+    expect(exitCodeForReport(scoped)).toBe(2);
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* F3 — explicit object-name keys are candidates                     */
+  /* ---------------------------------------------------------------- */
+
+  it("case 69: object-name keys are found by name, and a generic `name` key is not", () => {
+    const bare = `render-${randomUUID()}.png`;
+    const nested = `${randomUUID()}/nested-${randomUUID()}.png`;
+    const upper = `UPPER-${randomUUID()}.PNG`;
+    const dashed = `dashed-${randomUUID()}.png`;
+    const plain = `plain-${randomUUID()}.png`;
+    const found: Array<{
+      pointer: string;
+      assetId: string | null;
+      kind: string | null;
+      fingerprint: string | null;
+    }> = [];
+
+    collectReferences(
+      {
+        object: {
+          objectName: bare,
+          object_name: nested,
+          fileName: plain,
+          file_name: dashed,
+          filename: upper,
+        },
+        tool: { name: "generate_image", displayName: "Generate Image" },
+        inline: { fileName: "data:image/png;base64,AAAA" },
+      },
+      (discovery) =>
+        found.push({
+          pointer: discovery.pointer,
+          assetId: discovery.assetId,
+          kind: discovery.fingerprintKind,
+          fingerprint: discovery.fingerprint,
+        }),
+    );
+
+    expect(found).toHaveLength(5);
+    expect(found.map((entry) => entry.pointer).sort()).toEqual([
+      "/object/fileName",
+      "/object/file_name",
+      "/object/filename",
+      "/object/objectName",
+      "/object/object_name",
+    ]);
+    for (const entry of found) {
+      expect(entry.kind).toBe("object_name");
+      expect(entry.assetId).toBeNull();
+      expect(entry.fingerprint).toMatch(/^[0-9a-f]{16}$/);
+    }
+    expect(found.find((entry) => entry.pointer === "/object/objectName")?.fingerprint).toBe(
+      fingerprint(bare),
+    );
+    expect(found.find((entry) => entry.pointer === "/object/object_name")?.fingerprint).toBe(
+      fingerprint(nested),
+    );
+    // A bare `name` is a model / tool name far more often than an object name.
+    expect(found.some((entry) => entry.pointer.startsWith("/tool"))).toBe(false);
+    // A data URL is an inline payload, never an object name.
+    expect(found.some((entry) => entry.pointer.startsWith("/inline"))).toBe(false);
+  });
+
+  it("case 70: an object name in a message column never becomes an object proof", async () => {
+    const project = await makeProject("w17-object-name-message");
+    const session = await makeSession(project.canvasId, randomUUID());
+    const contentName = `content-${randomUUID()}.png`;
+    const toolName = `tool-${randomUUID()}.png`;
+    const message = await makeMessage(
+      session,
+      [{ type: "image", objectName: contentName }],
+      [{ name: "generate_image", output: { file_name: toolName } }],
+    );
+
+    const report = await inventory();
+    const items = itemsOf(report, message);
+
+    expect(items).toHaveLength(2);
+    expect(items.map((entry) => entry.sourceColumn).sort()).toEqual([
+      "content_blocks",
+      "tool_activities",
+    ]);
+    expect(items.map((entry) => entry.pointer).sort()).toEqual(["/0/objectName", "/0/output/file_name"]);
+    expect(items.every((entry) => entry.fingerprintKind === "object_name")).toBe(true);
+    expect(items.every((entry) => entry.assetId === null)).toBe(true);
+    expect(items.every((entry) => entry.objectProof === "UNPROVEN")).toBe(true);
+    expect(items.every((entry) => entry.reason === "asset_id_missing")).toBe(true);
+    expect(items.every((entry) => entry.containerProof === "PROJECT_CHAIN_EXACT")).toBe(true);
+    expect(items.some((entry) => entry.fingerprint === fingerprint(contentName))).toBe(true);
+    expect(items.some((entry) => entry.fingerprint === fingerprint(toolName))).toBe(true);
+
+    const json = serializeReport(report);
+    expect(json).not.toContain(contentName);
+    expect(json).not.toContain(toolName);
+  });
+
+  it("case 71: object names in a checkpoint and in a job are candidates too", async () => {
+    const project = await makeProject("w17-object-name-misc");
+    const thread = randomUUID();
+    await makeSession(project.canvasId, thread);
+    const checkpointName = `checkpoint-${randomUUID()}.png`;
+    const jobName = `job-${randomUUID()}.png`;
+    const checkpointId = await makeCheckpoint({
+      threadId: thread,
+      metadata: { attachment: { fileName: checkpointName } },
+      checkpoint: {},
+    });
+    const jobId = await makeJob({
+      projectId: project.id,
+      result: { artefacts: [{ object_name: jobName }] },
+    });
+
+    const report = await inventory();
+    const checkpointItems = report.items.filter((entry) => entry.rowId.includes(checkpointId));
+    const jobItems = itemsOf(report, jobId);
+
+    expect(checkpointItems).toHaveLength(1);
+    expect(checkpointItems[0]).toMatchObject({
+      sourceTable: "langgraph.checkpoints",
+      sourceColumn: "metadata",
+      pointer: "/attachment/fileName",
+      fingerprintKind: "object_name",
+      assetId: null,
+      objectProof: "UNPROVEN",
+      reason: "asset_id_missing",
+      containerProof: "THREAD_SESSION_EXACT",
+      containerProjectId: project.id,
+    });
+    expect(checkpointItems[0]?.fingerprint).toBe(fingerprint(checkpointName));
+
+    expect(jobItems).toHaveLength(1);
+    expect(jobItems[0]).toMatchObject({
+      sourceTable: "public.background_jobs",
+      sourceColumn: "result",
+      pointer: "/artefacts/0/object_name",
+      fingerprintKind: "object_name",
+      assetId: null,
+      objectProof: "UNPROVEN",
+      reason: "asset_id_missing",
+      containerProof: "PROJECT_CHAIN_EXACT",
+      containerProjectId: project.id,
+    });
+    expect(jobItems[0]?.fingerprint).toBe(fingerprint(jobName));
+
+    const json = serializeReport(report);
+    expect(json).not.toContain(checkpointName);
+    expect(json).not.toContain(jobName);
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* F4 — dedup stops at the container defect                          */
+  /* ---------------------------------------------------------------- */
+
+  it("case 72: one broken container is one defect, but two columns are two references", async () => {
+    const project = await makeProject("w17-dedup-boundary");
+    const session = await makeSession(project.canvasId, randomUUID());
+    const message = await makeMessage(
+      session,
+      [{ type: "image", url: URL_WITH_TOKEN }],
+      [{ name: "generate_image", output: { url: URL_WITH_TOKEN } }],
+    );
+
+    const blind: QueryExecutor = createReadOnlyExecutor({
+      query: async (sql, params) => {
+        const result = await baseExecutor.query(sql, params);
+        return sql.includes("from public.canvases") ? { rows: [] } : result;
+      },
+    });
+
+    const items = itemsOf(await runHistoryReferenceInventory(blind, {}), message);
+
+    expect(items.filter((entry) => entry.reason === "broken_container_chain")).toHaveLength(1);
+    const references = items.filter((entry) => entry.reason === "asset_id_missing");
+    expect(references).toHaveLength(2);
+    expect(references.map((entry) => entry.sourceColumn).sort()).toEqual([
+      "content_blocks",
+      "tool_activities",
+    ]);
+    expect(references.map((entry) => entry.pointer).sort()).toEqual(["/0/output/url", "/0/url"]);
+    // The same URL on both sides is still two hits: identical fingerprints are
+    // never merged into one item.
+    expect(new Set(references.map((entry) => entry.fingerprint)).size).toBe(1);
+    expect(items.every((entry) => entry.containerProof === "UNPROVEN")).toBe(true);
+  });
+
+  it("case 73: only container defects are deduplicated, never references", () => {
+    const defect = item({
+      reason: "broken_container_chain",
+      action: "FIX_RELATIONSHIP",
+      pointer: null,
+      containerProof: "UNPROVEN",
+      containerProjectId: null,
+      fingerprint: null,
+      fingerprintKind: null,
+    });
+    const reference = item({});
+
+    const report = buildReport([defect, defect, reference, item({})]);
+
+    expect(report.items.filter((entry) => entry.reason === "broken_container_chain")).toHaveLength(1);
+    // Two byte-identical reference items stay two items.
+    expect(report.items.filter((entry) => entry.reason === "asset_id_missing")).toHaveLength(2);
+    expect(report.summary.referencesScanned).toBe(2);
   });
 });
