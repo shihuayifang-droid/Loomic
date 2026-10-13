@@ -1059,6 +1059,25 @@ export type Database = {
         }
         Returns: Json
       }
+      record_project_asset_if_matches: {
+        Args: {
+          p_bucket: string
+          p_object_path: string
+          p_created_by: string
+          p_fallback_workspace_id: string
+          p_project_id?: string | null
+          p_canvas_id?: string | null
+          p_mime_type?: string | null
+          p_byte_size?: number | null
+          p_expected_asset_id?: string | null
+          p_expected_workspace_id?: string | null
+          p_expected_project_id?: string | null
+          p_expected_created_by?: string | null
+          p_expected_mime_type?: string | null
+          p_expected_byte_size?: number | null
+        }
+        Returns: Json
+      }
       migrate_personal_projects_to_team: {
         Args: Record<string, never>
         Returns: Json
