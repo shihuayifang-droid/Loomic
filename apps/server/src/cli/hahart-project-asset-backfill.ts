@@ -26,8 +26,15 @@
  *
  * A NOTE ON WHAT IT DOES NOT DO
  * It never overwrites a row that already names a different project, never deletes
- * anything, and never touches `projects` / `canvases` — it only calls the same
- * `record_project_asset` RPC the live workers use.
+ * anything, and never touches `projects` / `canvases` — it only calls the
+ * `record_project_asset_if_matches` RPC, which locks the row, compares it against
+ * the full snapshot this tool planned from, and writes only on an exact match.
+ *
+ * The plan is therefore only a *proposal*. Between planning and writing, a live
+ * worker (or a second operator) may claim, move or delete the row; the RPC answers
+ * `conflict` and nothing is written. That comparison cannot be done here: a
+ * pre-read followed by a write is two round trips with a window in between, which
+ * is exactly the race this tool used to lose.
  *
  * OUTPUT
  * Only the JSON report goes to stdout. Object keys are bucket-relative and every
@@ -73,12 +80,24 @@ type Candidate = {
   byteSize: number | null;
 };
 
+/**
+ * The row as it looked at PLAN time. Every field below is part of the snapshot the
+ * compare-and-write RPC verifies, so this is deliberately the whole metadata the
+ * RPC compares — adding a compared field there without adding it here would make
+ * this tool send a snapshot the database can never match.
+ */
 type ExistingRow = {
+  id: string;
   object_path: string;
   project_id: string | null;
   workspace_id: string;
   created_by: string | null;
+  mime_type: string | null;
+  byte_size: number | null;
 };
+
+/** What `record_project_asset_if_matches` returns. */
+type CompareWriteResult = { status?: unknown; reason?: unknown };
 
 type Plan = {
   objectPath: string;
@@ -327,11 +346,13 @@ export async function runProjectAssetBackfill(
   }
 
   // ---- existing rows --------------------------------------------------------
+  // The full compared snapshot, not just the ownership pair: the RPC will refuse
+  // to write unless every one of these fields still matches what is stored.
   const assets = await loadAllRows<ExistingRow>(
     (from, to) =>
       admin
         .from("asset_objects")
-        .select("object_path, project_id, workspace_id, created_by")
+        .select("id, object_path, project_id, workspace_id, created_by, mime_type, byte_size")
         .eq("bucket", BUCKET)
         .range(from, to),
     "asset_objects",
@@ -422,42 +443,17 @@ export async function runProjectAssetBackfill(
 
   if (options.apply) {
     for (const plan of plans) {
-      // Optimistic guard: the row must still look the way it did when the plan
-      // was made, or a concurrent worker has already claimed the object.
+      // One call, one lock, one verdict. The row is compared against the plan-time
+      // snapshot inside the database, while the row is locked, so there is no
+      // window between "it still looks unchanged" and "write it".
       //
-      // Compare the FULL ownership state, not just the project. A concurrent
-      // writer can move a row to another workspace while leaving `project_id`
-      // null — comparing only the project would call that "unchanged", and the
-      // RPC below would then write the planned workspace over it. That is the
-      // overwrite this guard exists to prevent.
-      const { data: current } = await admin
-        .from("asset_objects")
-        .select("project_id, workspace_id")
-        .eq("bucket", BUCKET)
-        .eq("object_path", plan.objectPath)
-        .maybeSingle();
+      // The snapshot is the FULL ownership + metadata state, not just the project.
+      // A concurrent writer can move a row to another workspace while leaving
+      // `project_id` null; comparing only the project would call that "unchanged"
+      // and the write would land on top of the newer state.
+      const existing = plan.existing;
 
-      const currentRow =
-        (current as { project_id: string | null; workspace_id: string | null } | null) ?? null;
-      const currentProject = currentRow?.project_id ?? null;
-      const currentWorkspace = currentRow?.workspace_id ?? null;
-
-      const expectedProject = plan.existing?.project_id ?? null;
-      const expectedWorkspace = plan.existing?.workspace_id ?? null;
-
-      const unchanged =
-        plan.existing === null
-          ? // Nothing existed at plan time, so anything that exists now (a row
-            // with any value at all) is somebody else's write.
-            currentProject === null && currentWorkspace === null
-          : currentProject === expectedProject && currentWorkspace === expectedWorkspace;
-
-      if (!unchanged) {
-        conflicts.push(plan.objectPath);
-        continue;
-      }
-
-      const { error } = await admin.rpc("record_project_asset", {
+      const { data, error } = await admin.rpc("record_project_asset_if_matches", {
         p_bucket: BUCKET,
         p_object_path: plan.objectPath,
         p_created_by: plan.createdBy,
@@ -466,10 +462,36 @@ export async function runProjectAssetBackfill(
         p_canvas_id: plan.canvasId,
         p_mime_type: plan.mimeType,
         p_byte_size: plan.byteSize,
+        // `null` asset id is how "no row existed at plan time" is expressed; the
+        // RPC then refuses to adopt any row that appeared since.
+        p_expected_asset_id: existing?.id ?? null,
+        p_expected_workspace_id: existing?.workspace_id ?? null,
+        p_expected_project_id: existing?.project_id ?? null,
+        p_expected_created_by: existing?.created_by ?? null,
+        p_expected_mime_type: existing?.mime_type ?? null,
+        p_expected_byte_size: existing?.byte_size ?? null,
       });
 
-      if (error) throw new Error(`record_project_asset failed: ${error.message}`);
-      recorded += 1;
+      if (error) throw new Error(`record_project_asset_if_matches failed: ${error.message}`);
+
+      const status = (data as CompareWriteResult | null)?.status;
+
+      if (status === "applied") {
+        recorded += 1;
+        continue;
+      }
+      if (status === "conflict") {
+        // A stale plan is a normal outcome, not a failure: report it and do not
+        // try a second write against a row we no longer have a snapshot for.
+        conflicts.push(plan.objectPath);
+        continue;
+      }
+
+      throw new Error(
+        `record_project_asset_if_matches returned an unexpected response: ${
+          status === undefined ? "no status" : String(status)
+        }`,
+      );
     }
   } else {
     // Dry run: the counts describe the change; no writes happen.
