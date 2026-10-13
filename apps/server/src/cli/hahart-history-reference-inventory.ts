@@ -40,7 +40,8 @@
  * blob, base64 payload, user id, email, connection string or key. References are
  * reduced to a truncated SHA-256 fingerprint, JSON Pointers replace opaque object
  * keys with a fingerprint, and the finished JSON is checked against a deny-list
- * before it is allowed onto stdout.
+ * before it is allowed onto stdout. A FAILURE prints no value either: stdout stays
+ * empty and stderr carries one fixed error classification and nothing else.
  *
  * EXIT CODES
  *   0 — complete scan, nothing unresolved, nothing conflicted
@@ -410,7 +411,7 @@ async function scanKeyset(options: {
 /* Redaction                                                           */
 /* ------------------------------------------------------------------ */
 
-/** Case-insensitive deny-list applied to the finished report and to stderr text. */
+/** Case-insensitive deny-list applied to the finished report before it reaches stdout. */
 export const DENY_LIST = ["http://", "https://", "token=", "eyj", "base64,"] as const;
 
 export function isRedactionSafe(text: string): boolean {
@@ -500,6 +501,13 @@ const OBJECT_NAME_KEYS = new Set([
 const URL_LIKE = /^https?:\/\//i;
 const SCHEME_LIKE = /^(oss|s3|gs|storage):\/\//i;
 
+/**
+ * A URI scheme is case-insensitive, so `DATA:`, `Data:` and `dAtA:` introduce the
+ * same inline payload as `data:` — and an inline payload is never a stored object,
+ * whatever key it sits under.
+ */
+const DATA_URI = /^data:/i;
+
 /** `bucket/key`-shaped and not prose: a candidate, never a proof. */
 function isPathLike(value: string): boolean {
   if (value.length === 0 || value.length > 1024) return false;
@@ -520,8 +528,10 @@ function discoveryForEntry(key: string, value: unknown, pointer: string): Discov
     return { pointer, assetId: value, fingerprint: null, fingerprintKind: null };
   }
   if (typeof value !== "string" || value.length === 0) return null;
-  // Inline payloads are not references to a stored object.
-  if (value.startsWith("data:")) return null;
+  // Inline payloads are not references to a stored object. The scheme match is
+  // case-insensitive on purpose: `DATA:image/png;base64,...` is the same payload
+  // as `data:...`, and letting it through would manufacture an object-name hit.
+  if (DATA_URI.test(value)) return null;
 
   // An explicit object-name key is a candidate on its own terms: a bare file name
   // has no slash and no scheme, and only the key says what it is. The value still
@@ -1616,61 +1626,158 @@ export function serializeReport(report: InventoryReport): string {
   return JSON.stringify(report);
 }
 
-/** Error text is only echoed when it is itself safe to print. */
-export function safeErrorText(error: unknown): string {
-  const raw = error instanceof Error ? `${error.name}: ${error.message}` : "unknown error";
-  const trimmed = raw.length > 300 ? `${raw.slice(0, 300)}...` : raw;
-  return isRedactionSafe(trimmed) ? trimmed : "error text withheld (failed the redaction deny-list)";
+/* ------------------------------------------------------------------ */
+/* Failure output: fixed classifications only                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The ONLY vocabulary a failure may use. Every entry is a compile-time constant,
+ * so stderr cannot carry a host, IP, port, path, SQL fragment, connection string
+ * or driver message — not because a deny-list happens to cover those shapes, but
+ * because no runtime value is ever interpolated into the line.
+ */
+export const ERROR_CLASSIFICATIONS = [
+  "argument_error",
+  "statement_not_allowed",
+  "pagination_error",
+  "redaction_failed",
+  "inventory_failed",
+] as const;
+export type ErrorClassification = (typeof ERROR_CLASSIFICATIONS)[number];
+
+/**
+ * Maps any error to one fixed classification.
+ *
+ * `error.message` is deliberately never read: a driver error is exactly where
+ * `getaddrinfo ENOTFOUND db.internal`, `ECONNREFUSED 10.20.30.40:5432`, a
+ * Windows/UNC path or `postgresql://user:password@host` would otherwise reappear.
+ * An unknown, non-local or non-Error throw is `inventory_failed`.
+ */
+export function classifyError(error: unknown): ErrorClassification {
+  if (error instanceof UsageError) return "argument_error";
+  if (error instanceof StatementNotAllowedError) return "statement_not_allowed";
+  if (error instanceof PaginationError) return "pagination_error";
+  if (error instanceof RedactionError) return "redaction_failed";
+  return "inventory_failed";
+}
+
+const FAILURE_PREFIX = "hahart-history-reference-inventory failed: ";
+
+/** The whole stderr line for a failure: a fixed prefix plus a fixed classification. */
+export function failureLine(error: unknown): string {
+  return `${FAILURE_PREFIX}${classifyError(error)}`;
 }
 
 /* ------------------------------------------------------------------ */
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
 
-async function execute(argv: readonly string[]): Promise<number> {
+export type TextSink = { write(chunk: string): unknown };
+
+export type ExecutorSession = {
+  executor: QueryExecutor;
+  close(): Promise<void>;
+};
+
+export type OpenExecutor = (connectionString: string) => Promise<ExecutorSession>;
+
+export type InventoryScan = (
+  executor: QueryExecutor,
+  options: { pageSize?: number },
+) => Promise<InventoryReport>;
+
+export type InventoryCliDeps = {
+  argv: readonly string[];
+  env: { readonly SUPABASE_DB_URL?: string | undefined };
+  openExecutor: OpenExecutor;
+  stdout: TextSink;
+  stderr: TextSink;
+  /**
+   * Injection seam: the shipped scan is the default. It exists so a test can drive
+   * the failure wrapper — including the redaction branch, which no scanned row can
+   * reach — without a database.
+   */
+  scan?: InventoryScan;
+};
+
+/**
+ * The whole CLI, with its driver and its writers injected.
+ *
+ * FAILURE CONTRACT — the reason this exists as a function instead of living inside
+ * `main`:
+ *   * stdout receives 0 bytes: the report is serialized, checked and written in
+ *     one place, so a run that fails anywhere leaves stdout untouched;
+ *   * stderr receives exactly one fixed classification line (plus the constant
+ *     usage text when the failure is an argument error) and never an error message;
+ *   * the exit code is 2.
+ */
+export async function runInventoryCli(deps: InventoryCliDeps): Promise<number> {
+  const scan = deps.scan ?? runHistoryReferenceInventory;
+
   let options: InventoryOptions;
   try {
-    options = parseArgs(argv);
+    options = parseArgs(deps.argv);
   } catch (error) {
-    if (error instanceof UsageError) {
-      process.stderr.write(`hahart-history-reference-inventory: ${safeErrorText(error)}\n`);
-      process.stderr.write(`${USAGE_TEXT}\n`);
-      return 2;
-    }
-    throw error;
-  }
-
-  const connectionString = process.env.SUPABASE_DB_URL;
-  if (connectionString === undefined || connectionString.length === 0) {
-    process.stderr.write("hahart-history-reference-inventory: SUPABASE_DB_URL is not set\n");
+    deps.stderr.write(`${failureLine(error)}\n`);
+    deps.stderr.write(`${USAGE_TEXT}\n`);
     return 2;
   }
 
-  const client = new pg.Client({ connectionString });
+  const connectionString = deps.env.SUPABASE_DB_URL;
+  if (connectionString === undefined || connectionString.length === 0) {
+    // Only the fixed variable NAME is ever part of a message; its value is not.
+    deps.stderr.write(`${failureLine(new UsageError("SUPABASE_DB_URL is not set"))}\n`);
+    return 2;
+  }
+
+  let session: ExecutorSession | null = null;
   try {
-    await client.connect();
-    const executor = createReadOnlyExecutor({
+    session = await deps.openExecutor(connectionString);
+    const report = await scan(session.executor, { pageSize: options.pageSize });
+
+    const json = serializeReport(report);
+    assertRedactionSafe(json);
+    deps.stdout.write(`${json}\n`);
+    return exitCodeForReport(report);
+  } catch (error) {
+    deps.stderr.write(`${failureLine(error)}\n`);
+    return 2;
+  } finally {
+    if (session !== null) {
+      try {
+        await session.close();
+      } catch {
+        // Nothing useful to do: the report (or the failure) is already decided.
+      }
+    }
+  }
+}
+
+/** The shipped driver: one `pg` client behind the read-only statement guard. */
+export const openPgExecutor: OpenExecutor = async (connectionString) => {
+  const client = new pg.Client({ connectionString });
+  await client.connect();
+  return {
+    executor: createReadOnlyExecutor({
       query: async (sql, params) => {
         const result = await client.query(sql, params === undefined ? undefined : [...params]);
         return { rows: result.rows as Array<Record<string, unknown>> };
       },
-    });
-    const report = await runHistoryReferenceInventory(executor, { pageSize: options.pageSize });
-
-    const json = serializeReport(report);
-    assertRedactionSafe(json);
-    process.stdout.write(`${json}\n`);
-    return exitCodeForReport(report);
-  } catch (error) {
-    process.stderr.write(`hahart-history-reference-inventory failed: ${safeErrorText(error)}\n`);
-    return 2;
-  } finally {
-    try {
+    }),
+    close: async () => {
       await client.end();
-    } catch {
-      // Nothing useful to do: the report (or the failure) is already decided.
-    }
-  }
+    },
+  };
+};
+
+async function execute(argv: readonly string[]): Promise<number> {
+  return runInventoryCli({
+    argv,
+    env: process.env,
+    openExecutor: openPgExecutor,
+    stdout: process.stdout,
+    stderr: process.stderr,
+  });
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {

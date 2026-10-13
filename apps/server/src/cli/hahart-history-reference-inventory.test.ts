@@ -26,30 +26,38 @@ import {
   ACTIONS,
   DEFAULT_PAGE_SIZE,
   DENY_LIST,
+  ERROR_CLASSIFICATIONS,
   LEGACY_CANVASES_BUCKET,
   MAX_PAGE_SIZE,
   PaginationError,
+  RedactionError,
   StatementNotAllowedError,
   USAGE_TEXT,
   UsageError,
   assertReadOnlyStatement,
   assertRedactionSafe,
   buildReport,
+  classifyError,
   collectReferences,
   createReadOnlyExecutor,
   decodeSerializedValue,
   exitCodeForReport,
+  failureLine,
   fingerprint,
   fingerprintKindFor,
   isRedactionSafe,
   parseArgs,
   runHistoryReferenceInventory,
+  runInventoryCli,
   sanitizeIdentifier,
   sanitizePointerSegment,
   serializeReport,
   toBytes,
+  type ExecutorSession,
   type InventoryItem,
+  type InventoryReport,
   type QueryExecutor,
+  type QueryResult,
 } from "./hahart-history-reference-inventory.js";
 
 /* ------------------------------------------------------------------ */
@@ -1793,5 +1801,432 @@ describe("history inventory against the migrated schema", () => {
     // Two byte-identical reference items stay two items.
     expect(report.items.filter((entry) => entry.reason === "asset_id_missing")).toHaveLength(2);
     expect(report.summary.referencesScanned).toBe(2);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* FIXUP2 — input scheme case, and the fixed failure output            */
+/* ------------------------------------------------------------------ */
+
+/** A writer that keeps exactly what it was handed, so "0 bytes" is checkable. */
+type Capture = { sink: { write(chunk: string): void }; chunks: string[]; text(): string };
+
+function capture(): Capture {
+  const chunks: string[] = [];
+  return {
+    sink: {
+      write(chunk: string): void {
+        chunks.push(chunk);
+      },
+    },
+    chunks,
+    text: () => chunks.join(""),
+  };
+}
+
+/**
+ * The three properties a failure must have, asserted together every time:
+ * stdout is 0 bytes, stderr is one fixed classification line, exit code is 2.
+ * Neither stream may contain any fragment of the original error value.
+ */
+function assertFixedFailure(options: {
+  stdout: Capture;
+  stderr: Capture;
+  classification: string;
+  fragments: readonly string[];
+}): void {
+  expect(ERROR_CLASSIFICATIONS).toContain(options.classification);
+  expect(Buffer.byteLength(options.stdout.text(), "utf8")).toBe(0);
+  expect(options.stdout.chunks).toEqual([]);
+
+  const lines = options.stderr.text().split("\n");
+  expect(lines[0]).toBe(`hahart-history-reference-inventory failed: ${options.classification}`);
+
+  for (const fragment of options.fragments) {
+    expect(options.stdout.text()).not.toContain(fragment);
+    expect(options.stderr.text()).not.toContain(fragment);
+  }
+}
+
+/** Driver errors that carry a host, an IP/port, a path, a UNC share or a credential. */
+const DRIVER_FAILURES: ReadonlyArray<{ original: string; fragments: readonly string[] }> = [
+  {
+    original: "getaddrinfo ENOTFOUND db.internal.example",
+    fragments: ["getaddrinfo", "ENOTFOUND", "db.internal.example", "db.internal"],
+  },
+  {
+    original: "connect ECONNREFUSED 10.20.30.40:5432",
+    fragments: ["ECONNREFUSED", "10.20.30.40", "5432"],
+  },
+  {
+    original: "connect ECONNREFUSED [2001:db8::1]:5432",
+    fragments: ["ECONNREFUSED", "[2001:db8::1]:5432", "2001:db8::1"],
+  },
+  {
+    original: "D:\\secret\\project\\.env.local",
+    fragments: ["D:\\secret", "secret\\project", ".env.local"],
+  },
+  {
+    original: "\\\\server\\share\\private\\file",
+    fragments: ["\\\\server", "share\\private", "private\\file"],
+  },
+  {
+    original: "postgresql://user:password@db.internal:5432/app",
+    fragments: ["postgresql://", "user:password", "password@db.internal", "://db.internal"],
+  },
+  { original: "user@example.test", fragments: ["user@example.test", "example.test"] },
+];
+
+const DRIVER_CONNECTION_STRING = "postgresql://user:password@db.internal:5432/app";
+
+describe("fixup2 — an inline payload is not a stored object, whatever its scheme case", () => {
+  it("case 74: no spelling of a data URI yields a discovery", () => {
+    const realName = `real-${randomUUID()}.png`;
+    const found: Array<{ pointer: string; kind: string | null; fingerprint: string | null }> = [];
+
+    collectReferences(
+      {
+        names: {
+          objectName: realName,
+          object_name: "data:image/png;base64,AAAA",
+          fileName: "DATA:image/png;base64,BBBB",
+          file_name: "Data:text/plain,hello",
+          filename: "dAtA:application/octet-stream;base64,CCCC",
+        },
+        urls: {
+          url: "DATA:image/png;base64,DDDD",
+          href: "Data:text/plain,world",
+          object_path: "DaTa:text/plain,x",
+        },
+      },
+      (discovery) =>
+        found.push({
+          pointer: discovery.pointer,
+          kind: discovery.fingerprintKind,
+          fingerprint: discovery.fingerprint,
+        }),
+    );
+
+    // The one real name is still found; every data URI is not, in any case.
+    expect(found).toHaveLength(1);
+    expect(found[0]?.pointer).toBe("/names/objectName");
+    expect(found[0]?.kind).toBe("object_name");
+    expect(found[0]?.fingerprint).toBe(fingerprint(realName));
+  });
+
+  it("case 75: a data URI stored in a message never becomes an item", async () => {
+    const project = await makeProject("w17f2-inline-payload");
+    const session = await makeSession(project.canvasId, randomUUID());
+    const realName = `real-${randomUUID()}.png`;
+    const message = await makeMessage(
+      session,
+      [
+        { type: "image", objectName: "DATA:image/png;base64,AAAA" },
+        { type: "file", fileName: "Data:text/plain;base64,BBBB" },
+        { type: "image", objectName: realName },
+      ],
+      [{ name: "generate_image", output: { object_name: "dAtA:image/png;base64,CCCC" } }],
+    );
+
+    const report = await inventory();
+    const items = itemsOf(report, message);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]?.reason).toBe("asset_id_missing");
+    expect(items[0]?.pointer).toBe("/2/objectName");
+    expect(items[0]?.fingerprint).toBe(fingerprint(realName));
+    expect(items[0]?.fingerprintKind).toBe("object_name");
+    // Nothing of the inline payload reaches the report, in any stream.
+    const json = serializeReport(report);
+    expect(json).not.toContain("image/png");
+    expect(json).not.toContain("base64,");
+    expect(isRedactionSafe(json)).toBe(true);
+  });
+});
+
+describe("fixup2 — a failure prints one fixed classification and nothing else", () => {
+  it("case 76: every local error class maps to a fixed, data-free classification", () => {
+    expect(classifyError(new UsageError("--page-size must be an integer"))).toBe("argument_error");
+    expect(classifyError(new StatementNotAllowedError("insert into public.asset_objects"))).toBe(
+      "statement_not_allowed",
+    );
+    expect(classifyError(new PaginationError("keyset cursor did not advance"))).toBe(
+      "pagination_error",
+    );
+    expect(classifyError(new RedactionError(`report carries ${URL_WITH_TOKEN}`))).toBe(
+      "redaction_failed",
+    );
+    expect(classifyError(new Error("getaddrinfo ENOTFOUND db.internal.example"))).toBe(
+      "inventory_failed",
+    );
+    // Not an Error at all, and not one of ours: still one fixed class.
+    expect(classifyError("ECONNREFUSED 10.20.30.40:5432")).toBe("inventory_failed");
+    expect(classifyError(undefined)).toBe("inventory_failed");
+
+    // The vocabulary is closed and carries no value.
+    expect([...ERROR_CLASSIFICATIONS]).toEqual([
+      "argument_error",
+      "statement_not_allowed",
+      "pagination_error",
+      "redaction_failed",
+      "inventory_failed",
+    ]);
+    for (const classification of ERROR_CLASSIFICATIONS) {
+      expect(classification).toMatch(/^[a-z_]+$/);
+    }
+    expect(failureLine(new Error(URL_WITH_TOKEN))).toBe(
+      "hahart-history-reference-inventory failed: inventory_failed",
+    );
+    expect(failureLine(new UsageError(URL_WITH_TOKEN))).toBe(
+      "hahart-history-reference-inventory failed: argument_error",
+    );
+    expect(failureLine(new Error(URL_WITH_TOKEN))).not.toContain("example.test");
+    expect(failureLine(new Error(URL_WITH_TOKEN))).not.toContain("secret-value");
+  });
+
+  it("case 77: a connection failure cannot put its own text on stdout or stderr", async () => {
+    for (const failure of DRIVER_FAILURES) {
+      const stdout = capture();
+      const stderr = capture();
+
+      const code = await runInventoryCli({
+        argv: [],
+        env: { SUPABASE_DB_URL: DRIVER_CONNECTION_STRING },
+        openExecutor: async () => {
+          throw new Error(failure.original);
+        },
+        stdout: stdout.sink,
+        stderr: stderr.sink,
+      });
+
+      expect(code).toBe(2);
+      assertFixedFailure({
+        stdout,
+        stderr,
+        classification: "inventory_failed",
+        fragments: [...failure.fragments, "password", "db.internal"],
+      });
+    }
+  });
+
+  it("case 78: a driver error inside the scan writes nothing and still closes the session", async () => {
+    let closed = 0;
+    const stdout = capture();
+    const stderr = capture();
+
+    const code = await runInventoryCli({
+      argv: [],
+      env: { SUPABASE_DB_URL: DRIVER_CONNECTION_STRING },
+      openExecutor: async (): Promise<ExecutorSession> => ({
+        executor: createReadOnlyExecutor({
+          query: async (sql: string): Promise<QueryResult> => {
+            throw new Error(`${sql.length} bytes sent then connect ECONNREFUSED 10.20.30.40:5432`);
+          },
+        }),
+        close: async () => {
+          closed += 1;
+        },
+      }),
+      stdout: stdout.sink,
+      stderr: stderr.sink,
+    });
+
+    expect(code).toBe(2);
+    assertFixedFailure({
+      stdout,
+      stderr,
+      classification: "inventory_failed",
+      fragments: ["bytes sent", "ECONNREFUSED", "10.20.30.40", "5432", "password"],
+    });
+    expect(closed).toBe(1);
+  });
+
+  it("case 79: pagination, allowlist and unknown throws are classified at the wrapper", async () => {
+    const repeated = randomUUID();
+    const scenarios: Array<{
+      classification: string;
+      fragments: readonly string[];
+      session: () => Promise<ExecutorSession>;
+    }> = [
+      {
+        // A keyset page that does not advance: the scan refuses to claim completeness.
+        classification: "pagination_error",
+        fragments: ["keyset cursor", "would repeat or skip rows"],
+        session: async () => ({
+          executor: createReadOnlyExecutor({
+            query: async (sql: string): Promise<QueryResult> =>
+              sql.includes("from public.projects")
+                ? { rows: [{ id: repeated }, { id: repeated }] }
+                : { rows: [] },
+          }),
+          close: async () => {},
+        }),
+      },
+      {
+        classification: "statement_not_allowed",
+        fragments: ["insert into public.asset_objects", "INSERT INTO"],
+        session: async () => ({
+          executor: createReadOnlyExecutor({
+            query: async (): Promise<QueryResult> => {
+              throw new StatementNotAllowedError("insert into public.asset_objects ...");
+            },
+          }),
+          close: async () => {},
+        }),
+      },
+      {
+        // A non-Error throw from a driver is still only `inventory_failed`.
+        classification: "inventory_failed",
+        fragments: ["ECONNREFUSED", "10.20.30.40"],
+        session: async () => ({
+          executor: createReadOnlyExecutor({
+            query: async (): Promise<QueryResult> => {
+              throw "connect ECONNREFUSED 10.20.30.40:5432";
+            },
+          }),
+          close: async () => {},
+        }),
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const stdout = capture();
+      const stderr = capture();
+
+      const code = await runInventoryCli({
+        argv: ["--page-size", "1"],
+        env: { SUPABASE_DB_URL: DRIVER_CONNECTION_STRING },
+        openExecutor: scenario.session,
+        stdout: stdout.sink,
+        stderr: stderr.sink,
+      });
+
+      expect(code).toBe(2);
+      assertFixedFailure({
+        stdout,
+        stderr,
+        classification: scenario.classification,
+        fragments: [...scenario.fragments, "password", "db.internal"],
+      });
+    }
+  });
+
+  it("case 80: a report the deny-list refuses is never written, and is classified", async () => {
+    let closed = 0;
+    const stdout = capture();
+    const stderr = capture();
+    const unsafe: InventoryReport = {
+      schemaVersion: 1,
+      mode: "read-only",
+      complete: true,
+      summary: {
+        referencesScanned: 1,
+        exactBindings: 0,
+        unresolved: 1,
+        conflicts: 0,
+        opaqueBinary: 0,
+        decodeFailures: 0,
+        unsupportedEncodings: 0,
+      },
+      // `sourceTable` is a constant in the shipped scan; handing it a value the
+      // deny-list must refuse is the only way to reach this branch at all.
+      items: [{ ...item({}), sourceTable: URL_WITH_TOKEN }],
+    };
+
+    const code = await runInventoryCli({
+      argv: [],
+      env: { SUPABASE_DB_URL: DRIVER_CONNECTION_STRING },
+      openExecutor: async (): Promise<ExecutorSession> => ({
+        executor,
+        close: async () => {
+          closed += 1;
+        },
+      }),
+      scan: async () => unsafe,
+      stdout: stdout.sink,
+      stderr: stderr.sink,
+    });
+
+    expect(code).toBe(2);
+    assertFixedFailure({
+      stdout,
+      stderr,
+      classification: "redaction_failed",
+      fragments: ["example.test", "token=", "secret-value", "https://"],
+    });
+    expect(closed).toBe(1);
+  });
+
+  it("case 81: a successful run writes exactly one JSON document and an empty stderr", async () => {
+    let closed = 0;
+    const stdout = capture();
+    const stderr = capture();
+
+    const code = await runInventoryCli({
+      argv: ["--page-size", "250"],
+      env: { SUPABASE_DB_URL: "postgresql://redacted.invalid/db" },
+      openExecutor: async (): Promise<ExecutorSession> => ({
+        executor,
+        close: async () => {
+          closed += 1;
+        },
+      }),
+      stdout: stdout.sink,
+      stderr: stderr.sink,
+    });
+
+    expect(stderr.text()).toBe("");
+    const text = stdout.text();
+    expect(text.endsWith("\n")).toBe(true);
+    expect(text.slice(0, -1)).not.toContain("\n");
+
+    const parsed = JSON.parse(text) as InventoryReport;
+    expect(parsed.mode).toBe("read-only");
+    expect(parsed.schemaVersion).toBe(1);
+    expect(parsed.complete).toBe(
+      parsed.summary.decodeFailures === 0 && parsed.summary.unsupportedEncodings === 0,
+    );
+    // The written document is exactly what the serializer produced, and the
+    // existing deny-list still guards it.
+    expect(serializeReport(parsed)).toBe(text.slice(0, -1));
+    expect(isRedactionSafe(text)).toBe(true);
+    expect(code).toBe(exitCodeForReport(parsed));
+    expect(text).not.toContain("redacted.invalid");
+    expect(closed).toBe(1);
+  });
+
+  it("case 82: an argument failure echoes no argument value and never opens a driver", async () => {
+    for (const argv of [
+      ["--page-size", URL_WITH_TOKEN],
+      [URL_WITH_TOKEN],
+      ["--apply"],
+      ["--help"],
+    ]) {
+      let opened = 0;
+      const stdout = capture();
+      const stderr = capture();
+
+      const code = await runInventoryCli({
+        argv,
+        env: { SUPABASE_DB_URL: DRIVER_CONNECTION_STRING },
+        openExecutor: async (): Promise<ExecutorSession> => {
+          opened += 1;
+          throw new Error("must not connect");
+        },
+        stdout: stdout.sink,
+        stderr: stderr.sink,
+      });
+
+      expect(code).toBe(2);
+      expect(opened).toBe(0);
+      expect(Buffer.byteLength(stdout.text(), "utf8")).toBe(0);
+      expect(stderr.text().split("\n")[0]).toBe(
+        "hahart-history-reference-inventory failed: argument_error",
+      );
+      expect(stderr.text()).not.toContain("example.test");
+      expect(stderr.text()).not.toContain("secret-value");
+      // The constant usage text is still shown for an argument error.
+      expect(stderr.text()).toContain(USAGE_TEXT);
+    }
   });
 });
