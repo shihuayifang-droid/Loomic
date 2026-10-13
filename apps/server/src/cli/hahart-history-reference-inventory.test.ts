@@ -29,6 +29,7 @@ import {
   ERROR_CLASSIFICATIONS,
   LEGACY_CANVASES_BUCKET,
   MAX_PAGE_SIZE,
+  OBJECT_NAME_KEYS,
   PaginationError,
   RedactionError,
   StatementNotAllowedError,
@@ -146,6 +147,22 @@ async function makeMessage(
           contentBlocks === null ? null : JSON.stringify(contentBlocks),
           toolActivities === null ? null : JSON.stringify(toolActivities),
         ],
+      )
+    ).rows,
+  ).id;
+}
+
+/**
+ * A message whose content block carries whatever keys the case needs, so a case
+ * can put a value under an exact key instead of a bare `url`.
+ */
+async function makeMixedMessage(sessionId: string, contentBlocks: unknown): Promise<string> {
+  return firstRow(
+    (
+      await db.query<{ id: string }>(
+        `insert into public.chat_messages (session_id, role, content, content_blocks)
+         values ($1, 'assistant', '', $2::jsonb) returning id`,
+        [sessionId, JSON.stringify(contentBlocks)],
       )
     ).rows,
   ).id;
@@ -1826,8 +1843,17 @@ function capture(): Capture {
 
 /**
  * The three properties a failure must have, asserted together every time:
- * stdout is 0 bytes, stderr is one fixed classification line, exit code is 2.
+ * stdout is 0 bytes, stderr is EXACTLY the fixed failure line, exit code is 2.
  * Neither stream may contain any fragment of the original error value.
+ *
+ * The stderr check is byte-exact on purpose. Asserting the first line only would
+ * stay green the day somebody appends a vendor string, a host or a caught
+ * `error.message` underneath the classification — the classification would still
+ * be "right" while the stream as a whole leaked. `toBe` compares the WHOLE
+ * captured text, so any added byte fails here.
+ *
+ * An argument error is the one failure allowed more than the line, and what it may
+ * add is a compile-time constant (`USAGE_TEXT`) — never a runtime value.
  */
 function assertFixedFailure(options: {
   stdout: Capture;
@@ -1839,8 +1865,18 @@ function assertFixedFailure(options: {
   expect(Buffer.byteLength(options.stdout.text(), "utf8")).toBe(0);
   expect(options.stdout.chunks).toEqual([]);
 
-  const lines = options.stderr.text().split("\n");
-  expect(lines[0]).toBe(`hahart-history-reference-inventory failed: ${options.classification}`);
+  const expectedLine = `hahart-history-reference-inventory failed: ${options.classification}`;
+  const expected =
+    options.classification === "argument_error"
+      ? `${expectedLine}\n${USAGE_TEXT}\n`
+      : `${expectedLine}\n`;
+  expect(options.stderr.text()).toBe(expected);
+  expect(options.stderr.chunks.join("")).toBe(expected);
+  // Exactly one classification line for a non-argument failure: a second line
+  // would mean the stream carries something the vocabulary does not name.
+  if (options.classification !== "argument_error") {
+    expect(options.stderr.text().split("\n")).toHaveLength(2);
+  }
 
   for (const fragment of options.fragments) {
     expect(options.stdout.text()).not.toContain(fragment);
@@ -2219,14 +2255,458 @@ describe("fixup2 — a failure prints one fixed classification and nothing else"
 
       expect(code).toBe(2);
       expect(opened).toBe(0);
-      expect(Buffer.byteLength(stdout.text(), "utf8")).toBe(0);
-      expect(stderr.text().split("\n")[0]).toBe(
-        "hahart-history-reference-inventory failed: argument_error",
-      );
-      expect(stderr.text()).not.toContain("example.test");
-      expect(stderr.text()).not.toContain("secret-value");
+      // Byte-exact: the fixed argument_error line, then the constant usage text.
+      assertFixedFailure({
+        stdout,
+        stderr,
+        classification: "argument_error",
+        fragments: ["example.test", "secret-value", "--page-size=", "password"],
+      });
       // The constant usage text is still shown for an argument error.
       expect(stderr.text()).toContain(USAGE_TEXT);
+      expect(Buffer.byteLength(stderr.text(), "utf8")).toBe(
+        Buffer.byteLength(
+          `hahart-history-reference-inventory failed: argument_error\n${USAGE_TEXT}\n`,
+          "utf8",
+        ),
+      );
     }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* FIXUP3 — object-name HTTP, stdout ordering, exact bytes, schemes     */
+/* ------------------------------------------------------------------ */
+
+describe("fixup3 — an object-name key classifies by key, not by the shape of its value", () => {
+  it("case 83: every object-name key keeps its kind for a URL, and the key set is pinned", () => {
+    // The key set is a contract: `objectName` and friends MEAN "this value names a
+    // stored object". Adding or removing one changes what the whole scan reports.
+    // (Default `Array#sort` compares UTF-16 code units, so `fileName` precedes
+    // `file_name` — the same order case 69 asserts.)
+    expect([...OBJECT_NAME_KEYS].sort()).toEqual([
+      "fileName",
+      "file_name",
+      "filename",
+      "objectName",
+      "object_name",
+    ]);
+
+    const url = `https://example.test/storage/v1/object/sign/project-assets/${randomUUID()}.png?token=${randomUUID()}`;
+    const plain = `plain-${randomUUID()}.png`;
+    const found: Array<{ pointer: string; kind: string | null; fingerprint: string | null }> = [];
+
+    collectReferences(
+      {
+        byName: {
+          objectName: url,
+          object_name: url,
+          fileName: url,
+          file_name: url,
+          filename: url,
+        },
+        byUrlKey: { url },
+        byNameKey: { fileName: plain },
+      },
+      (discovery) =>
+        found.push({
+          pointer: discovery.pointer,
+          kind: discovery.fingerprintKind,
+          fingerprint: discovery.fingerprint,
+        }),
+    );
+
+    // Seven: the same URL under five object-name keys, under one generic url key,
+    // and a bare name under one object-name key. Both routes find the URL — what
+    // the KEY decides is not whether it is found but how it is CLASSIFIED.
+    expect(found).toHaveLength(7);
+    expect(found.filter((entry) => entry.pointer.startsWith("/byName/"))).toHaveLength(5);
+    for (const entry of found.filter((entry) => entry.pointer.startsWith("/byName/"))) {
+      // Key semantics win over the value's shape: it is an object NAME, not a URL.
+      expect(entry.kind).toBe("object_name");
+      expect(entry.fingerprint).toBe(fingerprint(url));
+    }
+    // The same value under a generic URL key is still a URL — only the key decides.
+    expect(found.find((entry) => entry.pointer === "/byUrlKey/url")).toMatchObject({
+      kind: "url",
+      fingerprint: fingerprint(url),
+    });
+    // And a schemeless name under an object-name key has not changed behaviour.
+    expect(found.find((entry) => entry.pointer === "/byNameKey/fileName")).toMatchObject({
+      kind: "object_name",
+      fingerprint: fingerprint(plain),
+    });
+  });
+
+  it("case 84: an HTTP URL in an object-name key is an unproven object name, end to end", async () => {
+    // The whole classification contract for this key/value pair, in one case.
+    const project = await makeProject("w17f3-object-name-http");
+    const session = await makeSession(project.canvasId, randomUUID());
+    const token = `token-${randomUUID()}`;
+    const host = `signed-${randomUUID()}.supabase.invalid`;
+    const objectPath = `storage/v1/object/sign/project-assets/${randomUUID()}.png`;
+    const contentUrl = `https://${host}/${objectPath}?token=${token}`;
+    const toolUrl = `https://${host}/other-${randomUUID()}.png?token=${token}`;
+    const message = await makeMessage(
+      session,
+      [{ type: "image", objectName: contentUrl }],
+      [{ name: "generate_image", output: { file_name: toolUrl } }],
+    );
+
+    const report = await inventory();
+    const items = itemsOf(report, message);
+
+    expect(items).toHaveLength(2);
+    expect(items.map((entry) => entry.sourceColumn).sort()).toEqual([
+      "content_blocks",
+      "tool_activities",
+    ]);
+    expect(items.map((entry) => entry.pointer).sort()).toEqual([
+      "/0/objectName",
+      "/0/output/file_name",
+    ]);
+    for (const entry of items) {
+      // Kind, proof and identity, all four at once.
+      expect(entry.fingerprintKind).toBe("object_name");
+      expect(entry.objectProof).toBe("UNPROVEN");
+      expect(entry.assetId).toBeNull();
+      expect(entry.reason).toBe("asset_id_missing");
+      expect(entry.action).toBe("BACKFILL_ASSET_ID_AFTER_MANUAL_PROOF");
+      expect(entry.containerProof).toBe("PROJECT_CHAIN_EXACT");
+      expect(entry.containerProjectId).toBe(project.id);
+      // Truncated SHA-256 over the WHOLE URL, query string included — stripping the
+      // token before hashing would silently change every fingerprint in the report.
+      expect(entry.fingerprint).toBe(fingerprint(entry.pointer === "/0/objectName" ? contentUrl : toolUrl));
+      expect(entry.fingerprint).toMatch(/^[0-9a-f]{16}$/);
+      expect(entry.fingerprint).not.toBe(fingerprint(new URL(contentUrl).origin + new URL(contentUrl).pathname));
+    }
+
+    const json = serializeReport(report);
+    for (const fragment of [
+      "https://",
+      contentUrl,
+      toolUrl,
+      host,
+      "supabase.invalid",
+      objectPath,
+      "project-assets",
+      token,
+      "token=",
+      "?token",
+      "/object/sign/",
+    ]) {
+      expect(json).not.toContain(fragment);
+    }
+    expect(isRedactionSafe(json)).toBe(true);
+    expect(() => assertRedactionSafe(json)).not.toThrow();
+  });
+});
+
+describe("fixup3 — every decision happens before the first byte of stdout", () => {
+  it("case 85: the malformed-report counter-example leaves stdout 0 bytes and exits 2", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    // `complete` stringifies and passes the deny-list; `summary` is what
+    // `exitCodeForReport` dereferences. This is a runtime shape the shipped scan
+    // never produces, which is exactly why the order has to be pinned.
+    const malformed = { complete: true, summary: null } as unknown as InventoryReport;
+
+    const code = await runInventoryCli({
+      argv: [],
+      env: { SUPABASE_DB_URL: DRIVER_CONNECTION_STRING },
+      openExecutor: async (): Promise<ExecutorSession> => ({ executor, close: async () => {} }),
+      scan: async () => malformed,
+      stdout: stdout.sink,
+      stderr: stderr.sink,
+    });
+
+    expect(code).toBe(2);
+    expect(JSON.stringify(malformed)).toBe('{"complete":true,"summary":null}');
+    expect(isRedactionSafe(JSON.stringify(malformed))).toBe(true);
+    assertFixedFailure({
+      stdout,
+      stderr,
+      classification: "inventory_failed",
+      fragments: ['{"complete":true', "summary", "TypeError", "Cannot read"],
+    });
+  });
+
+  it("case 86: the exit code is computed before stdout is written, observably", async () => {
+    const order: string[] = [];
+    const stdout = capture();
+    const stderr = capture();
+    const report: InventoryReport = {
+      schemaVersion: 1,
+      mode: "read-only",
+      get complete(): boolean {
+        order.push("complete:get");
+        return false;
+      },
+      summary: {
+        referencesScanned: 1,
+        exactBindings: 0,
+        unresolved: 1,
+        conflicts: 0,
+        opaqueBinary: 0,
+        decodeFailures: 0,
+        unsupportedEncodings: 0,
+      },
+      items: [],
+    };
+    const sink = {
+      write(chunk: string): void {
+        order.push(`stdout.write:${chunk.length}`);
+        stdout.sink.write(chunk);
+      },
+    };
+
+    const code = await runInventoryCli({
+      argv: [],
+      env: { SUPABASE_DB_URL: DRIVER_CONNECTION_STRING },
+      openExecutor: async (): Promise<ExecutorSession> => ({ executor, close: async () => {} }),
+      scan: async () => report,
+      stdout: sink,
+      stderr: stderr.sink,
+    });
+
+    // The exit code was already decided when the write happened; the write is last.
+    expect(code).toBe(2);
+    expect(order[0]).toBe("complete:get");
+    expect(order[order.length - 1]).toBe(`stdout.write:${stdout.text().length}`);
+    expect(order.filter((entry) => entry.startsWith("stdout.write"))).toHaveLength(1);
+    expect(order.indexOf("complete:get")).toBeLessThan(order.findIndex((e) => e.startsWith("stdout.write")));
+    expect(stderr.text()).toBe("");
+    expect(exitCodeForReport(report)).toBe(2);
+  });
+});
+
+describe("fixup3 — the failure stream is byte-exact, not first-line-exact", () => {
+  it("case 87: failures from different branches are each locked byte for byte", async () => {
+    // (a) An unparseable argument: the fixed line AND the constant usage text.
+    const argOut = capture();
+    const argErr = capture();
+    const argCode = await runInventoryCli({
+      argv: ["--page-size", "99999"],
+      env: { SUPABASE_DB_URL: DRIVER_CONNECTION_STRING },
+      openExecutor: async (): Promise<ExecutorSession> => {
+        throw new Error("must not connect");
+      },
+      stdout: argOut.sink,
+      stderr: argErr.sink,
+    });
+    expect(argCode).toBe(2);
+    assertFixedFailure({
+      stdout: argOut,
+      stderr: argErr,
+      classification: "argument_error",
+      fragments: ["--page-size must be between", "99999"],
+    });
+    expect(argErr.text().split("\n").slice(1, -1).join("\n")).toBe(USAGE_TEXT);
+
+    // (b) A missing connection string: the fixed line and NOTHING else. The
+    // arguments themselves were valid, so the usage text is not appended — this is
+    // the branch that used to be pinned only by its first line.
+    const envOut = capture();
+    const envErr = capture();
+    const envCode = await runInventoryCli({
+      argv: [],
+      env: {},
+      openExecutor: async (): Promise<ExecutorSession> => {
+        throw new Error("must not connect");
+      },
+      stdout: envOut.sink,
+      stderr: envErr.sink,
+    });
+    expect(envCode).toBe(2);
+    // The whole stream, byte for byte: the fixed line and its newline, nothing else.
+    expect(envErr.text()).toBe("hahart-history-reference-inventory failed: argument_error\n");
+    expect(envErr.chunks.join("")).toBe(envErr.text());
+    expect(Buffer.byteLength(envOut.text(), "utf8")).toBe(0);
+    expect(envOut.chunks).toEqual([]);
+    // The variable NAME is the only thing the failure may mention — not its value,
+    // and not the usage text either: the arguments themselves were fine.
+    expect(envErr.text()).not.toContain("SUPABASE_DB_URL");
+    expect(envErr.text()).not.toContain(USAGE_TEXT);
+    expect(envErr.text().split("\n")).toHaveLength(2);
+  });
+});
+
+describe("fixup3 — a scheme this tool does not know is not an object path", () => {
+  it("case 88: mailto, blob, file and unknown schemes never become path-like", () => {
+    const rejected = [
+      "mailto:someone@example.test",
+      "MAILTO:someone@example.test",
+      "blob:https://example.test/9a1b2c3d",
+      "BLOB:https://example.test/9a1b2c3d",
+      "file:///D:/objects/a.png",
+      "file://server/share/objects/a.png",
+      "FILE:///C:/objects/a.png",
+      "ftp://example.test/objects/a.png",
+      "chrome-extension://abcdefg/objects/a.png",
+      "custom-scheme://bucket/key.png",
+      "x+y.z://bucket/key.png",
+      "readonly-cache://bucket/key.png",
+      "urn:example:object:path",
+      // Windows drive letters: a local disk path is not an object-storage reference.
+      // Escaped so the literal really contains backslashes.
+      "C:\\objects\\a.png",
+      "C:/objects/a.png",
+      "D:\\w17\\nested\\b.png",
+      "c:/w17/b.png",
+      "\\\\server\\share\\objects\\a.png",
+      "//server/share/objects/a.png",
+      "s3x://bucket/key.png",
+      "oss:bucket/key.png",
+    ];
+    for (const value of rejected) {
+      expect(fingerprintKindFor(value)).toBe(null);
+    }
+
+    const accepted: ReadonlyArray<readonly [string, string]> = [
+      ["https://example.test/a/b.png", "url"],
+      ["HTTPS://example.test/a/b.png", "url"],
+      ["http://example.test/bucket/key.png", "url"],
+      ["oss://bucket/key.png", "object_path"],
+      ["OSS://bucket/key.png", "object_path"],
+      ["S3://bucket/key.png", "object_path"],
+      ["gs://bucket/key.png", "object_path"],
+      ["storage://bucket/key.png", "object_path"],
+      ["w17/objects/bucket-key.png", "object_path"],
+      ["project-assets/ws/canvas/a.png", "object_path"],
+      // A colon only declares a scheme in the FIRST segment. Inside a path it is
+      // just a character, so this stays a `bucket/key` candidate.
+      ["custom/x:y.png", "object_path"],
+    ];
+    for (const [value, kind] of accepted) {
+      expect(fingerprintKindFor(value)).toBe(kind);
+    }
+    // A bare name is still not a path candidate on its own.
+    expect(fingerprintKindFor("render.png")).toBe(null);
+  });
+
+  it("case 89: those values produce no discovery, while bucket/key still does", () => {
+    const bucketPath = `w17/objects/${randomUUID()}.png`;
+    const bareName = `bare-${randomUUID()}.png`;
+    const found: Array<{
+      pointer: string;
+      kind: string | null;
+      assetId: string | null;
+      fingerprint: string | null;
+    }> = [];
+
+    collectReferences(
+      {
+        schemes: {
+          url: "mailto:someone@example.test",
+          href: "blob:https://example.test/9a1b2c3d",
+          src: "file:///D:/objects/a.png",
+          object_path: "BLOB:https://example.test/9a1b2c3d",
+          objectPath: "unknown-scheme://bucket/key.png",
+          storage_path: "C:/objects/a.png",
+          storagePath: "C:\\objects\\a.png",
+          file_path: "urn:example:object:path",
+        },
+        real: {
+          object_path: bucketPath,
+          fileName: bareName,
+          // A colon inside the path is not a scheme; this is still a candidate.
+          filePath: "custom/x:y.png",
+        },
+        allowed: { object_path: "oss://bucket/key.png", url: "https://example.test/a.png" },
+      },
+      (discovery) =>
+        found.push({
+          pointer: discovery.pointer,
+          kind: discovery.fingerprintKind,
+          assetId: discovery.assetId,
+          fingerprint: discovery.fingerprint,
+        }),
+    );
+
+    // `filePath` is separate below: it is path-like on purpose.
+    expect(found.map((entry) => entry.pointer).sort()).toEqual([
+      "/allowed/object_path",
+      "/allowed/url",
+      "/real/fileName",
+      "/real/filePath",
+      "/real/object_path",
+    ]);
+    expect(found.find((entry) => entry.pointer === "/real/object_path")).toMatchObject({
+      kind: "object_path",
+      fingerprint: fingerprint(bucketPath),
+    });
+    expect(found.find((entry) => entry.pointer === "/real/fileName")).toMatchObject({
+      kind: "object_name",
+      fingerprint: fingerprint(bareName),
+    });
+    expect(found.find((entry) => entry.pointer === "/real/filePath")).toMatchObject({
+      kind: "object_path",
+      fingerprint: fingerprint("custom/x:y.png"),
+    });
+    expect(found.find((entry) => entry.pointer === "/allowed/object_path")).toMatchObject({
+      kind: "object_path",
+      fingerprint: fingerprint("oss://bucket/key.png"),
+    });
+  });
+
+  it("case 90: a non-object scheme in a real scan yields no item, and the assetId branch stays first", async () => {
+    const project = await makeProject("w17f3-scheme-noise");
+    const session = await makeSession(project.canvasId, randomUUID());
+    const bucketPath = `w17/objects/${randomUUID()}.png`;
+    const noSchemeUrl = `https://example.test/legacy/${randomUUID()}.png`;
+    const message = await makeMixedMessage(session, [
+      { type: "link", url: "mailto:someone@example.test" },
+      { type: "blob", href: "blob:https://example.test/9a1b2c3d" },
+      { type: "local", src: "file:///D:/objects/a.png" },
+      { type: "local", object_path: "C:/objects/a.png" },
+      { type: "local", objectPath: "custom-scheme://bucket/key.png" },
+      { type: "image", object_path: bucketPath },
+      { type: "image", url: noSchemeUrl },
+    ]);
+
+    const report = await inventory();
+    const items = itemsOf(report, message);
+
+    // Both object-storage references are found: the bucket path under the generic
+    // path key, and the plain HTTP URL under the generic url key.
+    expect(items).toHaveLength(2);
+    expect(items.map((entry) => entry.pointer).sort()).toEqual(["/5/object_path", "/6/url"]);
+    expect(items.map((entry) => entry.fingerprint).sort()).toEqual(
+      [fingerprint(bucketPath), fingerprint(noSchemeUrl)].sort(),
+    );
+    expect(items.every((entry) => entry.reason === "asset_id_missing")).toBe(true);
+    expect(items.every((entry) => entry.objectProof === "UNPROVEN")).toBe(true);
+
+    // The five noise blocks produced nothing at all.
+    const json = serializeReport(report);
+    for (const fragment of [
+      "mailto:",
+      "someone@example.test",
+      "blob:",
+      "file://",
+      "D:/objects",
+      "C:/objects",
+      "custom-scheme",
+    ]) {
+      expect(json).not.toContain(fragment);
+    }
+    expect(json).not.toContain("D:\\objects");
+
+    // An `assetId` whose value is an inline payload is STILL a bad stable identity:
+    // the identity branch sits in front of every scheme rule, so M4 cannot hide it.
+    const identity = await makeMixedMessage(session, [
+      { type: "image", asset_id: "data:image/png;base64,AAAA" },
+    ]);
+    const identityItems = itemsOf(await inventory(), identity);
+    expect(identityItems).toHaveLength(1);
+    expect(identityItems[0]).toMatchObject({
+      pointer: "/0/asset_id",
+      reason: "asset_id_missing",
+      action: "KEEP_UNRESOLVED",
+      assetId: null,
+      fingerprint: null,
+      fingerprintKind: null,
+      objectProof: "UNPROVEN",
+    });
   });
 });

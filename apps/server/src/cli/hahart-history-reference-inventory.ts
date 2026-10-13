@@ -489,8 +489,11 @@ const REFERENCE_KEYS = new Set([
  * The generic `name` key is deliberately absent: in this schema it holds model
  * names, tool names and channel names far more often than object names, and
  * treating it as a reference would manufacture noise instead of finding history.
+ *
+ * Exported so a test can pin the set itself: which keys mean "this value names a
+ * stored object" is a contract, not an implementation detail.
  */
-const OBJECT_NAME_KEYS = new Set([
+export const OBJECT_NAME_KEYS = new Set([
   "objectName",
   "object_name",
   "fileName",
@@ -508,10 +511,40 @@ const SCHEME_LIKE = /^(oss|s3|gs|storage):\/\//i;
  */
 const DATA_URI = /^data:/i;
 
-/** `bucket/key`-shaped and not prose: a candidate, never a proof. */
+/**
+ * Any RFC 3986 scheme: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`.
+ *
+ * A value that declares a scheme is naming a DIFFERENT namespace, and a bucket/key
+ * path is namespace-free by definition. `mailto:` and `blob:` carry no slash at all;
+ * `file:` and `ftp:` do, and their slashes are path separators of their own scheme,
+ * not of object storage. None of them is a `bucket/key` candidate, so none of them
+ * may manufacture an object path — a false positive here is a human sent to look at
+ * a reference that does not exist, which is the one thing an inventory may not do.
+ *
+ * The match is case-insensitive because schemes are (`FILE:` ≡ `file:`), and a
+ * Windows drive letter matches it too — `C:\objects\a.png` and `C:/objects/a.png`
+ * are both single-letter schemes by this rule, which is exactly the wanted verdict:
+ * a local disk path is not an object-storage reference.
+ */
+const EXPLICIT_SCHEME = /^[a-z][a-z0-9+.\-]*:/i;
+
+/**
+ * `bucket/key`-shaped and not prose: a candidate, never a proof.
+ *
+ * Only a SCHEMELESS value can be one. The two schemes that mean "stored object"
+ * — `http(s)` and `oss`/`s3`/`gs`/`storage` — are matched before this function is
+ * ever reached, so a value arriving here with any scheme at all is carrying one
+ * this tool does not know, and an unknown scheme is "not a stored object" rather
+ * than "assume it is a path". `bucket/key.png` is the shape this accepts.
+ */
 function isPathLike(value: string): boolean {
   if (value.length === 0 || value.length > 1024) return false;
   if (/\s/.test(value)) return false;
+  if (EXPLICIT_SCHEME.test(value)) return false;
+  // A `//`-rooted value is a scheme-relative reference (`//host/path`, the UNC
+  // spelling of the same thing), not an absolute `bucket/key` path. Buckets are
+  // named, never empty, so the first segment may not be blank.
+  if (value.startsWith("//")) return false;
   if (value.includes("://")) return false;
   return value.includes("/");
 }
@@ -1705,8 +1738,10 @@ export type InventoryCliDeps = {
  *
  * FAILURE CONTRACT — the reason this exists as a function instead of living inside
  * `main`:
- *   * stdout receives 0 bytes: the report is serialized, checked and written in
- *     one place, so a run that fails anywhere leaves stdout untouched;
+ *   * stdout receives 0 bytes. The report is serialized, checked, and has its exit
+ *     code decided before the single write — which is the LAST step of the success
+ *     path — so a failure anywhere, including in `exitCodeForReport` itself, leaves
+ *     stdout untouched rather than emitting a document the exit code contradicts;
  *   * stderr receives exactly one fixed classification line (plus the constant
  *     usage text when the failure is an argument error) and never an error message;
  *   * the exit code is 2.
@@ -1735,10 +1770,22 @@ export async function runInventoryCli(deps: InventoryCliDeps): Promise<number> {
     session = await deps.openExecutor(connectionString);
     const report = await scan(session.executor, { pageSize: options.pageSize });
 
+    // ORDER IS THE CONTRACT. Serialization, the redaction deny-list and the exit
+    // code are all decided BEFORE a single byte reaches stdout, and the write is
+    // the last statement in the success path. Every one of them can fail on input
+    // the shipped scan would never produce but a test seam or a future bug can:
+    // a report that cannot be stringified, one that would leak a URL, or a
+    // malformed one that makes `exitCodeForReport` throw. Computing the exit code
+    // after writing would turn each of those into "a partial success document on
+    // stdout and exit 2" — a reader who trusts stdout and a shell that trusts the
+    // exit code would then disagree about the same run. Nothing is written until
+    // there is an exit code to return alongside it.
     const json = serializeReport(report);
     assertRedactionSafe(json);
+    const exitCode = exitCodeForReport(report);
+
     deps.stdout.write(`${json}\n`);
-    return exitCodeForReport(report);
+    return exitCode;
   } catch (error) {
     deps.stderr.write(`${failureLine(error)}\n`);
     return 2;
