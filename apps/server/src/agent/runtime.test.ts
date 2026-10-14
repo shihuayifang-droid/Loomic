@@ -19,8 +19,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ImageAttachment } from "@loomic/shared";
 
+import type { CanvasReadRepository } from "../db/canvas-read-repository.js";
 import type { UserSupabaseClient } from "../supabase/user.js";
-import { resolveAttachmentContent } from "./runtime.js";
+import { readCanvasSummaryForRun, resolveAttachmentContent } from "./runtime.js";
 
 const BUCKET = "project-assets";
 const OBJECT_PATH = "ws-team/p/a.png";
@@ -144,6 +145,50 @@ const VISIBLE: AssetRow = {
   mime_type: "image/png",
 };
 
+// ---------------------------------------------------------------------------
+// Workorder 20C: the automatic canvas summary is a pure read, so it goes through
+// the canvas repository with the run's own actor id. It must never be able to
+// fail an Agent run.
+// ---------------------------------------------------------------------------
+
+const RUN_ACTOR = "user-1";
+const RUN_CANVAS = "canvas-1";
+
+const CANVAS_ELEMENT = {
+  id: "el-1",
+  type: "rectangle",
+  x: 10,
+  y: 20,
+  width: 100,
+  height: 50,
+  isDeleted: false,
+};
+
+/** A repository that records what it was asked and answers `content`. */
+function canvasRepository(options: {
+  content?: unknown;
+  error?: Error;
+  found?: boolean;
+}) {
+  const calls: Array<{ actorId: string; canvasId: string }> = [];
+
+  const repository: CanvasReadRepository = {
+    async findReadableCanvasContent(input) {
+      calls.push({ actorId: input.actorId, canvasId: input.canvasId });
+      if (options.error) throw options.error;
+      return options.found === false ? null : { content: options.content as never };
+    },
+    async listReadableSucceededImageJobs() {
+      return [];
+    },
+    async listReadableCanvasAssets() {
+      return [];
+    },
+  };
+
+  return { repository, calls };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -257,5 +302,101 @@ describe("resolveAttachmentContent treats assetId as the authority (T1)", () => 
     // A signed URL is a bearer token: neither the message nor the log carries one.
     expect(error.message).not.toContain("http");
     expect(f.calls).toHaveLength(0);
+  });
+});
+
+describe("readCanvasSummaryForRun (20C)", () => {
+  it("case 1: summarises a readable canvas and asks for it with the run's own actor and canvas", async () => {
+    const h = canvasRepository({
+      content: { elements: [CANVAS_ELEMENT], appState: {} },
+    });
+
+    const summary = await readCanvasSummaryForRun({
+      repository: h.repository,
+      actorId: RUN_ACTOR,
+      canvasId: RUN_CANVAS,
+    });
+
+    expect(summary).toContain("Canvas: 1 elements");
+    expect(summary).toContain("el-1");
+    // The repository is the authority for who is asking; a summary built for
+    // somebody else's canvas would be a leak with no error attached.
+    expect(h.calls).toEqual([{ actorId: RUN_ACTOR, canvasId: RUN_CANVAS }]);
+  });
+
+  it("case 2: a repository error degrades to no summary instead of failing the run", async () => {
+    const h = canvasRepository({
+      error: new Error("canvas read failed (findReadableCanvasContent)"),
+    });
+
+    await expect(
+      readCanvasSummaryForRun({
+        repository: h.repository,
+        actorId: RUN_ACTOR,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toBeNull();
+    expect(h.calls).toHaveLength(1);
+  });
+
+  it("case 3: an unreadable canvas and an empty canvas both produce no summary", async () => {
+    const denied = canvasRepository({ found: false });
+    await expect(
+      readCanvasSummaryForRun({
+        repository: denied.repository,
+        actorId: RUN_ACTOR,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toBeNull();
+
+    const noContent = canvasRepository({ content: null });
+    await expect(
+      readCanvasSummaryForRun({
+        repository: noContent.repository,
+        actorId: RUN_ACTOR,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toBeNull();
+
+    // A canvas whose elements are all soft-deleted has nothing to summarise.
+    const allDeleted = canvasRepository({
+      content: { elements: [{ ...CANVAS_ELEMENT, isDeleted: true }], appState: {} },
+    });
+    await expect(
+      readCanvasSummaryForRun({
+        repository: allDeleted.repository,
+        actorId: RUN_ACTOR,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("case 4: without a repository, an actor or a canvas nothing is asked at all", async () => {
+    const h = canvasRepository({ content: { elements: [CANVAS_ELEMENT] } });
+
+    await expect(
+      readCanvasSummaryForRun({
+        repository: undefined,
+        actorId: RUN_ACTOR,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      readCanvasSummaryForRun({
+        repository: h.repository,
+        actorId: undefined,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      readCanvasSummaryForRun({
+        repository: h.repository,
+        actorId: RUN_ACTOR,
+        canvasId: undefined,
+      }),
+    ).resolves.toBeNull();
+
+    // An actor-less read is not a read: it must never reach the database.
+    expect(h.calls).toHaveLength(0);
   });
 });

@@ -60,6 +60,10 @@ import {
   type IdentityReadRepository,
 } from "./db/identity-read-repository.js";
 import {
+  createCanvasReadRepository,
+  type CanvasReadRepository,
+} from "./db/canvas-read-repository.js";
+import {
   createProjectReadRepository,
   type ProjectReadRepository,
 } from "./db/project-read-repository.js";
@@ -124,6 +128,7 @@ export type BuildAppOptions = {
   agentRunMetadataService?: AgentRunMetadataService;
   auth?: RequestAuthenticator;
   brandKitService?: BrandKitService;
+  canvasReadRepository?: CanvasReadRepository;
   canvasService?: CanvasService;
   chatService?: ChatService;
   connectionManager?: ConnectionManager;
@@ -200,6 +205,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createProjectReadRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 20C: canvas reads inherit the project ACL, so the canvas
+  // read repository is built the same lazy way and handed to the two features
+  // that perform them — the canvas service (asset identities, recovery) and the
+  // Agent runtime (automatic canvas summary).
+  const canvasReadRepository =
+    options.canvasReadRepository ??
+    createCanvasReadRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   const teamMembershipService =
     options.teamMembershipService ??
     createTeamMembershipService({ identityReadRepository });
@@ -225,7 +239,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.brandKitService ?? createBrandKitService({ createUserClient });
   const canvasService =
     options.canvasService ??
-    createCanvasService({ createUserClient, getAdminClient });
+    createCanvasService({
+      createUserClient,
+      getAdminClient,
+      canvasReadRepository,
+    });
   const threadService =
     options.threadService ?? createThreadService({ createUserClient });
   const chatService =
@@ -278,6 +296,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     agentPersistenceService,
     ...(options.agentFactory ? { agentFactory: options.agentFactory } : {}),
     agentRunMetadataService,
+    canvasReadRepository,
     connectionManager,
     createUserClient,
     // X-52: the Agent-side persistence entry point records asset ownership

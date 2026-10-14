@@ -4,10 +4,15 @@ import type { RecoverableArtifact } from "@loomic/shared";
 
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import {
+  CanvasReadError,
+  type CanvasReadRepository,
+} from "../../db/canvas-read-repository.js";
 import { signProjectAssetUrl } from "../storage/project-asset-urls.js";
 import {
   listRecoverableArtifacts as listRecoverable,
   recoverArtifacts as restoreArtifacts,
+  type RecoveryReadAccess,
 } from "./canvas-recovery.js";
 // Shared with canvas-element-writer.ts so the save path and the agent's direct
 // insert path cannot drift apart on bucket name or marker format.
@@ -86,6 +91,21 @@ export type CanvasService = {
 export function createCanvasService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
+  /**
+   * Canvas read repository (workorder 20C). The canvas inherits its project's
+   * ACL, so the asset-identity projection and the recovery job list are read
+   * through explicit, actor-carrying SQL instead of the caller's PostgREST
+   * client.
+   *
+   * It is optional so that constructing the service stays free of database
+   * infrastructure — the same reason the repository itself resolves its pool
+   * lazily. Its absence is not silent for recovery: an empty job list would read
+   * as "nothing to recover" when the truth is "nobody asked the database", so
+   * that path refuses (see recoveryAccess). The asset-identity projection
+   * degrades instead, because "no assetId" is already a legal answer (a legacy
+   * object with no metadata row) while "no recoverable images" is not.
+   */
+  canvasReadRepository?: CanvasReadRepository;
 }): CanvasService {
   return {
     async getCanvas(user, canvasId) {
@@ -114,7 +134,13 @@ export function createCanvasService(options: {
       const content = (data.content as CanvasContent) ?? { elements: [], appState: {} };
 
       // Resolve OSS-stored files back to base64 dataURLs for the frontend
-      const resolvedContent = await resolveFilesFromStorage(client, content);
+      const resolvedContent = await resolveFilesFromStorage(
+        client,
+        canvasId,
+        content,
+        options.canvasReadRepository,
+        user.id,
+      );
 
       // CV-01: attach a playable URL for video markers. Read-time only — the
       // persisted `link` keeps its oss:// marker (see the function's notes).
@@ -253,7 +279,11 @@ export function createCanvasService(options: {
     async listRecoverableArtifacts(user, canvasId) {
       const client = options.createUserClient(user.accessToken);
       try {
-        return await listRecoverable(client, canvasId);
+        return await listRecoverable(
+          client,
+          canvasId,
+          recoveryAccess(options.canvasReadRepository, user.id),
+        );
       } catch (error) {
         throw asCanvasServiceError(error);
       }
@@ -262,12 +292,33 @@ export function createCanvasService(options: {
     async recoverArtifacts(user, canvasId, jobIds) {
       const client = options.createUserClient(user.accessToken);
       try {
-        return await restoreArtifacts(client, canvasId, jobIds);
+        return await restoreArtifacts(
+          client,
+          canvasId,
+          jobIds,
+          recoveryAccess(options.canvasReadRepository, user.id),
+        );
       } catch (error) {
         throw asCanvasServiceError(error);
       }
     },
   };
+}
+
+/**
+ * The recovery paths cannot answer "nothing to recover" when the reason is that
+ * no repository was wired: that would be a false empty list about a user's own
+ * generated images. The two-argument form of the recovery functions stays legal
+ * for the legacy manual verifier `apps/server/_p25-verify.ts` (outside this
+ * ticket's file list), and canvas-recovery refuses it loudly; here we simply do
+ * not invent an access it was never given. The refusal surfaces as the existing
+ * 500 (`application_error`) — a misconfiguration report, not a data claim.
+ */
+function recoveryAccess(
+  repository: CanvasReadRepository | undefined,
+  actorId: string,
+): RecoveryReadAccess | undefined {
+  return repository ? { repository, actorId } : undefined;
 }
 
 /**
@@ -534,7 +585,10 @@ function canTransformOnTheFly(mimeType: string): boolean {
 
 async function resolveFilesFromStorage(
   client: UserSupabaseClient,
+  canvasId: string,
   content: CanvasContent,
+  repository: CanvasReadRepository | undefined,
+  actorId: string,
 ): Promise<CanvasContent> {
   const files = (content as { files?: CanvasFileRecord }).files;
   if (!files || Object.keys(files).length === 0) {
@@ -570,11 +624,13 @@ async function resolveFilesFromStorage(
   // X-52 (T3): the RESPONSE field each file also carries — the real asset id of
   // the object behind its marker.
   //
-  // It is looked up by the exact `(bucket, object_path)` pair, through the
-  // CALLER's client, because `asset_objects` RLS is what says whether they may
-  // see this asset at all. Two things are deliberately absent:
+  // It is looked up by the exact `(bucket, object_path)` pair through the canvas
+  // read repository (workorder 20C), which requires the object to belong to THIS
+  // canvas's project and re-applies the project's ACL for the caller in SQL. Two
+  // things are deliberately absent:
   //   * nothing here parses the marker's path to guess a project or workspace —
-  //     the row is the authority, the string is only a lookup key;
+  //     the `asset_objects.project_id` column is the authority, the string is
+  //     only a lookup key;
   //   * this is a RESPONSE-only projection. It is never written into the canvas
   //     JSON, so the document keeps carrying `oss://<bucket>/<path>` exactly as
   //     before and no client can inject an id of its own choosing.
@@ -582,7 +638,12 @@ async function resolveFilesFromStorage(
   // A file with no row simply has no assetId: that is a legacy object (extracted
   // before工单12/13), and T3's rule is that it cannot be sent as a persistent
   // Agent attachment rather than that it should be guessed at.
-  const assetIdByMarker = await lookupAssetIds(client, ossEntries);
+  const assetIdByPair = await lookupAssetIds(
+    repository,
+    actorId,
+    canvasId,
+    ossEntries,
+  );
 
   // Resolve public URLs instead of downloading each file
   // Group by bucket (normally all in one bucket)
@@ -660,8 +721,12 @@ async function resolveFilesFromStorage(
         // X-52 (T3): the stable identity the browser must use when it hands this
         // file to the Agent. Absent for a legacy object with no metadata row —
         // see below.
-        ...(assetIdByMarker.get(entry.objectPath)
-          ? { assetId: assetIdByMarker.get(entry.objectPath) }
+        ...(assetIdByPair.get(markerPairKey(entry.bucket, entry.objectPath))
+          ? {
+              assetId: assetIdByPair.get(
+                markerPairKey(entry.bucket, entry.objectPath),
+              ),
+            }
           : {}),
       };
     }
@@ -674,56 +739,68 @@ async function resolveFilesFromStorage(
 }
 
 /**
- * X-52 (T3): object path → asset id, for every marker on this canvas.
+ * `(bucket, object path)` → asset id for every marker on this canvas.
  *
- * Keyed by OBJECT PATH because that is what the canvas marker carries; the
- * bucket is part of the `(bucket, object_path)` predicate so an object of the
- * same name in another bucket cannot answer for this one.
+ * Keyed by the PAIR because that is what identifies the object: the same path in
+ * another bucket is a different row, and `asset_objects` is unique on the pair.
+ * Keying by path alone used to be safe only because the lookup grouped by bucket
+ * and merged the results into one map — the merge is what has to go.
  *
  * A failure or a missing row yields no entry rather than an error: an asset the
  * caller may not read is indistinguishable from one that does not exist, and
  * neither should stop the canvas from loading.
  */
 async function lookupAssetIds(
-  client: UserSupabaseClient,
+  repository: CanvasReadRepository | undefined,
+  actorId: string,
+  canvasId: string,
   entries: ReadonlyArray<{ bucket: string; objectPath: string }>,
 ): Promise<Map<string, string>> {
-  const byMarker = new Map<string, string>();
-  const buckets = [...new Set(entries.map((entry) => entry.bucket))];
-  const paths = [...new Set(entries.map((entry) => entry.objectPath))];
+  const byPair = new Map<string, string>();
 
-  const results = await Promise.all(
-    buckets.map(async (bucket) => {
-      try {
-        const { data, error } = await client
-          .from("asset_objects")
-          .select("id, object_path, bucket")
-          .eq("bucket", bucket)
-          .in("object_path", paths);
+  // No repository means no identity is projected — the same answer a legacy
+  // object with no metadata row already produces.
+  if (!repository) return byPair;
 
-        if (error) {
-          console.log(
-            `[canvas-service] asset id lookup failed bucket=${bucket} reason=${error.message}`,
-          );
-          return [];
-        }
-        return (data ?? []) as Array<{ id: string; object_path: string }>;
-      } catch (error) {
-        console.log(
-          `[canvas-service] asset id lookup threw bucket=${bucket} reason=${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        return [];
-      }
-    }),
-  );
+  // A marker with an empty half cannot address an object; dropping it here keeps
+  // one damaged marker from failing the lookup for every other file.
+  const refs = entries
+    .filter((entry) => entry.bucket.length > 0 && entry.objectPath.length > 0)
+    .map((entry) => ({ bucket: entry.bucket, objectPath: entry.objectPath }));
 
-  for (const row of results.flat()) {
-    byMarker.set(row.object_path, row.id);
+  if (refs.length === 0) return byPair;
+
+  try {
+    const rows = await repository.listReadableCanvasAssets({
+      actorId,
+      canvasId,
+      refs,
+    });
+
+    for (const row of rows) {
+      byPair.set(markerPairKey(row.bucket, row.object_path), row.id);
+    }
+  } catch (error) {
+    // The log carries the operation, never the statement or the connection: a
+    // repository failure's own message is already fixed text.
+    console.log(
+      `[canvas-service] asset id lookup failed canvasId=${canvasId} reason=${
+        error instanceof CanvasReadError
+          ? error.operation
+          : error instanceof Error
+            ? error.name
+            : typeof error
+      }`,
+    );
+    return byPair;
   }
 
-  return byMarker;
+  return byPair;
+}
+
+/** The key `asset_objects` is actually unique on. */
+function markerPairKey(bucket: string, objectPath: string): string {
+  return `${bucket}\u0000${objectPath}`;
 }
 
 async function resolveVideoElementsFromStorage(

@@ -19,6 +19,14 @@
 import type { CanvasContent } from "@loomic/shared";
 import type { RecoverableArtifact } from "@loomic/shared";
 
+import type {
+  CanvasReadRepository,
+  CanvasRecoveryJobRow,
+} from "../../db/canvas-read-repository.js";
+import {
+  CanvasReadError,
+  LIST_READABLE_SUCCEEDED_IMAGE_JOBS,
+} from "../../db/canvas-read-repository.js";
 import {
   CANVAS_FILES_BUCKET,
   OSS_MARKER_PREFIX,
@@ -31,11 +39,18 @@ type RecoveryClient = {
   storage: { from: (bucket: string) => any };
 };
 
-type JobRow = {
-  id: string;
-  created_at: string;
-  payload: Record<string, unknown> | null;
-  result: Record<string, unknown> | null;
+/**
+ * How the job list is authorised (workorder 20C).
+ *
+ * The snapshot still comes from `canvas-version.ts` — this ticket deliberately
+ * does not touch the shared read/CAS path — but the job list is a pure read and
+ * now goes through the repository, which re-derives the canvas's project ACL in
+ * SQL and carries the actor into the transaction. The actor is the authenticated
+ * user id, never a value from the request body.
+ */
+export type RecoveryReadAccess = {
+  repository: CanvasReadRepository;
+  actorId: string;
 };
 
 /**
@@ -84,7 +99,7 @@ function referencedObjectPaths(content: CanvasContent): Set<string> {
  * when in fact there is something we are failing to reach.
  */
 function usableArtifact(
-  job: JobRow,
+  job: CanvasRecoveryJobRow,
 ): { artifact: RecoverableArtifact } | { reason: string } {
   const result = job.result ?? {};
   const objectPath = result.object_path;
@@ -128,24 +143,36 @@ function usableArtifact(
   };
 }
 
+/**
+ * Succeeded image generations for one canvas, read through the canvas read
+ * repository.
+ *
+ * Images only, on purpose. Video elements are embeddables carrying a signed URL
+ * rather than an oss:// marker, and those URLs expire — restoring one would put a
+ * permanently broken frame on the canvas. Recovering videos needs them re-signed
+ * first, which is a separate change. The filter, the order and the ACL all live
+ * in the repository's statement now.
+ *
+ * `access` is optional only so that the legacy manual verifier
+ * `apps/server/_p25-verify.ts` — which still calls the two-argument form and is
+ * outside this ticket — keeps compiling. It is NOT a way to skip the database:
+ * omitting it fails loud instead of answering "nothing to recover".
+ */
 async function fetchSucceededImageJobs(
-  client: RecoveryClient,
+  access: RecoveryReadAccess | undefined,
   canvasId: string,
-): Promise<JobRow[]> {
-  // Images only, on purpose. Video elements are embeddables carrying a signed
-  // URL rather than an oss:// marker, and those URLs expire — restoring one
-  // would put a permanently broken frame on the canvas. Recovering videos needs
-  // them re-signed first, which is a separate change.
-  const { data, error } = await client
-    .from("background_jobs")
-    .select("id, created_at, payload, result")
-    .eq("canvas_id", canvasId)
-    .eq("status", "succeeded")
-    .eq("job_type", "image_generation")
-    .order("created_at", { ascending: true });
+): Promise<CanvasRecoveryJobRow[]> {
+  if (!access) {
+    throw new CanvasReadError(
+      LIST_READABLE_SUCCEEDED_IMAGE_JOBS,
+      new Error("canvas read repository and actor are required"),
+    );
+  }
 
-  if (error) throw error;
-  return (data as JobRow[]) ?? [];
+  return access.repository.listReadableSucceededImageJobs({
+    actorId: access.actorId,
+    canvasId,
+  });
 }
 
 /**
@@ -155,10 +182,11 @@ async function fetchSucceededImageJobs(
 export async function listRecoverableArtifacts(
   client: RecoveryClient,
   canvasId: string,
+  access?: RecoveryReadAccess,
 ): Promise<RecoverableArtifact[]> {
   const [snapshot, jobs] = await Promise.all([
     readCanvasSnapshot(client, canvasId),
-    fetchSucceededImageJobs(client, canvasId),
+    fetchSucceededImageJobs(access, canvasId),
   ]);
 
   const referenced = referencedObjectPaths(snapshot.content);
@@ -205,9 +233,10 @@ export async function recoverArtifacts(
   client: RecoveryClient,
   canvasId: string,
   jobIds: string[],
+  access?: RecoveryReadAccess,
 ): Promise<{ recovered: number; skipped: string[]; version?: number }> {
   const requested = new Set(jobIds);
-  const available = await listRecoverableArtifacts(client, canvasId);
+  const available = await listRecoverableArtifacts(client, canvasId, access);
   const byJobId = new Map(available.map((a) => [a.jobId, a]));
 
   const skipped = jobIds.filter((id) => !byJobId.has(id));

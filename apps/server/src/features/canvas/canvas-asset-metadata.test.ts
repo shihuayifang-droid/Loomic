@@ -22,6 +22,11 @@ import type { CanvasContent } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
+import {
+  CanvasReadError,
+  LIST_READABLE_CANVAS_ASSETS,
+  type CanvasReadRepository,
+} from "../../db/canvas-read-repository.js";
 import { readCanvasRow, replaceCanvasContent } from "./canvas-version.js";
 import { createCanvasService } from "./canvas-service.js";
 
@@ -226,53 +231,47 @@ describe("canvas file extraction records asset metadata", () => {
 
 // ---------------------------------------------------------------------------
 // X-52 T3: the READ projection the browser uses as the Agent's attachment
-// identity.
+// identity — now served by the canvas read repository (workorder 20C).
 //
 // The canvas marker is `oss://project-assets/<objectPath>` — a path, not an id.
 // The browser used to make do with the Excalidraw element id, which is an
 // identity of the ELEMENT and has nothing to do with the stored object, so the
 // server now reports the real `assetId` next to the file.
 //
+// The lookup is no longer a PostgREST read through the caller's client: the
+// repository requires the object to belong to THIS canvas's project and matches
+// the exact `(bucket, object_path)` pair. These cases pin the caller's half of
+// that contract — the pair it asks for, the actor it names, and the fact that no
+// answer at all (error, no row, no repository) can stop a canvas from loading.
+//
 // A file with no metadata row keeps NO assetId. Guessing one from the path is
 // the "把旧URL反解为objectPath" trap: authorising against a guessed owner is worse
 // than a file that cannot be attached.
 // ---------------------------------------------------------------------------
 
+type AssetRef = { bucket: string; objectPath: string };
+
 type ReadStub = {
   service: ReturnType<typeof createCanvasService>;
-  lookups: Array<{ bucket: string; paths: string[] }>;
+  calls: Array<{ actorId: string; canvasId: string; refs: AssetRef[] }>;
 };
 
 function makeReadStub(options: {
-  /** `asset_objects` rows the caller can see. */
-  assets?: Array<{ id: string; object_path: string }>;
-  assetError?: { message: string } | null;
+  /** What the repository answers, or the failure it raises instead. */
+  rows?: Array<{ id: string; bucket: string; object_path: string }>;
+  repositoryError?: Error | null;
+  /** Omit the repository entirely, to pin the degraded path. */
+  withoutRepository?: boolean;
   files: Record<string, unknown>;
 }): ReadStub {
-  const lookups: Array<{ bucket: string; paths: string[] }> = [];
+  const calls: Array<{ actorId: string; canvasId: string; refs: AssetRef[] }> = [];
 
   const userClient = {
-    from(table: string) {
-      if (table === "asset_objects") {
-        const chain: Record<string, unknown> = {};
-        chain.select = () => chain;
-        chain.eq = (column: string, value: string) => {
-          chain.__bucket = value;
-          return chain;
-        };
-        chain.in = async (column: string, values: string[]) => {
-          lookups.push({ bucket: String(chain.__bucket ?? ""), paths: values });
-          if (options.assetError) return { data: null, error: options.assetError };
-          return { data: options.assets ?? [], error: null };
-        };
-        return chain;
-      }
-      // Any other table: no rows, no error.
-      const empty: Record<string, unknown> = {};
-      empty.select = () => empty;
-      empty.eq = () => empty;
-      empty.in = async () => ({ data: [], error: null });
-      return empty;
+    // The read path reaches storage for signatures and nothing else. A
+    // PostgREST table read appearing here again is exactly the regression this
+    // ticket removed, so it fails the case instead of answering empty.
+    from(table: string): never {
+      throw new Error(`the canvas read must not query "${table}" through the client`);
     },
     storage: {
       from(bucket: string) {
@@ -285,6 +284,28 @@ function makeReadStub(options: {
           }),
         };
       },
+    },
+  };
+
+  const repository = {
+    async findReadableCanvasContent() {
+      throw new Error("the canvas read must not fetch content through the repository");
+    },
+    async listReadableSucceededImageJobs() {
+      return [];
+    },
+    async listReadableCanvasAssets(input: {
+      actorId: string;
+      canvasId: string;
+      refs: readonly AssetRef[];
+    }) {
+      calls.push({
+        actorId: input.actorId,
+        canvasId: input.canvasId,
+        refs: input.refs.map((ref) => ({ ...ref })),
+      });
+      if (options.repositoryError) throw options.repositoryError;
+      return options.rows ?? [];
     },
   };
 
@@ -305,9 +326,12 @@ function makeReadStub(options: {
     createUserClient: () => userClient as unknown as UserSupabaseClient,
     getAdminClient: () =>
       ({ rpc: async () => ({ data: null, error: null }) }) as unknown as AdminSupabaseClient,
+    ...(options.withoutRepository
+      ? {}
+      : { canvasReadRepository: repository as unknown as CanvasReadRepository }),
   });
 
-  return { service, lookups };
+  return { service, calls };
 }
 
 function readFiles(result: { content: CanvasContent }): Record<string, Record<string, unknown>> {
@@ -315,7 +339,7 @@ function readFiles(result: { content: CanvasContent }): Record<string, Record<st
 }
 
 describe("canvas read projects the real assetId (X-52 T3)", () => {
-  it("case 1: an oss file gets its assetId from the exact (bucket, object_path) row", async () => {
+  it("case 1: an oss file gets its assetId from the exact (bucket, object_path) pair, for the real actor", async () => {
     const stub = makeReadStub({
       files: {
         "el-1": {
@@ -324,16 +348,28 @@ describe("canvas read projects the real assetId (X-52 T3)", () => {
           mimeType: "image/png",
         },
       },
-      assets: [{ id: "asset-real-1", object_path: "ws-team/canvas-1/pic.png" }],
+      rows: [
+        {
+          id: "asset-real-1",
+          bucket: "project-assets",
+          object_path: "ws-team/canvas-1/pic.png",
+        },
+      ],
     });
 
     const result = await stub.service.getCanvas(USER, "canvas-1");
     const files = readFiles(result);
 
     expect(files["el-1"]?.assetId).toBe("asset-real-1");
-    // Looked up by bucket AND path — never by parsing the marker into a project.
-    expect(stub.lookups[0]?.bucket).toBe("project-assets");
-    expect(stub.lookups[0]?.paths).toEqual(["ws-team/canvas-1/pic.png"]);
+    // Asked by canvas AND actor, by the BUCKET and the path — never by parsing
+    // the marker into a project.
+    expect(stub.calls).toEqual([
+      {
+        actorId: "user-1",
+        canvasId: "canvas-1",
+        refs: [{ bucket: "project-assets", objectPath: "ws-team/canvas-1/pic.png" }],
+      },
+    ]);
     // The marker itself is untouched: the id is a response projection only.
     expect(files["el-1"]?.dataURL).toBe(
       "oss://project-assets/ws-team/canvas-1/pic.png",
@@ -349,7 +385,7 @@ describe("canvas read projects the real assetId (X-52 T3)", () => {
           mimeType: "image/png",
         },
       },
-      assets: [],
+      rows: [],
     });
 
     const result = await stub.service.getCanvas(USER, "canvas-1");
@@ -362,5 +398,124 @@ describe("canvas read projects the real assetId (X-52 T3)", () => {
       "oss://project-assets/ws-team/canvas-1/old.png",
     );
     expect(String(files["el-legacy"]?.storageUrl)).toContain("token=sig");
+  });
+
+  it("case 3: a repository failure costs the assetId and nothing else", async () => {
+    const stub = makeReadStub({
+      files: {
+        "el-1": {
+          id: "el-1",
+          dataURL: "oss://project-assets/ws-team/canvas-1/pic.png",
+          mimeType: "image/png",
+        },
+      },
+      repositoryError: new CanvasReadError(
+        LIST_READABLE_CANVAS_ASSETS,
+        new Error("postgres://user:secret@host/db is unreachable"),
+      ),
+    });
+
+    // The canvas must still load: a failed identity lookup is one missing
+    // response field, not a 404/503 on the whole document.
+    const result = await stub.service.getCanvas(USER, "canvas-1");
+    const files = readFiles(result);
+
+    expect(result.id).toBe("canvas-1");
+    expect(result.version).toBe(3);
+    expect(files["el-1"]?.assetId).toBeUndefined();
+    expect(files["el-1"]?.dataURL).toBe(
+      "oss://project-assets/ws-team/canvas-1/pic.png",
+    );
+    expect(String(files["el-1"]?.storageUrl)).toContain("token=sig");
+    expect(stub.calls).toHaveLength(1);
+  });
+
+  it("case 4: the same object path in two buckets is never mismatched", async () => {
+    const path = "ws-team/canvas-1/shared.png";
+    const stub = makeReadStub({
+      files: {
+        "el-project": {
+          id: "el-project",
+          dataURL: `oss://project-assets/${path}`,
+          mimeType: "image/png",
+        },
+        "el-avatar": {
+          id: "el-avatar",
+          dataURL: `oss://user-avatars/${path}`,
+          mimeType: "image/png",
+        },
+      },
+      // Only the project-assets object is this canvas's asset; the identically
+      // named avatar in another bucket has no row here.
+      rows: [{ id: "asset-project", bucket: "project-assets", object_path: path }],
+    });
+
+    const result = await stub.service.getCanvas(USER, "canvas-1");
+    const files = readFiles(result);
+
+    expect(files["el-project"]?.assetId).toBe("asset-project");
+    expect(files["el-avatar"]?.assetId).toBeUndefined();
+    // Both pairs were asked for, each with its own bucket.
+    expect(stub.calls[0]?.refs).toEqual([
+      { bucket: "project-assets", objectPath: path },
+      { bucket: "user-avatars", objectPath: path },
+    ]);
+  });
+
+  it("case 5: without a repository the canvas still loads, with no assetIds", async () => {
+    const stub = makeReadStub({
+      files: {
+        "el-1": {
+          id: "el-1",
+          dataURL: "oss://project-assets/ws-team/canvas-1/pic.png",
+          mimeType: "image/png",
+        },
+      },
+      withoutRepository: true,
+    });
+
+    const result = await stub.service.getCanvas(USER, "canvas-1");
+    const files = readFiles(result);
+
+    // "No identity" is a legal answer — the same one a legacy object produces.
+    expect(files["el-1"]?.assetId).toBeUndefined();
+    expect(files["el-1"]?.dataURL).toBe(
+      "oss://project-assets/ws-team/canvas-1/pic.png",
+    );
+    expect(stub.calls).toHaveLength(0);
+  });
+
+  it("case 6: a marker that cannot address an object is dropped, not sent as a lookup key", async () => {
+    const stub = makeReadStub({
+      files: {
+        "el-empty-bucket": {
+          id: "el-empty-bucket",
+          dataURL: "oss:///ws-team/canvas-1/pic.png",
+          mimeType: "image/png",
+        },
+        "el-ok": {
+          id: "el-ok",
+          dataURL: "oss://project-assets/ws-team/canvas-1/ok.png",
+          mimeType: "image/png",
+        },
+      },
+      rows: [
+        {
+          id: "asset-ok",
+          bucket: "project-assets",
+          object_path: "ws-team/canvas-1/ok.png",
+        },
+      ],
+    });
+
+    const result = await stub.service.getCanvas(USER, "canvas-1");
+    const files = readFiles(result);
+
+    // One damaged marker must not take the other files' identities with it.
+    expect(stub.calls[0]?.refs).toEqual([
+      { bucket: "project-assets", objectPath: "ws-team/canvas-1/ok.png" },
+    ]);
+    expect(files["el-ok"]?.assetId).toBe("asset-ok");
+    expect(files["el-empty-bucket"]?.assetId).toBeUndefined();
   });
 });

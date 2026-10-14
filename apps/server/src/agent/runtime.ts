@@ -19,6 +19,7 @@ import type {
 import type { ServerEnv } from "../config/env.js";
 import { createPipelineLogger } from "../ws/logger.js";
 import type { AgentRunMetadataService } from "../features/agent-runs/agent-run-service.js";
+import type { CanvasReadRepository } from "../db/canvas-read-repository.js";
 import type { JobService } from "../features/jobs/job-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { AdminSupabaseClient } from "../supabase/admin.js";
@@ -367,6 +368,14 @@ type CreateAgentRuntimeOptions = {
   agentPersistenceService?: AgentPersistenceService;
   agentFactory?: LoomicAgentFactory;
   agentRunMetadataService?: AgentRunMetadataService;
+  /**
+   * Canvas read repository (workorder 20C). The automatic canvas summary is a
+   * pure read, so it goes through actor-carrying SQL that re-applies the
+   * canvas's project ACL instead of the caller's PostgREST client. Optional:
+   * without it the summary is simply absent, which is the same degradation a
+   * failed read already produced.
+   */
+  canvasReadRepository?: CanvasReadRepository;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => unknown;
   /**
@@ -458,6 +467,47 @@ async function resolveBrandKitId(
       console.warn("Failed to resolve brand kit ID:", err);
       return null;
     }
+  }
+}
+
+/**
+ * The automatic canvas summary injected before the model's first turn.
+ *
+ * Read through the canvas repository (workorder 20C) with the REAL actor id and
+ * canvas id of the run, so a canvas the caller cannot read returns nothing
+ * rather than its content. Extracted from the stream pipeline so the two
+ * properties that matter are testable on their own: what the repository is
+ * asked, and that no failure here can fail the Agent run.
+ *
+ * Every reason not to answer — no repository, no actor, no canvas, an
+ * unreadable canvas, a repository error — ends as `null`, which is exactly the
+ * "no automatic summary" the stream already degrades to. The agent can still
+ * call `inspect_canvas` itself.
+ */
+export async function readCanvasSummaryForRun(input: {
+  repository: CanvasReadRepository | undefined;
+  actorId: string | undefined;
+  canvasId: string | undefined;
+}): Promise<string | null> {
+  const { repository, actorId, canvasId } = input;
+  if (!repository || !actorId || !canvasId) return null;
+
+  try {
+    const readable = await repository.findReadableCanvasContent({
+      actorId,
+      canvasId,
+    });
+
+    const elements = (readable?.content as { elements?: unknown } | null)
+      ?.elements;
+    if (!Array.isArray(elements)) return null;
+
+    return buildCanvasSummaryForContext(
+      elements as Array<Record<string, unknown>>,
+    );
+  } catch {
+    // Non-critical — agent can still call inspect_canvas manually
+    return null;
   }
 }
 
@@ -1509,24 +1559,15 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
       try {
         // Auto-inject canvas state summary so the agent has immediate awareness
         // of what's on the canvas without needing to call inspect_canvas first.
-        let canvasSummary: string | null = null;
-        if (run.canvasId && run.accessToken && options.createUserClient) {
-          try {
-            const canvasClient = options.createUserClient(run.accessToken) as any;
-            const { data: canvasData } = await canvasClient
-              .from("canvases")
-              .select("content")
-              .eq("id", run.canvasId)
-              .single();
-            if (canvasData?.content?.elements) {
-              canvasSummary = buildCanvasSummaryForContext(
-                canvasData.content.elements as Array<Record<string, unknown>>,
-              );
-            }
-          } catch {
-            // Non-critical — agent can still call inspect_canvas manually
-          }
-        }
+        // Read through the canvas repository with the run's own actor id — see
+        // readCanvasSummaryForRun; it never throws.
+        const canvasSummary = run.canvasId
+          ? await readCanvasSummaryForRun({
+              repository: options.canvasReadRepository,
+              actorId: run.userId,
+              canvasId: run.canvasId,
+            })
+          : null;
 
         const hasAttachments = run.attachments && run.attachments.length > 0;
         let userMessage: HumanMessage;
