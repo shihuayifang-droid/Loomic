@@ -7,7 +7,8 @@
  * 2. runs `BEGIN`,
  * 3. sets the HaHart session context as transaction-local settings
  *    (`set_config(name, value, true)`), parameterised — values are never
- *    concatenated into SQL,
+ *    concatenated into SQL. Three of them are the actor; the fourth
+ *    (`app.execution_mode`) is a diagnostic label that grants nothing,
  * 4. runs the caller's callback, and
  * 5. runs `COMMIT`.
  *
@@ -22,12 +23,20 @@
 /**
  * Session settings written on every transaction. The names are the database
  * side of the identity contract and must not change shape per call site.
+ *
+ * `app.execution_mode` is a DIAGNOSTIC label only ("user" or "privileged"). It
+ * records how the transaction was opened so logs and audit trails can tell the
+ * two apart. It is NOT an authorization switch: no RLS policy and no
+ * authorization function may grant access because this setting says
+ * "privileged". Real database privileges are expressed by the dedicated
+ * database role / connection a later ticket introduces, never by a GUC value a
+ * caller can set.
  */
 export const TRANSACTION_SETTING_NAMES = {
   userId: "app.user_id",
   workspaceId: "app.workspace_id",
   role: "app.role",
-  privileged: "app.privileged",
+  executionMode: "app.execution_mode",
 } as const;
 
 export type TransactionSettingName =
@@ -35,13 +44,13 @@ export type TransactionSettingName =
 
 /**
  * Ordered context tuple. Order is part of the contract: index 0 userId,
- * 1 workspaceId, 2 role, 3 privileged.
+ * 1 workspaceId, 2 role, 3 executionMode.
  */
 export const TRANSACTION_SETTING_ORDER: readonly TransactionSettingName[] = [
   TRANSACTION_SETTING_NAMES.userId,
   TRANSACTION_SETTING_NAMES.workspaceId,
   TRANSACTION_SETTING_NAMES.role,
-  TRANSACTION_SETTING_NAMES.privileged,
+  TRANSACTION_SETTING_NAMES.executionMode,
 ];
 
 export const TRANSACTION_STATEMENTS = {
@@ -64,7 +73,13 @@ export type ActorContext = {
 
 /**
  * Privileged access is an explicit mode, never implied by an empty userId.
- * A caller that wants database-level privileged access must say so.
+ * A caller that wants privileged database access must say so.
+ *
+ * The mode is carried into the transaction as the diagnostic
+ * `app.execution_mode` setting. It does not by itself grant anything, and it is
+ * orthogonal to the actor: an administrator acting through a privileged
+ * connection still reports userId/workspaceId/role so the operation stays
+ * auditable, while a system task runs privileged with a null actor.
  */
 export type TransactionMode = "user" | "privileged";
 
@@ -84,8 +99,11 @@ export type TransactionOptions = {
   mode?: TransactionMode;
 };
 
-const PRIVILEGED_SETTING_VALUE = "on";
-const USER_SETTING_VALUE = "off";
+/** Diagnostic labels for `app.execution_mode`; never an authorization token. */
+const EXECUTION_MODE_SETTING_VALUES: Record<TransactionMode, string> = {
+  user: "user",
+  privileged: "privileged",
+};
 
 export async function withTransaction<T>(
   pool: TransactionPool,
@@ -139,51 +157,45 @@ export async function withTransaction<T>(
 
 /**
  * Explicit privileged entry point. Equivalent to
- * `withTransaction(pool, null, run, { mode: "privileged" })` and provided so
+ * `withTransaction(pool, actor, run, { mode: "privileged" })` and provided so
  * privileged work never has to be expressed by omitting an actor.
+ *
+ * Privileged work is not anonymous work: pass the acting administrator so the
+ * three actor settings are still written, or `null` for a system task that
+ * genuinely has no actor.
  */
 export async function withPrivilegedTransaction<T>(
   pool: TransactionPool,
+  actor: ActorContext | null,
   run: (client: TransactionConnection) => Promise<T>,
   options: TransactionOptions = {},
 ): Promise<T> {
-  return withTransaction(pool, null, run, {
+  return withTransaction(pool, actor, run, {
     ...options,
     mode: "privileged",
   });
 }
 
+/**
+ * Build the four settings in `TRANSACTION_SETTING_ORDER`. The actor fields are
+ * written in both modes; only the diagnostic execution mode differs, and it is
+ * always explicit (`mode` defaults to the non-privileged "user").
+ */
 export function buildContextValues(
   actor: ActorContext | null | undefined,
   mode: TransactionMode = "user",
 ): readonly [string, string, string, string] {
-  if (mode === "privileged" && hasActorIdentity(actor)) {
-    throw new Error(
-      "Privileged transaction mode cannot carry an actor identity " +
-        "(userId/workspaceId/role must be empty). Pass an explicit actor with " +
-        "mode \"user\" instead.",
-    );
-  }
-
   return [
     normalizeActorValue(actor?.userId),
     normalizeActorValue(actor?.workspaceId),
     normalizeActorValue(actor?.role),
-    mode === "privileged" ? PRIVILEGED_SETTING_VALUE : USER_SETTING_VALUE,
+    EXECUTION_MODE_SETTING_VALUES[mode],
   ];
 }
 
 function normalizeActorValue(value: string | null | undefined): string {
   if (value === null || value === undefined) return "";
   return value;
-}
-
-function hasActorIdentity(actor: ActorContext | null | undefined): boolean {
-  if (!actor) return false;
-
-  return [actor.userId, actor.workspaceId, actor.role].some(
-    (value) => typeof value === "string" && value.trim() !== "",
-  );
 }
 
 function attachRollbackError(error: unknown, rollbackError: unknown): void {

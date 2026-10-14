@@ -30,21 +30,45 @@
  *   `config.unknownSupabaseEnvTokens` so a new name cannot slip in silently.
  * - Active SQL is `supabase/migrations/**`. Rollbacks, snippets and the test
  *   support stub are counted separately.
+ * - Active tooling is `apps/server/scripts/**` (minus the two files named
+ *   below) and the repository-root `scripts/**`: JS/TS files that run in this
+ *   repository but are not production source. They get their own `tooling.*`
+ *   metrics, so a Supabase call in a script cannot hide behind an exclusion.
  * - Excluded from every counter: archives, vendored docs and scratch output -
  *   `node_modules`, `.git`, `dist`, `.next`, `out`, `.turbo`, `coverage`,
- *   `docs`, `.agents`, `skills`, `semantic-review`, `.j-can-see`, and this
- *   script's own directory (`apps/server/scripts`). Their Supabase mentions are
- *   still reported as `excluded.archiveDocSupabaseMentions`, so moving code
- *   into an excluded area raises a problem instead of hiding a hit.
+ *   `docs`, `.agents`, `skills`, `semantic-review`, `.j-can-see`. Inside the
+ *   tooling scope exactly two files are excluded, both by identity: this script
+ *   itself and the baseline file in use (counting the baseline would make the
+ *   audit depend on its own output). Every exclusion is printed as a
+ *   `[tooling] excluded=` line. Archive Supabase mentions are still reported as
+ *   `excluded.archiveDocSupabaseMentions`, so moving code into an excluded
+ *   archive area raises a problem instead of hiding a hit.
+ *
+ * Coverage and trend are two separate verdicts:
+ *
+ * - Coverage (fail-closed): the required scope - root manifest, `apps/web/src`,
+ *   `apps/server/src`, `apps/server/package.json`, `supabase/migrations` - must
+ *   exist, be readable and be non-empty. A tree the audit could not scan is a
+ *   `[PROBLEMS]` failure, never a "supabase is gone" success, and it also
+ *   refuses `--update-baseline`.
+ * - Trend (baseline): only coupling metrics are compared, and only a RISE is a
+ *   problem. A lower number is the goal, so a shrinking count is reported as a
+ *   `[delta]` line and never as an error.
  */
 
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const SCRIPT_SELF = fileURLToPath(import.meta.url);
+const SCRIPT_DIR = dirname(SCRIPT_SELF);
 const REPO_ROOT_DEFAULT = resolve(SCRIPT_DIR, "..", "..", "..");
 const BASELINE_DEFAULT = join(SCRIPT_DIR, "supabase-dependency-baseline.json");
+
+/** POSIX-shaped relative path, so exclusion matching is separator independent. */
+function normalizeRelPath(value) {
+  return value.split(sep).join("/");
+}
 
 const SKIP_DIR_NAMES = new Set([
   "node_modules",
@@ -58,6 +82,58 @@ const SKIP_DIR_NAMES = new Set([
 
 const ARCHIVE_DIRS = ["docs", ".agents", "skills"];
 const SCRATCH_DIRS = ["semantic-review", ".j-can-see"];
+
+/** Active tooling: run in this repo, but not production source. */
+const TOOLING_DIRS = ["scripts", "apps/server/scripts"];
+const TOOLING_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+];
+
+/**
+ * The only two tooling files that are never counted: the auditor itself and
+ * the baseline. Matching happens both by absolute path and by position
+ * relative to the default repository root, so a mirror root that carries a
+ * copy of either file still behaves like the real root.
+ */
+const TOOLING_EXCLUDED_RELATIVE_PATHS = [
+  normalizeRelPath(relative(REPO_ROOT_DEFAULT, SCRIPT_SELF)),
+  normalizeRelPath(relative(REPO_ROOT_DEFAULT, BASELINE_DEFAULT)),
+];
+
+/**
+ * Required scope for the coverage gate. This is deliberately about
+ * "did I actually scan the repository", not about Supabase counts: an absent
+ * or empty scope must fail closed instead of reporting a clean zero.
+ */
+const REQUIRED_SCOPE = [
+  { label: "rootManifest", path: "package.json", kind: "file" },
+  {
+    label: "webSource",
+    path: "apps/web/src",
+    kind: "dir",
+    extensions: [".ts", ".tsx"],
+  },
+  {
+    label: "serverSource",
+    path: "apps/server/src",
+    kind: "dir",
+    extensions: [".ts"],
+  },
+  { label: "serverManifest", path: "apps/server/package.json", kind: "file" },
+  {
+    label: "activeMigrations",
+    path: "supabase/migrations",
+    kind: "dir",
+    extensions: [".sql"],
+  },
+];
 
 const SUPABASE_ENV_NAMES = [
   "SUPABASE_URL",
@@ -191,7 +267,7 @@ function listSqlFiles(dir) {
     .sort();
 }
 
-function collect(root) {
+function collect(root, baselinePath) {
   const metrics = {};
   const skipped = [];
 
@@ -365,6 +441,88 @@ function collect(root) {
     /auth\.uid\s*\(/i,
   );
 
+  // ---- active tooling (scripts are NOT invisible) ----------------------------
+  const toolingExclusionTargets = [
+    { label: "auditor", abs: SCRIPT_SELF },
+    { label: "baseline", abs: BASELINE_DEFAULT },
+    { label: "baseline in use", abs: baselinePath },
+  ];
+  const toolingExcludedAbsolute = new Set(
+    toolingExclusionTargets.map((entry) => resolve(entry.abs)),
+  );
+  const toolingExcludedRelative = new Set(TOOLING_EXCLUDED_RELATIVE_PATHS);
+  const toolingReport = [];
+  const toolingFiles = [];
+  const toolingExcludedFound = new Set();
+
+  for (const dir of TOOLING_DIRS) {
+    const dirPath = join(root, dir);
+    let counted = 0;
+
+    for (const file of walkFiles(dirPath, TOOLING_EXTENSIONS)) {
+      const relToRoot = normalizeRelPath(relative(root, file));
+      if (
+        toolingExcludedAbsolute.has(resolve(file)) ||
+        toolingExcludedRelative.has(relToRoot)
+      ) {
+        toolingExcludedFound.add(relToRoot);
+        continue;
+      }
+
+      toolingFiles.push(file);
+      counted += 1;
+    }
+
+    toolingReport.push(
+      `[tooling] dir=${normalizeRelPath(dir)} files=${counted} (active JS/TS counted)`,
+    );
+  }
+
+  for (const entry of toolingExclusionTargets) {
+    const relToRoot = normalizeRelPath(relative(root, entry.abs));
+    const present =
+      existsSync(entry.abs) || (relToRoot && existsSync(join(root, relToRoot)));
+
+    toolingReport.push(
+      `[tooling] excluded=${relToRoot} reason=${entry.label} present=${
+        present ? "yes" : "no"
+      } suppressed=${
+        toolingExcludedFound.has(relToRoot) ? "yes" : "no"
+      } (never counted)`,
+    );
+  }
+
+  const toolingText = readAll(toolingFiles);
+  const toolingEnvNames = SUPABASE_ENV_NAMES.filter((name) =>
+    new RegExp(`(?<![A-Z0-9_])${name}(?![A-Z0-9_])`).test(toolingText),
+  );
+
+  metrics["tooling.supabaseMentions"] = countMatches(toolingText, /supabase/i);
+  metrics["tooling.supabaseSdkImportHits"] = countMatches(
+    toolingText,
+    /@supabase\/supabase-js/,
+  );
+  metrics["tooling.fromCalls"] = countMatches(
+    toolingText,
+    /(?<!Array)(?<!Object)(?<!Buffer)\.from\s*\(/,
+  );
+  metrics["tooling.rpcCalls"] = countMatches(toolingText, /\.rpc\s*\(/);
+  metrics["tooling.storageCalls"] = countMatches(toolingText, /\.storage\b/);
+  metrics["tooling.authGetUserCalls"] = countMatches(
+    toolingText,
+    /\.auth\.getUser\s*\(/,
+  );
+  metrics["tooling.supabaseEnvVariableFamily"] = toolingEnvNames.length;
+  metrics["tooling.supabaseEnvHits"] = SUPABASE_ENV_NAMES.reduce(
+    (total, name) =>
+      total +
+      countMatches(
+        toolingText,
+        new RegExp(`(?<![A-Z0-9_])${name}(?![A-Z0-9_])`),
+      ),
+    0,
+  );
+
   // ---- excluded areas (visibility only, never silently dropped) -------------
   const archiveText = readAll(
     ARCHIVE_DIRS.flatMap((dir) =>
@@ -376,11 +534,66 @@ function collect(root) {
     /supabase/i,
   );
 
-  for (const dir of [...ARCHIVE_DIRS, ...SCRATCH_DIRS, "apps/server/scripts"]) {
+  for (const dir of [...ARCHIVE_DIRS, ...SCRATCH_DIRS]) {
     skipped.push(dir);
   }
 
-  return { metrics, skipped, configFiles, manifestFiles, migrationsDir };
+  return {
+    metrics,
+    skipped,
+    toolingReport,
+    configFiles,
+    manifestFiles,
+    migrationsDir,
+  };
+}
+
+/**
+ * Coverage gate: prove the audit actually reached the repository it claims to
+ * measure. Runs before any baseline comparison, never derived from it.
+ */
+function checkRequiredScope(root) {
+  return REQUIRED_SCOPE.map((entry) => {
+    const full = join(root, entry.path);
+    const base = {
+      label: entry.label,
+      kind: entry.kind,
+      path: normalizeRelPath(entry.path),
+      full,
+      files: 0,
+    };
+
+    let stats;
+    try {
+      stats = statSync(full);
+    } catch (error) {
+      const missing = error && error.code === "ENOENT";
+      return { ...base, status: missing ? "missing" : "unreadable" };
+    }
+
+    if (entry.kind === "file") {
+      if (!stats.isFile()) return { ...base, status: "not-a-file" };
+      try {
+        readText(full);
+      } catch {
+        return { ...base, status: "unreadable" };
+      }
+      return { ...base, files: 1, status: "ok" };
+    }
+
+    if (!stats.isDirectory()) return { ...base, status: "not-a-directory" };
+
+    try {
+      readdirSync(full);
+    } catch {
+      return { ...base, status: "unreadable" };
+    }
+
+    const files = walkFiles(full, entry.extensions);
+    if (files.length === 0) return { ...base, status: "empty" };
+
+    return { ...base, files: files.length, status: "ok" };
+  });
 }
 
 function formatTable(metrics) {
@@ -392,52 +605,96 @@ function formatTable(metrics) {
 
 function main() {
   const options = parseArgs(process.argv.slice(2));
-  const { metrics, skipped, configFiles, manifestFiles } = collect(options.root);
   const lines = [];
+  const problems = [];
 
   lines.push(`[audit] root=${options.root}`);
   lines.push(`[audit] baseline=${options.baseline}`);
-  lines.push(
-    `[audit] configFiles=${configFiles.length} manifests=${manifestFiles.length}`,
-  );
-  lines.push(`[skip] ${skipped.join(", ")} (scratch output is never counted)`);
-  lines.push(formatTable(metrics));
 
-  for (const anchor of ANCHORS) {
-    const measured = metrics[anchor.key] ?? 0;
-    const verdict =
-      measured === anchor.value ? "match" : `DIFFERS by ${measured - anchor.value}`;
+  // ---- coverage gate (fail-closed, independent of the trend) ----------------
+  const coverage = checkRequiredScope(options.root);
+  for (const entry of coverage) {
     lines.push(
-      `[anchor] ${anchor.label}: anchor=${anchor.value} measured[${anchor.key}]=${measured} (${verdict})`,
+      `[scope] ${entry.label} kind=${entry.kind} files=${entry.files} ` +
+        `status=${entry.status} path=${entry.full}`,
+    );
+  }
+  for (const entry of coverage) {
+    if (entry.status === "ok") continue;
+    problems.push(
+      `required scope ${entry.label} (${entry.path}) is ${entry.status}; ` +
+        "the audit refuses to certify a repository it could not scan",
     );
   }
 
-  const problems = [];
-
-  if (options.updateBaseline) {
-    const payload = {
-      version: 1,
-      generatedBy: "apps/server/scripts/audit-supabase-dependencies.mjs",
-      generatedAt: new Date().toISOString(),
-      note:
-        "Supabase coupling baseline (ticket 19). Counts are textual over the " +
-        "scopes documented in the script header. A later ticket may only lower " +
-        "a number; an increase fails the audit.",
-      anchors: Object.fromEntries(
-        ANCHORS.map((anchor) => [anchor.label, anchor.value]),
-      ),
-      supersededX52Migrations: SUPERSEDED_X52_MIGRATIONS,
-      metrics,
-    };
-    writeFileSync(
-      options.baseline,
-      `${JSON.stringify(payload, null, 2)}\n`,
-      "utf8",
+  // ---- coupling metrics -----------------------------------------------------
+  let collected = null;
+  try {
+    collected = collect(options.root, options.baseline);
+  } catch (error) {
+    problems.push(
+      `scan failed: ${error instanceof Error ? error.message : String(error)}`,
     );
-    lines.push(`[OK] baseline written: ${options.baseline}`);
+  }
+
+  if (collected) {
+    const { metrics, skipped, toolingReport, configFiles, manifestFiles } =
+      collected;
+
+    lines.push(
+      `[audit] configFiles=${configFiles.length} manifests=${manifestFiles.length}`,
+    );
+    lines.push(
+      `[skip] ${skipped.join(", ")} (archive/scratch output is never counted)`,
+    );
+    lines.push(...toolingReport);
+    lines.push(formatTable(metrics));
+
+    for (const anchor of ANCHORS) {
+      const measured = metrics[anchor.key] ?? 0;
+      const verdict =
+        measured === anchor.value
+          ? "match"
+          : `DIFFERS by ${measured - anchor.value}`;
+      lines.push(
+        `[anchor] ${anchor.label}: anchor=${anchor.value} measured[${anchor.key}]=${measured} (${verdict})`,
+      );
+    }
+  }
+
+  // ---- baseline: write or compare -------------------------------------------
+  if (options.updateBaseline) {
+    if (problems.length > 0 || !collected) {
+      lines.push(
+        `[!] refusing to write baseline: ${problems.length} problem(s) before ` +
+          "any comparison (coverage failures can never be re-baselined away)",
+      );
+    } else {
+      const payload = {
+        version: 1,
+        generatedBy: "apps/server/scripts/audit-supabase-dependencies.mjs",
+        generatedAt: new Date().toISOString(),
+        note:
+          "Supabase coupling baseline (ticket 19). Counts are textual over the " +
+          "scopes documented in the script header. A later ticket may only lower " +
+          "a number; an increase fails the audit.",
+        anchors: Object.fromEntries(
+          ANCHORS.map((anchor) => [anchor.label, anchor.value]),
+        ),
+        supersededX52Migrations: SUPERSEDED_X52_MIGRATIONS,
+        metrics: collected.metrics,
+      };
+      writeFileSync(
+        options.baseline,
+        `${JSON.stringify(payload, null, 2)}\n`,
+        "utf8",
+      );
+      lines.push(`[OK] baseline written: ${options.baseline}`);
+    }
   } else if (!existsSync(options.baseline)) {
     problems.push(`baseline file not found: ${options.baseline}`);
-  } else {
+  } else if (collected) {
+    const metrics = collected.metrics;
     const baseline = JSON.parse(readText(options.baseline));
     const baselineMetrics = baseline.metrics ?? {};
     const keys = [
@@ -484,4 +741,13 @@ function main() {
   process.exitCode = problems.length === 0 ? 0 : 1;
 }
 
-main();
+try {
+  main();
+} catch (error) {
+  // Fail closed: an audit that could not finish must never look like a pass.
+  process.stdout.write(
+    `[!] audit failed: ${error instanceof Error ? error.message : String(error)}\n` +
+      "[PROBLEMS] 1\n",
+  );
+  process.exitCode = 1;
+}

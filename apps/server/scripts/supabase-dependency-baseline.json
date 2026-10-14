@@ -1,7 +1,7 @@
 {
   "version": 1,
   "generatedBy": "apps/server/scripts/audit-supabase-dependencies.mjs",
-  "generatedAt": "2026-10-14T02:20:17.776Z",
+  "generatedAt": "2026-10-14T06:18:30.819Z",
   "note": "Supabase coupling baseline (ticket 19). Counts are textual over the scopes documented in the script header. A later ticket may only lower a number; an increase fails the audit.",
   "anchors": {
     "web.Auth": 9,
@@ -51,6 +51,14 @@
     "sql.rollbackStorageApiReferences": 10,
     "sql.testSupportRlsStatements": 1,
     "sql.testSupportAuthUidCalls": 2,
+    "tooling.supabaseMentions": 15,
+    "tooling.supabaseSdkImportHits": 1,
+    "tooling.fromCalls": 5,
+    "tooling.rpcCalls": 1,
+    "tooling.storageCalls": 0,
+    "tooling.authGetUserCalls": 0,
+    "tooling.supabaseEnvVariableFamily": 2,
+    "tooling.supabaseEnvHits": 10,
     "excluded.archiveDocSupabaseMentions": 41
   }
 }

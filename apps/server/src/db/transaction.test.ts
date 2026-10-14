@@ -99,7 +99,7 @@ describe("withTransaction: session context", () => {
       ["app.user_id", "user-1"],
       ["app.workspace_id", "ws-1"],
       ["app.role", "owner"],
-      ["app.privileged", "off"],
+      ["app.execution_mode", "user"],
     ]);
   });
 
@@ -108,13 +108,13 @@ describe("withTransaction: session context", () => {
       "app.user_id",
       "app.workspace_id",
       "app.role",
-      "app.privileged",
+      "app.execution_mode",
     ]);
     expect(TRANSACTION_SETTING_ORDER).toEqual([
       TRANSACTION_SETTING_NAMES.userId,
       TRANSACTION_SETTING_NAMES.workspaceId,
       TRANSACTION_SETTING_NAMES.role,
-      TRANSACTION_SETTING_NAMES.privileged,
+      TRANSACTION_SETTING_NAMES.executionMode,
     ]);
   });
 
@@ -131,7 +131,7 @@ describe("withTransaction: session context", () => {
       ["app.user_id", ""],
       ["app.workspace_id", ""],
       ["app.role", ""],
-      ["app.privileged", "off"],
+      ["app.execution_mode", "user"],
     ]);
   });
 
@@ -144,7 +144,7 @@ describe("withTransaction: session context", () => {
       ["app.user_id", ""],
       ["app.workspace_id", ""],
       ["app.role", ""],
-      ["app.privileged", "off"],
+      ["app.execution_mode", "user"],
     ]);
   });
 
@@ -161,7 +161,7 @@ describe("withTransaction: session context", () => {
       ["app.user_id", "user-7"],
       ["app.workspace_id", ""],
       ["app.role", ""],
-      ["app.privileged", "off"],
+      ["app.execution_mode", "user"],
     ]);
   });
 
@@ -170,7 +170,16 @@ describe("withTransaction: session context", () => {
       "user-1",
       "ws-1",
       "owner",
-      "off",
+      "user",
+    ]);
+  });
+
+  it("defaults the execution mode to the non-privileged label", () => {
+    expect(buildContextValues(ACTOR)).toEqual([
+      "user-1",
+      "ws-1",
+      "owner",
+      "user",
     ]);
   });
 
@@ -201,41 +210,81 @@ describe("withTransaction: session context", () => {
 });
 
 describe("withTransaction: explicit privileged mode", () => {
-  it("sets app.privileged on and clears the actor fields", async () => {
+  it("labels the transaction privileged and keeps all three actor settings", async () => {
     const client = createFakeClient();
 
-    await withTransaction(createFakePool(client), null, async () => undefined, {
-      mode: "privileged",
-    });
+    await withTransaction(
+      createFakePool(client),
+      ACTOR,
+      async () => undefined,
+      { mode: "privileged" },
+    );
+
+    expect(configCalls(client).map((entry) => entry.params)).toEqual([
+      ["app.user_id", "user-1"],
+      ["app.workspace_id", "ws-1"],
+      ["app.role", "owner"],
+      ["app.execution_mode", "privileged"],
+    ]);
+  });
+
+  it("keeps the actor settings verbatim in the context tuple", () => {
+    expect(buildContextValues(ACTOR, "privileged")).toEqual([
+      "user-1",
+      "ws-1",
+      "owner",
+      "privileged",
+    ]);
+  });
+
+  it("keeps a system privileged transaction with a null actor empty", async () => {
+    const client = createFakeClient();
+
+    await withTransaction(
+      createFakePool(client),
+      null,
+      async () => undefined,
+      { mode: "privileged" },
+    );
 
     expect(configCalls(client).map((entry) => entry.params)).toEqual([
       ["app.user_id", ""],
       ["app.workspace_id", ""],
       ["app.role", ""],
-      ["app.privileged", "on"],
+      ["app.execution_mode", "privileged"],
     ]);
   });
 
   it("is reachable through the dedicated withPrivilegedTransaction entry", async () => {
     const client = createFakeClient();
 
-    await withPrivilegedTransaction(createFakePool(client), async () => "done");
+    await withPrivilegedTransaction(
+      createFakePool(client),
+      null,
+      async () => "done",
+    );
 
     expect(configCalls(client).at(-1)?.params).toEqual([
-      "app.privileged",
-      "on",
+      "app.execution_mode",
+      "privileged",
     ]);
   });
 
-  it("refuses to carry an actor identity", async () => {
+  it("carries the acting administrator through withPrivilegedTransaction", async () => {
     const client = createFakeClient();
 
-    await expect(
-      withTransaction(createFakePool(client), ACTOR, async () => undefined, {
-        mode: "privileged",
-      }),
-    ).rejects.toThrow(/cannot carry an actor identity/);
-    expect(client.queries).toEqual([]);
+    await withPrivilegedTransaction(
+      createFakePool(client),
+      ACTOR,
+      async () => "done",
+    );
+
+    expect(configCalls(client).map((entry) => entry.params)).toEqual([
+      ["app.user_id", "user-1"],
+      ["app.workspace_id", "ws-1"],
+      ["app.role", "owner"],
+      ["app.execution_mode", "privileged"],
+    ]);
   });
 
   it("does not treat an empty userId in user mode as privileged", async () => {
@@ -248,8 +297,8 @@ describe("withTransaction: explicit privileged mode", () => {
     );
 
     expect(configCalls(client).at(-1)?.params).toEqual([
-      "app.privileged",
-      "off",
+      "app.execution_mode",
+      "user",
     ]);
   });
 });
