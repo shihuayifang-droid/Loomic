@@ -59,6 +59,10 @@ import {
   createIdentityReadRepository,
   type IdentityReadRepository,
 } from "./db/identity-read-repository.js";
+import {
+  createProjectReadRepository,
+  type ProjectReadRepository,
+} from "./db/project-read-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -131,6 +135,7 @@ export type BuildAppOptions = {
   tierGuard?: TierGuard;
   uploadService?: UploadService;
   mockEventDelayMs?: number;
+  projectReadRepository?: ProjectReadRepository;
   projectService?: ProjectService;
   settingsService?: SettingsService;
   teamAdminService?: TeamAdminService;
@@ -187,6 +192,14 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createIdentityReadRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 20B: the project read repository is built the same way
+  // — lazily and against the same transaction pool — so `buildApp` still never
+  // connects and never requires `DATABASE_URL`.
+  const projectReadRepository =
+    options.projectReadRepository ??
+    createProjectReadRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   const teamMembershipService =
     options.teamMembershipService ??
     createTeamMembershipService({ identityReadRepository });
@@ -202,7 +215,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     });
   const projectService =
     options.projectService ??
-    createProjectService({ createUserClient, viewerService, getAdminClient });
+    createProjectService({
+      createUserClient,
+      viewerService,
+      getAdminClient,
+      projectReadRepository,
+    });
   const brandKitService =
     options.brandKitService ?? createBrandKitService({ createUserClient });
   const canvasService =

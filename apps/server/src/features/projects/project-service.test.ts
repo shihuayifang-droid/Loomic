@@ -5,6 +5,7 @@ import {
   createProjectService,
   ProjectServiceError,
 } from "./project-service.js";
+import type { ProjectReadRepository } from "../../db/project-read-repository.js";
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import type {
   AuthenticatedUser,
@@ -94,6 +95,71 @@ function makeClientStub(config: { projects?: unknown[]; canvases?: unknown[] }) 
   return { client: client as unknown as UserSupabaseClient, queries, rpcs };
 }
 
+/** A client whose only useful surface is the X-52 storage signature. */
+function makeSigningClient() {
+  const signed: Array<{ bucket: string; path: string }> = [];
+
+  const client = {
+    storage: {
+      from(bucket: string) {
+        return {
+          createSignedUrl: async (path: string) => {
+            signed.push({ bucket, path });
+            return {
+              data: {
+                signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+              },
+              error: null,
+            };
+          },
+        };
+      },
+    },
+  };
+
+  return { client: client as unknown as UserSupabaseClient, signed };
+}
+
+type RepositoryCall = { method: string; input: Record<string, unknown> };
+
+/**
+ * Workorder 20B: the three project reads are the PostgreSQL repository's. The
+ * fake records the calls so the service contract — which ids it asks for, which
+ * DTO it publishes, how it classifies null and failure — is what gets asserted.
+ */
+function makeRepositoryStub(
+  config: {
+    detail?: unknown;
+    detailError?: Error;
+    projects?: unknown[];
+    projectsError?: Error;
+    canvases?: unknown[];
+    canvasesError?: Error;
+  } = {},
+) {
+  const calls: RepositoryCall[] = [];
+
+  const repository = {
+    async findReadableProject(input: Record<string, unknown>) {
+      calls.push({ method: "findReadableProject", input });
+      if (config.detailError) throw config.detailError;
+      return config.detail ?? null;
+    },
+    async listOwnProjects(input: Record<string, unknown>) {
+      calls.push({ method: "listOwnProjects", input });
+      if (config.projectsError) throw config.projectsError;
+      return config.projects ?? [];
+    },
+    async listReadablePrimaryCanvases(input: Record<string, unknown>) {
+      calls.push({ method: "listReadablePrimaryCanvases", input });
+      if (config.canvasesError) throw config.canvasesError;
+      return config.canvases ?? [];
+    },
+  };
+
+  return { repository: repository as unknown as ProjectReadRepository, calls };
+}
+
 function makeViewerStub(teamWorkspace: {
   id: string;
   name: string;
@@ -136,6 +202,35 @@ const TEAM_WORKSPACE = {
   type: "team" as const,
 };
 
+const PROJECT_ROW = {
+  id: "project-1",
+  name: "Mine",
+  slug: "mine-abc123",
+  description: null,
+  created_at: "2026-09-29T00:00:00.000Z",
+  updated_at: "2026-09-29T00:00:00.000Z",
+  workspace_id: TEAM_ID,
+  thumbnail_path: null,
+};
+
+const CANVAS_ROW = {
+  id: "canvas-1",
+  name: "Main Canvas",
+  is_primary: true,
+  project_id: "project-1",
+};
+
+const DETAIL_ROW = {
+  id: "project-1",
+  name: "Mine",
+  slug: "mine-abc123",
+  description: null,
+  workspace_id: TEAM_ID,
+  brand_kit_id: null,
+  created_at: "2026-09-29T00:00:00.000Z",
+  updated_at: "2026-09-29T00:00:00.000Z",
+};
+
 describe("createProjectService with the team workspace", () => {
   it("case 1: createProject sends the team workspace id to the RPC", async () => {
     const { client, rpcs } = makeClientStub({});
@@ -160,38 +255,47 @@ describe("createProjectService with the team workspace", () => {
     });
   });
 
-  it("case 2: listProjects filters by team workspace AND created_by", async () => {
+  it("case 2: listProjects asks the repository for this workspace and this author, not for a table", async () => {
+    // 20B: the team-workspace AND created_by filters did not disappear, they
+    // moved into the repository SQL (asserted in project-read-repository.test.ts
+    // cases 8 and 11). What this case nails down at the service boundary is that
+    // the read is scoped to the viewer's team workspace and the caller, and that
+    // the PostgREST path is no longer used at all.
     const { client, queries } = makeClientStub({
-      projects: [
-        {
-          id: "project-1",
-          name: "Mine",
-          slug: "mine-abc123",
-          description: null,
-          created_at: "2026-09-29T00:00:00.000Z",
-          updated_at: "2026-09-29T00:00:00.000Z",
-          workspace_id: TEAM_ID,
-          thumbnail_path: null,
-        },
-      ],
-      canvases: [{ id: "canvas-1", name: "Main Canvas", is_primary: true, project_id: "project-1" }],
+      projects: [PROJECT_ROW],
+      canvases: [CANVAS_ROW],
+    });
+    const { repository, calls } = makeRepositoryStub({
+      projects: [PROJECT_ROW],
+      canvases: [CANVAS_ROW],
     });
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
+      projectReadRepository: repository,
     });
 
     const projects = await service.listProjects(USER);
 
-    const projectQuery = queries.find((query) => query.table === "projects");
-    expect(projectQuery?.eqs).toEqual([
-      ["workspace_id", TEAM_ID],
-      ["created_by", USER_ID],
+    expect(calls).toEqual([
+      {
+        method: "listOwnProjects",
+        input: { actorId: USER_ID, workspaceId: TEAM_ID },
+      },
+      {
+        method: "listReadablePrimaryCanvases",
+        input: {
+          actorId: USER_ID,
+          workspaceId: TEAM_ID,
+          projectIds: ["project-1"],
+        },
+      },
     ]);
-    expect(projectQuery?.is).toEqual([["archived_at", null]]);
+    expect(queries).toEqual([]);
     expect(projects.length).toBe(1);
     expect(projects[0]?.workspace.id).toBe(TEAM_ID);
+    expect(projects[0]?.primaryCanvas.id).toBe("canvas-1");
   });
 
   it("case 3: no team workspace means 403 and no RPC call", async () => {
@@ -211,6 +315,232 @@ describe("createProjectService with the team workspace", () => {
     expect((error as ProjectServiceError).statusCode).toBe(403);
     expect((error as ProjectServiceError).code).toBe("not_team_member");
     expect(rpcs.length).toBe(0);
+  });
+});
+
+// ADR-0001 step 2b: `getProject` is the repository's read, and the service keeps
+// the existing 404 / 500 contract around it — including the anti-enumeration
+// rule that "missing", "archived" and "forbidden" are one answer.
+describe("getProject delegating to the project read repository", () => {
+  function makeService(
+    config: Parameters<typeof makeRepositoryStub>[0] = {},
+    options: { withRepository?: boolean } = { withRepository: true },
+  ) {
+    const { client } = makeClientStub({});
+    const stub = makeRepositoryStub(config);
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+      ...(options.withRepository
+        ? { projectReadRepository: stub.repository }
+        : {}),
+    });
+
+    return { service, calls: stub.calls };
+  }
+
+  it("case 6: the repository's detail row is the DTO, with the caller as actor", async () => {
+    const { service, calls } = makeService({ detail: DETAIL_ROW });
+
+    const project = await service.getProject(USER, "project-1");
+
+    expect(calls).toEqual([
+      {
+        method: "findReadableProject",
+        input: { actorId: USER_ID, projectId: "project-1" },
+      },
+    ]);
+    expect(project).toEqual(DETAIL_ROW);
+    expect(project.brand_kit_id).toBeNull();
+  });
+
+  it("case 7: null stays the existing 404 project_not_found", async () => {
+    const { service } = makeService({ detail: null });
+
+    const error = await service
+      .getProject(USER, "project-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(404);
+    expect(error?.code).toBe("project_not_found");
+    expect(error?.message).toBe("Project not found.");
+  });
+
+  it("case 8: a repository failure stays the existing 500 project_query_failed", async () => {
+    const { service } = makeService({
+      detailError: new Error("project read failed (findReadableProject)"),
+    });
+
+    const error = await service
+      .getProject(USER, "project-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_query_failed");
+    expect(error?.message).toBe("Failed to load project.");
+    // The repository's own text (which names the statement's operation) is not
+    // what the client is shown.
+    expect(error?.message).not.toContain("findReadableProject");
+  });
+
+  it("case 9: a service built without the repository answers 500 instead of falling back", async () => {
+    const { service, calls } = makeService({}, { withRepository: false });
+
+    const error = await service
+      .getProject(USER, "project-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_query_failed");
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("listProjects delegating to the project read repository", () => {
+  it("case 10: thumbnails are signed through the user client, and only the own ids reach the canvas read", async () => {
+    const withThumbnail = {
+      ...PROJECT_ROW,
+      thumbnail_path: `${TEAM_ID}/project-1/thumbnail.webp`,
+    };
+    const { client, signed } = makeSigningClient();
+    const { repository, calls } = makeRepositoryStub({
+      projects: [withThumbnail],
+      canvases: [CANVAS_ROW],
+    });
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+      projectReadRepository: repository,
+    });
+
+    const projects = await service.listProjects(USER);
+
+    expect(signed).toEqual([
+      {
+        bucket: "project-assets",
+        path: `${TEAM_ID}/project-1/thumbnail.webp`,
+      },
+    ]);
+    expect(projects[0]?.thumbnailUrl).toContain("token=sig");
+    expect(calls[1]).toEqual({
+      method: "listReadablePrimaryCanvases",
+      input: {
+        actorId: USER_ID,
+        workspaceId: TEAM_ID,
+        projectIds: ["project-1"],
+      },
+    });
+  });
+
+  it("case 11: no own projects is an empty list, and no canvas read is issued", async () => {
+    const { repository, calls } = makeRepositoryStub({ projects: [] });
+    const { client, signed } = makeSigningClient();
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+      projectReadRepository: repository,
+    });
+
+    await expect(service.listProjects(USER)).resolves.toEqual([]);
+    expect(calls.map((call) => call.method)).toEqual(["listOwnProjects"]);
+    expect(signed).toEqual([]);
+  });
+
+  it("case 12: a project without a primary canvas is still the existing 500", async () => {
+    const { repository } = makeRepositoryStub({
+      projects: [PROJECT_ROW],
+      canvases: [],
+    });
+    const { client } = makeClientStub({});
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+      projectReadRepository: repository,
+    });
+
+    const error = await service
+      .listProjects(USER)
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_query_failed");
+    expect(error?.message).toBe("Unable to load projects.");
+  });
+
+  it("case 13: a repository failure is the existing 500, never a partial list", async () => {
+    const { repository } = makeRepositoryStub({
+      projectsError: new Error("project read failed (listOwnProjects)"),
+    });
+    const { client } = makeClientStub({});
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+      projectReadRepository: repository,
+    });
+
+    const error = await service
+      .listProjects(USER)
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_query_failed");
+    expect(error?.message).toBe("Unable to load projects.");
+  });
+
+  it("case 14: a failing canvas read is the existing 500 and signs nothing", async () => {
+    const { repository } = makeRepositoryStub({
+      projects: [PROJECT_ROW],
+      canvasesError: new Error("project read failed (listReadablePrimaryCanvases)"),
+    });
+    const { client, signed } = makeSigningClient();
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+      projectReadRepository: repository,
+    });
+
+    const error = await service
+      .listProjects(USER)
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_query_failed");
+    expect(signed).toEqual([]);
+  });
+
+  it("case 15: a service built without the repository answers 500 and reads nothing", async () => {
+    const { client, queries } = makeClientStub({});
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+    });
+
+    const error = await service
+      .listProjects(USER)
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_query_failed");
+    expect(queries).toEqual([]);
   });
 });
 

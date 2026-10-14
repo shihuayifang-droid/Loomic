@@ -8,6 +8,11 @@ import {
   BootstrapError,
   type ViewerService,
 } from "../bootstrap/ensure-user-foundation.js";
+import type {
+  PrimaryCanvasRow,
+  ProjectListRow,
+  ProjectReadRepository,
+} from "../../db/project-read-repository.js";
 import { withTransportRetry } from "../../supabase/transport-retry.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import {
@@ -100,6 +105,13 @@ export function createProjectService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   viewerService: ViewerService;
   getAdminClient: () => AdminSupabaseClient;
+  /**
+   * Workorder 20B: the project READ paths moved to the PostgreSQL repository.
+   * Optional only because unrelated call sites build this service for the write
+   * paths alone; a read without one is a wiring bug and answers the existing
+   * `project_query_failed` 500 instead of falling back to PostgREST.
+   */
+  projectReadRepository?: ProjectReadRepository;
 }): ProjectService {
   return {
     async archiveProject(user, projectId) {
@@ -142,17 +154,28 @@ export function createProjectService(options: {
       }
     },
     async getProject(user, projectId) {
-      const client = options.createUserClient(user.accessToken);
-      const { data, error } = await client
-        .from("projects")
-        .select("id, name, slug, description, workspace_id, brand_kit_id, created_at, updated_at")
-        .eq("id", projectId)
-        .is("archived_at", null)
-        .maybeSingle();
+      // ADR-0001: the read is the repository's, and the repository's SQL is the
+      // authorization — a plain "select by id" would hand an admin's row to
+      // anyone who guessed an id. Missing, archived and forbidden are one answer
+      // (null → the existing 404), so the route cannot be used to enumerate ids.
+      const repository = options.projectReadRepository;
 
-      if (error) throw new ProjectServiceError("project_query_failed", "Failed to load project.", 500);
-      if (!data) throw new ProjectServiceError("project_not_found", "Project not found.", 404);
-      return data;
+      if (!repository) {
+        throw new ProjectServiceError("project_query_failed", "Failed to load project.", 500);
+      }
+
+      let project;
+      try {
+        project = await repository.findReadableProject({
+          actorId: user.id,
+          projectId,
+        });
+      } catch {
+        throw new ProjectServiceError("project_query_failed", "Failed to load project.", 500);
+      }
+
+      if (!project) throw new ProjectServiceError("project_not_found", "Project not found.", 404);
+      return project;
     },
     async createProject(user, input) {
       const viewer = await ensureFoundation(
@@ -223,20 +246,9 @@ export function createProjectService(options: {
       );
       const client = options.createUserClient(user.accessToken);
       const workspace = requireTeamWorkspace(viewer, "project_query_failed");
-      // PJ-11: the project page lists only the caller's own projects. RLS lets
-      // admins read every project in the workspace, so without this filter an
-      // admin's list would be mixed with other people's projects.
-      const { data: projects, error: projectQueryError } = await client
-        .from("projects")
-        .select(
-          "id, name, slug, description, created_at, updated_at, workspace_id, thumbnail_path",
-        )
-        .eq("workspace_id", workspace.id)
-        .eq("created_by", user.id)
-        .is("archived_at", null)
-        .order("updated_at", { ascending: false });
+      const repository = options.projectReadRepository;
 
-      if (projectQueryError) {
+      if (!repository) {
         throw new ProjectServiceError(
           "project_query_failed",
           PROJECT_QUERY_FAILED_MESSAGE,
@@ -244,20 +256,31 @@ export function createProjectService(options: {
         );
       }
 
-      if (!projects.length) {
-        return [];
-      }
+      // PJ-11: the project page lists only the caller's own projects, and that
+      // rule now lives in the repository SQL (workspace + membership +
+      // created_by + not archived). An admin's list therefore cannot be widened
+      // here even by accident.
+      let projects: ProjectListRow[];
+      let canvases: PrimaryCanvasRow[];
 
-      const { data: canvases, error: canvasQueryError } = await client
-        .from("canvases")
-        .select("id, name, is_primary, project_id")
-        .in(
-          "project_id",
-          projects.map((project) => project.id),
-        )
-        .eq("is_primary", true);
+      try {
+        projects = await repository.listOwnProjects({
+          actorId: user.id,
+          workspaceId: workspace.id,
+        });
 
-      if (canvasQueryError) {
+        if (!projects.length) {
+          return [];
+        }
+
+        // The ids come from the list above, but the canvas read re-applies the
+        // same ACL rather than trusting them.
+        canvases = await repository.listReadablePrimaryCanvases({
+          actorId: user.id,
+          workspaceId: workspace.id,
+          projectIds: projects.map((project) => project.id),
+        });
+      } catch {
         throw new ProjectServiceError(
           "project_query_failed",
           PROJECT_QUERY_FAILED_MESSAGE,
@@ -269,7 +292,8 @@ export function createProjectService(options: {
         canvases.map((canvas) => [canvas.project_id, canvas]),
       );
 
-      // Signed thumbnail URLs for projects that have them (X-52)
+      // Signed thumbnail URLs for projects that have them (X-52). Signing stays
+      // on the user client: the storage signature is not a table read.
       const thumbnailUrls = await generateThumbnailUrls(
         client,
         projects.filter((p) => p.thumbnail_path),
