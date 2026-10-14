@@ -1,5 +1,6 @@
 import type { TeamMember } from "@loomic/shared";
 
+import type { TeamAdminReadRepository } from "../../db/team-admin-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { TeamMembershipService } from "./team-membership.js";
 
@@ -18,7 +19,7 @@ export type ForeignReadVia =
   | "asset";
 
 export type TeamAdminService = {
-  listMembers(): Promise<TeamMember[]>;
+  listMembers(actorId: string): Promise<TeamMember[]>;
   addMember(
     actorId: string,
     input: { email: string; role: "member" | "admin" },
@@ -65,6 +66,14 @@ export class TeamAdminError extends Error {
 type RpcError = { message?: string } | null;
 
 /**
+ * The one answer a failed roster read gives. Fixed text on purpose: the
+ * repository's own error carries driver detail (and, one level down, the
+ * statement), and none of it may reach an HTTP body or a log line through this
+ * service.
+ */
+const TEAM_MEMBER_LIST_FAILED_MESSAGE = "Unable to load team members.";
+
+/**
  * Every mutation runs inside a single database function that also writes the
  * audit row, so this service never writes the audit table itself. The mapping
  * below turns the database's exception text into an HTTP answer; anything not
@@ -97,73 +106,42 @@ function mapDatabaseError(error: RpcError): TeamAdminError {
 export function createTeamAdminService(options: {
   getAdminClient: () => AdminSupabaseClient;
   teamMembership: TeamMembershipService;
+  /**
+   * ADR-0001 / workorder 20F-A: the member list is the PostgreSQL repository's
+   * read. Optional only because unrelated call sites build this service without
+   * one; calling without it is a wiring bug and answers exactly what a failed
+   * read answers (503 `application_error`) instead of falling back to PostgREST.
+   *
+   * The repository's SQL is the authorization for this read: it requires the
+   * actor to hold an admin/owner membership row in the team workspace, so the
+   * HTTP gate and the route are not the only thing standing between a plain
+   * member and the roster.
+   */
+  teamAdminReadRepository?: TeamAdminReadRepository;
 }): TeamAdminService {
-  async function teamWorkspaceId(): Promise<string | null> {
-    const admin = options.getAdminClient();
-    const { data, error } = await admin
-      .from("workspaces")
-      .select("id")
-      .eq("type", "team")
-      .order("created_at", { ascending: true })
-      .limit(1)
-      .maybeSingle();
-
-    if (error) {
-      throw new TeamAdminError("application_error", error.message, 503);
-    }
-
-    return data?.id ?? null;
-  }
-
   return {
-    async listMembers() {
-      const admin = options.getAdminClient();
-      const workspaceId = await teamWorkspaceId();
+    async listMembers(actorId) {
+      const repository = options.teamAdminReadRepository;
 
-      if (!workspaceId) {
-        return [];
+      if (!repository) {
+        throw new TeamAdminError(
+          "application_error",
+          TEAM_MEMBER_LIST_FAILED_MESSAGE,
+          503,
+        );
       }
 
-      const { data: members, error: memberError } = await admin
-        .from("workspace_members")
-        .select("user_id, role, created_at")
-        .eq("workspace_id", workspaceId)
-        .order("created_at", { ascending: true });
-
-      if (memberError) {
-        throw new TeamAdminError("application_error", memberError.message, 503);
+      try {
+        // The actor is passed through to the repository and becomes the userId
+        // of the privileged transaction, so the audit trail keeps who asked.
+        return await repository.listTeamMembers({ actorId });
+      } catch {
+        throw new TeamAdminError(
+          "application_error",
+          TEAM_MEMBER_LIST_FAILED_MESSAGE,
+          503,
+        );
       }
-
-      const userIds = (members ?? []).map((member) => member.user_id);
-
-      if (userIds.length === 0) {
-        return [];
-      }
-
-      const { data: profiles, error: profileError } = await admin
-        .from("profiles")
-        .select("id, email, display_name")
-        .in("id", userIds);
-
-      if (profileError) {
-        throw new TeamAdminError("application_error", profileError.message, 503);
-      }
-
-      const profileById = new Map(
-        (profiles ?? []).map((profile) => [profile.id, profile]),
-      );
-
-      return (members ?? []).map((member) => {
-        const profile = profileById.get(member.user_id);
-
-        return {
-          userId: member.user_id,
-          email: profile?.email ?? "",
-          displayName: profile?.display_name ?? null,
-          role: member.role,
-          joinedAt: member.created_at,
-        } satisfies TeamMember;
-      });
     },
 
     async addMember(actorId, input) {

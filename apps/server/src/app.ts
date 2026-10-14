@@ -75,6 +75,10 @@ import {
   createAssetReadRepository,
   type AssetReadRepository,
 } from "./db/asset-read-repository.js";
+import {
+  createTeamAdminReadRepository,
+  type TeamAdminReadRepository,
+} from "./db/team-admin-read-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -153,6 +157,7 @@ export type BuildAppOptions = {
   projectReadRepository?: ProjectReadRepository;
   projectService?: ProjectService;
   settingsService?: SettingsService;
+  teamAdminReadRepository?: TeamAdminReadRepository;
   teamAdminService?: TeamAdminService;
   teamMembershipService?: TeamMembershipService;
   threadService?: ThreadService;
@@ -243,12 +248,25 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createAssetReadRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 20F-A: the member list behind
+  // `GET /api/admin/team/members` is the PostgreSQL repository's read, built
+  // lazily against the same pool as the other repositories. The service is
+  // handed the repository here, so production never runs the read without one.
+  const teamAdminReadRepository =
+    options.teamAdminReadRepository ??
+    createTeamAdminReadRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   const teamMembershipService =
     options.teamMembershipService ??
     createTeamMembershipService({ identityReadRepository });
   const teamAdminService =
     options.teamAdminService ??
-    createTeamAdminService({ getAdminClient, teamMembership: teamMembershipService });
+    createTeamAdminService({
+      getAdminClient,
+      teamMembership: teamMembershipService,
+      teamAdminReadRepository,
+    });
   const viewerService =
     options.viewerService ??
     createViewerService({

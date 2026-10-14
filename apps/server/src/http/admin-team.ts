@@ -101,7 +101,7 @@ export async function registerAdminTeamRoutes(
     if (!user) return reply;
 
     try {
-      const members = await options.teamAdminService.listMembers();
+      const members = await options.teamAdminService.listMembers(user.id);
       return reply
         .code(200)
         .send(teamMemberListResponseSchema.parse({ members }));

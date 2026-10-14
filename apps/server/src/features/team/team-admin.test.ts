@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import type { TeamMember } from "@loomic/shared";
+
+import type { TeamAdminReadRepository } from "../../db/team-admin-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { TeamMembershipService } from "./team-membership.js";
 import {
@@ -18,13 +21,20 @@ type StubOptions = {
   profile?: { id: string; email?: string } | null;
   rpcError?: { message: string } | null;
   rpcData?: unknown;
+  /** What the roster repository answers; throws when it is an Error. */
+  members?: TeamMember[];
+  memberError?: Error;
+  /** Build the service without the roster repository (wiring-bug path). */
+  withoutReadRepository?: boolean;
 };
 
 function makeAdminStub(options: StubOptions = {}) {
   const rpcs: RpcCall[] = [];
+  const tables: string[] = [];
 
   const client = {
     from(table: string) {
+      tables.push(table);
       const builder = {
         select: () => builder,
         eq: () => builder,
@@ -55,12 +65,13 @@ function makeAdminStub(options: StubOptions = {}) {
     },
   };
 
-  return { client: client as unknown as AdminSupabaseClient, rpcs };
+  return { client: client as unknown as AdminSupabaseClient, rpcs, tables };
 }
 
 function makeHarness(options: StubOptions = {}) {
-  const { client, rpcs } = makeAdminStub(options);
+  const { client, rpcs, tables } = makeAdminStub(options);
   const invalidated: string[] = [];
+  const actorIds: string[] = [];
   const teamMembership: TeamMembershipService = {
     async get() {
       return null;
@@ -70,12 +81,23 @@ function makeHarness(options: StubOptions = {}) {
     },
   };
 
+  const readRepository: TeamAdminReadRepository = {
+    async listTeamMembers({ actorId }) {
+      actorIds.push(actorId);
+      if (options.memberError) throw options.memberError;
+      return options.members ?? [];
+    },
+  };
+
   const service: TeamAdminService = createTeamAdminService({
     getAdminClient: () => client,
     teamMembership,
+    ...(options.withoutReadRepository
+      ? {}
+      : { teamAdminReadRepository: readRepository }),
   });
 
-  return { service, rpcs, invalidated };
+  return { service, rpcs, tables, invalidated, actorIds };
 }
 
 async function capture(run: () => Promise<unknown>): Promise<TeamAdminError> {
@@ -250,5 +272,92 @@ describe("createTeamAdminService", () => {
     await expect(
       service.recordForeignRead(ACTOR_ID, "project", { projectId: "p-1" }),
     ).rejects.toThrow(/connection terminated unexpectedly/);
+  });
+
+  it("case 8: listMembers hands the actor to the repository and returns its rows unchanged", async () => {
+    const members: TeamMember[] = [
+      {
+        userId: TARGET_ID,
+        email: "",
+        displayName: null,
+        role: "member",
+        joinedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        userId: ACTOR_ID,
+        email: "admin@hahart.test",
+        displayName: "Admin",
+        role: "owner",
+        joinedAt: "2026-01-02T00:00:00.000Z",
+      },
+    ];
+    const { service, actorIds } = makeHarness({ members });
+
+    const result = await service.listMembers(ACTOR_ID);
+
+    expect(actorIds).toEqual([ACTOR_ID]);
+    // Order and projection are the repository's; the service adds nothing and
+    // fills nothing in — a member without a profile stays `email: ""`.
+    expect(result).toEqual(members);
+  });
+
+  it("case 9: listMembers reads no PostgREST table, calls no RPC and invalidates no cache", async () => {
+    const { service, tables, rpcs, invalidated, actorIds } = makeHarness({
+      members: [],
+    });
+
+    await service.listMembers(ACTOR_ID);
+
+    expect(tables).toEqual([]);
+    expect(rpcs).toEqual([]);
+    expect(invalidated).toEqual([]);
+    expect(actorIds).toEqual([ACTOR_ID]);
+  });
+
+  it("case 10: a repository failure is a fixed 503 that leaks no driver detail", async () => {
+    const { service } = makeHarness({
+      memberError: new Error(
+        "connect ECONNREFUSED 10.210.134.37:5432 for postgres://user:pw@host/db",
+      ),
+    });
+
+    const error = await capture(() => service.listMembers(ACTOR_ID));
+
+    expect(error.statusCode).toBe(503);
+    expect(error.code).toBe("application_error");
+    expect(error.message).toBe("Unable to load team members.");
+    expect(error.message).not.toContain("ECONNREFUSED");
+    expect(error.message).not.toContain("postgres://");
+  });
+
+  it("case 11: without a repository the read is a 503 — never a PostgREST fallback", async () => {
+    const { service, tables, rpcs } = makeHarness({
+      withoutReadRepository: true,
+      profile: { id: TARGET_ID },
+    });
+
+    const error = await capture(() => service.listMembers(ACTOR_ID));
+
+    expect(error.statusCode).toBe(503);
+    expect(error.code).toBe("application_error");
+    expect(error.message).toBe("Unable to load team members.");
+    expect(tables).toEqual([]);
+    expect(rpcs).toEqual([]);
+  });
+
+  it("case 12: an empty roster is an empty list, not an error", async () => {
+    const { service, invalidated } = makeHarness({ members: [] });
+
+    await expect(service.listMembers(ACTOR_ID)).resolves.toEqual([]);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("case 13: each call carries the actor it was given", async () => {
+    const { service, actorIds } = makeHarness({ members: [] });
+
+    await service.listMembers(ACTOR_ID);
+    await service.listMembers(TARGET_ID);
+
+    expect(actorIds).toEqual([ACTOR_ID, TARGET_ID]);
   });
 });

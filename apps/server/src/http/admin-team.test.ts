@@ -1,4 +1,5 @@
 import { teamMemberListResponseSchema } from "@loomic/shared";
+import type { TeamMember } from "@loomic/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 
@@ -42,6 +43,9 @@ const IDS: Record<string, string> = {
 let teamAdminCalls: string[] = [];
 let adminFailure: TeamAdminError | null = null;
 let addedResult = true;
+/** The actor each `listMembers` call received; the route must pass `user.id`. */
+let listActorIds: string[] = [];
+let listResult: TeamMember[] = [];
 
 const MEMBER_ROW = {
   userId: ADMIN_ID,
@@ -49,6 +53,15 @@ const MEMBER_ROW = {
   displayName: "Admin",
   role: "admin" as const,
   joinedAt: new Date().toISOString(),
+};
+
+/** A member with neither profile nor display name: the projection the SQL allows. */
+const PROFILELESS_ROW = {
+  userId: TARGET_ID,
+  email: "",
+  displayName: null,
+  role: "member" as const,
+  joinedAt: "2026-01-01T00:00:00.000Z",
 };
 
 const auth: RequestAuthenticator = {
@@ -86,10 +99,11 @@ const teamMembership: TeamMembershipService = {
 };
 
 const teamAdminService: TeamAdminService = {
-  async listMembers() {
+  async listMembers(actorId) {
     teamAdminCalls.push("listMembers");
+    listActorIds.push(actorId);
     if (adminFailure) throw adminFailure;
-    return [MEMBER_ROW];
+    return listResult;
   },
   async addMember() {
     teamAdminCalls.push("addMember");
@@ -173,6 +187,8 @@ beforeEach(() => {
   teamAdminCalls = [];
   adminFailure = null;
   addedResult = true;
+  listActorIds = [];
+  listResult = [MEMBER_ROW];
   app = buildApp({
     auth,
     env: {},
@@ -344,5 +360,93 @@ describe("admin team member routes", () => {
     });
 
     expect(response.statusCode).toBe(200);
+  });
+
+  it("case 11: the route passes the authenticated user id to the service", async () => {
+    const asAdmin = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members",
+      headers: bearer("admin-token"),
+    });
+    expect(asAdmin.statusCode).toBe(200);
+    expect(listActorIds).toEqual([ADMIN_ID]);
+
+    const asOwner = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members",
+      headers: bearer("owner-token"),
+    });
+    expect(asOwner.statusCode).toBe(200);
+    expect(listActorIds).toEqual([ADMIN_ID, OWNER_ID]);
+  });
+
+  it("case 12: GET touches only listMembers — no member RPC and no foreign-read audit", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members",
+      headers: bearer("admin-token"),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(teamAdminCalls).toEqual(["listMembers"]);
+  });
+
+  it("case 13: an empty roster is a 200 with an empty members array", async () => {
+    listResult = [];
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members",
+      headers: bearer("admin-token"),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ members: [] });
+  });
+
+  it("case 14: a member without a profile is published as email '' / displayName null", async () => {
+    listResult = [MEMBER_ROW, PROFILELESS_ROW];
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members",
+      headers: bearer("admin-token"),
+    });
+
+    expect(response.statusCode).toBe(200);
+    const parsed = teamMemberListResponseSchema.safeParse(response.json());
+    expect(parsed.success).toBe(true);
+    expect(response.json().members).toEqual([MEMBER_ROW, PROFILELESS_ROW]);
+  });
+
+  it("case 15: a failed roster read is a 503 with no members in the body", async () => {
+    adminFailure = new TeamAdminError(
+      "application_error",
+      "Unable to load team members.",
+      503,
+    );
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members",
+      headers: bearer("admin-token"),
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error.code).toBe("application_error");
+    expect(response.json().error.message).toBe("Unable to load team members.");
+    expect(response.json()).not.toHaveProperty("members");
+  });
+
+  it("case 16: a plain member is refused before the service is reached", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members",
+      headers: bearer("member-token"),
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(teamAdminCalls).toEqual([]);
+    expect(listActorIds).toEqual([]);
   });
 });
