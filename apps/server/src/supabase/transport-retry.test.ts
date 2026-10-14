@@ -6,8 +6,9 @@
 //      turned a successful agent run into "请求处理失败，请重试")
 //   3. retrying forever
 //
-// The predicate's own table of real error shapes lives in `_retry-predicate.mjs`,
-// which imports the shipped function; here we pin the LOOP's behaviour.
+// `_retry-predicate.mjs` carries the table copied out of the server log; here we
+// pin the LOOP's behaviour, plus the pg/Node classification the migrated mutation
+// lookups now depend on (工单20E fixup).
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -94,5 +95,107 @@ describe("throwIfError", () => {
   it("passes data through untouched on success", () => {
     const data = { workspace_id: "w1" };
     expect(throwIfError({ data, error: null })).toBe(data);
+  });
+});
+
+// 工单20E fixup: the mutation lookups moved off PostgREST onto the pg repository,
+// so the predicate is now asked about error shapes supabase-js never produced.
+// The two tables below are that contract, in both directions: the driver's real
+// transport shapes must retry, and everything the database actually answered with
+// must not — including when its message mentions a connection.
+describe("isTransportFailure pg/Node classification", () => {
+  const NODE_NETWORK_CODES = [
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "EPIPE",
+    "ECONNREFUSED",
+    "ENETUNREACH",
+    "EHOSTUNREACH",
+    "EAI_AGAIN",
+  ];
+
+  const RETRYABLE: Array<[string, unknown]> = [
+    // node-postgres' own disconnect: no code at all.
+    [
+      "pg disconnect, code undefined",
+      new Error("Connection terminated unexpectedly"),
+    ],
+    [
+      "pg disconnect, code empty string (the supabase-js shape)",
+      { code: "", message: "Connection terminated unexpectedly" },
+    ],
+    ...NODE_NETWORK_CODES.map(
+      (code): [string, unknown] => [
+        `Node socket error ${code}`,
+        Object.assign(new Error(`read ${code} 198.18.0.20:5432`), { code }),
+      ],
+    ),
+    // The pre-existing Supabase/proxy shapes must keep working: the read paths
+    // still run through PostgREST.
+    ["proxy blip, empty code", { code: "", message: "TypeError: fetch failed" }],
+  ];
+
+  const FAIL_FAST: Array<[string, unknown]> = [
+    [
+      "22P02 invalid_text_representation",
+      { code: "22P02", message: "invalid input syntax for type uuid" },
+    ],
+    [
+      "23505 unique_violation",
+      { code: "23505", message: "duplicate key value violates unique constraint" },
+    ],
+    [
+      "42501 insufficient_privilege",
+      { code: "42501", message: "new row violates row-level security policy" },
+    ],
+    [
+      "57014 query_canceled",
+      { code: "57014", message: "canceling statement due to statement timeout" },
+    ],
+    // 57P01's real text contains "connection": a predicate that looked at the
+    // message before the code would replay a failure Postgres already answered.
+    [
+      "57P01 admin_shutdown (message says connection)",
+      {
+        code: "57P01",
+        message: "terminating connection due to administrator command",
+      },
+    ],
+    // 工单20E: the 08 class stays fail-fast too — do not widen to all 08xxx.
+    [
+      "08006 connection_failure is still a SQLSTATE",
+      { code: "08006", message: "connection failure" },
+    ],
+    [
+      "unknown PostgREST code",
+      { code: "PGRST116", message: "JSON object requested, multiple rows returned" },
+    ],
+    // Unknown code beats a message that the regex alone would match: the driver
+    // named a failure, so it has to be on the whitelist to be replayed.
+    [
+      "unknown code with a transport-looking message",
+      { code: "UNPROVEN", message: "fetch failed on the way back" },
+    ],
+    [
+      "no code, unrelated message",
+      { code: "", message: "invalid input syntax for type json" },
+    ],
+    ["plain business error", new Error("Project not found.")],
+    ["null", null],
+    ["undefined", undefined],
+    ["a bare string", "fetch failed"],
+    ["an empty object", {}],
+  ];
+
+  it("retries every real pg/Node transport shape", () => {
+    for (const [name, error] of RETRYABLE) {
+      expect(isTransportFailure(error), name).toBe(true);
+    }
+  });
+
+  it("fails fast on every SQLSTATE and every unknown code", () => {
+    for (const [name, error] of FAIL_FAST) {
+      expect(isTransportFailure(error), name).toBe(false);
+    }
   });
 });

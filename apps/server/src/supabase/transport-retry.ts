@@ -20,24 +20,66 @@
 // "chat imports from canvas" would be the wrong dependency.
 
 /**
+ * Node socket errors, as `pg` surfaces them through the pool. These are the only
+ * codes that mean "the request never reached Postgres"; every other code is an
+ * answer from something that did (a SQLSTATE) or one we have not proven.
+ */
+const NODE_NETWORK_ERROR_CODES = new Set([
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EPIPE",
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "EAI_AGAIN",
+]);
+
+/** Message text that only the transport layer produces. */
+const TRANSPORT_MESSAGE =
+  /fetch failed|ECONNRESET|ETIMEDOUT|EPIPE|socket disconnected|network|connection terminated unexpectedly/i;
+
+/**
  * True when the request never reached Postgres, so replaying the statement is
  * safe.
  *
- * Deliberately narrow. Anything carrying a pg code (a statement timeout, an RLS
- * denial, a constraint violation) is a real answer from the database and will fail
- * again identically — retrying those just multiplies the wait.
+ * Deliberately narrow. A SQLSTATE (a statement timeout, an RLS denial, a
+ * constraint violation) is a real answer from the database and will fail again
+ * identically — retrying those just multiplies the wait.
+ *
+ * 工单20E fixup: the mutation lookups now run through the `pg` repository instead
+ * of PostgREST, and that driver reports its transport failures differently:
+ *
+ *   - node-postgres' own disconnect carries NO code at all; its message is
+ *     `Connection terminated unexpectedly`.
+ *   - the socket errors underneath it carry a NODE code (ECONNRESET, ETIMEDOUT,
+ *     EPIPE, …) — truthy, but not a SQLSTATE.
+ *
+ * So "any code means the database answered" is wrong on the new path. A truthy
+ * code is retried only when it is one of the Node network codes above; everything
+ * else with a code — every SQLSTATE, every PostgREST code, every code we have not
+ * proven to be a socket failure — fails fast, even when its message happens to
+ * contain `connection` or `network`. That check runs BEFORE the message is
+ * consulted, which is also why it is a whitelist and not a SQLSTATE shape test:
+ * `EPIPE` is five characters long, exactly like a SQLSTATE.
  *
  * Note `!error.code` and not `error.code === undefined`: supabase-js was observed
  * setting `code` to an EMPTY STRING on transport failures. `_retry-predicate.mjs`
  * pins that case against error shapes copied out of the server log.
  */
 export function isTransportFailure(error: unknown): boolean {
-  const e = error as { code?: string; message?: string } | null | undefined;
-  if (!e) return false;
-  if (e.code) return false;
-  return /fetch failed|ECONNRESET|ETIMEDOUT|EPIPE|socket disconnected|network/i.test(
-    e.message ?? "",
-  );
+  if (!error || typeof error !== "object") return false;
+
+  const e = error as { code?: unknown; message?: unknown };
+  const code =
+    typeof e.code === "string"
+      ? e.code.trim()
+      : e.code === undefined || e.code === null
+        ? ""
+        : String(e.code);
+
+  if (code) return NODE_NETWORK_ERROR_CODES.has(code.toUpperCase());
+
+  return typeof e.message === "string" && TRANSPORT_MESSAGE.test(e.message);
 }
 
 export interface TransportRetryOptions {

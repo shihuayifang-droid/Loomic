@@ -791,13 +791,29 @@ describe("archiveProject delegating to the project read repository", () => {
 // its transport retry (3 attempts, 400ms/800ms) — but only for transport
 // failures, and the final answer is a fixed 503 that names nothing.
 describe("saveThumbnail lookup retry", () => {
-  const TRANSPORT_CAUSE = new Error("TypeError: fetch failed");
+  // 工单20E fixup: this lookup now runs through the pg repository, so the retry
+  // contract is pinned against the shapes that driver really produces — not the
+  // PostgREST/proxy `TypeError: fetch failed` this path used to see. A
+  // node-postgres disconnect has NO code (`Connection terminated unexpectedly`);
+  // the socket error underneath it carries a Node code.
+  const PG_DISCONNECT_CAUSE = new Error("Connection terminated unexpectedly");
+  const ECONNRESET_CAUSE = Object.assign(new Error("read ECONNRESET"), {
+    code: "ECONNRESET",
+  });
+  const ETIMEDOUT_CAUSE = Object.assign(
+    new Error("connect ETIMEDOUT 198.18.0.20:5432"),
+    { code: "ETIMEDOUT" },
+  );
   const PG_CAUSE = Object.assign(
     new Error("invalid input syntax for type uuid"),
     { code: "22P02" },
   );
 
-  function makeRetryHarness(options: { failures: number; cause?: unknown }) {
+  function makeRetryHarness(options: {
+    failures: number;
+    /** Cause for failure N (the last entry repeats if there are more failures). */
+    causes: readonly unknown[];
+  }) {
     const attempts: number[] = [];
     const inputs: Array<Record<string, unknown>> = [];
     const uploads: string[] = [];
@@ -814,7 +830,9 @@ describe("saveThumbnail lookup retry", () => {
         if (attempts.length <= options.failures) {
           throw new ProjectReadError(
             FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
-            options.cause ?? TRANSPORT_CAUSE,
+            options.causes[
+              Math.min(attempts.length - 1, options.causes.length - 1)
+            ],
           );
         }
 
@@ -870,8 +888,13 @@ describe("saveThumbnail lookup retry", () => {
     return { service, attempts, inputs, uploads, rpcs, updatePatches };
   }
 
+  // The two failures below are the two real pg transport shapes: the driver's own
+  // no-code disconnect first, then the socket error underneath it.
   it("case 20: two transport failures are replayed after 400ms and 800ms, and the third attempt succeeds", async () => {
-    const harness = makeRetryHarness({ failures: 2 });
+    const harness = makeRetryHarness({
+      failures: 2,
+      causes: [PG_DISCONNECT_CAUSE, ECONNRESET_CAUSE],
+    });
 
     vi.useFakeTimers();
     vi.setSystemTime(0);
@@ -921,7 +944,9 @@ describe("saveThumbnail lookup retry", () => {
   });
 
   it("case 21: a real database failure is not replayed and the fixed 503 leaks nothing", async () => {
-    const harness = makeRetryHarness({ failures: 3, cause: PG_CAUSE });
+    // 22P02 keeps failing: if the predicate ever treated a SQLSTATE as transport,
+    // this case would retry it three times instead of one.
+    const harness = makeRetryHarness({ failures: 3, causes: [PG_CAUSE] });
 
     const error = await harness.service
       .saveThumbnail(USER, "project-1", Buffer.from("thumb"), "image/png")
@@ -943,7 +968,12 @@ describe("saveThumbnail lookup retry", () => {
   });
 
   it("case 22: three transport failures stop after three attempts with the same fixed 503", async () => {
-    const harness = makeRetryHarness({ failures: 3 });
+    // Three consecutive real pg/Node transport failures — no Supabase fetch shape
+    // anywhere in this path any more.
+    const harness = makeRetryHarness({
+      failures: 3,
+      causes: [PG_DISCONNECT_CAUSE, ECONNRESET_CAUSE, ETIMEDOUT_CAUSE],
+    });
 
     vi.useFakeTimers();
     vi.setSystemTime(0);
