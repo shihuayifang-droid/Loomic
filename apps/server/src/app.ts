@@ -55,6 +55,11 @@ import {
   type UploadService,
 } from "./features/uploads/upload-service.js";
 import { type ServerEnv, loadServerEnv, resolveDefaultAgentModel } from "./config/env.js";
+import {
+  createIdentityReadRepository,
+  type IdentityReadRepository,
+} from "./db/identity-read-repository.js";
+import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
   createCreditService,
@@ -120,6 +125,7 @@ export type BuildAppOptions = {
   connectionManager?: ConnectionManager;
   creditService?: CreditService;
   env?: Partial<ServerEnv>;
+  identityReadRepository?: IdentityReadRepository;
   jobService?: JobService;
   paymentService?: PaymentService;
   tierGuard?: TierGuard;
@@ -169,15 +175,31 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     adminClient ??= createAdminSupabaseClient(env);
     return adminClient;
   };
+  // ADR-0001 / workorder 20: identity reads go through the pure `pg`
+  // repository. It is built — not called — here, and it resolves its pool
+  // lazily on the first read, so `buildApp` never connects and never fails
+  // because `DATABASE_URL` is absent.
+  const databaseEnv: NodeJS.ProcessEnv = env.databaseUrl
+    ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl }
+    : {};
+  const identityReadRepository =
+    options.identityReadRepository ??
+    createIdentityReadRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   const teamMembershipService =
     options.teamMembershipService ??
-    createTeamMembershipService({ getAdminClient });
+    createTeamMembershipService({ identityReadRepository });
   const teamAdminService =
     options.teamAdminService ??
     createTeamAdminService({ getAdminClient, teamMembership: teamMembershipService });
   const viewerService =
     options.viewerService ??
-    createViewerService({ getAdminClient, teamMembership: teamMembershipService });
+    createViewerService({
+      getAdminClient,
+      identityReadRepository,
+      teamMembership: teamMembershipService,
+    });
   const projectService =
     options.projectService ??
     createProjectService({ createUserClient, viewerService, getAdminClient });

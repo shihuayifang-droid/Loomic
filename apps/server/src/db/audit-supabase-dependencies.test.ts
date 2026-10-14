@@ -325,10 +325,10 @@ describe("audit-supabase-dependencies: real repository root", () => {
       expect(scopeStatus(run.stdout, label)).toBe("ok");
     }
 
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(163);
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(158);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(163);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(158);
   });
 });

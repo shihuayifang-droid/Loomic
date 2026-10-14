@@ -1,4 +1,4 @@
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type { IdentityReadRepository } from "../../db/identity-read-repository.js";
 
 export type TeamMembership = {
   workspace: { id: string; name: string; type: "team"; ownerUserId: string };
@@ -16,7 +16,7 @@ const DEFAULT_TTL_MS = 30_000;
 
 /**
  * Reads the single team workspace and the caller's membership row through the
- * admin client, and caches the answer per user.
+ * PostgreSQL identity repository, and caches the answer per user.
  *
  * Deliberately separate from `authenticate()` (which caches tokens for 5 min):
  * a member removed from the team must lose access within one TTL, and
@@ -24,11 +24,13 @@ const DEFAULT_TTL_MS = 30_000;
  * immediately.
  *
  * Query failures **throw**. Swallowing them into `null` would turn a transient
- * Supabase error into "you are not a member" — i.e. a 403 for the whole team
- * that looks exactly like a permissions problem.
+ * database error into "you are not a member" — i.e. a 403 for the whole team
+ * that looks exactly like a permissions problem. `RepositoryReadError` is
+ * therefore propagated untouched: the HTTP gate turns it into 503 and the
+ * websocket into 1011.
  */
 export function createTeamMembershipService(options: {
-  getAdminClient: () => AdminSupabaseClient;
+  identityReadRepository: IdentityReadRepository;
   ttlMs?: number;
   now?: () => number;
 }): TeamMembershipService {
@@ -51,49 +53,19 @@ export function createTeamMembershipService(options: {
         return cached.value;
       }
 
-      const admin = options.getAdminClient();
+      const record = await options.identityReadRepository.findTeamMembership(
+        userId,
+      );
 
-      const { data: workspace, error: workspaceError } = await admin
-        .from("workspaces")
-        .select("id, name, owner_user_id")
-        .eq("type", "team")
-        .order("created_at", { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      if (workspaceError) {
-        throw new Error(
-          `team workspace lookup failed: ${workspaceError.message}`,
-        );
-      }
-
-      if (!workspace) {
-        return remember(userId, null);
-      }
-
-      const { data: member, error: memberError } = await admin
-        .from("workspace_members")
-        .select("role")
-        .eq("workspace_id", workspace.id)
-        .eq("user_id", userId)
-        .maybeSingle();
-
-      if (memberError) {
-        throw new Error(`team membership lookup failed: ${memberError.message}`);
-      }
-
-      if (!member) {
+      // "No team workspace yet" and "not a member" are the same answer to every
+      // caller, and both are cached: neither is an error.
+      if (!record) {
         return remember(userId, null);
       }
 
       return remember(userId, {
-        workspace: {
-          id: workspace.id,
-          name: workspace.name,
-          type: "team",
-          ownerUserId: workspace.owner_user_id,
-        },
-        role: member.role as TeamMembership["role"],
+        workspace: record.workspace,
+        role: record.role,
       });
     },
 

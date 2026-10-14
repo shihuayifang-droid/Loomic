@@ -1,4 +1,7 @@
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type {
+  IdentityReadRepository,
+  TeamMembershipRecord,
+} from "../../db/identity-read-repository.js";
 import { describe, expect, it } from "vitest";
 
 import { createTeamMembershipService } from "./team-membership.js";
@@ -6,44 +9,39 @@ import { createTeamMembershipService } from "./team-membership.js";
 const TEAM_ID = "11111111-1111-1111-1111-111111111111";
 const USER_ID = "00000000-0000-0000-0000-00000000000a";
 
-type RecordedQuery = { table: string; eqs: Array<[string, unknown]> };
-
 type StubConfig = {
-  workspace: { id: string; name: string; owner_user_id: string } | null;
-  workspaceError?: { message: string } | null;
-  member?: { role: string } | null;
-  memberError?: { message: string } | null;
+  /** What the repository returns; `null` covers both "no team" and "not a member". */
+  record?: TeamMembershipRecord | null;
+  /** When set, the repository rejects with this error instead of returning. */
+  failure?: Error;
 };
 
-/** Chainable fake for the two queries the service makes. Never touches a real DB. */
-function makeAdminStub(config: StubConfig) {
-  const queries: RecordedQuery[] = [];
+/**
+ * Fake identity repository. The service under test owns caching and error
+ * propagation only — the statement, its parameters and the actor live in
+ * `src/db/identity-read-repository.test.ts`. Never touches a real database.
+ */
+function makeRepositoryStub(config: StubConfig) {
+  const calls: string[] = [];
 
-  const client = {
-    from(table: string) {
-      const eqs: Array<[string, unknown]> = [];
-      const builder = {
-        select: () => builder,
-        eq: (column: string, value: unknown) => {
-          eqs.push([column, value]);
-          return builder;
-        },
-        order: () => builder,
-        limit: () => builder,
-        maybeSingle: async () => {
-          queries.push({ table, eqs });
-          if (table === "workspaces") {
-            return { data: config.workspace, error: config.workspaceError ?? null };
-          }
-          return { data: config.member ?? null, error: config.memberError ?? null };
-        },
-      };
-      return builder;
+  const repository: IdentityReadRepository = {
+    async findPersonalFoundation() {
+      throw new Error("findPersonalFoundation is not used by team membership");
+    },
+    async findTeamMembership(userId) {
+      calls.push(userId);
+      if (config.failure) throw config.failure;
+      return config.record ?? null;
     },
   };
 
-  return { client: client as unknown as AdminSupabaseClient, queries };
+  return { repository, calls };
 }
+
+const TEAM_RECORD: TeamMembershipRecord = {
+  workspace: { id: TEAM_ID, name: "HaHart 团队", ownerUserId: "owner-1", type: "team" },
+  role: "admin",
+};
 
 function makeClock(start = 1_000) {
   let value = start;
@@ -57,11 +55,10 @@ function makeClock(start = 1_000) {
 
 describe("createTeamMembershipService", () => {
   it("case 1: a team member gets the team workspace id and their role", async () => {
-    const { client, queries } = makeAdminStub({
-      workspace: { id: TEAM_ID, name: "HaHart 团队", owner_user_id: "owner-1" },
-      member: { role: "admin" },
+    const { repository, calls } = makeRepositoryStub({ record: TEAM_RECORD });
+    const service = createTeamMembershipService({
+      identityReadRepository: repository,
     });
-    const service = createTeamMembershipService({ getAdminClient: () => client });
 
     const membership = await service.get(USER_ID);
 
@@ -74,107 +71,99 @@ describe("createTeamMembershipService", () => {
       },
       role: "admin",
     });
-    expect(queries.map((query) => query.table)).toEqual([
-      "workspaces",
-      "workspace_members",
-    ]);
-    const memberQuery = queries[1];
-    expect(memberQuery?.eqs).toEqual([
-      ["workspace_id", TEAM_ID],
-      ["user_id", USER_ID],
-    ]);
+    expect(calls).toEqual([USER_ID]);
   });
 
   it("case 2: a non-member gets null", async () => {
-    const { client } = makeAdminStub({
-      workspace: { id: TEAM_ID, name: "HaHart 团队", owner_user_id: "owner-1" },
-      member: null,
+    const { repository } = makeRepositoryStub({ record: null });
+    const service = createTeamMembershipService({
+      identityReadRepository: repository,
     });
-    const service = createTeamMembershipService({ getAdminClient: () => client });
 
     expect(await service.get(USER_ID)).toBeNull();
   });
 
-  it("case 3: no team workspace yet gets null without touching members", async () => {
-    const { client, queries } = makeAdminStub({ workspace: null });
-    const service = createTeamMembershipService({ getAdminClient: () => client });
+  it("case 3: no team workspace yet gets null without a second lookup", async () => {
+    const { repository, calls } = makeRepositoryStub({ record: null });
+    const service = createTeamMembershipService({
+      identityReadRepository: repository,
+    });
 
     expect(await service.get(USER_ID)).toBeNull();
-    expect(queries.map((query) => query.table)).toEqual(["workspaces"]);
+
+    // "No team workspace" and "not a member" are one joined read; the service
+    // must not probe the repository again for the membership row.
+    expect(calls).toHaveLength(1);
   });
 
-  it("case 4: a second call inside the TTL does not hit the database again", async () => {
-    const { client, queries } = makeAdminStub({
-      workspace: { id: TEAM_ID, name: "HaHart 团队", owner_user_id: "owner-1" },
-      member: { role: "member" },
+  it("case 4: a second call inside the TTL does not hit the repository again", async () => {
+    const { repository, calls } = makeRepositoryStub({
+      record: { ...TEAM_RECORD, role: "member" },
     });
     const clock = makeClock();
     const service = createTeamMembershipService({
-      getAdminClient: () => client,
+      identityReadRepository: repository,
       now: clock.now,
       ttlMs: 30_000,
     });
 
     await service.get(USER_ID);
-    const afterFirst = queries.length;
+    const afterFirst = calls.length;
 
     clock.advance(29_999);
     const second = await service.get(USER_ID);
 
     expect(second?.role).toBe("member");
-    expect(queries.length).toBe(afterFirst);
+    expect(calls.length).toBe(afterFirst);
   });
 
-  it("case 5: a call past the TTL queries again", async () => {
-    const { client, queries } = makeAdminStub({
-      workspace: { id: TEAM_ID, name: "HaHart 团队", owner_user_id: "owner-1" },
-      member: { role: "member" },
+  it("case 5: a call past the TTL reads again", async () => {
+    const { repository, calls } = makeRepositoryStub({
+      record: { ...TEAM_RECORD, role: "member" },
     });
     const clock = makeClock();
     const service = createTeamMembershipService({
-      getAdminClient: () => client,
+      identityReadRepository: repository,
       now: clock.now,
       ttlMs: 30_000,
     });
 
     await service.get(USER_ID);
-    const afterFirst = queries.length;
+    const afterFirst = calls.length;
 
     clock.advance(30_001);
     await service.get(USER_ID);
 
-    expect(queries.length).toBe(afterFirst + 2);
+    expect(calls.length).toBe(afterFirst + 1);
   });
 
   it("case 6: invalidate forces a fresh lookup", async () => {
-    const { client, queries } = makeAdminStub({
-      workspace: { id: TEAM_ID, name: "HaHart 团队", owner_user_id: "owner-1" },
-      member: { role: "member" },
+    const { repository, calls } = makeRepositoryStub({
+      record: { ...TEAM_RECORD, role: "member" },
     });
     const clock = makeClock();
     const service = createTeamMembershipService({
-      getAdminClient: () => client,
+      identityReadRepository: repository,
       now: clock.now,
       ttlMs: 30_000,
     });
 
     await service.get(USER_ID);
-    const afterFirst = queries.length;
+    const afterFirst = calls.length;
 
     service.invalidate(USER_ID);
     await service.get(USER_ID);
 
-    expect(queries.length).toBe(afterFirst + 2);
+    expect(calls.length).toBe(afterFirst + 1);
   });
 
   it("case 7: a query error throws instead of reading as 'not a member'", async () => {
-    const membershipFailure = makeAdminStub({
-      workspace: { id: TEAM_ID, name: "HaHart 团队", owner_user_id: "owner-1" },
-      member: null,
-      memberError: { message: "connection reset" },
+    // 成员查询故障必须抛（不能吞成 null，否则整队被误报 403）
+    const membershipFailure = makeRepositoryStub({
+      failure: new Error("connection reset"),
     });
     const membershipService = createTeamMembershipService({
-      getAdminClient: () => membershipFailure.client,
+      identityReadRepository: membershipFailure.repository,
     });
 
     await expect(membershipService.get(USER_ID)).rejects.toThrow(
@@ -182,12 +171,11 @@ describe("createTeamMembershipService", () => {
     );
 
     // 团队工作区那一跳出错同样必须抛（两条查询路径都不能吞成 null）
-    const workspaceFailure = makeAdminStub({
-      workspace: null,
-      workspaceError: { message: "tenant not found" },
+    const workspaceFailure = makeRepositoryStub({
+      failure: new Error("tenant not found"),
     });
     const workspaceService = createTeamMembershipService({
-      getAdminClient: () => workspaceFailure.client,
+      identityReadRepository: workspaceFailure.repository,
     });
 
     await expect(workspaceService.get(USER_ID)).rejects.toThrow(

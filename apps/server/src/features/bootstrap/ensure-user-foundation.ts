@@ -4,6 +4,10 @@ import {
   viewerResponseSchema,
 } from "@loomic/shared";
 
+import type {
+  IdentityReadRepository,
+  PersonalFoundationRecord,
+} from "../../db/identity-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { TeamMembershipService } from "../team/team-membership.js";
 import type { AuthenticatedUser } from "../../supabase/user.js";
@@ -18,19 +22,28 @@ export class BootstrapError extends Error {
   readonly code = "bootstrap_failed";
   readonly statusCode = 500;
 
-  constructor() {
-    super(BOOTSTRAP_FAILED_MESSAGE);
+  /**
+   * `cause` is optional and never rendered: it exists so the original
+   * repository/driver failure can still be inspected by an operator while the
+   * HTTP contract keeps the one fixed message.
+   */
+  constructor(cause?: unknown) {
+    super(BOOTSTRAP_FAILED_MESSAGE, cause === undefined ? {} : { cause });
+    this.name = "BootstrapError";
   }
 }
 
 export function createViewerService(options: {
   getAdminClient: () => AdminSupabaseClient;
+  identityReadRepository: IdentityReadRepository;
   teamMembership: TeamMembershipService;
 }): ViewerService {
   return {
     async ensureViewer(user) {
       const admin = options.getAdminClient();
 
+      // The RPC stays first and stays authoritative: if bootstrap fails, the
+      // read below must not run and paper over it.
       const { error: rpcError } = await admin.rpc("bootstrap_viewer", {
         p_user_id: user.id,
         p_email: user.email,
@@ -38,21 +51,15 @@ export function createViewerService(options: {
       });
 
       if (rpcError) {
-        throw new BootstrapError();
+        throw new BootstrapError(rpcError);
       }
 
-      const workspace = await loadPersonalWorkspace(admin, user.id);
+      const foundation = await loadFoundation(
+        options.identityReadRepository,
+        user.id,
+      );
 
-      if (!workspace) {
-        throw new BootstrapError();
-      }
-
-      const [profile, membership] = await Promise.all([
-        loadProfile(admin, user.id),
-        loadMembership(admin, workspace.id, user.id),
-      ]);
-
-      if (!profile || !membership) {
+      if (!foundation) {
         throw new BootstrapError();
       }
 
@@ -64,9 +71,9 @@ export function createViewerService(options: {
       const team = await options.teamMembership.get(user.id);
 
       return viewerResponseSchema.parse({
-        membership,
-        profile,
-        workspace,
+        membership: foundation.membership,
+        profile: toViewerProfile(foundation.profile),
+        workspace: foundation.workspace,
         teamWorkspace: team ? team.workspace : null,
         teamMembership: team
           ? { workspaceId: team.workspace.id, userId: user.id, role: team.role }
@@ -76,69 +83,32 @@ export function createViewerService(options: {
   };
 }
 
-async function loadPersonalWorkspace(
-  admin: AdminSupabaseClient,
+/**
+ * A repository failure is not an empty foundation. Both are 500s through the
+ * existing `BootstrapError` → `bootstrap_failed` mapping, but the failure keeps
+ * its cause instead of silently reading as "user has no workspace".
+ */
+async function loadFoundation(
+  repository: IdentityReadRepository,
   userId: string,
-) {
-  const { data, error } = await admin
-    .from("workspaces")
-    .select("id, name, type, owner_user_id")
-    .eq("owner_user_id", userId)
-    .eq("type", "personal")
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-
-  if (error || !data) {
-    return null;
+): Promise<PersonalFoundationRecord | null> {
+  try {
+    return await repository.findPersonalFoundation(userId);
+  } catch (error) {
+    throw new BootstrapError(error);
   }
-
-  return {
-    id: data.id,
-    name: data.name,
-    ownerUserId: data.owner_user_id,
-    type: data.type,
-  } as const;
 }
 
-async function loadProfile(admin: AdminSupabaseClient, userId: string) {
-  const { data, error } = await admin
-    .from("profiles")
-    .select("id, email, display_name, avatar_url")
-    .eq("id", userId)
-    .single();
-
-  if (error || !data) {
-    return null;
-  }
-
+/**
+ * Defaults are part of the viewer contract and are applied here, not in the
+ * repository: the repository reports what the row holds, the service decides
+ * what a missing value means to the client.
+ */
+function toViewerProfile(profile: PersonalFoundationRecord["profile"]) {
   return {
-    avatarUrl: data.avatar_url ?? null,
-    displayName: data.display_name ?? "Personal",
-    email: data.email ?? "",
-    id: data.id,
-  } as const;
-}
-
-async function loadMembership(
-  admin: AdminSupabaseClient,
-  workspaceId: string,
-  userId: string,
-) {
-  const { data, error } = await admin
-    .from("workspace_members")
-    .select("workspace_id, user_id, role")
-    .eq("workspace_id", workspaceId)
-    .eq("user_id", userId)
-    .single();
-
-  if (error || !data) {
-    return null;
-  }
-
-  return {
-    role: data.role,
-    userId: data.user_id,
-    workspaceId: data.workspace_id,
+    avatarUrl: profile.avatarUrl ?? null,
+    displayName: profile.displayName ?? "Personal",
+    email: profile.email ?? "",
+    id: profile.id,
   } as const;
 }
