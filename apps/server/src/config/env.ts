@@ -32,6 +32,13 @@ export type ServerEnv = {
   agentFilesRoot?: string;
   agentModel: string;
   /**
+   * Canonical PostgreSQL connection string for the self-hosted backend
+   * (ADR-0001). Optional: nothing connects at import time, and the pure `pg`
+   * pool in `src/db/pool.ts` fails loud when a caller asks for a pool without
+   * this value. The Supabase-era variables below are untouched by this field.
+   */
+  databaseUrl?: string;
+  /**
    * Override the Gemini API endpoint, e.g. an OpenAI/Gemini-compatible gateway.
    * Value is the host root WITHOUT the version segment (the SDK appends
    * `/v1beta/models/...` itself), e.g. "https://kwjm.com".
@@ -86,6 +93,8 @@ export function loadServerEnv(
   const agentFilesRoot =
     overrides.agentFilesRoot ??
     parseAgentFilesRoot(source.LOOMIC_AGENT_FILES_ROOT);
+  const databaseUrl =
+    overrides.databaseUrl ?? normalizeOptionalString(source.DATABASE_URL);
   const openAIApiBase =
     overrides.openAIApiBase ?? normalizeOptionalString(source.OPENAI_API_BASE);
   const openAIApiKey =
@@ -222,6 +231,7 @@ export function loadServerEnv(
     webOrigin:
       overrides.webOrigin ?? source.LOOMIC_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
     ...(agentFilesRoot ? { agentFilesRoot } : {}),
+    ...(databaseUrl ? { databaseUrl } : {}),
     ...(googleApiBase ? { googleApiBase } : {}),
     ...(googleApiKey ? { googleApiKey } : {}),
     ...(googleApplicationCredentials ? { googleApplicationCredentials } : {}),
