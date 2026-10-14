@@ -33,6 +33,15 @@ const BASELINE = join(
   "supabase-dependency-baseline.json",
 );
 
+/**
+ * Every test in this file copies a mirror of the repository and drives the real
+ * audit script as a child process, so its cost tracks the size of the source
+ * tree and the load of a full parallel run. This budget widens only the outer
+ * Vitest limit; the 120s `spawnSync` ceiling in `runAudit` is unchanged. Thirty
+ * seconds is not a performance SLA.
+ */
+const AUDIT_TEST_TIMEOUT_MS = 30_000;
+
 /** Directories copied into a mirror root, relative to the repository root. */
 const MIRROR_TREES = [
   "apps/web/src",
@@ -182,7 +191,7 @@ describe("audit-supabase-dependencies: coverage fails closed", () => {
     ]) {
       expect(scopeStatus(run.stdout, label)).toBe("missing");
     }
-  });
+  }, AUDIT_TEST_TIMEOUT_MS);
 
   it("reports a problem and exits 1 when apps/server/src is missing", () => {
     const root = buildMirror("no-server-src", {
@@ -195,7 +204,7 @@ describe("audit-supabase-dependencies: coverage fails closed", () => {
     expect(problemCount(run.stdout)).toBeGreaterThanOrEqual(1);
     expect(scopeStatus(run.stdout, "serverSource")).toBe("missing");
     expect(scopeStatus(run.stdout, "webSource")).toBe("ok");
-  });
+  }, AUDIT_TEST_TIMEOUT_MS);
 
   it("reports a problem and exits 1 when apps/web/src is missing", () => {
     const root = buildMirror("no-web-src", { skipTrees: ["apps/web/src"] });
@@ -206,7 +215,7 @@ describe("audit-supabase-dependencies: coverage fails closed", () => {
     expect(problemCount(run.stdout)).toBeGreaterThanOrEqual(1);
     expect(scopeStatus(run.stdout, "webSource")).toBe("missing");
     expect(scopeStatus(run.stdout, "serverSource")).toBe("ok");
-  });
+  }, AUDIT_TEST_TIMEOUT_MS);
 
   it("reports a problem and exits 1 when a required scope holds zero source files", () => {
     const root = buildMirror("empty-web-src", { emptyTrees: ["apps/web/src"] });
@@ -216,7 +225,7 @@ describe("audit-supabase-dependencies: coverage fails closed", () => {
     expect(run.status).toBe(1);
     expect(problemCount(run.stdout)).toBeGreaterThanOrEqual(1);
     expect(scopeStatus(run.stdout, "webSource")).toBe("empty");
-  });
+  }, AUDIT_TEST_TIMEOUT_MS);
 
   it("refuses to write a baseline while coverage is failing", () => {
     const root = makeTempRoot("no-write");
@@ -231,7 +240,7 @@ describe("audit-supabase-dependencies: coverage fails closed", () => {
     expect(run.status).toBe(1);
     expect(run.stdout).toContain("refusing to write baseline");
     expect(existsSync(target)).toBe(false);
-  });
+  }, AUDIT_TEST_TIMEOUT_MS);
 });
 
 describe("audit-supabase-dependencies: scripts are inside the audit", () => {
@@ -282,7 +291,7 @@ describe("audit-supabase-dependencies: scripts are inside the audit", () => {
     expect(metricValue(restored.stdout, "tooling.supabaseSdkImportHits")).toBe(
       baselineSdkImports,
     );
-  });
+  }, AUDIT_TEST_TIMEOUT_MS);
 
   it("counts the repository-root scripts and excludes only the auditor and baseline", () => {
     const run = runAudit([`--baseline=${BASELINE}`]);
@@ -305,7 +314,7 @@ describe("audit-supabase-dependencies: scripts are inside the audit", () => {
     expect(metricValue(run.stdout, "tooling.rpcCalls")).toBeGreaterThanOrEqual(
       1,
     );
-  });
+  }, AUDIT_TEST_TIMEOUT_MS);
 });
 
 describe("audit-supabase-dependencies: real repository root", () => {
@@ -330,5 +339,5 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
     expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(152);
-  });
+  }, AUDIT_TEST_TIMEOUT_MS);
 });
