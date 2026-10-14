@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  FIND_PROFILE_BY_EMAIL_FOR_ADMIN,
   LIST_TEAM_MEMBERS,
   TeamAdminReadError,
   createTeamAdminReadRepository,
@@ -31,6 +32,10 @@ const ACTOR_ID = "00000000-0000-0000-0000-00000000000a";
 const ADMIN_ID = "00000000-0000-0000-0000-00000000000e";
 const OWNER_ID = "00000000-0000-0000-0000-00000000000f";
 const MEMBER_ID = "00000000-0000-0000-0000-00000000000b";
+const PROFILE_ID = "00000000-0000-0000-0000-000000000011";
+
+/** The value `addMember` would pass after its own trim. */
+const LOOKUP_EMAIL = "b@hahart.test";
 
 const JOINED_AT = new Date("2026-01-02T03:04:05.678Z");
 
@@ -113,6 +118,35 @@ function expectReadError(error: unknown): TeamAdminReadError {
   // Fixed text: the driver message must not travel through the repository.
   expect(readError.message).toBe(`team admin read failed (${LIST_TEAM_MEMBERS})`);
   return readError;
+}
+
+/** Run a profile lookup that is expected to fail and return what it threw. */
+async function captureLookup(
+  repository: TeamAdminReadRepository,
+  email = LOOKUP_EMAIL,
+  actorId = ACTOR_ID,
+): Promise<unknown> {
+  return repository
+    .findProfileByEmailForAdmin({ actorId, email })
+    .catch((reason: unknown) => reason);
+}
+
+function expectLookupError(error: unknown): TeamAdminReadError {
+  expect(error).toBeInstanceOf(TeamAdminReadError);
+  const readError = error as TeamAdminReadError;
+  expect(readError.operation).toBe(FIND_PROFILE_BY_EMAIL_FOR_ADMIN);
+  // Fixed text: no SQL, no host and no driver message may travel through us.
+  expect(readError.message).toBe(
+    `team admin read failed (${FIND_PROFILE_BY_EMAIL_FOR_ADMIN})`,
+  );
+  return readError;
+}
+
+/** The one statement the lookup issues (the transaction statements carry no table). */
+function lookupSql(queries: readonly QueryRecord[]): string {
+  const statements = domainCalls(queries);
+  expect(statements).toHaveLength(1);
+  return statements[0]?.sql ?? "";
 }
 
 const MEMBER_ROW = {
@@ -366,5 +400,178 @@ describe("team-admin-read-repository: listTeamMembers", () => {
     expect(error.message).not.toContain("postgres://");
     expect(error.message).not.toContain("select");
     expect((error.cause as Error).message).toContain("ECONNREFUSED");
+  });
+});
+
+describe("team-admin-read-repository: findProfileByEmailForAdmin", () => {
+  it("case 13: the lookup runs in one privileged transaction that binds actor and email verbatim", async () => {
+    const harness = createHarness(() => [{ id: PROFILE_ID }]);
+    // The spaces belong to the caller's value: trimming is the service's job, and
+    // the repository must not do it a second time on the way to the statement.
+    const email = `  ${LOOKUP_EMAIL}  `;
+
+    await repositoryFor(harness).findProfileByEmailForAdmin({
+      actorId: ACTOR_ID,
+      email,
+    });
+
+    const settings = contextParams(harness.queries);
+    expect(
+      settings.find((params) => params[0] === TRANSACTION_SETTING_NAMES.userId),
+    ).toEqual([TRANSACTION_SETTING_NAMES.userId, ACTOR_ID]);
+    expect(
+      settings.find(
+        (params) => params[0] === TRANSACTION_SETTING_NAMES.executionMode,
+      ),
+    ).toEqual([TRANSACTION_SETTING_NAMES.executionMode, "privileged"]);
+
+    const statements = domainCalls(harness.queries);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]?.params).toEqual([ACTOR_ID, email]);
+    expect(harness.connectAttempts()).toBe(1);
+  });
+
+  it("case 14: the lookup pool is lazy — building the repository connects to nothing", async () => {
+    const harness = createHarness(() => [{ id: PROFILE_ID }]);
+    let asked = 0;
+
+    const repository = createTeamAdminReadRepository({
+      getTransactionPool: () => {
+        asked += 1;
+        return harness.pool;
+      },
+    });
+
+    expect(asked).toBe(0);
+    expect(harness.connectAttempts()).toBe(0);
+
+    await repository.findProfileByEmailForAdmin({
+      actorId: ACTOR_ID,
+      email: LOOKUP_EMAIL,
+    });
+
+    expect(asked).toBe(1);
+    expect(harness.connectAttempts()).toBe(1);
+  });
+
+  it("case 15: the statement carries the same ACL and an exact, case-sensitive equality", async () => {
+    const harness = createHarness(() => [{ id: PROFILE_ID }]);
+
+    await repositoryFor(harness).findProfileByEmailForAdmin({
+      actorId: ACTOR_ID,
+      email: LOOKUP_EMAIL,
+    });
+
+    const sql = lookupSql(harness.queries);
+    // The team workspace, pinned exactly as the PostgREST chain pinned it.
+    expect(sql).toContain("from public.workspaces");
+    expect(sql).toContain("where type = 'team'");
+    expect(sql).toContain("order by created_at asc");
+    expect(sql).toContain("limit 1");
+    // The ACL: the actor needs a real admin/owner membership row in that team.
+    expect(sql).toContain("join public.workspace_members as actor");
+    expect(sql).toContain("actor.workspace_id = w.id");
+    expect(sql).toContain("actor.user_id = $1");
+    expect(sql).toContain("actor.role in ('admin', 'owner')");
+    // The legacy branch this deliberately does NOT copy: `owner_user_id` alone.
+    expect(sql).not.toContain("owner_user_id");
+    // The execution mode is a diagnostic label, never an authorization input.
+    expect(sql).not.toContain("execution_mode");
+    expect(sql).not.toMatch(/select\s+\*/i);
+    // An exact equality on the email column: no trimming, no case folding, no
+    // pattern matching anywhere in the statement.
+    expect(sql).toContain("join public.profiles as p");
+    expect(sql).toContain("on p.email = $2");
+    expect(sql).not.toMatch(/lower\s*\(/i);
+    expect(sql).not.toMatch(/trim\s*\(/i);
+    expect(sql).not.toMatch(/ilike/i);
+    expect(sql).not.toContain("$3");
+    // Exactly one ordering: the team-workspace pin. The email match is never
+    // narrowed down to "the first row" — several matches are a contradiction.
+    expect(sql.match(/order by/gi)).toHaveLength(1);
+    for (const value of [ACTOR_ID, OWNER_ID, MEMBER_ID, LOOKUP_EMAIL]) {
+      expect(sql).not.toContain(value);
+    }
+  });
+
+  it("case 16: no matching row answers null, exactly like 'not an admin' does", async () => {
+    const harness = createHarness(() => []);
+
+    await expect(
+      repositoryFor(harness).findProfileByEmailForAdmin({
+        actorId: ACTOR_ID,
+        email: LOOKUP_EMAIL,
+      }),
+    ).resolves.toBeNull();
+    // One statement: "no team", "not a member", "not an admin" and "no such
+    // email" cannot be told apart from the number of round trips either.
+    expect(domainCalls(harness.queries)).toHaveLength(1);
+  });
+
+  it("case 17: one matching row is that profile — the id is taken verbatim", async () => {
+    const harness = createHarness(() => [
+      // Extra columns are not part of the contract and are ignored.
+      { id: PROFILE_ID, email: LOOKUP_EMAIL, display_name: "Member B" },
+    ]);
+
+    await expect(
+      repositoryFor(harness).findProfileByEmailForAdmin({
+        actorId: ACTOR_ID,
+        email: LOOKUP_EMAIL,
+      }),
+    ).resolves.toEqual({ id: PROFILE_ID });
+  });
+
+  it("case 18: several profiles with the same email fail loud instead of picking one", async () => {
+    const harness = createHarness(() => [
+      { id: PROFILE_ID },
+      { id: OWNER_ID },
+    ]);
+
+    const error = expectLookupError(await captureLookup(repositoryFor(harness)));
+
+    expect((error.cause as Error).message).toMatch(/more than one profile/);
+    // The read itself succeeded: several rows are a legal result, and the
+    // contradiction is in its shape. The transaction therefore commits and the
+    // mapper is what refuses the answer — no row is ever selected for the caller.
+    expect(harness.queries.at(-1)?.sql).toBe(TRANSACTION_STATEMENTS.commit);
+  });
+
+  it("case 19: an unusable id or a non-object row is a fixed failure, never a null", async () => {
+    const unusable: Array<[string, unknown]> = [
+      ["the id field is absent", {}],
+      ["the id is undefined", { id: undefined }],
+      ["the id is null", { id: null }],
+      ["the id is empty", { id: "" }],
+      ["the id is a number", { id: 11 }],
+    ];
+
+    for (const [label, row] of unusable) {
+      const error = expectLookupError(
+        await captureLookup(repositoryFor(createHarness(() => [row]))),
+      );
+      expect((error.cause as Error).message, label).toContain('"id"');
+    }
+
+    for (const row of ["row", null, ["row"], 42]) {
+      const notAnObject = expectLookupError(
+        await captureLookup(repositoryFor(createHarness(() => [row]))),
+      );
+      expect((notAnObject.cause as Error).message).toMatch(/not an object/);
+    }
+  });
+
+  it("case 20: a SQL failure keeps the driver cause, rolls back and leaks no SQL or host", async () => {
+    const harness = createHarness(() => {
+      throw new Error('relation "public.profiles" does not exist');
+    });
+
+    const error = expectLookupError(await captureLookup(repositoryFor(harness)));
+
+    expect((error.cause as Error).message).toContain("does not exist");
+    expect(harness.queries.at(-1)?.sql).toBe(TRANSACTION_STATEMENTS.rollback);
+    expect(error.message).not.toContain("select");
+    expect(error.message).not.toContain("profiles");
+    expect(error.message).not.toContain("postgres://");
   });
 });

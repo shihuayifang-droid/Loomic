@@ -19,6 +19,8 @@ type RpcCall = { name: string; params: Record<string, unknown> };
 
 type StubOptions = {
   profile?: { id: string; email?: string } | null;
+  /** What the repository's email lookup answers; throws when it is an Error. */
+  profileLookupError?: Error;
   rpcError?: { message: string } | null;
   rpcData?: unknown;
   /** What the roster repository answers; throws when it is an Error. */
@@ -72,6 +74,8 @@ function makeHarness(options: StubOptions = {}) {
   const { client, rpcs, tables } = makeAdminStub(options);
   const invalidated: string[] = [];
   const actorIds: string[] = [];
+  const lookedUpEmails: string[] = [];
+  const lookupActorIds: string[] = [];
   const teamMembership: TeamMembershipService = {
     async get() {
       return null;
@@ -87,6 +91,12 @@ function makeHarness(options: StubOptions = {}) {
       if (options.memberError) throw options.memberError;
       return options.members ?? [];
     },
+    async findProfileByEmailForAdmin({ actorId, email }) {
+      lookupActorIds.push(actorId);
+      lookedUpEmails.push(email);
+      if (options.profileLookupError) throw options.profileLookupError;
+      return options.profile ?? null;
+    },
   };
 
   const service: TeamAdminService = createTeamAdminService({
@@ -97,7 +107,15 @@ function makeHarness(options: StubOptions = {}) {
       : { teamAdminReadRepository: readRepository }),
   });
 
-  return { service, rpcs, tables, invalidated, actorIds };
+  return {
+    service,
+    rpcs,
+    tables,
+    invalidated,
+    actorIds,
+    lookedUpEmails,
+    lookupActorIds,
+  };
 }
 
 async function capture(run: () => Promise<unknown>): Promise<TeamAdminError> {
@@ -112,10 +130,11 @@ async function capture(run: () => Promise<unknown>): Promise<TeamAdminError> {
 
 describe("createTeamAdminService", () => {
   it("case 1: addMember resolves the email then calls the audited RPC", async () => {
-    const { service, rpcs, invalidated } = makeHarness({
-      profile: { id: TARGET_ID },
-      rpcData: true,
-    });
+    const { service, rpcs, invalidated, lookedUpEmails, lookupActorIds, tables } =
+      makeHarness({
+        profile: { id: TARGET_ID },
+        rpcData: true,
+      });
 
     const result = await service.addMember(ACTOR_ID, {
       email: "  b@hahart.test  ",
@@ -123,6 +142,11 @@ describe("createTeamAdminService", () => {
     });
 
     expect(result).toEqual({ added: true });
+    // The lookup is the repository's read now, and it carries the trimmed email
+    // and the real actor — not a PostgREST table read.
+    expect(lookedUpEmails).toEqual(["b@hahart.test"]);
+    expect(lookupActorIds).toEqual([ACTOR_ID]);
+    expect(tables).toEqual([]);
     expect(rpcs).toEqual([
       {
         name: "admin_add_team_member",
@@ -133,7 +157,9 @@ describe("createTeamAdminService", () => {
   });
 
   it("case 2: an unknown email is a 404 with no RPC call and no invalidation", async () => {
-    const { service, rpcs, invalidated } = makeHarness({ profile: null });
+    const { service, rpcs, invalidated, lookedUpEmails, tables } = makeHarness({
+      profile: null,
+    });
 
     const error = await capture(() =>
       service.addMember(ACTOR_ID, { email: "nobody@hahart.test", role: "member" }),
@@ -141,6 +167,9 @@ describe("createTeamAdminService", () => {
 
     expect(error.statusCode).toBe(404);
     expect(error.code).toBe("user_not_found");
+    expect(error.message).toBe("No user with email nobody@hahart.test.");
+    expect(lookedUpEmails).toEqual(["nobody@hahart.test"]);
+    expect(tables).toEqual([]);
     expect(rpcs.length).toBe(0);
     expect(invalidated.length).toBe(0);
   });
@@ -359,5 +388,128 @@ describe("createTeamAdminService", () => {
     await service.listMembers(TARGET_ID);
 
     expect(actorIds).toEqual([ACTOR_ID, TARGET_ID]);
+  });
+
+  it("case 14: the lookup gets the trimmed email and the actor, and its id is what the RPC receives", async () => {
+    const { service, rpcs, invalidated, lookedUpEmails, lookupActorIds } =
+      makeHarness({ profile: { id: TARGET_ID } });
+
+    const result = await service.addMember(ACTOR_ID, {
+      email: "  Mixed.Case@Hahart.test  ",
+      role: "member",
+    });
+
+    expect(result).toEqual({ added: true });
+    // Trimmed exactly once, in the service: the case is untouched, because the
+    // lookup is an exact equality and lowercasing it would change who is found.
+    expect(lookedUpEmails).toEqual(["Mixed.Case@Hahart.test"]);
+    expect(lookupActorIds).toEqual([ACTOR_ID]);
+    expect(rpcs).toEqual([
+      {
+        name: "admin_add_team_member",
+        params: { p_actor: ACTOR_ID, p_user_id: TARGET_ID, p_role: "member" },
+      },
+    ]);
+    expect(invalidated).toEqual([TARGET_ID]);
+  });
+
+  it("case 15: an idempotent add still runs the RPC once and invalidates the target once", async () => {
+    const { service, rpcs, invalidated, lookedUpEmails } = makeHarness({
+      profile: { id: TARGET_ID },
+      rpcData: false,
+    });
+
+    await expect(
+      service.addMember(ACTOR_ID, { email: "b@hahart.test", role: "member" }),
+    ).resolves.toEqual({ added: false });
+
+    expect(lookedUpEmails).toEqual(["b@hahart.test"]);
+    expect(rpcs).toHaveLength(1);
+    expect(invalidated).toEqual([TARGET_ID]);
+  });
+
+  it("case 16: a repository failure is a fixed 503 that leaks no driver detail, with no RPC and no invalidation", async () => {
+    const { service, rpcs, invalidated, lookedUpEmails } = makeHarness({
+      profileLookupError: new Error(
+        "connect ECONNREFUSED 10.210.134.37:5432 for postgres://user:pw@host/db",
+      ),
+    });
+
+    const error = await capture(() =>
+      service.addMember(ACTOR_ID, { email: "b@hahart.test", role: "member" }),
+    );
+
+    expect(error.statusCode).toBe(503);
+    expect(error.code).toBe("application_error");
+    expect(error.message).toBe("Unable to add the team member.");
+    expect(error.message).not.toContain("ECONNREFUSED");
+    expect(error.message).not.toContain("postgres://");
+    expect(error.message).not.toContain("team admin read failed");
+    // One attempt, and the write never happened.
+    expect(lookedUpEmails).toEqual(["b@hahart.test"]);
+    expect(rpcs).toEqual([]);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("case 17: without a repository the add is a 503 — never a PostgREST fallback", async () => {
+    const { service, rpcs, invalidated, tables } = makeHarness({
+      withoutReadRepository: true,
+      profile: { id: TARGET_ID },
+    });
+
+    const error = await capture(() =>
+      service.addMember(ACTOR_ID, { email: "b@hahart.test", role: "member" }),
+    );
+
+    expect(error.statusCode).toBe(503);
+    expect(error.code).toBe("application_error");
+    expect(error.message).toBe("Unable to add the team member.");
+    expect(tables).toEqual([]);
+    expect(rpcs).toEqual([]);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("case 18: a refused add keeps the existing mapping and invalidates nothing", async () => {
+    const { service, rpcs, invalidated } = makeHarness({
+      profile: { id: TARGET_ID },
+      rpcError: { message: "actor is not a team admin" },
+    });
+
+    const error = await capture(() =>
+      service.addMember(ACTOR_ID, { email: "b@hahart.test", role: "admin" }),
+    );
+
+    expect(error.statusCode).toBe(403);
+    expect(error.code).toBe("forbidden");
+    expect(rpcs).toHaveLength(1);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("case 19: an unrecognised RPC failure stays a 503 with the cache left alone", async () => {
+    const { service, rpcs, invalidated } = makeHarness({
+      profile: { id: TARGET_ID },
+      rpcError: { message: "connection terminated unexpectedly" },
+    });
+
+    const error = await capture(() =>
+      service.addMember(ACTOR_ID, { email: "b@hahart.test", role: "member" }),
+    );
+
+    expect(error.statusCode).toBe(503);
+    expect(error.code).toBe("application_error");
+    expect(error.message).toBe("connection terminated unexpectedly");
+    expect(rpcs).toHaveLength(1);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("case 20: the happy path reads no PostgREST table — the lookup is the repository's, the write is the RPC", async () => {
+    const { service, tables, rpcs } = makeHarness({ profile: { id: TARGET_ID } });
+
+    await service.addMember(ACTOR_ID, { email: "b@hahart.test", role: "member" });
+
+    // The service's only database calls are the repository's read and the
+    // audited RPC: it opens no table of its own and writes no audit row.
+    expect(tables).toEqual([]);
+    expect(rpcs.map((call) => call.name)).toEqual(["admin_add_team_member"]);
   });
 });

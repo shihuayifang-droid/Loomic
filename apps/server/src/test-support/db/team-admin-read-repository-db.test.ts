@@ -2,9 +2,11 @@ import type { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  FIND_PROFILE_BY_EMAIL_FOR_ADMIN,
   LIST_TEAM_MEMBERS,
   TeamAdminReadError,
   createTeamAdminReadRepository,
+  type TeamAdminReadOperation,
   type TeamAdminReadRepository,
 } from "../../db/team-admin-read-repository.js";
 import {
@@ -80,15 +82,30 @@ async function read(actorId: string) {
   return repository.listTeamMembers({ actorId });
 }
 
+/** The add-member email lookup, workorder 20F-B. */
+async function lookup(actorId: string, email: string) {
+  return repository.findProfileByEmailForAdmin({ actorId, email });
+}
+
 /** Run a read that is expected to fail and return what it threw. */
 async function capture(actorId: string): Promise<unknown> {
   return repository.listTeamMembers({ actorId }).catch((reason: unknown) => reason);
 }
 
-function expectReadError(error: unknown): TeamAdminReadError {
+/** Run an email lookup that is expected to fail and return what it threw. */
+async function captureLookup(actorId: string, email: string): Promise<unknown> {
+  return repository
+    .findProfileByEmailForAdmin({ actorId, email })
+    .catch((reason: unknown) => reason);
+}
+
+function expectReadError(
+  error: unknown,
+  operation: TeamAdminReadOperation = LIST_TEAM_MEMBERS,
+): TeamAdminReadError {
   expect(error).toBeInstanceOf(TeamAdminReadError);
   const readError = error as TeamAdminReadError;
-  expect(readError.operation).toBe(LIST_TEAM_MEMBERS);
+  expect(readError.operation).toBe(operation);
   return readError;
 }
 
@@ -301,5 +318,117 @@ describe("team member list: failures", () => {
 
     // The failed attempt changed nothing.
     await expect(read(ADMIN_ID)).resolves.toHaveLength(4);
+  });
+});
+
+describe("profile by email: the admin ACL and an exact match", () => {
+  it("case 10: an admin resolves the profile behind an exact email", async () => {
+    await expect(lookup(ADMIN_ID, "o@hahart.test")).resolves.toEqual({
+      id: OWNER_ID,
+    });
+  });
+
+  it("case 11: the owner resolves the same way, and an unclaimed address answers null", async () => {
+    await expect(lookup(OWNER_ID, "e@hahart.test")).resolves.toEqual({
+      id: ADMIN_ID,
+    });
+    await expect(lookup(OWNER_ID, "ghost@hahart.test")).resolves.toBeNull();
+  });
+
+  it("case 12: a plain member, a non-member and a stranger all read null — the same answer as an unclaimed address", async () => {
+    // The email exists, but the ACL is decided before any profile is matched.
+    await expect(lookup(MEMBER_ID, "o@hahart.test")).resolves.toBeNull();
+    await expect(lookup(MEMBER_ID, "ghost@hahart.test")).resolves.toBeNull();
+    await expect(lookup(STRANGER_ID, "o@hahart.test")).resolves.toBeNull();
+    await expect(lookup(UNKNOWN_ID, "o@hahart.test")).resolves.toBeNull();
+  });
+
+  it("case 13: the match is exact — a different case, surrounding spaces and a NULL email never match", async () => {
+    await expect(lookup(ADMIN_ID, "O@HAHART.TEST")).resolves.toBeNull();
+    await expect(lookup(ADMIN_ID, "o@hahart.test ")).resolves.toBeNull();
+    await expect(lookup(ADMIN_ID, " o@hahart.test")).resolves.toBeNull();
+
+    // `profiles.email` is nullable: NULL matches no string, not even the empty one.
+    await db.query("update public.profiles set email = null where id = $1", [
+      STRANGER_ID,
+    ]);
+    await expect(lookup(ADMIN_ID, "c@hahart.test")).resolves.toBeNull();
+    await expect(lookup(ADMIN_ID, "")).resolves.toBeNull();
+
+    // The other addresses are untouched by all of the above.
+    await expect(lookup(ADMIN_ID, "o@hahart.test")).resolves.toEqual({
+      id: OWNER_ID,
+    });
+  });
+
+  it("case 14: an injection-shaped email is a bind parameter, not SQL", async () => {
+    await expect(lookup(ADMIN_ID, "' or true --")).resolves.toBeNull();
+    await expect(lookup(ADMIN_ID, "o@hahart.test' or '1'='1")).resolves.toBeNull();
+
+    await expect(lookup(ADMIN_ID, "o@hahart.test")).resolves.toEqual({
+      id: OWNER_ID,
+    });
+  });
+
+  it("case 15: a lookup writes no audit row", async () => {
+    const before = await countAuditRows();
+
+    await lookup(ADMIN_ID, "o@hahart.test");
+    await lookup(ADMIN_ID, "ghost@hahart.test");
+    await lookup(MEMBER_ID, "o@hahart.test");
+
+    expect(await countAuditRows()).toBe(before);
+    expect(await countAuditRows()).toBe(0);
+  });
+});
+
+describe("profile by email: two profiles sharing one email", () => {
+  beforeAll(async () => {
+    // Reachable in this schema: `profiles_email_idx` is a plain index, not a
+    // unique constraint. The UPDATE runs on the owner connection, which is the
+    // connection these tests use — the guard trigger
+    // `profiles_prevent_email_change` only refuses the change for the
+    // `authenticated` role, so this is the same state the database itself allows.
+    await db.query("update public.profiles set email = $2 where id = $1", [
+      MEMBER_ID,
+      "shared@hahart.test",
+    ]);
+    await db.query("update public.profiles set email = $2 where id = $1", [
+      OWNER_ID,
+      "shared@hahart.test",
+    ]);
+  });
+
+  it("case 16: two matches fail loud and pick no row, and the pool keeps working afterwards", async () => {
+    const shared = firstRow(
+      (await db.query<{ n: number }>(
+        "select count(*)::int as n from public.profiles where email = $1",
+        ["shared@hahart.test"],
+      )).rows,
+    ).n;
+    expect(shared).toBe(2);
+
+    const error = expectReadError(
+      await captureLookup(ADMIN_ID, "shared@hahart.test"),
+      FIND_PROFILE_BY_EMAIL_FOR_ADMIN,
+    );
+
+    // Fixed text: no SQL, no host and no driver detail.
+    expect(error.message).toBe(
+      `team admin read failed (${FIND_PROFILE_BY_EMAIL_FOR_ADMIN})`,
+    );
+    expect(error.message).not.toContain("select");
+    expect(error.message).not.toContain("profiles");
+    expect((error.cause as Error).message).toMatch(/more than one profile/);
+
+    // The failed transaction was rolled back, so the next lookup both succeeds
+    // and still resolves the addresses that were never duplicated.
+    await expect(lookup(ADMIN_ID, "e@hahart.test")).resolves.toEqual({
+      id: ADMIN_ID,
+    });
+    await expect(lookup(ADMIN_ID, "d@hahart.test")).resolves.toBeNull();
+    expect(
+      firstRow((await db.query<{ n: number }>("select 1::int as n")).rows).n,
+    ).toBe(1);
   });
 });

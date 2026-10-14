@@ -1,13 +1,28 @@
 /**
- * Read-only team administration repository (workorder 20F-A, ADR-0001 migration
- * step 2f).
+ * Read-only team administration repository (workorders 20F-A + 20F-B, ADR-0001
+ * migration step 2f).
  *
- * One read moves here: the member list behind `GET /api/admin/team/members`,
- * which used to be three PostgREST reads (the first `type='team'` workspace, that
- * workspace's `workspace_members` rows, then the `profiles` of those members).
- * They are one statement now, so the workspace, the membership proof and the
- * members all come from a single snapshot — there is no window in which the list
- * could be assembled from two different team workspaces.
+ * Two reads have moved here:
+ *
+ * - the member list behind `GET /api/admin/team/members` (workorder 20F-A), which
+ *   used to be three PostgREST reads (the first `type='team'` workspace, that
+ *   workspace's `workspace_members` rows, then the `profiles` of those members).
+ *   They are one statement now, so the workspace, the membership proof and the
+ *   members all come from a single snapshot — there is no window in which the
+ *   list could be assembled from two different team workspaces.
+ * - the email lookup `TeamAdminService.addMember` performs before it calls
+ *   `admin_add_team_member` (workorder 20F-B). It used to be a PostgREST
+ *   `.eq("email", email).maybeSingle()`, i.e. an exact, case-sensitive equality
+ *   against a nullable, plain-indexed column with no uniqueness guarantee.
+ *
+ * The lookup keeps that equality verbatim: the parameter is bound as-is and is
+ * never trimmed, lowercased or turned into a pattern (the service trims once,
+ * before calling). `profiles.email` is nullable and only indexed, so two
+ * profiles can share an email; the old `maybeSingle` answered an error there, and
+ * this module fails loud for the same reason rather than picking a row — a
+ * member the administrator never named must not be added. "the actor may not
+ * look this up" and "no profile carries this email" are both `null`, so the
+ * answer never reveals whether an email exists.
  *
  * Access control is part of the SQL now, not a side effect of the environment:
  * the database owner bypasses RLS, so the predicate has to be in the statement.
@@ -51,11 +66,27 @@ import {
 
 export type TeamAdminReadRepository = {
   listTeamMembers(input: { actorId: string }): Promise<TeamMember[]>;
+  /**
+   * The profile a team administrator addresses by email, or `null` when the
+   * actor may not perform the lookup or no profile carries that email.
+   *
+   * The returned id is the identity the caller then hands to
+   * `admin_add_team_member`; it is never a profile this module chose among
+   * several matches (see the module header).
+   */
+  findProfileByEmailForAdmin(input: {
+    actorId: string;
+    email: string;
+  }): Promise<{ id: string } | null>;
 };
 
 export const LIST_TEAM_MEMBERS = "listTeamMembers";
 
-export type TeamAdminReadOperation = typeof LIST_TEAM_MEMBERS;
+export const FIND_PROFILE_BY_EMAIL_FOR_ADMIN = "findProfileByEmailForAdmin";
+
+export type TeamAdminReadOperation =
+  | typeof LIST_TEAM_MEMBERS
+  | typeof FIND_PROFILE_BY_EMAIL_FOR_ADMIN;
 
 /**
  * The failure shape of this module. The message is built from the fixed
@@ -123,6 +154,42 @@ order by m.created_at asc, m.user_id asc
 `;
 
 /**
+ * One profile id by exact email, behind the same ACL as the member list.
+ *
+ * The ACL is structural, exactly as in `LIST_TEAM_MEMBERS_SQL`: the actor needs a
+ * `workspace_members` row in the team workspace with role `admin` or `owner`, and
+ * there is deliberately NO `workspaces.owner_user_id` branch. Zero rows in the
+ * ACL join therefore produce zero rows here, which is why "no team workspace",
+ * "not a member" and "not an admin" all answer `null` — the same answer as "no
+ * profile carries this email", so no caller can use this read as an address book.
+ *
+ * `profiles` is joined on `p.email = $2`, a bind parameter compared with `=`. The
+ * old PostgREST chain was an exact equality too, so nothing here lowercases,
+ * trims or matches a pattern: `profiles.email` is a nullable column with a plain
+ * index (`profiles_email_idx`), not a unique or case-insensitive constraint, so
+ * `$2` may legitimately match zero, one or several rows.
+ *
+ * No `order by` and no `limit`: the caller must never be handed an arbitrary pick
+ * among several matches. Several rows are a contradiction the mapper rejects.
+ */
+const FIND_PROFILE_BY_EMAIL_FOR_ADMIN_SQL = `
+select p.id as id
+from (
+  select id
+  from public.workspaces
+  where type = 'team'
+  order by created_at asc
+  limit 1
+) as w
+join public.workspace_members as actor
+  on actor.workspace_id = w.id
+ and actor.user_id = $1
+ and actor.role in ('admin', 'owner')
+join public.profiles as p
+  on p.email = $2
+`;
+
+/**
  * Build the PostgreSQL implementation. The pool is reached through a getter,
  * never stored: constructing the repository is free, and a missing
  * `DATABASE_URL` only surfaces as a `TeamAdminReadError` on an actual read.
@@ -147,6 +214,28 @@ export function createTeamAdminReadRepository(options: {
         return mapTeamMembers(rows);
       } catch (error) {
         throw new TeamAdminReadError(LIST_TEAM_MEMBERS, error);
+      }
+    },
+
+    async findProfileByEmailForAdmin({ actorId, email }) {
+      try {
+        const pool = options.getTransactionPool();
+
+        const rows = await withPrivilegedTransaction(
+          pool,
+          { userId: actorId },
+          async (client) => {
+            const result = await client.query(
+              FIND_PROFILE_BY_EMAIL_FOR_ADMIN_SQL,
+              [actorId, email],
+            );
+            return result.rows;
+          },
+        );
+
+        return mapProfileByEmail(rows);
+      } catch (error) {
+        throw new TeamAdminReadError(FIND_PROFILE_BY_EMAIL_FOR_ADMIN, error);
       }
     },
   };
@@ -175,6 +264,34 @@ function mapTeamMembers(rows: readonly unknown[]): TeamMember[] {
   return members;
 }
 
+/**
+ * Map the email lookup's rows: none is `null`, exactly one is that profile, and
+ * two or more are a contradiction.
+ *
+ * `profiles.email` is nullable and indexed but not unique, so the same email can
+ * belong to two profiles. The statement deliberately carries no ordering or
+ * limit, which leaves this mapper as the only place that could silently pick one
+ * — and it does not: returning either id would add a member the administrator
+ * never named, so it fails loud. The guard around the read turns that into a
+ * fixed `TeamAdminReadError`.
+ */
+function mapProfileByEmail(
+  rows: readonly unknown[],
+): { id: string } | null {
+  if (rows.length === 0) return null;
+
+  if (rows.length > 1) {
+    throw new Error("team admin read matched more than one profile for the email");
+  }
+
+  const row = rows[0];
+  if (row === undefined) {
+    throw new Error("team admin read returned no row for a single-row result");
+  }
+
+  return { id: requireProfileId(asRow(row)) };
+}
+
 function mapTeamMember(row: Readonly<Record<string, unknown>>): TeamMember {
   const profileEmail = optionalText(row, "email");
   const displayName = optionalText(row, "display_name");
@@ -197,6 +314,31 @@ function asRow(value: unknown): Readonly<Record<string, unknown>> {
   }
 
   return value as Record<string, unknown>;
+}
+
+/**
+ * The profile id an administrator's email lookup resolved.
+ *
+ * It becomes `p_user_id` of `admin_add_team_member` one level up, so an absent
+ * field, an explicit `undefined`, `null`, a number or an empty string all mean
+ * the statement and this module disagree. Reading any of those as "no such
+ * profile" would answer 404 for a user who exists, so every shape failure is
+ * fixed text that the guard turns into a `TeamAdminReadError`.
+ *
+ * `Object.prototype.hasOwnProperty.call` rather than `field in row`: an inherited
+ * key is not a column the statement selected.
+ */
+function requireProfileId(row: Readonly<Record<string, unknown>>): string {
+  if (!Object.prototype.hasOwnProperty.call(row, "id")) {
+    throw new Error('team admin read returned no "id"');
+  }
+
+  const value = row["id"];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error('team admin read returned an unusable "id"');
+  }
+
+  return value;
 }
 
 /** A `NOT NULL` text column that must carry a value: empty is not a user id. */

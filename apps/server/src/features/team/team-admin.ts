@@ -74,6 +74,15 @@ type RpcError = { message?: string } | null;
 const TEAM_MEMBER_LIST_FAILED_MESSAGE = "Unable to load team members.";
 
 /**
+ * The one answer a failed email lookup gives (workorder 20F-B). Fixed text for
+ * the same reason as the roster message: the repository's error carries driver
+ * detail (and, one level down, the statement), and the PostgREST error this
+ * lookup used to surface carried the same kind of text. None of it may reach an
+ * HTTP body or a log line through this service.
+ */
+const TEAM_MEMBER_ADD_FAILED_MESSAGE = "Unable to add the team member.";
+
+/**
  * Every mutation runs inside a single database function that also writes the
  * audit row, so this service never writes the audit table itself. The mapping
  * below turns the database's exception text into an HTTP answer; anything not
@@ -108,14 +117,16 @@ export function createTeamAdminService(options: {
   teamMembership: TeamMembershipService;
   /**
    * ADR-0001 / workorder 20F-A: the member list is the PostgreSQL repository's
-   * read. Optional only because unrelated call sites build this service without
-   * one; calling without it is a wiring bug and answers exactly what a failed
-   * read answers (503 `application_error`) instead of falling back to PostgREST.
+   * read. Workorder 20F-B moved `addMember`'s email lookup into the same
+   * repository, under the same ACL. Optional only because unrelated call sites
+   * build this service without one; calling either read without it is a wiring bug
+   * and answers exactly what a failed read answers (503 `application_error`)
+   * instead of falling back to PostgREST.
    *
-   * The repository's SQL is the authorization for this read: it requires the
+   * The repository's SQL is the authorization for these reads: it requires the
    * actor to hold an admin/owner membership row in the team workspace, so the
    * HTTP gate and the route are not the only thing standing between a plain
-   * member and the roster.
+   * member and the roster, nor between a plain member and an email lookup.
    */
   teamAdminReadRepository?: TeamAdminReadRepository;
 }): TeamAdminService {
@@ -148,14 +159,37 @@ export function createTeamAdminService(options: {
       const admin = options.getAdminClient();
       const email = input.email.trim();
 
-      const { data: profile, error: profileError } = await admin
-        .from("profiles")
-        .select("id")
-        .eq("email", email)
-        .maybeSingle();
+      // Workorder 20F-B: the profile behind the email is the repository's read.
+      // Optional only because unrelated call sites build this service without one
+      // (the same wiring note as `listMembers`); without it the add fails closed
+      // with the same 503 instead of falling back to PostgREST. The trim above is
+      // the service's, and it happens before the lookup: the repository binds the
+      // value verbatim, so the SQL stays an exact equality match.
+      const repository = options.teamAdminReadRepository;
 
-      if (profileError) {
-        throw new TeamAdminError("application_error", profileError.message, 503);
+      if (!repository) {
+        throw new TeamAdminError(
+          "application_error",
+          TEAM_MEMBER_ADD_FAILED_MESSAGE,
+          503,
+        );
+      }
+
+      let profile: { id: string } | null;
+
+      try {
+        profile = await repository.findProfileByEmailForAdmin({
+          actorId,
+          email,
+        });
+      } catch {
+        // The repository's error is fixed text, but it still names its operation
+        // and carries the driver error as `cause`: neither may leave this service.
+        throw new TeamAdminError(
+          "application_error",
+          TEAM_MEMBER_ADD_FAILED_MESSAGE,
+          503,
+        );
       }
 
       if (!profile) {
