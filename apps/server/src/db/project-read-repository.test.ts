@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   FIND_READABLE_PROJECT,
+  FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
   LIST_OWN_PROJECTS,
   LIST_READABLE_PRIMARY_CANVASES,
   ProjectReadError,
@@ -441,5 +442,106 @@ describe("project-read-repository: listReadablePrimaryCanvases", () => {
       expect(sqlText).not.toContain(value);
     }
     expect(sqlText).not.toContain("$4");
+  });
+});
+
+/**
+ * Workorder 20E: the read-only lookup the two WRITE flows perform before they
+ * write (`saveThumbnail`, `uploadFile`). Same authorization as the by-id read
+ * above — membership, then author or admin/owner — with one deliberate
+ * difference: no archive clause, because the PostgREST lookup it replaces had
+ * none either.
+ */
+describe("project-read-repository: findReadableProjectWorkspaceForMutation", () => {
+  it("case 14: one actor-bound statement with the ACL and no archive filter", async () => {
+    const harness = createHarness(() => [{ workspace_id: WORKSPACE_ID }]);
+
+    const row = await repositoryFor(
+      harness,
+    ).findReadableProjectWorkspaceForMutation({
+      actorId: ACTOR_ID,
+      projectId: PROJECT_ID,
+    });
+
+    const settingNames = contextParams(harness.queries).map(
+      (params) => params[0],
+    );
+    expect(settingNames).toEqual([...TRANSACTION_SETTING_ORDER]);
+
+    const statements = domainCalls(harness.queries);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]?.params).toEqual([ACTOR_ID, PROJECT_ID]);
+
+    const sql = statements[0]?.sql ?? "";
+    expect(sql).toContain("join public.workspace_members as m");
+    expect(sql).toContain("m.workspace_id = p.workspace_id");
+    expect(sql).toContain("m.user_id = $1");
+    expect(sql).toContain("p.created_by = $1");
+    expect(sql).toContain("m.role in ('admin', 'owner')");
+    // The whole point of the separate method: an archived project still resolves.
+    expect(sql).not.toContain("archived_at");
+    // One column, because the caller builds an object key from it and nothing else.
+    expect(sql).not.toContain("p.name");
+    expect(sql).not.toMatch(/select\s+\*/i);
+    // The execution mode is a diagnostic label, never an authorization input.
+    expect(sql).not.toContain("execution_mode");
+    expect(harness.connectAttempts()).toBe(1);
+    expect(row).toEqual({ workspace_id: WORKSPACE_ID });
+  });
+
+  it("case 15: zero rows mean null, a second row is a contradiction", async () => {
+    const empty = createHarness(() => []);
+    await expect(
+      repositoryFor(empty).findReadableProjectWorkspaceForMutation({
+        actorId: ACTOR_ID,
+        projectId: PROJECT_ID,
+      }),
+    ).resolves.toBeNull();
+
+    const duplicate = createHarness(() => [
+      { workspace_id: WORKSPACE_ID },
+      { workspace_id: WORKSPACE_ID },
+    ]);
+    const error = await repositoryFor(duplicate)
+      .findReadableProjectWorkspaceForMutation({
+        actorId: ACTOR_ID,
+        projectId: PROJECT_ID,
+      })
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ProjectReadError);
+    expect((error as ProjectReadError).operation).toBe(
+      FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
+    );
+    expect(((error as ProjectReadError).cause as Error).message).toMatch(
+      /more than one row/,
+    );
+  });
+
+  it("case 16: a missing, empty, undefined or non-string workspace fails loud", async () => {
+    const shapes: Array<Record<string, unknown>> = [
+      {},
+      { workspace_id: "" },
+      { workspace_id: undefined },
+      { workspace_id: 42 },
+    ];
+
+    for (const shape of shapes) {
+      const harness = createHarness(() => [shape]);
+      const error = await repositoryFor(harness)
+        .findReadableProjectWorkspaceForMutation({
+          actorId: ACTOR_ID,
+          projectId: PROJECT_ID,
+        })
+        .catch((reason: unknown) => reason);
+
+      expect(error).toBeInstanceOf(ProjectReadError);
+      expect((error as ProjectReadError).operation).toBe(
+        FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
+      );
+      expect(((error as ProjectReadError).cause as Error).message).toContain(
+        '"workspace_id"',
+      );
+    }
   });
 });

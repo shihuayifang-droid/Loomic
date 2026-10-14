@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   FIND_READABLE_PROJECT,
+  FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
   LIST_OWN_PROJECTS,
   LIST_READABLE_PRIMARY_CANVASES,
   ProjectReadError,
@@ -65,6 +66,9 @@ const ARCHIVED_AT = "2026-01-09T00:00:00.000Z";
 
 /** Not a uuid: PostgreSQL itself must reject this bind parameter. */
 const INVALID_ID = "not-a-uuid";
+
+/** A well-formed uuid no row uses: "no such project" has to be a null, not an error. */
+const UNKNOWN_PROJECT = "aaaa0000-0000-4000-8000-0000000000ff";
 
 type ProjectRow = {
   id: string;
@@ -623,6 +627,198 @@ describe("project-read-repository: PGlite real SQL ACL", () => {
     );
 
     expect(rows[0]).toEqual({
+      user_id: AUTHOR_ID,
+      execution_mode: "privileged",
+    });
+  });
+
+  // Workorder 20E: the two write flows that look a project up before writing
+  // (`saveThumbnail`, `uploadFile`). Same ACL as the by-id read, no archive
+  // clause — proven here against the real parser on real rows.
+  it("case 13: the mutation lookup answers author/admin/owner and refuses a plain member and a non-member", async () => {
+    const asAuthor = await repository.findReadableProjectWorkspaceForMutation({
+      actorId: AUTHOR_ID,
+      projectId: ACTIVE_PROJECT,
+    });
+    expect(asAuthor).toEqual({ workspace_id: teamWorkspaceId });
+    // The uuid really is the workspace PostgreSQL stored, not a formatted copy.
+    expect(asAuthor?.workspace_id).toBe(
+      firstRow(await projectRows([ACTIVE_PROJECT])).workspace_id,
+    );
+
+    // admin/owner widen the lookup to someone else's project, exactly as they do
+    // for the by-id read.
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: ADMIN_ID,
+        projectId: ACTIVE_PROJECT,
+      }),
+    ).resolves.toEqual({ workspace_id: teamWorkspaceId });
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: OWNER_ID,
+        projectId: ACTIVE_PROJECT,
+      }),
+    ).resolves.toEqual({ workspace_id: teamWorkspaceId });
+
+    // A plain member is not the author of that project: nothing.
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: MEMBER_ID,
+        projectId: ACTIVE_PROJECT,
+      }),
+    ).resolves.toBeNull();
+    // The same member on their own project is answered.
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: MEMBER_ID,
+        projectId: MEMBER_PROJECT,
+      }),
+    ).resolves.toEqual({ workspace_id: teamWorkspaceId });
+
+    // The outsider owns a row in this very workspace and still gets nothing.
+    expect(firstRow(await projectRows([OUTSIDER_PROJECT])).id).toBe(
+      OUTSIDER_PROJECT,
+    );
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: OUTSIDER_ID,
+        projectId: OUTSIDER_PROJECT,
+      }),
+    ).resolves.toBeNull();
+
+    // The workspace comes from the project, not from "the team workspace": a
+    // project in the personal workspace answers with that one.
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: AUTHOR_ID,
+        projectId: PERSONAL_PROJECT,
+      }),
+    ).resolves.toEqual({ workspace_id: authorPersonalWorkspaceId });
+
+    // No such project is a null answer, not a failure.
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: AUTHOR_ID,
+        projectId: UNKNOWN_PROJECT,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("case 14: an archived project still resolves for the mutation lookup while the read answers null", async () => {
+    // The row is really there and really archived: the contrast comes from the
+    // predicate, not from missing data.
+    expect(firstRow(await projectRows([ARCHIVED_PROJECT])).archived_at).not.toBeNull();
+
+    // The READ contract hides it (workorder 20B)...
+    await expect(
+      repository.findReadableProject({
+        actorId: AUTHOR_ID,
+        projectId: ARCHIVED_PROJECT,
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      repository.findReadableProject({
+        actorId: ADMIN_ID,
+        projectId: ARCHIVED_PROJECT,
+      }),
+    ).resolves.toBeNull();
+
+    // ...the write flows' lookup does not, which is what keeps a thumbnail or a
+    // project upload behaving as it did before the lookup moved.
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: AUTHOR_ID,
+        projectId: ARCHIVED_PROJECT,
+      }),
+    ).resolves.toEqual({ workspace_id: teamWorkspaceId });
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: ADMIN_ID,
+        projectId: ARCHIVED_PROJECT,
+      }),
+    ).resolves.toEqual({ workspace_id: teamWorkspaceId });
+
+    // Dropping the archive clause did not widen anything else.
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: MEMBER_ID,
+        projectId: ARCHIVED_PROJECT,
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: OUTSIDER_ID,
+        projectId: ARCHIVED_PROJECT,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("case 15: an illegal uuid is a real SQL error and the same pool reads afterwards", async () => {
+    await expect(
+      db.query("select id from public.projects where id = $1", [INVALID_ID]),
+    ).rejects.toThrow(/invalid input syntax for type uuid/);
+
+    const thrown = await repository
+      .findReadableProjectWorkspaceForMutation({
+        actorId: AUTHOR_ID,
+        projectId: INVALID_ID,
+      })
+      .catch((reason: unknown) => reason);
+
+    expect(thrown).toBeInstanceOf(ProjectReadError);
+    const readError = thrown as ProjectReadError;
+    expect(readError.operation).toBe(
+      FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
+    );
+    expect(readError.message).toBe(
+      `project read failed (${FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION})`,
+    );
+    expect(readError.message).not.toMatch(
+      /select|public\.|join|postgres:\/\/|10\.210\.134\.37|secret/i,
+    );
+    expect((readError.cause as Error).message).toMatch(
+      /invalid input syntax for type uuid/,
+    );
+
+    // ROLLBACK plus release left the connection usable for the next read.
+    await expect(
+      repository.findReadableProjectWorkspaceForMutation({
+        actorId: AUTHOR_ID,
+        projectId: ACTIVE_PROJECT,
+      }),
+    ).resolves.toEqual({ workspace_id: teamWorkspaceId });
+  });
+
+  it("case 16: the mutation lookup runs privileged with the actor and answers the stored column", async () => {
+    const personal = await repository.findReadableProjectWorkspaceForMutation({
+      actorId: AUTHOR_ID,
+      projectId: PERSONAL_PROJECT,
+    });
+    const stored = firstRow(
+      (
+        await db.query<{ workspace_id: string }>(
+          "select workspace_id from public.projects where id = $1",
+          [PERSONAL_PROJECT],
+        )
+      ).rows,
+    );
+    expect(personal?.workspace_id).toBe(stored.workspace_id);
+
+    const settings = await withPrivilegedTransaction(
+      pool,
+      { userId: AUTHOR_ID },
+      async (client) =>
+        (
+          await client.query(
+            `select
+               current_setting('app.user_id', true) as user_id,
+               current_setting('app.execution_mode', true) as execution_mode`,
+          )
+        ).rows,
+    );
+
+    expect(settings[0]).toEqual({
       user_id: AUTHOR_ID,
       execution_mode: "privileged",
     });

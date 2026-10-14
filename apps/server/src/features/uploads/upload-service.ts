@@ -1,5 +1,10 @@
 import type { AssetBucket, AssetObject } from "@loomic/shared";
 
+import type {
+  AssetReadRepository,
+  AssetReadRow,
+} from "../../db/asset-read-repository.js";
+import type { ProjectReadRepository } from "../../db/project-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type {
   AuthenticatedUser,
@@ -55,6 +60,19 @@ export type UploadService = {
 export function createUploadService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
+  /**
+   * Workorder 20E: the read-only lookup the project branch performs before the
+   * object is written. Optional only because unrelated call sites build this
+   * service without one; a project upload without it is a wiring bug and answers
+   * the existing 500 for an unanswerable lookup.
+   */
+  projectReadRepository?: ProjectReadRepository;
+  /**
+   * Workorder 20E: the asset row `record_project_asset` created, and the row
+   * `deleteAsset` locates before removing the object. Same wire-it-or-fail rule as
+   * above; the existing 500 (upload) / 404 (delete) are the answers.
+   */
+  assetReadRepository?: AssetReadRepository;
 }): UploadService {
   return {
     async uploadFile(user, input) {
@@ -63,25 +81,42 @@ export function createUploadService(options: {
       // A project upload belongs to the workspace that actually owns the project.
       // The client sends both ids, and both are used to build the object path and
       // the asset row, so a client that names someone else's workspace would file
-      // the object under a workspace its project does not belong to. Verified
-      // through the CALLER's client, so RLS also decides whether they may use the
-      // project at all.
+      // the object under a workspace its project does not belong to.
+      //
+      // ADR-0001 / workorder 20E: the verification is the repository's read. Its
+      // SQL requires membership in the project's workspace and author/admin/owner,
+      // and it does NOT filter `archived_at` — the lookup it replaces had no
+      // archive clause either. What it answers is unchanged: a failure is the
+      // existing 500, no row the existing 403, a foreign workspace the existing
+      // 403 — and in all three cases nothing has been written yet.
       let workspaceId = input.workspaceId;
 
       if (input.projectId) {
-        const { data: project, error: projectError } = await client
-          .from("projects")
-          .select("workspace_id")
-          .eq("id", input.projectId)
-          .maybeSingle();
+        const repository = options.projectReadRepository;
 
-        if (projectError) {
+        if (!repository) {
           throw new UploadServiceError(
             "upload_failed",
             "Failed to verify the upload project.",
             500,
           );
         }
+
+        let project: { workspace_id: string } | null = null;
+
+        try {
+          project = await repository.findReadableProjectWorkspaceForMutation({
+            actorId: user.id,
+            projectId: input.projectId,
+          });
+        } catch {
+          throw new UploadServiceError(
+            "upload_failed",
+            "Failed to verify the upload project.",
+            500,
+          );
+        }
+
         if (!project) {
           throw new UploadServiceError(
             "upload_failed",
@@ -149,16 +184,30 @@ export function createUploadService(options: {
         );
       }
 
-      // Read the row back through the user's own client: it is the truthful
-      // createdAt (the RPC returns ids only) and it proves the uploader can see
-      // what they just created.
-      const { data: assetRow, error: readError } = await client
-        .from("asset_objects")
-        .select("id, bucket, object_path, mime_type, byte_size, workspace_id, project_id, created_at")
-        .eq("id", assetId)
-        .single();
+      // Read the row back: it is the truthful createdAt and DTO (the RPC returns
+      // ids only) and it proves the uploader can see what they just created.
+      //
+      // ADR-0001 / workorder 20E: this is the repository's read now, and its SQL
+      // is the ACL — the row is only found when the caller is the project's author
+      // or an admin/owner (or, for a project-less asset, its creator). A failure
+      // and a missing row are still one answer: the object is removed again and the
+      // existing 500 is reported, exactly as before, and no other compensation is
+      // added.
+      const assetRepository = options.assetReadRepository;
+      let asset: AssetReadRow | null = null;
 
-      if (readError || !assetRow) {
+      if (assetRepository) {
+        try {
+          asset = await assetRepository.findReadableAsset({
+            actorId: user.id,
+            assetId,
+          });
+        } catch {
+          asset = null;
+        }
+      }
+
+      if (!asset) {
         await client.storage.from(input.bucket).remove([objectPath]);
         throw new UploadServiceError(
           "upload_failed",
@@ -171,14 +220,14 @@ export function createUploadService(options: {
 
       return {
         asset: {
-          id: assetRow.id,
-          bucket: assetRow.bucket as AssetBucket,
-          objectPath: assetRow.object_path,
-          mimeType: assetRow.mime_type,
-          byteSize: assetRow.byte_size,
-          workspaceId: assetRow.workspace_id,
-          projectId: assetRow.project_id,
-          createdAt: assetRow.created_at,
+          id: asset.id,
+          bucket: asset.bucket as AssetBucket,
+          objectPath: asset.object_path,
+          mimeType: asset.mime_type,
+          byteSize: asset.byte_size,
+          workspaceId: asset.workspace_id,
+          projectId: asset.project_id,
+          createdAt: asset.created_at,
         },
         url,
       };
@@ -206,14 +255,25 @@ export function createUploadService(options: {
 
     async deleteAsset(user, assetId) {
       const client = options.createUserClient(user.accessToken);
+      const repository = options.assetReadRepository;
 
-      const { data: assetRow, error: fetchError } = await client
-        .from("asset_objects")
-        .select("bucket, object_path")
-        .eq("id", assetId)
-        .single();
+      // ADR-0001 / workorder 20E: only the locating read moved. Its ACL is the
+      // repository's SQL; a failure and "no such row" keep the existing single
+      // answer, `asset_not_found` 404, and nothing has been removed at that point.
+      let assetRow: AssetReadRow | null = null;
 
-      if (fetchError || !assetRow) {
+      if (repository) {
+        try {
+          assetRow = await repository.findReadableAsset({
+            actorId: user.id,
+            assetId,
+          });
+        } catch {
+          assetRow = null;
+        }
+      }
+
+      if (!assetRow) {
         throw new UploadServiceError(
           "asset_not_found",
           "Asset not found.",
@@ -221,6 +281,8 @@ export function createUploadService(options: {
         );
       }
 
+      // The order is part of the contract: the object first, the row second. The
+      // DELETE below is NOT migrated — it stays the user client's PostgREST call.
       await client.storage
         .from(assetRow.bucket)
         .remove([assetRow.object_path]);

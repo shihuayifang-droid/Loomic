@@ -8,12 +8,17 @@ import {
   BootstrapError,
   type ViewerService,
 } from "../bootstrap/ensure-user-foundation.js";
-import type {
-  PrimaryCanvasRow,
-  ProjectListRow,
-  ProjectReadRepository,
+import {
+  FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
+  ProjectReadError,
+  type PrimaryCanvasRow,
+  type ProjectListRow,
+  type ProjectReadRepository,
 } from "../../db/project-read-repository.js";
-import { withTransportRetry } from "../../supabase/transport-retry.js";
+import {
+  isTransportFailure,
+  withTransportRetry,
+} from "../../supabase/transport-retry.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import {
   ProjectAssetUrlError,
@@ -27,6 +32,7 @@ import type {
 
 const THUMBNAIL_BUCKET = "project-assets";
 const PROJECT_QUERY_FAILED_MESSAGE = "Unable to load projects.";
+const PROJECT_LOOKUP_FAILED_MESSAGE = "Unable to look up project.";
 const PROJECT_CREATE_FAILED_MESSAGE = "Unable to create project.";
 const PROJECT_DELETE_FAILED_MESSAGE = "Unable to delete project.";
 const PROJECT_NOT_FOUND_MESSAGE = "Project not found.";
@@ -106,25 +112,45 @@ export function createProjectService(options: {
   viewerService: ViewerService;
   getAdminClient: () => AdminSupabaseClient;
   /**
-   * Workorder 20B: the project READ paths moved to the PostgreSQL repository.
-   * Optional only because unrelated call sites build this service for the write
-   * paths alone; a read without one is a wiring bug and answers the existing
-   * `project_query_failed` 500 instead of falling back to PostgREST.
+   * Workorder 20B / 20E: the project read paths — the two real reads and the
+   * read-only lookups the write flows perform before writing — are the PostgreSQL
+   * repository's. Optional only because unrelated call sites build this service
+   * without one; calling without it is a wiring bug and answers exactly what a
+   * failed lookup answers on that path (`project_query_failed` 500 for a read,
+   * `project_delete_failed` 500 for `archiveProject`, `project_query_failed` 503
+   * for the thumbnail lookup) instead of falling back to PostgREST.
    */
   projectReadRepository?: ProjectReadRepository;
 }): ProjectService {
   return {
     async archiveProject(user, projectId) {
       const client = options.createUserClient(user.accessToken);
+      const repository = options.projectReadRepository;
 
-      const { data: existing, error: findError } = await client
-        .from("projects")
-        .select("id")
-        .eq("id", projectId)
-        .is("archived_at", null)
-        .maybeSingle();
+      // ADR-0001 / workorder 20E: the existence (and visibility) check is the
+      // repository's read. Its SQL requires membership in the project's workspace
+      // plus author/admin/owner, and it filters `archived_at` exactly as the
+      // PostgREST lookup it replaces did — which is what keeps "already archived"
+      // and "not yours" one answer, the existing 404.
+      //
+      // Only the lookup moved: the UPDATE below, its timestamp and the number of
+      // calls are unchanged, and the two are deliberately not merged (no lock, no
+      // CAS, no count check).
+      if (!repository) {
+        throw new ProjectServiceError(
+          "project_delete_failed",
+          PROJECT_DELETE_FAILED_MESSAGE,
+          500,
+        );
+      }
 
-      if (findError) {
+      let existing;
+      try {
+        existing = await repository.findReadableProject({
+          actorId: user.id,
+          projectId,
+        });
+      } catch {
         throw new ProjectServiceError(
           "project_delete_failed",
           PROJECT_DELETE_FAILED_MESSAGE,
@@ -322,7 +348,8 @@ export function createProjectService(options: {
     async saveThumbnail(user, projectId, buffer, mimeType) {
       const client = options.createUserClient(user.accessToken);
 
-      // Resolve workspace_id — RLS requires first path segment to be the workspace UUID
+      // Resolve workspace_id — the object key's first segment is the workspace
+      // UUID, so it has to come from the project row rather than from the client.
       //
       // LOCAL FORK: `error` used to be discarded here, so EVERY failure became
       // "Project not found." with a 404. A transport failure (the Supabase host
@@ -332,35 +359,60 @@ export function createProjectService(options: {
       // next attempt. That answer sends whoever is debugging to look at project
       // rows and permissions, which are fine.
       //
-      // PGRST116 is PostgREST's "single() matched no rows"; that alone is a real
-      // 404. Anything else means the question never got answered, which is a 503.
+      // "No row" and "the question was never answered" are still different
+      // answers: the first is the existing 404, the second the existing 503. What
+      // changed with workorder 20E is only WHERE the lookup runs: the repository
+      // answers with the project's workspace, and its own failure is fixed text.
       //
-      // …and it is now RETRIED rather than merely reported. It is a plain SELECT, so
-      // replaying it cannot do damage, and without the retry one proxy blip made the
+      // …and it is still RETRIED rather than merely reported. It is a plain SELECT,
+      // so replaying it cannot do damage, and without the retry one proxy blip made the
       // whole thumbnail upload answer 503 after a 5-second stall (observed
-      // 2026-09-15). The throw inside is what the retry sees — supabase-js returns
-      // `{data, error}` and never rejects, so a wrapper around the raw call would
-      // never fire.
+      // 2026-09-15).
+      //
+      // The retry predicate reads the DRIVER error (its `code` and `message`), so a
+      // transport failure has to be unwrapped out of `ProjectReadError` before it
+      // can be replayed; every other failure — a real SQL error, a row that is not
+      // the promised shape — is rethrown wrapped and is therefore NOT retried.
       let proj: { workspace_id: string } | null;
       try {
         proj = await withTransportRetry(
           "projects.select(workspace_id)",
           async () => {
-            const { data, error } = await client
-              .from("projects")
-              .select("workspace_id")
-              .eq("id", projectId)
-              .single();
-            if (error && error.code !== "PGRST116") throw error;
-            return (data as { workspace_id: string } | null) ?? null;
+            const repository = options.projectReadRepository;
+
+            if (!repository) {
+              throw new ProjectReadError(
+                FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
+                new Error("project read repository is not wired"),
+              );
+            }
+
+            try {
+              // The MUTATION variant on purpose: it does not filter
+              // `archived_at`, so an archived project can still take a thumbnail
+              // exactly as it could through the previous lookup.
+              return await repository.findReadableProjectWorkspaceForMutation({
+                actorId: user.id,
+                projectId,
+              });
+            } catch (error) {
+              if (
+                error instanceof ProjectReadError &&
+                isTransportFailure(error.cause)
+              ) {
+                throw error.cause;
+              }
+
+              throw error;
+            }
           },
         );
-      } catch (error) {
-        const e = error as { code?: string; message?: string };
+      } catch {
+        // Fixed text and no interpolation: the driver's message can name a host,
+        // a statement or a credential, and none of that may reach the client.
         throw new ProjectServiceError(
           "project_query_failed",
-          `Could not look up project ${projectId}: ${e.message}` +
-            (e.code ? ` (code ${e.code})` : ""),
+          PROJECT_LOOKUP_FAILED_MESSAGE,
           503,
         );
       }

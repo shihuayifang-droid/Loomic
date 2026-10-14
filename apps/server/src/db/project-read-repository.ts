@@ -75,11 +75,26 @@ export type PrimaryCanvasRow = {
   project_id: string;
 };
 
+/**
+ * The workspace a project belongs to, for a caller about to write to it
+ * (workorder 20E). Deliberately one column: the two write flows that need it use
+ * it to build an object key and a fallback workspace id, and nothing else — a
+ * wider row would invite a caller to start reading project content it did not ask
+ * for.
+ */
+export type ProjectWorkspaceLookupRow = {
+  workspace_id: string;
+};
+
 export type ProjectReadRepository = {
   findReadableProject(input: {
     actorId: string;
     projectId: string;
   }): Promise<ProjectDetailRow | null>;
+  findReadableProjectWorkspaceForMutation(input: {
+    actorId: string;
+    projectId: string;
+  }): Promise<ProjectWorkspaceLookupRow | null>;
   listOwnProjects(input: {
     actorId: string;
     workspaceId: string;
@@ -92,11 +107,14 @@ export type ProjectReadRepository = {
 };
 
 export const FIND_READABLE_PROJECT = "findReadableProject";
+export const FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION =
+  "findReadableProjectWorkspaceForMutation";
 export const LIST_OWN_PROJECTS = "listOwnProjects";
 export const LIST_READABLE_PRIMARY_CANVASES = "listReadablePrimaryCanvases";
 
 export type ProjectReadOperation =
   | typeof FIND_READABLE_PROJECT
+  | typeof FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION
   | typeof LIST_OWN_PROJECTS
   | typeof LIST_READABLE_PRIMARY_CANVASES;
 
@@ -143,6 +161,32 @@ join public.workspace_members as m
  and m.user_id = $1
 where p.id = $2
   and p.archived_at is null
+  and (p.created_by = $1 or m.role in ('admin', 'owner'))
+`;
+
+/**
+ * The workspace of one project, for a caller who is about to WRITE to it
+ * (workorder 20E: `saveThumbnail`, `uploadFile`).
+ *
+ * Same authorization as the by-id read above — membership, then author or
+ * `admin`/`owner` — with one deliberate difference: there is NO archived filter.
+ *
+ * The lookup it replaces is the one the write flows have always performed
+ * (`projects.select("workspace_id")` through RLS, whose policy has no archive
+ * clause either), so it answers for an archived project exactly as it did
+ * before. The archived clause belongs to the READ contract (`findReadableProject`
+ * returns null for an archived project, and `archiveProject` needs that); adding
+ * it here would silently change what a thumbnail upload or a project upload can
+ * do, which is not what moving a read onto this repository may do.
+ */
+const READABLE_PROJECT_WORKSPACE_FOR_MUTATION_SQL = `
+select
+  p.workspace_id as workspace_id
+from public.projects as p
+join public.workspace_members as m
+  on m.workspace_id = p.workspace_id
+ and m.user_id = $1
+where p.id = $2
   and (p.created_by = $1 or m.role in ('admin', 'owner'))
 `;
 
@@ -262,6 +306,15 @@ export function createProjectReadRepository(options: {
         mapProjectDetail,
       );
     },
+    findReadableProjectWorkspaceForMutation({ actorId, projectId }) {
+      return readOne(
+        FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
+        actorId,
+        READABLE_PROJECT_WORKSPACE_FOR_MUTATION_SQL,
+        [actorId, projectId],
+        mapProjectWorkspace,
+      );
+    },
     listOwnProjects({ actorId, workspaceId }) {
       return readRows(
         LIST_OWN_PROJECTS,
@@ -299,6 +352,15 @@ function mapProjectDetail(
     brand_kit_id: optionalString(row, "brand_kit_id"),
     created_at: requireTimestamp(row, "created_at"),
     updated_at: requireTimestamp(row, "updated_at"),
+  };
+}
+
+/** The one column the mutation lookup answers with: the project's workspace. */
+function mapProjectWorkspace(
+  row: Readonly<Record<string, unknown>>,
+): ProjectWorkspaceLookupRow {
+  return {
+    workspace_id: requireString(row, "workspace_id"),
   };
 }
 

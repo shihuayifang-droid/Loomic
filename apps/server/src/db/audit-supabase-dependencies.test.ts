@@ -335,11 +335,14 @@ describe("audit-supabase-dependencies: real repository root", () => {
     }
 
     // Workorder 20D moved the four chat read points (session list, message
-    // history, asset identities, thread binding) into the pure `pg` repository.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(148);
+    // history, asset identities, thread binding) into the pure `pg` repository,
+    // and workorder 20E moved the five read-only lookups the Project/Upload WRITE
+    // flows perform (archive existence, thumbnail workspace, upload project +
+    // row read-back, delete locate) after it.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(143);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(148);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(143);
   }, AUDIT_TEST_TIMEOUT_MS);
 });

@@ -71,6 +71,10 @@ import {
   createProjectReadRepository,
   type ProjectReadRepository,
 } from "./db/project-read-repository.js";
+import {
+  createAssetReadRepository,
+  type AssetReadRepository,
+} from "./db/asset-read-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -131,6 +135,7 @@ export type BuildAppOptions = {
   agentPersistenceService?: AgentPersistenceService;
   agentRunMetadataService?: AgentRunMetadataService;
   auth?: RequestAuthenticator;
+  assetReadRepository?: AssetReadRepository;
   brandKitService?: BrandKitService;
   canvasReadRepository?: CanvasReadRepository;
   canvasService?: CanvasService;
@@ -228,6 +233,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createChatReadRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 20E: the read-only lookups the WRITE flows perform (the
+  // project existence/ownership check before an upload or an archive, and the
+  // asset row the upload reads back) go through the same lazily-built pool. The
+  // repositories are built here and handed to the two services that write; no
+  // statement of their own is a write.
+  const assetReadRepository =
+    options.assetReadRepository ??
+    createAssetReadRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   const teamMembershipService =
     options.teamMembershipService ??
     createTeamMembershipService({ identityReadRepository });
@@ -275,7 +290,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         defaultModel: resolveDefaultAgentModel(env),
       });
   const uploadService =
-    options.uploadService ?? createUploadService({ createUserClient, getAdminClient });
+    options.uploadService ??
+    createUploadService({
+      createUserClient,
+      getAdminClient,
+      projectReadRepository,
+      assetReadRepository,
+    });
   const pgmq = env.supabaseDbUrl
     ? createPgmqClient(env.supabaseDbUrl)
     : undefined;

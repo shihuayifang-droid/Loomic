@@ -1,11 +1,15 @@
 import type { ViewerResponse } from "@loomic/shared";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   createProjectService,
   ProjectServiceError,
 } from "./project-service.js";
-import type { ProjectReadRepository } from "../../db/project-read-repository.js";
+import {
+  FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
+  ProjectReadError,
+  type ProjectReadRepository,
+} from "../../db/project-read-repository.js";
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import type {
   AuthenticatedUser,
@@ -549,6 +553,9 @@ describe("listProjects delegating to the project read repository", () => {
 describe("saveThumbnail answers with a signed URL", () => {
   function makeThumbnailService(options: { signError?: { message: string } | null }) {
     const signedCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
+    // 工单20E: the workspace lookup is the repository's now, so the fixture has to
+    // answer it — a client stub can no longer carry the lookup.
+    const lookupCalls: Array<{ actorId: string; projectId: string }> = [];
 
     const client = {
       from(table: string) {
@@ -588,13 +595,23 @@ describe("saveThumbnail answers with a signed URL", () => {
       rpc: async () => ({ data: { asset_id: "asset-thumb" }, error: null }),
     };
 
+    const repository = {
+      async findReadableProjectWorkspaceForMutation(
+        input: { actorId: string; projectId: string },
+      ) {
+        lookupCalls.push(input);
+        return { workspace_id: TEAM_ID };
+      },
+    };
+
     const service = createProjectService({
       createUserClient: () => client as unknown as UserSupabaseClient,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
+      projectReadRepository: repository as unknown as ProjectReadRepository,
     });
 
-    return { service, signedCalls };
+    return { service, signedCalls, lookupCalls };
   }
 
   it("case 4: the thumbnail URL is a signature, not a public URL", async () => {
@@ -629,5 +646,325 @@ describe("saveThumbnail answers with a signed URL", () => {
     expect(error).toBeInstanceOf(ProjectServiceError);
     expect(error?.statusCode).toBe(500);
     expect(error?.message).not.toContain("http");
+  });
+});
+
+// ADR-0001 step 2e (工单20E): `archiveProject`'s existence and visibility check is
+// the repository's read. Only the lookup moved — the UPDATE, its timestamp and
+// the number of calls are frozen, and the two are deliberately not merged.
+describe("archiveProject delegating to the project read repository", () => {
+  function makeArchiveHarness(
+    config: {
+      detail?: unknown;
+      detailError?: Error;
+      updateError?: { message: string } | null;
+      withRepository?: boolean;
+    } = {},
+  ) {
+    const updatePatches: Array<Record<string, unknown>> = [];
+    const tables: string[] = [];
+    const calls: RepositoryCall[] = [];
+
+    const client = {
+      from(table: string) {
+        tables.push(table);
+        const chain = {
+          update: (patch: Record<string, unknown>) => {
+            updatePatches.push(patch);
+            return chain;
+          },
+          eq: () => chain,
+          then: (resolve: (value: unknown) => unknown) =>
+            Promise.resolve({
+              data: null,
+              error: config.updateError ?? null,
+            }).then(resolve),
+        };
+        return chain;
+      },
+    };
+
+    const repository = {
+      async findReadableProject(input: Record<string, unknown>) {
+        calls.push({ method: "findReadableProject", input });
+        if (config.detailError) throw config.detailError;
+        return config.detail ?? null;
+      },
+    };
+
+    const service = createProjectService({
+      createUserClient: () => client as unknown as UserSupabaseClient,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+      ...(config.withRepository === false
+        ? {}
+        : {
+            projectReadRepository:
+              repository as unknown as ProjectReadRepository,
+          }),
+    });
+
+    return { service, calls, updatePatches, tables };
+  }
+
+  it("case 16: the lookup asks the repository first, then the single UPDATE runs with an ISO archived_at", async () => {
+    const harness = makeArchiveHarness({ detail: DETAIL_ROW });
+
+    await expect(
+      harness.service.archiveProject(USER, "project-1"),
+    ).resolves.toBeUndefined();
+
+    expect(harness.calls).toEqual([
+      {
+        method: "findReadableProject",
+        input: { actorId: USER_ID, projectId: "project-1" },
+      },
+    ]);
+    // Exactly one write, and it is the unchanged one: same table, one column, and
+    // the timestamp is still generated at call time.
+    expect(harness.tables).toEqual(["projects"]);
+    expect(harness.updatePatches).toHaveLength(1);
+    const patch = harness.updatePatches[0] ?? {};
+    expect(Object.keys(patch)).toEqual(["archived_at"]);
+    expect(patch["archived_at"]).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+    );
+    expect(
+      Number.isNaN(Date.parse(String(patch["archived_at"]))),
+    ).toBe(false);
+  });
+
+  it("case 17: a null lookup is the existing 404 and nothing is written", async () => {
+    const harness = makeArchiveHarness({ detail: null });
+
+    const error = await harness.service
+      .archiveProject(USER, "project-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(404);
+    expect(error?.code).toBe("project_not_found");
+    expect(error?.message).toBe("Project not found.");
+    expect(harness.updatePatches).toEqual([]);
+    expect(harness.tables).toEqual([]);
+  });
+
+  it("case 18: a repository failure is the existing project_delete_failed 500 and nothing is written", async () => {
+    const harness = makeArchiveHarness({
+      detailError: new Error("project read failed (findReadableProject)"),
+    });
+
+    const error = await harness.service
+      .archiveProject(USER, "project-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_delete_failed");
+    expect(error?.message).toBe("Unable to delete project.");
+    // The repository's own text is not what the client is shown.
+    expect(error?.message).not.toContain("findReadableProject");
+    expect(harness.updatePatches).toEqual([]);
+    expect(harness.tables).toEqual([]);
+  });
+
+  it("case 19: a service built without the repository answers 500 and touches no table", async () => {
+    const harness = makeArchiveHarness({ withRepository: false });
+
+    const error = await harness.service
+      .archiveProject(USER, "project-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_delete_failed");
+    expect(harness.calls).toEqual([]);
+    expect(harness.updatePatches).toEqual([]);
+    expect(harness.tables).toEqual([]);
+  });
+});
+
+// 工单20E: the thumbnail's workspace lookup is still a plain SELECT, so it keeps
+// its transport retry (3 attempts, 400ms/800ms) — but only for transport
+// failures, and the final answer is a fixed 503 that names nothing.
+describe("saveThumbnail lookup retry", () => {
+  const TRANSPORT_CAUSE = new Error("TypeError: fetch failed");
+  const PG_CAUSE = Object.assign(
+    new Error("invalid input syntax for type uuid"),
+    { code: "22P02" },
+  );
+
+  function makeRetryHarness(options: { failures: number; cause?: unknown }) {
+    const attempts: number[] = [];
+    const inputs: Array<Record<string, unknown>> = [];
+    const uploads: string[] = [];
+    const rpcs: string[] = [];
+    const updatePatches: Array<Record<string, unknown>> = [];
+
+    const repository = {
+      async findReadableProjectWorkspaceForMutation(input: {
+        actorId: string;
+        projectId: string;
+      }) {
+        attempts.push(Date.now());
+        inputs.push(input);
+        if (attempts.length <= options.failures) {
+          throw new ProjectReadError(
+            FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
+            options.cause ?? TRANSPORT_CAUSE,
+          );
+        }
+
+        return { workspace_id: TEAM_ID };
+      },
+    };
+
+    const client = {
+      from(table: string) {
+        const chain = {
+          update: (patch: Record<string, unknown>) => {
+            updatePatches.push(patch);
+            return chain;
+          },
+          eq: () => chain,
+          then: (resolve: (value: unknown) => unknown) =>
+            Promise.resolve({ data: null, error: null }).then(resolve),
+        };
+        return chain;
+      },
+      storage: {
+        from(bucket: string) {
+          return {
+            upload: async (path: string) => {
+              uploads.push(path);
+              return { data: { path }, error: null };
+            },
+            createSignedUrl: async (path: string) => ({
+              data: {
+                signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+              },
+              error: null,
+            }),
+            getPublicUrl: (path: string) => ({
+              data: { publicUrl: `https://cdn.test/${bucket}/${path}` },
+            }),
+          };
+        },
+      },
+      rpc: async (name: string) => {
+        rpcs.push(name);
+        return { data: { asset_id: "asset-thumb" }, error: null };
+      },
+    };
+
+    const service = createProjectService({
+      createUserClient: () => client as unknown as UserSupabaseClient,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+      projectReadRepository: repository as unknown as ProjectReadRepository,
+    });
+
+    return { service, attempts, inputs, uploads, rpcs, updatePatches };
+  }
+
+  it("case 20: two transport failures are replayed after 400ms and 800ms, and the third attempt succeeds", async () => {
+    const harness = makeRetryHarness({ failures: 2 });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const promise = harness.service.saveThumbnail(
+        USER,
+        "project-1",
+        Buffer.from("thumb"),
+        "image/png",
+      );
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.attempts).toEqual([0]);
+
+      await vi.advanceTimersByTimeAsync(399);
+      expect(harness.attempts).toEqual([0]);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(harness.attempts).toEqual([0, 400]);
+
+      await vi.advanceTimersByTimeAsync(799);
+      expect(harness.attempts).toEqual([0, 400]);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(harness.attempts).toEqual([0, 400, 1200]);
+
+      const result = await promise;
+      expect(result.thumbnailUrl).toContain("token=sig");
+      expect(result.thumbnailUrl).not.toContain("cdn.test");
+
+      // Every attempt asked the same question, and the write path then ran once.
+      expect(harness.inputs).toEqual([
+        { actorId: USER_ID, projectId: "project-1" },
+        { actorId: USER_ID, projectId: "project-1" },
+        { actorId: USER_ID, projectId: "project-1" },
+      ]);
+      expect(harness.uploads).toEqual([
+        `${TEAM_ID}/project-1/thumbnail.png`,
+      ]);
+      expect(harness.rpcs).toEqual(["record_project_asset"]);
+      expect(harness.updatePatches).toEqual([
+        { thumbnail_path: `${TEAM_ID}/project-1/thumbnail.png` },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("case 21: a real database failure is not replayed and the fixed 503 leaks nothing", async () => {
+    const harness = makeRetryHarness({ failures: 3, cause: PG_CAUSE });
+
+    const error = await harness.service
+      .saveThumbnail(USER, "project-1", Buffer.from("thumb"), "image/png")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(harness.attempts).toHaveLength(1);
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(503);
+    expect(error?.code).toBe("project_query_failed");
+    expect(error?.message).toBe("Unable to look up project.");
+    expect(error?.message).not.toMatch(
+      /select|public\.|uuid|22P02|postgres:\/\/|10\.210\.134\.37|secret/i,
+    );
+    // Nothing was written: no object, no metadata row, no reference.
+    expect(harness.uploads).toEqual([]);
+    expect(harness.rpcs).toEqual([]);
+    expect(harness.updatePatches).toEqual([]);
+  });
+
+  it("case 22: three transport failures stop after three attempts with the same fixed 503", async () => {
+    const harness = makeRetryHarness({ failures: 3 });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const settled = harness.service
+        .saveThumbnail(USER, "project-1", Buffer.from("thumb"), "image/png")
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+      await vi.runAllTimersAsync();
+      const error = await settled;
+
+      expect(harness.attempts).toEqual([0, 400, 1200]);
+      expect(error?.statusCode).toBe(503);
+      expect(error?.code).toBe("project_query_failed");
+      expect(error?.message).toBe("Unable to look up project.");
+      expect(harness.uploads).toEqual([]);
+      expect(harness.rpcs).toEqual([]);
+      expect(harness.updatePatches).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
