@@ -511,6 +511,38 @@ function asRow(value: unknown): Readonly<Record<string, unknown>> {
   return value as Record<string, unknown>;
 }
 
+/**
+ * Read a nullable column, keeping "the database answered NULL" apart from "the
+ * result row does not carry the column at all".
+ *
+ * A nullable column has exactly one legal absent value: the field is present on
+ * the row and is `null`. A row that never had the field — a column dropped from
+ * the statement, a drifting alias, a half-built driver row — or one that carries
+ * an explicit `undefined` means the statement and this module disagree. Folding
+ * that into a business `null` would serve a column drift as a legitimate answer:
+ * a missing `thread_id` would read as "this session has no thread yet" (409)
+ * and a missing jsonb column as "this message has no blocks". So it fails loud,
+ * and the guard around the read turns it into a fixed `ChatReadError`.
+ *
+ * `Object.prototype.hasOwnProperty.call` rather than `field in row`: an
+ * inherited key is not a column the statement selected.
+ */
+function requireNullableField(
+  row: Readonly<Record<string, unknown>>,
+  field: string,
+): unknown {
+  if (!Object.prototype.hasOwnProperty.call(row, field)) {
+    throw new Error(`chat read returned no "${field}"`);
+  }
+
+  const value = row[field];
+  if (value === undefined) {
+    throw new Error(`chat read returned an unusable "${field}"`);
+  }
+
+  return value;
+}
+
 function requireText(
   row: Readonly<Record<string, unknown>>,
   field: string,
@@ -541,13 +573,16 @@ function requirePlainText(
   return value;
 }
 
-/** A nullable text column: `null` is a real answer, anything else is not. */
+/**
+ * A nullable text column: a present `null` is a real answer, anything else — a
+ * missing field included — is not.
+ */
 function optionalText(
   row: Readonly<Record<string, unknown>>,
   field: string,
 ): string | null {
-  const value = row[field];
-  if (value === null || value === undefined) return null;
+  const value = requireNullableField(row, field);
+  if (value === null) return null;
 
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`chat read returned an unusable "${field}"`);
@@ -570,15 +605,16 @@ function requireRole(
 
 /**
  * `jsonb` arrives as a parsed array from both drivers. A JSON `null` arrives as
- * SQL NULL. Anything else (an object, a scalar) is not the shape this module
- * promises its callers, so it fails loud instead of being passed along.
+ * SQL NULL. Anything else — a missing column, an `undefined`, an object, a
+ * scalar — is not the shape this module promises its callers, so it fails loud
+ * instead of being passed along.
  */
 function optionalJsonArray(
   row: Readonly<Record<string, unknown>>,
   field: string,
 ): unknown[] | null {
-  const value = row[field];
-  if (value === null || value === undefined) return null;
+  const value = requireNullableField(row, field);
+  if (value === null) return null;
 
   if (!Array.isArray(value)) {
     throw new Error(`chat read returned an unusable "${field}"`);

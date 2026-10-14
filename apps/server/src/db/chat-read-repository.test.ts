@@ -136,6 +136,17 @@ const ASSET_ROW = {
   bucket: BUCKET,
 };
 
+/**
+ * A message row as a statement that dropped a column returns it: the field is
+ * simply not on the object. That is a different answer from SQL `NULL`, which
+ * arrives as the field being present and `null`.
+ */
+function messageRowWithout(...fields: readonly string[]): Record<string, unknown> {
+  const row: Record<string, unknown> = { ...MESSAGE_ROW };
+  for (const field of fields) delete row[field];
+  return row;
+}
+
 /** The ACL walk every statement must contain, whatever else it selects. */
 function expectAclPredicates(sql: string): void {
   expect(sql).toContain("public.workspace_members");
@@ -358,6 +369,70 @@ describe("chat-read-repository: listReadableMessages", () => {
       }),
     ).resolves.toBeNull();
   });
+
+  it("case 18: present null jsonb columns stay legal, a missing or undefined one fails loud", async () => {
+    // Both jsonb columns present and null: the SQL said NULL, which is legal.
+    const presentNulls = createHarness(() => [
+      { ...MESSAGE_ROW, tool_activities: null, content_blocks: null },
+    ]);
+
+    await expect(
+      repositoryFor(presentNulls).listReadableMessages({
+        actorId: ACTOR_ID,
+        sessionId: SESSION_ID,
+      }),
+    ).resolves.toEqual([
+      {
+        id: MESSAGE_ID,
+        role: "assistant",
+        content: "hello",
+        tool_activities: null,
+        content_blocks: null,
+        created_at: CREATED_AT.toISOString(),
+      },
+    ]);
+
+    // Each column is checked on its own: dropping one must not be served as
+    // "this message has no such column".
+    const droppedColumns = [
+      ["tool_activities"],
+      ["content_blocks"],
+      ["tool_activities", "content_blocks"],
+    ] as const;
+
+    for (const dropped of droppedColumns) {
+      const harness = createHarness(() => [messageRowWithout(...dropped)]);
+      const error = await repositoryFor(harness)
+        .listReadableMessages({ actorId: ACTOR_ID, sessionId: SESSION_ID })
+        .catch((reason: unknown) => reason);
+
+      expect(error).toBeInstanceOf(ChatReadError);
+      expect((error as ChatReadError).operation).toBe(LIST_READABLE_MESSAGES);
+      expect((error as ChatReadError).message).toBe(
+        `chat read failed (${LIST_READABLE_MESSAGES})`,
+      );
+    }
+
+    const undefinedColumns = [
+      { ...MESSAGE_ROW, tool_activities: undefined },
+      { ...MESSAGE_ROW, content_blocks: undefined },
+      {
+        ...MESSAGE_ROW,
+        tool_activities: undefined,
+        content_blocks: undefined,
+      },
+    ];
+
+    for (const row of undefinedColumns) {
+      const harness = createHarness(() => [row]);
+      const error = await repositoryFor(harness)
+        .listReadableMessages({ actorId: ACTOR_ID, sessionId: SESSION_ID })
+        .catch((reason: unknown) => reason);
+
+      expect(error).toBeInstanceOf(ChatReadError);
+      expect((error as ChatReadError).operation).toBe(LIST_READABLE_MESSAGES);
+    }
+  });
 });
 
 describe("chat-read-repository: listReadableSessionAssets", () => {
@@ -489,6 +564,49 @@ describe("chat-read-repository: findReadableSessionThread", () => {
 
     expect(duplicateError).toBeInstanceOf(ChatReadError);
     expect((duplicateError as ChatReadError).operation).toBe(
+      FIND_READABLE_SESSION_THREAD,
+    );
+  });
+
+  it("case 17: a present null thread stays an answer, a missing or undefined thread fails loud", async () => {
+    // The nullable half of the row-shape rule: `thread_id` present and null is
+    // the legacy "no thread yet" the caller turns into a 409.
+    const presentNull = createHarness(() => [{ id: SESSION_ID, thread_id: null }]);
+    await expect(
+      repositoryFor(presentNull).findReadableSessionThread({
+        actorId: ACTOR_ID,
+        sessionId: SESSION_ID,
+      }),
+    ).resolves.toEqual({ id: SESSION_ID, threadId: null });
+
+    // The column is gone from the row: a dropped select, a drifting alias or a
+    // half-built driver row. It must not be served as "no thread yet".
+    const missingField = createHarness(() => [{ id: SESSION_ID }]);
+    const missingError = await repositoryFor(missingField)
+      .findReadableSessionThread({ actorId: ACTOR_ID, sessionId: SESSION_ID })
+      .catch((reason: unknown) => reason);
+
+    expect(missingError).toBeInstanceOf(ChatReadError);
+    expect((missingError as ChatReadError).operation).toBe(
+      FIND_READABLE_SESSION_THREAD,
+    );
+    expect((missingError as ChatReadError).message).toBe(
+      `chat read failed (${FIND_READABLE_SESSION_THREAD})`,
+    );
+    expect((missingError as ChatReadError).message).not.toMatch(
+      /select|public\.|join|postgres:\/\//i,
+    );
+
+    // Present but explicitly `undefined` is the same disagreement as missing.
+    const undefinedField = createHarness(() => [
+      { id: SESSION_ID, thread_id: undefined },
+    ]);
+    const undefinedError = await repositoryFor(undefinedField)
+      .findReadableSessionThread({ actorId: ACTOR_ID, sessionId: SESSION_ID })
+      .catch((reason: unknown) => reason);
+
+    expect(undefinedError).toBeInstanceOf(ChatReadError);
+    expect((undefinedError as ChatReadError).operation).toBe(
       FIND_READABLE_SESSION_THREAD,
     );
   });
