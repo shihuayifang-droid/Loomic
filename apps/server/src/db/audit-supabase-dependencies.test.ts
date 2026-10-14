@@ -334,10 +334,12 @@ describe("audit-supabase-dependencies: real repository root", () => {
       expect(scopeStatus(run.stdout, label)).toBe("ok");
     }
 
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(152);
+    // Workorder 20D moved the four chat read points (session list, message
+    // history, asset identities, thread binding) into the pure `pg` repository.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(148);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(152);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(148);
   }, AUDIT_TEST_TIMEOUT_MS);
 });

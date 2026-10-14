@@ -1,14 +1,26 @@
 import { randomUUID } from "node:crypto";
 
-import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
+import type { ChatReadRepository } from "../../db/chat-read-repository.js";
+import type { AuthenticatedUser } from "../../supabase/user.js";
 
 export class ThreadServiceError extends Error {
   readonly statusCode: number;
-  readonly code: "session_not_found";
+  /**
+   * `session_not_found` for the two existing refusals (404 missing, 409 not
+   * resumable). `application_error` is the infrastructure failure (workorder
+   * 20D): a read that could not be answered must stop pretending the session is
+   * absent, so `POST /api/agent/runs` answers 500 with a fixed, information-free
+   * body instead of a 404 that would tell the caller nothing about the outage.
+   */
+  readonly code: "session_not_found" | "application_error";
 
-  constructor(message: string, statusCode: number) {
+  constructor(
+    code: "session_not_found" | "application_error",
+    message: string,
+    statusCode: number,
+  ) {
     super(message);
-    this.code = "session_not_found";
+    this.code = code;
     this.statusCode = statusCode;
   }
 }
@@ -27,7 +39,7 @@ export type ThreadService = {
 };
 
 export function createThreadService(options: {
-  createUserClient: (accessToken: string) => UserSupabaseClient;
+  chatReadRepository: ChatReadRepository;
   threadIdFactory?: () => string;
 }): ThreadService {
   const threadIdFactory =
@@ -39,27 +51,42 @@ export function createThreadService(options: {
     },
 
     async resolveOwnedSessionThread(user, sessionId) {
-      const client = options.createUserClient(user.accessToken);
-      const { data, error } = await client
-        .from("chat_sessions")
-        .select("id, thread_id")
-        .eq("id", sessionId)
-        .single();
-
-      if (error || !data) {
-        throw new ThreadServiceError("Session not found.", 404);
+      // ADR-0001 / workorder 20D: the binding is read through the pure `pg`
+      // repository, which re-walks `session → canvas → project → members` inside
+      // the statement. A session the caller may not read is indistinguishable
+      // from one that does not exist — both are 404, on purpose.
+      let row: { id: string; threadId: string | null } | null;
+      try {
+        row = await options.chatReadRepository.findReadableSessionThread({
+          actorId: user.id,
+          sessionId,
+        });
+      } catch {
+        // Fixed text, no driver detail: the underlying failure is logged by the
+        // repository's own error, and a response body must not carry SQL, a host
+        // or a connection string.
+        throw new ThreadServiceError(
+          "application_error",
+          "Unable to resolve the session thread.",
+          500,
+        );
       }
 
-      if (!data.thread_id) {
+      if (row === null) {
+        throw new ThreadServiceError("session_not_found", "Session not found.", 404);
+      }
+
+      if (!row.threadId) {
         throw new ThreadServiceError(
+          "session_not_found",
           "Session is not resumable because no thread is bound yet.",
           409,
         );
       }
 
       return {
-        sessionId: data.id,
-        threadId: data.thread_id,
+        sessionId: row.id,
+        threadId: row.threadId,
       };
     },
   };

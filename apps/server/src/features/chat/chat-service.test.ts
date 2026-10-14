@@ -18,7 +18,15 @@ import {
   messageListResponseSchema,
 } from "@loomic/shared";
 
-import { createChatService } from "./chat-service.js";
+import {
+  LIST_READABLE_SESSION_ASSETS,
+  ChatReadError,
+  type ChatAssetReadRow,
+  type ChatMessageReadRow,
+  type ChatReadRepository,
+  type ChatSessionReadRow,
+} from "../../db/chat-read-repository.js";
+import { createChatService, ChatServiceError } from "./chat-service.js";
 
 const USER = { accessToken: "t", id: "u1" } as never;
 const SESSION = "s1";
@@ -29,6 +37,82 @@ const PG_DENIED = {
   code: "42501",
   message: "new row violates row-level security policy",
 };
+
+/**
+ * The read side of this service moved to the chat read repository (workorder
+ * 20D), so the doubles below answer those reads and record the actor and parent
+ * ids they were called with. `assetError` / `messagesError` model the repository
+ * failing, which the service must classify rather than leak.
+ */
+type RepositoryScript = {
+  sessions?: { rows: ChatSessionReadRow[] | null; error?: unknown };
+  messages?: { rows: ChatMessageReadRow[] | null; error?: unknown };
+  assets?: ChatAssetReadRow[];
+  assetError?: unknown;
+};
+
+type RepositoryCalls = {
+  sessions: Array<{ actorId: string; canvasId: string }>;
+  messages: Array<{ actorId: string; sessionId: string }>;
+  assets: Array<{ actorId: string; sessionId: string; assetIds: readonly string[] }>;
+};
+
+function repositoryStub(script: RepositoryScript): {
+  repository: ChatReadRepository;
+  calls: RepositoryCalls;
+} {
+  const calls: RepositoryCalls = { sessions: [], messages: [], assets: [] };
+
+  const repository: ChatReadRepository = {
+    async listReadableSessions(input) {
+      calls.sessions.push({ ...input });
+      if (script.sessions?.error) throw script.sessions.error;
+      // `null` is the repository's "not readable" answer and must survive: `?? []`
+      // here would silently turn every 404 case into an empty list.
+      if (script.sessions === undefined) return [];
+      return script.sessions.rows;
+    },
+    async listReadableMessages(input) {
+      calls.messages.push({ ...input });
+      if (script.messages?.error) throw script.messages.error;
+      if (script.messages === undefined) return [];
+      return script.messages.rows;
+    },
+    async listReadableSessionAssets(input) {
+      calls.assets.push({ ...input });
+      if (script.assetError) throw script.assetError;
+      return script.assets ?? [];
+    },
+    async findReadableSessionThread() {
+      return null;
+    },
+  };
+
+  return { repository, calls };
+}
+
+function sessionRow(
+  id: string,
+  title: string,
+  updatedAt: string,
+): ChatSessionReadRow {
+  return { id, title, updated_at: updatedAt };
+}
+
+function messageRow(
+  id: string,
+  overrides: Partial<ChatMessageReadRow> = {},
+): ChatMessageReadRow {
+  return {
+    id,
+    role: "assistant",
+    content: "hello",
+    tool_activities: null,
+    content_blocks: null,
+    created_at: "2026-09-15T00:00:00.000Z",
+    ...overrides,
+  };
+}
 
 function row(id: string) {
   return {
@@ -54,8 +138,11 @@ function fakeClient(script: {
   /**
    * Rows the caller may read from `asset_objects` (工单14 fixup T2: the create
    * response is projected through the same signing path as the list response).
+   * Since 20D they are read through the chat read repository, not the client.
    */
-  assets?: Array<{ id: string; object_path: string; bucket: string }>;
+  assets?: ChatAssetReadRow[];
+  /** Set when the asset read itself fails. */
+  assetError?: unknown;
   /** Object paths the storage API refuses to sign. */
   unsignable?: ReadonlySet<string>;
 }) {
@@ -66,11 +153,9 @@ function fakeClient(script: {
   const client = {
     from: (table: string) => {
       if (table === "asset_objects") {
-        return {
-          select: () => ({
-            in: async () => ({ data: script.assets ?? [], error: null }),
-          }),
-        };
+        throw new Error(
+          "asset_objects must be read through the chat read repository (20D)",
+        );
       }
       if (table !== "chat_messages") {
         // chat_sessions updated_at touch — irrelevant here, must not blow up.
@@ -121,12 +206,19 @@ function fakeClient(script: {
     },
   };
 
+  const { repository, calls } = repositoryStub({
+    assets: script.assets ?? [],
+    ...(script.assetError ? { assetError: script.assetError } : {}),
+  });
+
   return {
     service: createChatService({
       createUserClient: () => client as never,
+      chatReadRepository: repository,
       threadService: { createThreadId: () => "th" },
     }),
     inserts,
+    calls,
     lookupCount: () => lookups,
   };
 }
@@ -219,17 +311,25 @@ const STALE = "https://proj.test/storage/v1/object/sign/project-assets/ws/a.png?
 type ReadHarness = {
   service: ReturnType<typeof createChatService>;
   inserts: Array<Record<string, unknown>>;
+  calls: RepositoryCalls;
   logs: string[];
 };
 
 /**
- * A fake client for the READ path: `chat_messages` returns the given rows and
- * `asset_objects` returns the given assets (or an error).
+ * A fake for the READ path: the message history and the asset identities come
+ * from the chat read repository (workorder 20D), while the storage signing still
+ * goes through the user client.
  */
 function fakeReadClient(options: {
   rows: Array<Record<string, unknown>>;
-  assets?: Array<{ id: string; object_path: string; bucket: string }>;
-  assetError?: { code?: string; message: string } | null;
+  /** Session-list rows or failure, for the `listSessions` cases. */
+  sessions?: { rows: ChatSessionReadRow[] | null; error?: unknown };
+  /** Message-history rows or failure; overrides `rows` when given. */
+  messages?: { rows: ChatMessageReadRow[] | null; error?: unknown };
+  /** Set when the message read itself fails. */
+  messagesError?: unknown;
+  assets?: ChatAssetReadRow[];
+  assetError?: unknown;
   /** Object paths the storage API refuses to sign. */
   unsignable?: ReadonlySet<string>;
   inserts?: Array<Record<string, unknown>>;
@@ -240,14 +340,9 @@ function fakeReadClient(options: {
   const client = {
     from: (table: string) => {
       if (table === "asset_objects") {
-        return {
-          select: () => ({
-            in: async () => ({
-              data: options.assetError ? null : (options.assets ?? []),
-              error: options.assetError ?? null,
-            }),
-          }),
-        };
+        throw new Error(
+          "asset_objects must be read through the chat read repository (20D)",
+        );
       }
       if (table === "chat_sessions") {
         return { update: () => ({ eq: async () => ({ error: null }) }) };
@@ -266,7 +361,6 @@ function fakeReadClient(options: {
         },
         select: () => ({
           eq: () => ({
-            order: async () => ({ data: options.rows, error: null }),
             maybeSingle: async () => ({ data: null, error: null }),
           }),
         }),
@@ -288,14 +382,26 @@ function fakeReadClient(options: {
     logs.push(args.map(String).join(" "));
   });
 
+  const { repository, calls } = repositoryStub({
+    ...(options.sessions ? { sessions: options.sessions } : {}),
+    messages: options.messages ?? {
+      rows: options.rows as unknown as ChatMessageReadRow[],
+      ...(options.messagesError ? { error: options.messagesError } : {}),
+    },
+    assets: options.assets ?? [],
+    ...(options.assetError ? { assetError: options.assetError } : {}),
+  });
+
   const service = createChatService({
     createUserClient: () => client as never,
+    chatReadRepository: repository,
     threadService: { createThreadId: () => "th" },
   });
 
   return {
     service,
     inserts,
+    calls,
     logs,
     // Restore in the test itself so the spy does not leak between cases.
     ...({ restore: () => spy.mockRestore() } as object),
@@ -449,15 +555,20 @@ describe("listMessages re-signs assets for the caller (X-52)", () => {
           { type: "image", assetId: "asset-1", objectPath: "ws-team/p/a.png", mimeType: "image/png" },
         ]),
       ],
-      assetError: { code: "57014", message: "statement timeout" },
+      assetError: new ChatReadError(
+        LIST_READABLE_SESSION_ASSETS,
+        new Error("statement timeout"),
+      ),
     });
 
     const messages = await harness.service.listMessages(USER, SESSION);
     const blocks = messages[0]?.contentBlocks as Array<Record<string, unknown>>;
 
     expect(blocks[0]?.url).toBeUndefined();
-    // The reason is logged; the URL never is (a signed URL is a bearer token).
+    // The reason is logged — the repository's fixed operation name — and the URL
+    // never is (a signed URL is a bearer token).
     expect(harness.logs.join("\n")).toContain("asset lookup failed");
+    expect(harness.logs.join("\n")).toContain(LIST_READABLE_SESSION_ASSETS);
     expect(harness.logs.join("\n")).not.toContain("token=");
   });
 
@@ -770,5 +881,239 @@ describe("tool block artifacts without a projection (X-52 fixup2)", () => {
 
     expect(messageListResponseSchema.safeParse({ messages: [message] }).success).toBe(false);
     expect(messageCreateResponseSchema.safeParse({ message }).success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR-0001 / 工单20D: the two chat READS (session list, message history) and the
+// asset-identity read behind the media projection move to the pure `pg`
+// repository. These cases pin what the caller must do with each repository
+// answer, because the two "empty" answers are not the same answer:
+//
+//   * `null` — no canvas/session the caller may read: 404, and no audit runs;
+//   * `[]`   — a readable parent whose children are genuinely absent: 200.
+//
+// A repository failure is never a 404 and never a broken write: it is the
+// existing fixed 500 for the lists, and for the asset read it is a safe
+// degradation (identity kept, url dropped, no fallback to the stale url).
+// ---------------------------------------------------------------------------
+describe("chat-service reads through the repository (20D)", () => {
+  const CANVAS = "canvas-1";
+
+  it("case 1: listSessions passes the REAL actor and canvas ids and maps the rows", async () => {
+    const harness = fakeReadClient({
+      rows: [],
+      sessions: {
+        rows: [
+          sessionRow("s-new", "Newest", "2026-03-02T00:00:00.000Z"),
+          sessionRow("s-old", "Older", "2026-03-01T00:00:00.000Z"),
+        ],
+      },
+    });
+
+    const sessions = await harness.service.listSessions(USER, CANVAS);
+
+    expect(harness.calls.sessions).toEqual([
+      { actorId: "u1", canvasId: CANVAS },
+    ]);
+    expect(sessions).toEqual([
+      { id: "s-new", title: "Newest", updatedAt: "2026-03-02T00:00:00.000Z" },
+      { id: "s-old", title: "Older", updatedAt: "2026-03-01T00:00:00.000Z" },
+    ]);
+  });
+
+  it("case 2: listSessions turns an unreadable canvas into the existing 404", async () => {
+    const harness = fakeReadClient({ rows: [], sessions: { rows: null } });
+
+    const error = await harness.service
+      .listSessions(USER, CANVAS)
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ChatServiceError);
+    expect((error as ChatServiceError).code).toBe("session_not_found");
+    expect((error as ChatServiceError).statusCode).toBe(404);
+    expect((error as ChatServiceError).message).toBe("Canvas not found.");
+  });
+
+  it("case 3: listSessions keeps [] legal and a repository failure a fixed 500", async () => {
+    const empty = fakeReadClient({ rows: [], sessions: { rows: [] } });
+    await expect(empty.service.listSessions(USER, CANVAS)).resolves.toEqual([]);
+
+    const failing = fakeReadClient({
+      rows: [],
+      sessions: { rows: null, error: new Error("connect ECONNREFUSED") },
+    });
+    const error = await failing.service
+      .listSessions(USER, CANVAS)
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ChatServiceError);
+    expect((error as ChatServiceError).code).toBe("chat_error");
+    expect((error as ChatServiceError).statusCode).toBe(500);
+    expect((error as ChatServiceError).message).toBe("Failed to list sessions.");
+    // The driver's own text never reaches the caller.
+    expect((error as ChatServiceError).message).not.toContain("ECONNREFUSED");
+  });
+
+  it("case 4: listMessages passes the REAL actor and session ids, keeps order, synthesis and the dedupe", async () => {
+    const harness = fakeReadClient({
+      rows: [
+        messageRow("m1", {
+          role: "user",
+          content: "legacy",
+          content_blocks: null,
+          tool_activities: null,
+          created_at: "2026-03-01T00:00:00.000Z",
+        }),
+        messageRow("m2", {
+          role: "assistant",
+          content: "same",
+          created_at: "2026-03-02T00:00:00.000Z",
+        }),
+        messageRow("m3", {
+          role: "assistant",
+          content: "same",
+          created_at: "2026-03-03T00:00:00.000Z",
+        }),
+      ],
+    });
+
+    const messages = await harness.service.listMessages(USER, SESSION);
+
+    expect(harness.calls.messages).toEqual([
+      { actorId: "u1", sessionId: SESSION },
+    ]);
+    // Oldest first, exactly as the statement returned them.
+    expect(messages.map((message) => message.id)).toEqual(["m1", "m2"]);
+    // A null `content_blocks` still becomes the legacy text block.
+    expect(messages[0]?.contentBlocks).toEqual([
+      { type: "text", text: "legacy" },
+    ]);
+  });
+
+  it("case 5: listMessages turns an unreadable session into 404, a failure into the fixed 500", async () => {
+    const missing = fakeReadClient({ rows: [], messages: { rows: null } });
+    const missingError = await missing.service
+      .listMessages(USER, SESSION)
+      .catch((reason: unknown) => reason);
+
+    expect(missingError).toBeInstanceOf(ChatServiceError);
+    expect((missingError as ChatServiceError).code).toBe("session_not_found");
+    expect((missingError as ChatServiceError).statusCode).toBe(404);
+    expect((missingError as ChatServiceError).message).toBe("Session not found.");
+
+    const failing = fakeReadClient({
+      rows: [],
+      messagesError: new Error("invalid input syntax for type uuid"),
+    });
+    const failingError = await failing.service
+      .listMessages(USER, SESSION)
+      .catch((reason: unknown) => reason);
+
+    expect(failingError).toBeInstanceOf(ChatServiceError);
+    expect((failingError as ChatServiceError).code).toBe("chat_error");
+    expect((failingError as ChatServiceError).statusCode).toBe(500);
+    expect((failingError as ChatServiceError).message).toBe(
+      "Failed to list messages.",
+    );
+  });
+
+  it("case 6: a readable session with no messages is [] and touches no asset read", async () => {
+    const harness = fakeReadClient({ rows: [], messages: { rows: [] } });
+
+    await expect(harness.service.listMessages(USER, SESSION)).resolves.toEqual([]);
+    expect(harness.calls.assets).toEqual([]);
+  });
+
+  it("case 7: a failing asset read neither breaks the list nor the successful write", async () => {
+    const failingAssets = () =>
+      new ChatReadError(LIST_READABLE_SESSION_ASSETS, new Error("statement timeout"));
+
+    const list = fakeReadClient({
+      rows: [
+        messageRow("m1", {
+          content_blocks: [
+            {
+              type: "image",
+              assetId: "asset-1",
+              objectPath: "ws-team/p/a.png",
+              mimeType: "image/png",
+              source: "upload",
+              url: STALE,
+            },
+          ],
+        }),
+      ],
+      assetError: failingAssets(),
+    });
+
+    const messages = await list.service.listMessages(USER, SESSION);
+    const blocks = messages[0]?.contentBlocks as Array<Record<string, unknown>>;
+    expect(blocks[0]?.assetId).toBe("asset-1");
+    expect(blocks[0]?.url).toBeUndefined();
+    expect(JSON.stringify(messages)).not.toContain("token=stale");
+
+    // The write already succeeded; a read-side asset failure must not turn it
+    // into a 500 on the way out.
+    const create = fakeReadClient({
+      rows: [],
+      assets: [],
+      assetError: failingAssets(),
+    });
+    const created = await create.service.createMessage(USER, SESSION, {
+      role: "user",
+      content: "look",
+      contentBlocks: [
+        {
+          type: "image",
+          assetId: "asset-1",
+          objectPath: "ws-team/p/a.png",
+          mimeType: "image/png",
+          source: "upload",
+          url: STALE,
+        },
+      ],
+    } as never);
+
+    expect(create.inserts).toHaveLength(1);
+    const createdBlocks = created.contentBlocks as Array<Record<string, unknown>>;
+    expect(createdBlocks[0]?.assetId).toBe("asset-1");
+    expect(createdBlocks[0]?.url).toBeUndefined();
+    expect(() => messageCreateResponseSchema.parse({ message: created })).not.toThrow();
+  });
+
+  it("case 8: the create response's asset read carries the REAL actor and session", async () => {
+    const harness = fakeReadClient({
+      rows: [],
+      assets: [
+        { id: "asset-1", object_path: "ws-team/p/a.png", bucket: "project-assets" },
+      ],
+    });
+
+    const created = await harness.service.createMessage(USER, SESSION, {
+      role: "user",
+      content: "look",
+      contentBlocks: [
+        {
+          type: "image",
+          assetId: "asset-1",
+          objectPath: "ws-team/p/a.png",
+          mimeType: "image/png",
+          source: "upload",
+        },
+      ],
+    } as never);
+
+    expect(harness.calls.assets).toEqual([
+      { actorId: "u1", sessionId: SESSION, assetIds: ["asset-1"] },
+    ]);
+    const blocks = created.contentBlocks as Array<Record<string, unknown>>;
+    expect(String(blocks[0]?.url)).toContain("token=fresh");
+    // The write protocol is untouched: exactly one insert, carrying the stored
+    // identity only.
+    expect(harness.inserts).toHaveLength(1);
+    expect(
+      (harness.inserts[0]?.content_blocks as Array<Record<string, unknown>>)[0],
+    ).not.toHaveProperty("url");
   });
 });

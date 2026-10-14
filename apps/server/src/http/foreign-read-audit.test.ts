@@ -27,6 +27,7 @@ const TOKEN = "admin-token";
 const PROJECT_ID = "p-1";
 const CANVAS_ID = "c-1";
 const SESSION_ID = "s-1";
+const MESSAGE_ID = "m-1";
 const ASSET_ID = "asset-1";
 
 type AuditCall = {
@@ -99,18 +100,37 @@ const canvasService = {
   },
 } as unknown as CanvasService;
 
+/**
+ * Real, parseable payloads on purpose: "the audit failed" has to be provable as
+ * "the data did NOT go out", and an empty list cannot prove that.
+ */
+const SESSION = {
+  id: SESSION_ID,
+  title: "Secret Session Alpha",
+  updatedAt: "2026-03-01T00:00:00.000Z",
+};
+
+const MESSAGE = {
+  id: MESSAGE_ID,
+  role: "user",
+  content: "Secret Message Bravo",
+  contentBlocks: null,
+  toolActivities: null,
+  createdAt: "2026-03-01T00:00:00.000Z",
+};
+
 const chatService = {
   async listSessions() {
     if (readsFail) {
       throw new ChatServiceError("session_not_found", "Canvas not found.", 404);
     }
-    return [];
+    return [SESSION];
   },
   async listMessages() {
     if (readsFail) {
       throw new ChatServiceError("session_not_found", "Session not found.", 404);
     }
-    return [];
+    return [MESSAGE];
   },
 } as unknown as ChatService;
 
@@ -219,6 +239,10 @@ describe("admin foreign-read auditing", () => {
     expect(auditCalls).toEqual([
       { userId: ADMIN_ID, via: "sessions", target: { canvasId: CANVAS_ID } },
     ]);
+    // The 200 really carries the sessions, so the 503 below proves they were
+    // withheld rather than never produced.
+    expect(response.json().sessions).toHaveLength(1);
+    expect(response.body).toContain("Secret Session Alpha");
   });
 
   it("case 4: GET /api/sessions/:sessionId/messages audits as 'messages'", async () => {
@@ -232,6 +256,8 @@ describe("admin foreign-read auditing", () => {
     expect(auditCalls).toEqual([
       { userId: ADMIN_ID, via: "messages", target: { sessionId: SESSION_ID } },
     ]);
+    expect(response.json().messages).toHaveLength(1);
+    expect(response.body).toContain("Secret Message Bravo");
   });
 
   it("case 5: a failed read is never audited", async () => {
@@ -312,5 +338,39 @@ describe("admin foreign-read auditing", () => {
     expect(response.json().error.code).toBe("application_error");
     expect(response.body).not.toContain("signed.example.invalid");
     expect(response.json().url).toBeUndefined();
+  });
+
+  it("case 10: a failed sessions audit is a 503 that returns no sessions", async () => {
+    auditFails = true;
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/canvases/${CANVAS_ID}/sessions`,
+      headers,
+    });
+
+    // The read succeeded; only the audit failed. The contract is 503 with no
+    // data — the session list must not ride along with an unrecorded access.
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error.code).toBe("application_error");
+    expect(response.body).not.toContain("Secret Session Alpha");
+    expect(response.json().sessions).toBeUndefined();
+    expect(auditCalls.length).toBe(0);
+  });
+
+  it("case 11: a failed messages audit is a 503 that returns no messages", async () => {
+    auditFails = true;
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/sessions/${SESSION_ID}/messages`,
+      headers,
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error.code).toBe("application_error");
+    expect(response.body).not.toContain("Secret Message Bravo");
+    expect(response.json().messages).toBeUndefined();
+    expect(auditCalls.length).toBe(0);
   });
 });

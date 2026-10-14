@@ -64,6 +64,10 @@ import {
   type CanvasReadRepository,
 } from "./db/canvas-read-repository.js";
 import {
+  createChatReadRepository,
+  type ChatReadRepository,
+} from "./db/chat-read-repository.js";
+import {
   createProjectReadRepository,
   type ProjectReadRepository,
 } from "./db/project-read-repository.js";
@@ -130,6 +134,7 @@ export type BuildAppOptions = {
   brandKitService?: BrandKitService;
   canvasReadRepository?: CanvasReadRepository;
   canvasService?: CanvasService;
+  chatReadRepository?: ChatReadRepository;
   chatService?: ChatService;
   connectionManager?: ConnectionManager;
   creditService?: CreditService;
@@ -214,6 +219,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createCanvasReadRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 20D: chat and session reads inherit the project ACL, so
+  // the chat read repository is built the same lazy way and handed to the two
+  // features that perform them — the chat service (sessions, messages, asset
+  // identities) and the thread service (the session's thread binding).
+  const chatReadRepository =
+    options.chatReadRepository ??
+    createChatReadRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   const teamMembershipService =
     options.teamMembershipService ??
     createTeamMembershipService({ identityReadRepository });
@@ -245,9 +259,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       canvasReadRepository,
     });
   const threadService =
-    options.threadService ?? createThreadService({ createUserClient });
+    options.threadService ?? createThreadService({ chatReadRepository });
   const chatService =
-    options.chatService ?? createChatService({ createUserClient, threadService });
+    options.chatService ??
+    createChatService({ createUserClient, chatReadRepository, threadService });
   const agentRunMetadataService =
     options.agentRunMetadataService ??
     createAgentRunMetadataService({ getAdminClient });

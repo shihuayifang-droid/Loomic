@@ -8,6 +8,13 @@ import type {
 
 import { randomUUID } from "node:crypto";
 
+import {
+  ChatReadError,
+  type ChatAssetReadRow,
+  type ChatReadRepository,
+  type ChatMessageReadRow,
+  type ChatSessionReadRow,
+} from "../../db/chat-read-repository.js";
 import { isTransportFailure } from "../../supabase/transport-retry.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 import { signProjectAssetUrls } from "../storage/project-asset-urls.js";
@@ -144,12 +151,15 @@ function collectBlockAssetIds(blocks: ContentBlock[]): string[] {
 /**
  * X-52: re-project a `url` onto every block that names an asset.
  *
- * The row is read through the CALLER's client, so RLS is what decides whether
- * the asset may be seen at all — the same authorisation that governs the canvas.
+ * The ASSET IDENTITIES are read through the chat read repository (workorder
+ * 20D), so the authorization is the SQL's own project ACL — the reader must be a
+ * member of the session's project and either its author or an admin/owner. The
+ * SIGNATURE is still minted through the CALLER's storage client, so the storage
+ * layer keeps deciding what it will sign.
  *
  * Two rules, and the second is the one that is easy to get wrong:
  *   * an asset that resolves is signed fresh for this caller;
- *   * an asset that does NOT resolve — invisible under RLS, gone, or refused by
+ *   * an asset that does NOT resolve — not in this project, gone, or refused by
  *     the signer — leaves its block with NO url. The url already sitting in the
  *     row is not a fallback: it is a token that used to work, and serving it
  *     again is exactly the "回退旧URL" the ticket forbids. So it is removed
@@ -159,9 +169,10 @@ function collectBlockAssetIds(blocks: ContentBlock[]): string[] {
  * showing one whose signature no longer stands is not.
  */
 async function projectBlockUrls(
+  repository: ChatReadRepository,
   client: UserSupabaseClient,
   blocks: ContentBlock[],
-  context: { sessionId: string },
+  context: { sessionId: string; actorId: string },
 ): Promise<ContentBlock[]> {
   const assetIds = collectBlockAssetIds(blocks);
 
@@ -195,25 +206,26 @@ async function projectBlockUrls(
 
   if (assetIds.length === 0) return withoutProjection;
 
-  const { data, error } = await client
-    .from("asset_objects")
-    .select("id, object_path, bucket")
-    .in("id", assetIds);
-
-  if (error) {
-    // Safe log: the reason, never a URL — a signed URL is a bearer token.
+  let rows: ChatAssetReadRow[];
+  try {
+    rows = await repository.listReadableSessionAssets({
+      actorId: context.actorId,
+      sessionId: context.sessionId,
+      assetIds,
+    });
+  } catch (error) {
+    // Safe log: the fixed operation name, never a URL — a signed URL is a bearer
+    // token. A read that fails is a display limitation, not a failed request:
+    // the blocks simply keep their identity and lose the projection.
     console.log(
       "[chat-service] asset lookup failed, returning blocks without urls",
-      JSON.stringify({ sessionId: context.sessionId, code: error.code }),
+      JSON.stringify({
+        sessionId: context.sessionId,
+        operation: error instanceof ChatReadError ? error.operation : "unknown",
+      }),
     );
     return withoutProjection;
   }
-
-  const rows = (data ?? []) as Array<{
-    id: string;
-    object_path: string;
-    bucket: string;
-  }>;
 
   // Sign each row with its own bucket; `signProjectAssetUrls` omits whatever it
   // cannot sign and never falls back to a public URL.
@@ -342,22 +354,40 @@ function synthesizeLegacyBlocks(
 
 export function createChatService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
+  chatReadRepository: ChatReadRepository;
   threadService: Pick<ThreadService, "createThreadId">;
 }): ChatService {
   return {
     async listSessions(user, canvasId) {
-      const client = options.createUserClient(user.accessToken);
-      const { data, error } = await client
-        .from("chat_sessions")
-        .select("id, title, updated_at")
-        .eq("canvas_id", canvasId)
-        .order("updated_at", { ascending: false });
-
-      if (error) {
+      // ADR-0001 / workorder 20D: the session list is read through the pure `pg`
+      // repository, so the project ACL is the statement's own predicate. `null`
+      // means "no canvas you may read" (404); `[]` means a readable canvas with
+      // no sessions yet (200 with an empty list) — the two must not collapse.
+      let rows: ChatSessionReadRow[] | null;
+      try {
+        rows = await options.chatReadRepository.listReadableSessions({
+          actorId: user.id,
+          canvasId,
+        });
+      } catch (error) {
+        console.log(
+          "[chat-service] listSessions failed",
+          "canvasId=" + canvasId,
+          "operation=" +
+            String(error instanceof ChatReadError ? error.operation : "unknown"),
+        );
         throw new ChatServiceError("chat_error", "Failed to list sessions.", 500);
       }
 
-      return (data ?? []).map((row) => ({
+      if (rows === null) {
+        throw new ChatServiceError(
+          "session_not_found",
+          "Canvas not found.",
+          404,
+        );
+      }
+
+      return rows.map((row) => ({
         id: row.id,
         title: row.title,
         updatedAt: row.updated_at,
@@ -414,29 +444,36 @@ export function createChatService(options: {
 
     async listMessages(user, sessionId) {
       const client = options.createUserClient(user.accessToken);
-      const { data, error } = await client
-        .from("chat_messages")
-        .select("id, role, content, tool_activities, content_blocks, created_at")
-        .eq("session_id", sessionId)
-        .order("created_at", { ascending: true });
 
-      if (error) {
-        // Log the driver's own error before wrapping it. ChatServiceError keeps
-        // only a fixed sentence, so the postgres code/message that says WHY —
-        // statement timeout, row too large, RLS refusal — was being thrown away,
-        // leaving "Failed to list messages." as the only evidence anywhere.
+      // ADR-0001 / workorder 20D: the history rows come from the pure `pg`
+      // repository, so `session → canvas → project` is re-walked inside the
+      // statement instead of being delegated to the old RLS policies. `null` is
+      // "no session you may read" (404); `[]` is a readable session whose history
+      // is genuinely empty (200).
+      let rows: ChatMessageReadRow[] | null;
+      try {
+        rows = await options.chatReadRepository.listReadableMessages({
+          actorId: user.id,
+          sessionId,
+        });
+      } catch (error) {
+        // Log the fixed operation name before wrapping the failure. The reason
+        // (statement timeout, illegal id, an unusable row shape) stays
+        // attributable without any SQL or credential reaching a log line.
         console.log(
           "[chat-service] listMessages failed",
           "sessionId=" + sessionId,
-          "code=" + String((error as { code?: string }).code ?? ""),
-          "message=" + String((error as { message?: string }).message ?? ""),
-          "details=" + String((error as { details?: string }).details ?? ""),
-          "hint=" + String((error as { hint?: string }).hint ?? ""),
+          "operation=" +
+            String(error instanceof ChatReadError ? error.operation : "unknown"),
         );
         throw new ChatServiceError("chat_error", "Failed to list messages.", 500);
       }
 
-      const rows = (data ?? []).map((row) => {
+      if (rows === null) {
+        throw new ChatServiceError("session_not_found", "Session not found.", 404);
+      }
+
+      const messages = rows.map((row) => {
         const contentBlocks =
           Array.isArray(row.content_blocks) && row.content_blocks.length > 0
             ? (row.content_blocks as ContentBlock[])
@@ -447,7 +484,7 @@ export function createChatService(options: {
 
         return {
           id: row.id,
-          role: row.role as "user" | "assistant",
+          role: row.role,
           content: row.content,
           toolActivities: row.tool_activities as ChatMessage["toolActivities"],
           contentBlocks,
@@ -457,10 +494,11 @@ export function createChatService(options: {
 
       // X-52: re-sign every block that names an asset, for THIS caller. The
       // stored rows carry no url at all for post-X-52 messages; the url below is
-      // a projection minted now, through the reader's own client, so RLS decides
-      // what they may see. Legacy url-only rows are counted, not repaired.
+      // a projection minted now, from the caller's own readable assets, so the
+      // project ACL decides what they may see. Legacy url-only rows are counted,
+      // not repaired.
       const projected = await Promise.all(
-        rows.map(async (message) => {
+        messages.map(async (message) => {
           if (!message.contentBlocks) return message;
           const legacyCount = message.contentBlocks.filter(isLegacyUrlOnlyBlock).length;
           if (legacyCount > 0) {
@@ -472,9 +510,10 @@ export function createChatService(options: {
           return {
             ...message,
             contentBlocks: await projectBlockUrls(
+              options.chatReadRepository,
               client,
               message.contentBlocks,
-              { sessionId },
+              { sessionId, actorId: user.id },
             ),
           };
         }),
@@ -617,7 +656,10 @@ export function createChatService(options: {
       const contentBlocks =
         storedBlocks === null
           ? null
-          : await projectBlockUrls(client, storedBlocks, { sessionId });
+          : await projectBlockUrls(options.chatReadRepository, client, storedBlocks, {
+              sessionId,
+              actorId: user.id,
+            });
 
       return {
         id: data.id,
