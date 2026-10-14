@@ -3,6 +3,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PGlite, type Transaction } from "@electric-sql/pglite";
 
+import type {
+  TransactionConnection,
+  TransactionPool,
+} from "../../db/transaction.js";
+
 /** `src/test-support/db` -> repo root is five levels up. No drive letter hardcoded. */
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, "..", "..", "..", "..", "..");
@@ -72,4 +77,43 @@ export async function asUser<T>(
     }
     return fn(tx);
   });
+}
+
+/**
+ * Test-only adapter: expose one PGlite instance as the `TransactionPool` of
+ * `src/db/transaction.ts`, so the real repository can run its real SQL against
+ * a real PostgreSQL parser without a server, a socket or `DATABASE_URL`.
+ *
+ * Two properties matter and are easy to break:
+ *
+ * - `withTransaction` issues `BEGIN` / `COMMIT` / `ROLLBACK` itself, so this
+ *   adapter must NOT wrap the callback in `db.transaction()`: that would open a
+ *   second, nested transaction and the transaction-local settings written with
+ *   `set_config(..., true)` would stop meaning what they mean in production.
+ *   PGlite keeps one session, so plain `BEGIN` ... `COMMIT` statements carry
+ *   across separate `query()` calls.
+ * - `release()` is deliberately a no-op. Closing the database here would tear it
+ *   down for every later case in the same file; the lifetime belongs to the test
+ *   file, which calls `db.close()` once in `afterAll`.
+ *
+ * Never import this from production code: it exists so tests can drive the
+ * `TransactionPool` contract, not so the application can run on PGlite.
+ */
+export function createPGliteTransactionPool(db: PGlite): TransactionPool {
+  return {
+    async connect(): Promise<TransactionConnection> {
+      return {
+        async query(
+          sql: string,
+          params?: readonly unknown[],
+        ): Promise<{ rows: unknown[] }> {
+          const result = await db.query(sql, params ? [...params] : undefined);
+          return { rows: result.rows };
+        },
+        release() {
+          // Intentionally empty: see the note above.
+        },
+      };
+    },
+  };
 }
