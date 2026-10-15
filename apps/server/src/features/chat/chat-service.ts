@@ -15,6 +15,13 @@ import {
   type ChatMessageReadRow,
   type ChatSessionReadRow,
 } from "../../db/chat-read-repository.js";
+import {
+  ChatWriteError,
+  chatWriteCause,
+  chatWriteFailureCode,
+  type ChatMessageWriteRow,
+  type ChatWriteRepository,
+} from "../../db/chat-write-repository.js";
 import { isTransportFailure } from "../../supabase/transport-retry.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 import { signProjectAssetUrls } from "../storage/project-asset-urls.js";
@@ -302,6 +309,38 @@ export class ChatServiceError extends Error {
   }
 }
 
+/**
+ * Which write failures may be confirmed and replayed (workorder 21B).
+ *
+ * The predicate is the accepted one (workorder 21-前置A) and it is not modified
+ * here; what changes is where its input comes from. The write repository wraps
+ * the driver's own error as `cause`, and that object IS the shape the predicate
+ * was verified against — a Node socket code, or the socket's own text with no
+ * SQLSTATE at all.
+ *
+ * Everything else fails fast, which is what keeps a real database answer (an RLS
+ * refusal, a constraint violation, an illegal uuid) from being confirmed and
+ * replayed: it would fail again identically, and a replay on top of a row that
+ * DID land is the duplicate-reply bug this whole branch exists to prevent.
+ */
+function isWriteTransportFailure(error: unknown): boolean {
+  return isTransportFailure(chatWriteCause(error));
+}
+
+/**
+ * The transport's own text, for the one log line that reports a transport
+ * failure. Safe by construction: the predicate only reaches the message when the
+ * error carries no code at all, and a statement that reached PostgreSQL always
+ * answers with a SQLSTATE.
+ */
+function transportFailureMessage(error: unknown): string | undefined {
+  const cause = chatWriteCause(error);
+  if (!cause || typeof cause !== "object") return undefined;
+
+  const message = (cause as { message?: unknown }).message;
+  return typeof message === "string" ? message : undefined;
+}
+
 export type ChatService = {
   listSessions(
     user: AuthenticatedUser,
@@ -355,6 +394,11 @@ function synthesizeLegacyBlocks(
 export function createChatService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   chatReadRepository: ChatReadRepository;
+  /**
+   * Required, never optional: the create path writes through the pure `pg`
+   * repository or it fails. A missing repository must not fall back to PostgREST.
+   */
+  chatWriteRepository: ChatWriteRepository;
   threadService: Pick<ThreadService, "createThreadId">;
 }): ChatService {
   return {
@@ -540,9 +584,6 @@ export function createChatService(options: {
           )
         : null;
 
-      const RETURNING =
-        "id, role, content, tool_activities, content_blocks, created_at";
-
       // WHY THIS ONE DOES NOT USE withTransportRetry
       //
       // A proxy blip here cost a real assistant reply: the generated image was on
@@ -556,81 +597,130 @@ export function createChatService(options: {
       //
       // So the id is generated HERE instead of by the database. That turns "did it
       // land?" from unknowable into a lookup: before replaying, ask for that exact
-      // id. The insert stays a plain insert, so no UPDATE policy is needed (an
-      // upsert would have required one, and RLS on chat_messages grants insert).
+      // id. The insert stays a plain insert under the caller's own id — the write
+      // repository stores it as given and never lets the database mint one.
       const messageId = randomUUID();
+      const actorId = user.id;
 
-      const attemptInsert = async () =>
-        await client
-          .from("chat_messages")
-          .insert({
-            id: messageId,
-            session_id: sessionId,
-            role: input.role,
-            content: input.content,
-            ...(input.toolActivities
-              ? { tool_activities: input.toolActivities as unknown as Json }
-              : {}),
-            ...(safeBlocks ? { content_blocks: safeBlocks as unknown as Json } : {}),
-          })
-          .select(RETURNING)
-          .single();
+      const attemptInsert = async (): Promise<ChatMessageWriteRow> =>
+        await options.chatWriteRepository.insertMessage({
+          actorId,
+          messageId,
+          sessionId,
+          role: input.role,
+          content: input.content,
+          toolActivities: input.toolActivities
+            ? (input.toolActivities as unknown as Json)
+            : null,
+          contentBlocks: safeBlocks ? (safeBlocks as unknown as Json) : null,
+        });
 
-      let { data, error } = await attemptInsert();
+      let data: ChatMessageWriteRow | null = null;
+      let failure: unknown = null;
 
-      if (error && isTransportFailure(error)) {
-        console.log(
-          "[chat.createMessage] transport failure, checking whether the row landed",
-          JSON.stringify({ sessionId, messageId, message: error.message }),
-        );
-        await new Promise((r) => setTimeout(r, 400));
-
-        const existing = await client
-          .from("chat_messages")
-          .select(RETURNING)
-          .eq("id", messageId)
-          .maybeSingle();
-
-        if (existing.data) {
-          // The first attempt did reach Postgres; only its answer was lost.
+      try {
+        data = await attemptInsert();
+      } catch (error) {
+        if (!isWriteTransportFailure(error)) {
+          // A real answer from PostgreSQL — a SQLSTATE, a constraint, or the write
+          // ACL's silent zero rows. It would fail again identically, so it is not
+          // confirmed and not replayed; the transport narrowing is what makes this
+          // branch safe.
+          failure = error;
+        } else {
           console.log(
-            "[chat.createMessage] row had landed, reusing it",
-            JSON.stringify({ sessionId, messageId }),
+            "[chat.createMessage] transport failure, checking whether the row landed",
+            JSON.stringify({
+              sessionId,
+              messageId,
+              message: transportFailureMessage(error),
+            }),
           );
-          data = existing.data;
-          error = null;
-        } else if (!existing.error) {
-          // Confirmed absent, so the statement never executed — safe to replay.
-          ({ data, error } = await attemptInsert());
+          await new Promise((r) => setTimeout(r, 400));
+
+          try {
+            const existing =
+              await options.chatWriteRepository.findMessageForRecovery({
+                actorId,
+                messageId,
+              });
+
+            if (existing) {
+              // The first attempt did reach Postgres; only its answer was lost.
+              console.log(
+                "[chat.createMessage] row had landed, reusing it",
+                JSON.stringify({ sessionId, messageId }),
+              );
+              data = existing;
+            } else {
+              // Confirmed absent, so the statement never executed — safe to replay.
+              data = await attemptInsert();
+            }
+          } catch (confirmationError) {
+            // If the confirmation itself failed we cannot tell, and inserting again
+            // risks a duplicate. Fall through to the error path: losing one message
+            // is recoverable by the user re-asking; two identical assistant replies
+            // in the transcript are not. The transport failure stays the reported
+            // reason. A replay attempt that fails lands here too, which is what
+            // keeps "at most one replay" true.
+            failure = error;
+            console.log(
+              "[chat.createMessage] could not confirm whether the row landed",
+              JSON.stringify({
+                sessionId,
+                messageId,
+                operation:
+                  confirmationError instanceof ChatWriteError
+                    ? confirmationError.operation
+                    : "unknown",
+              }),
+            );
+          }
         }
-        // If the CHECK itself failed we cannot tell, and inserting again risks a
-        // duplicate. Fall through to the error path: losing one message is
-        // recoverable by the user re-asking; two identical assistant replies in the
-        // transcript are not.
       }
 
-      if (error || !data) {
-        // Log the driver's own reason. Collapsing every failure into one generic
-        // sentence is what turned a statement timeout into a multi-hour hunt.
+      if (failure || !data) {
+        // Log the driver's own CODE, never its message: `pg` echoes the failing
+        // statement and its bind values inside the message, and this line is read
+        // by operators, not by the caller. Collapsing every failure into one
+        // generic sentence is what turned a statement timeout into a multi-hour
+        // hunt, so the operation name and the SQLSTATE stay attributable.
         console.log(
           "[chat.createMessage] insert failed",
           JSON.stringify({
             sessionId,
             messageId,
-            code: error?.code,
-            message: error?.message,
-            details: error?.details,
-            hint: error?.hint,
+            operation:
+              failure instanceof ChatWriteError ? failure.operation : "unknown",
+            code: chatWriteFailureCode(failure),
           }),
         );
         throw new ChatServiceError("chat_error", "Failed to save message.", 500);
       }
 
-      // Touch session updated_at
-      await client
-        .from("chat_sessions")
-        .update({ updated_at: new Date().toISOString() })
-        .eq("id", sessionId);
+      // Touch session updated_at.
+      //
+      // T-34 (workorder 21B): a touch that affects ZERO rows — the session is
+      // gone, or this actor may not write it — is a legal outcome and must NOT
+      // become a business error. The old update never inspected its result
+      // either, so the message stays a stored, successful write; a repository
+      // failure is swallowed for the same reason. Only the safe operation name is
+      // logged, and `affectedRows` is deliberately not turned into control flow.
+      try {
+        await options.chatWriteRepository.touchSession({
+          actorId,
+          sessionId,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.log(
+          "[chat.createMessage] session touch failed, the message stays stored",
+          JSON.stringify({
+            sessionId,
+            operation: error instanceof ChatWriteError ? error.operation : "unknown",
+          }),
+        );
+      }
 
       const storedBlocks =
         Array.isArray(data.content_blocks) && data.content_blocks.length > 0

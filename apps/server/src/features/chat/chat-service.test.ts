@@ -11,6 +11,13 @@
 // createMessage therefore generates the id itself and, on a transport failure,
 // LOOKS to see whether the row landed before deciding. These tests pin all four
 // branches of that decision.
+//
+// Workorder 21B moved the three writes of that state machine (the insert, the
+// "did it land?" read, the session touch) from PostgREST into
+// `ChatWriteRepository`. The branches above are unchanged; what moved is the
+// surface they are observed through, so the doubles below record the same insert
+// payloads they always did and answer the same way — a scripted `error` still
+// means "this call failed", and it is now thrown as the repository's own error.
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -26,6 +33,14 @@ import {
   type ChatReadRepository,
   type ChatSessionReadRow,
 } from "../../db/chat-read-repository.js";
+import {
+  FIND_MESSAGE_FOR_RECOVERY,
+  INSERT_MESSAGE,
+  TOUCH_SESSION,
+  ChatWriteError,
+  type ChatMessageWriteRow,
+  type ChatWriteRepository,
+} from "../../db/chat-write-repository.js";
 import { createChatService, ChatServiceError } from "./chat-service.js";
 
 const USER = { accessToken: "t", id: "u1" } as never;
@@ -126,15 +141,119 @@ function row(id: string) {
 }
 
 /**
- * A fake `chat_messages` table that records every insert and lets each test script
- * what the driver returns.
+ * What the WRITE repository should answer, scripted per call.
  *
- * `inserts` is the thing under test: its LENGTH is how a duplicate would show up.
+ * `insertResults` is consumed in order and the last entry is sticky, so a replay
+ * after the last scripted entry answers the same way again — the shape the old
+ * PostgREST double had, kept so every existing case keeps its own script.
+ *
+ * An entry with `error` makes the call FAIL the way the repository fails: it
+ * throws `ChatWriteError` wrapping that driver error. An entry with `data` is the
+ * stored row (the insert's `RETURNING`, echoed back).
+ */
+type WriteScript = {
+  insertResults: Array<{ data?: unknown; error?: unknown }>;
+  /**
+   * Answer the insert with the row the caller asked to store, which is what
+   * PostgREST's `RETURNING` did. Used by the read-path harness.
+   */
+  echo?: boolean;
+  /** Result of the "did it land?" lookup, when one happens. */
+  lookup?: { data?: unknown; error?: unknown };
+  /** Result of the session touch. Defaults to one affected row. */
+  touch?: { affectedRows?: number; error?: unknown };
+};
+
+type WriteCalls = {
+  inserts: Array<Record<string, unknown>>;
+  lookups: Array<{ actorId: string; messageId: string }>;
+  touches: Array<{ actorId: string; sessionId: string; updatedAt: string }>;
+};
+
+/**
+ * The write repository as this service sees it.
+ *
+ * `inserts` stays the thing under test: its LENGTH is still how a duplicate would
+ * show up, and each entry is the payload the old PostgREST insert carried, so the
+ * assertions written against it did not have to change when the transport did.
+ */
+function writeRepositoryStub(script: WriteScript): {
+  repository: ChatWriteRepository;
+  calls: WriteCalls;
+} {
+  const calls: WriteCalls = { inserts: [], lookups: [], touches: [] };
+  let insertCalls = 0;
+
+  const repository: ChatWriteRepository = {
+    async insertMessage(input) {
+      calls.inserts.push({
+        id: input.messageId,
+        session_id: input.sessionId,
+        role: input.role,
+        content: input.content,
+        tool_activities: input.toolActivities,
+        content_blocks: input.contentBlocks,
+      });
+
+      const result =
+        script.insertResults[Math.min(insertCalls, script.insertResults.length - 1)];
+      insertCalls += 1;
+
+      if (result?.error) throw new ChatWriteError(INSERT_MESSAGE, result.error);
+
+      if (script.echo) {
+        return {
+          id: input.messageId,
+          role: input.role,
+          content: input.content,
+          tool_activities: Array.isArray(input.toolActivities) ? input.toolActivities : null,
+          content_blocks: Array.isArray(input.contentBlocks) ? input.contentBlocks : null,
+          created_at: "2026-09-15T00:00:00.000Z",
+        };
+      }
+
+      if (!result?.data) {
+        // What the real repository does when the write ACL answers zero rows.
+        throw new ChatWriteError(
+          INSERT_MESSAGE,
+          new Error("chat write inserted no row"),
+        );
+      }
+
+      return result.data as ChatMessageWriteRow;
+    },
+
+    async findMessageForRecovery(input) {
+      calls.lookups.push({ ...input });
+      if (script.lookup?.error) {
+        throw new ChatWriteError(FIND_MESSAGE_FOR_RECOVERY, script.lookup.error);
+      }
+      return (script.lookup?.data as ChatMessageWriteRow | undefined) ?? null;
+    },
+
+    async touchSession(input) {
+      calls.touches.push({ ...input });
+      if (script.touch?.error) {
+        throw new ChatWriteError(TOUCH_SESSION, script.touch.error);
+      }
+      return { affectedRows: script.touch?.affectedRows ?? 1 };
+    },
+  };
+
+  return { repository, calls };
+}
+
+/**
+ * A fake for the CREATE path: the three writes are answered by the write
+ * repository above, the asset identities come from the chat read repository
+ * (workorder 20D), and the storage signing still goes through the user client.
  */
 function fakeClient(script: {
   insertResults: Array<{ data?: unknown; error?: unknown }>;
   /** Result of the "did it land?" lookup, when one happens. */
   lookup?: { data?: unknown; error?: unknown };
+  /** Result of the session touch; defaults to one affected row. */
+  touch?: { affectedRows?: number; error?: unknown };
   /**
    * Rows the caller may read from `asset_objects` (工单14 fixup T2: the create
    * response is projected through the same signing path as the list response).
@@ -146,50 +265,14 @@ function fakeClient(script: {
   /** Object paths the storage API refuses to sign. */
   unsignable?: ReadonlySet<string>;
 }) {
-  const inserts: Array<Record<string, unknown>> = [];
-  let lookups = 0;
-  let insertCalls = 0;
-
   const client = {
+    // Workorder 21B: no part of the create path may reach a table through the
+    // user's own client any more. A call here is a regression — there is no
+    // PostgREST fallback — so it fails the case loudly for ANY table.
     from: (table: string) => {
-      if (table === "asset_objects") {
-        throw new Error(
-          "asset_objects must be read through the chat read repository (20D)",
-        );
-      }
-      if (table !== "chat_messages") {
-        // chat_sessions updated_at touch — irrelevant here, must not blow up.
-        return { update: () => ({ eq: async () => ({ error: null }) }) };
-      }
-      return {
-        insert: (values: Record<string, unknown>) => {
-          inserts.push(values);
-          const result =
-            script.insertResults[
-              Math.min(insertCalls, script.insertResults.length - 1)
-            ];
-          insertCalls++;
-          return {
-            select: () => ({
-              single: async () => ({
-                data: result?.data ?? null,
-                error: result?.error ?? null,
-              }),
-            }),
-          };
-        },
-        select: () => ({
-          eq: () => ({
-            maybeSingle: async () => {
-              lookups++;
-              return {
-                data: script.lookup?.data ?? null,
-                error: script.lookup?.error ?? null,
-              };
-            },
-          }),
-        }),
-      };
+      throw new Error(
+        `${table} must not be reached through the user client (21B: writes and reads both have repositories)`,
+      );
     },
     storage: {
       from: (bucket: string) => ({
@@ -210,16 +293,24 @@ function fakeClient(script: {
     assets: script.assets ?? [],
     ...(script.assetError ? { assetError: script.assetError } : {}),
   });
+  const { repository: chatWriteRepository, calls: writeCalls } = writeRepositoryStub({
+    insertResults: script.insertResults,
+    ...(script.lookup ? { lookup: script.lookup } : {}),
+    ...(script.touch ? { touch: script.touch } : {}),
+  });
 
   return {
     service: createChatService({
       createUserClient: () => client as never,
       chatReadRepository: repository,
+      chatWriteRepository,
       threadService: { createThreadId: () => "th" },
     }),
-    inserts,
+    inserts: writeCalls.inserts,
     calls,
-    lookupCount: () => lookups,
+    writeCalls,
+    lookupCount: () => writeCalls.lookups.length,
+    touchCount: () => writeCalls.touches.length,
   };
 }
 
@@ -312,13 +403,17 @@ type ReadHarness = {
   service: ReturnType<typeof createChatService>;
   inserts: Array<Record<string, unknown>>;
   calls: RepositoryCalls;
+  writeCalls: WriteCalls;
   logs: string[];
+  lookupCount: () => number;
+  touchCount: () => number;
 };
 
 /**
  * A fake for the READ path: the message history and the asset identities come
- * from the chat read repository (workorder 20D), while the storage signing still
- * goes through the user client.
+ * from the chat read repository (workorder 20D), the three chat writes from the
+ * write repository (workorder 21B), while the storage signing still goes through
+ * the user client.
  */
 function fakeReadClient(options: {
   rows: Array<Record<string, unknown>>;
@@ -332,39 +427,18 @@ function fakeReadClient(options: {
   assetError?: unknown;
   /** Object paths the storage API refuses to sign. */
   unsignable?: ReadonlySet<string>;
-  inserts?: Array<Record<string, unknown>>;
+  /** Result of the session touch; defaults to one affected row. */
+  touch?: { affectedRows?: number; error?: unknown };
 }): ReadHarness {
-  const inserts = options.inserts ?? [];
   const logs: string[] = [];
 
   const client = {
+    // Workorder 21B: the create path may not reach a table through the user's own
+    // client any more (see `fakeClient`).
     from: (table: string) => {
-      if (table === "asset_objects") {
-        throw new Error(
-          "asset_objects must be read through the chat read repository (20D)",
-        );
-      }
-      if (table === "chat_sessions") {
-        return { update: () => ({ eq: async () => ({ error: null }) }) };
-      }
-      return {
-        insert: (values: Record<string, unknown>) => {
-          inserts.push(values);
-          return {
-            select: () => ({
-              single: async () => ({
-                data: { ...row("m1"), ...values },
-                error: null,
-              }),
-            }),
-          };
-        },
-        select: () => ({
-          eq: () => ({
-            maybeSingle: async () => ({ data: null, error: null }),
-          }),
-        }),
-      };
+      throw new Error(
+        `${table} must not be reached through the user client (21B: writes and reads both have repositories)`,
+      );
     },
     storage: {
       from: (bucket: string) => ({
@@ -391,18 +465,30 @@ function fakeReadClient(options: {
     assets: options.assets ?? [],
     ...(options.assetError ? { assetError: options.assetError } : {}),
   });
+  // The insert answers with the row the caller asked to store, which is what
+  // PostgREST's `RETURNING` did — so the response is built from the STORED
+  // (identity-only) blocks, never from anything the test handed in.
+  const { repository: chatWriteRepository, calls: writeCalls } = writeRepositoryStub({
+    insertResults: [],
+    echo: true,
+    ...(options.touch ? { touch: options.touch } : {}),
+  });
 
   const service = createChatService({
     createUserClient: () => client as never,
     chatReadRepository: repository,
+    chatWriteRepository,
     threadService: { createThreadId: () => "th" },
   });
 
   return {
     service,
-    inserts,
+    inserts: writeCalls.inserts,
     calls,
+    writeCalls,
     logs,
+    lookupCount: () => writeCalls.lookups.length,
+    touchCount: () => writeCalls.touches.length,
     // Restore in the test itself so the spy does not leak between cases.
     ...({ restore: () => spy.mockRestore() } as object),
   } as ReadHarness;
@@ -1115,5 +1201,282 @@ describe("chat-service reads through the repository (20D)", () => {
     expect(
       (harness.inserts[0]?.content_blocks as Array<Record<string, unknown>>)[0],
     ).not.toHaveProperty("url");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workorder 21B: the create-message state machine, driven through
+// `ChatWriteRepository` instead of PostgREST.
+//
+// The DECISION is unchanged — insert under a caller-supplied id, and on a
+// transport failure look before replaying — but every branch of it now gets its
+// evidence from the repository, and two of those branches are the ones the old
+// transport could not express:
+//
+//   * a write ACL that refuses SILENTLY (zero rows, no SQLSTATE) must not look
+//     like a transport failure, or the service would wait 400ms and confirm a
+//     write that never happened;
+//   * a touch that fails or affects zero rows must not turn an already-stored
+//     message into a 500 (T-34).
+// ---------------------------------------------------------------------------
+describe("createMessage write state machine through the repository (21B)", () => {
+  it("case 1: a first insert that succeeds touches the session once, for the REAL actor", async () => {
+    const f = fakeClient({ insertResults: [{ data: row("m1") }] });
+
+    const message = await f.service.createMessage(USER, SESSION, INPUT);
+
+    expect(message.id).toBe("m1");
+    expect(f.inserts).toHaveLength(1);
+    expect(f.lookupCount()).toBe(0);
+    expect(f.touchCount()).toBe(1);
+    expect(f.writeCalls.touches[0]).toMatchObject({
+      actorId: "u1",
+      sessionId: SESSION,
+    });
+    // The touch is published as an ISO-8601 timestamp, which is the shape the
+    // repository validates before it binds anything.
+    const updatedAt = f.writeCalls.touches[0]!.updatedAt;
+    expect(new Date(updatedAt).toISOString()).toBe(updatedAt);
+  });
+
+  it("case 2: the confirmation read carries the real actor and the same id the insert used", async () => {
+    vi.useFakeTimers();
+    const f = fakeClient({
+      insertResults: [{ error: TRANSPORT }],
+      lookup: { data: row("landed") },
+    });
+
+    const promise = f.service.createMessage(USER, SESSION, INPUT);
+    await vi.runAllTimersAsync();
+    const message = await promise;
+
+    expect(f.writeCalls.lookups).toEqual([
+      { actorId: "u1", messageId: String(f.inserts[0]!.id) },
+    ]);
+    // Reusing the landed row is still a successful write: it touches too.
+    expect(message.id).toBe("landed");
+    expect(f.touchCount()).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it("case 3: ★ the 400ms wait happens BEFORE the confirmation, never instead of it", async () => {
+    vi.useFakeTimers();
+    const f = fakeClient({
+      insertResults: [{ error: TRANSPORT }],
+      lookup: { data: row("landed") },
+    });
+
+    const promise = f.service.createMessage(USER, SESSION, INPUT);
+    await vi.advanceTimersByTimeAsync(399);
+    // Not confirmed yet: the wait is what makes the lost-response case rare
+    // rather than a race against the database's own commit.
+    expect(f.lookupCount()).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await promise;
+
+    expect(f.lookupCount()).toBe(1);
+    expect(f.inserts).toHaveLength(1);
+    vi.useRealTimers();
+  });
+
+  it("case 4: ★ a landed row is reused — insert=1, confirm=1, touch=1, never a replay", async () => {
+    vi.useFakeTimers();
+    const f = fakeClient({
+      insertResults: [{ error: TRANSPORT }],
+      lookup: { data: row("landed") },
+    });
+
+    const promise = f.service.createMessage(USER, SESSION, INPUT);
+    await vi.runAllTimersAsync();
+    const message = await promise;
+
+    // THE assertion of this file, restated on the repository surface: two
+    // inserts here would be two identical assistant replies in the transcript.
+    expect(f.inserts).toHaveLength(1);
+    expect(f.lookupCount()).toBe(1);
+    expect(f.touchCount()).toBe(1);
+    expect(message.id).toBe("landed");
+    vi.useRealTimers();
+  });
+
+  it("case 5: confirmed absent → exactly ONE replay, both payloads carrying the same id", async () => {
+    vi.useFakeTimers();
+    const f = fakeClient({
+      insertResults: [{ error: TRANSPORT }, { data: row("second-try") }],
+      lookup: { data: null, error: null },
+    });
+
+    const promise = f.service.createMessage(USER, SESSION, INPUT);
+    await vi.runAllTimersAsync();
+    const message = await promise;
+
+    expect(f.inserts).toHaveLength(2);
+    expect(f.lookupCount()).toBe(1);
+    // Same id both times, or the confirmation was pointless.
+    expect(f.inserts[0]!.id).toBe(f.inserts[1]!.id);
+    expect(message.id).toBe("second-try");
+    expect(f.touchCount()).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it("case 6: ★ a replay that fails is not confirmed a second time (at most one replay)", async () => {
+    vi.useFakeTimers();
+    const f = fakeClient({
+      insertResults: [{ error: TRANSPORT }, { error: TRANSPORT }],
+      lookup: { data: null, error: null },
+    });
+
+    const promise = f.service.createMessage(USER, SESSION, INPUT);
+    const settled = expect(promise).rejects.toBeInstanceOf(ChatServiceError);
+    await vi.runAllTimersAsync();
+    await settled;
+
+    expect(f.inserts).toHaveLength(2);
+    // One confirmation for the ONE insert that was in doubt — a second one would
+    // mean the replay's fate was being probed too, and a third insert is how a
+    // duplicate gets written.
+    expect(f.lookupCount()).toBe(1);
+    expect(f.touchCount()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it("case 7: a confirmation read that fails is never replayed on top of (insert=1, confirm=1, 500)", async () => {
+    vi.useFakeTimers();
+    const f = fakeClient({
+      insertResults: [{ error: TRANSPORT }],
+      lookup: { data: null, error: TRANSPORT },
+    });
+
+    const promise = f.service.createMessage(USER, SESSION, INPUT);
+    const settled = expect(promise).rejects.toBeInstanceOf(ChatServiceError);
+    await vi.runAllTimersAsync();
+    await settled;
+
+    expect(f.inserts).toHaveLength(1);
+    expect(f.lookupCount()).toBe(1);
+    expect(f.touchCount()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it("case 8: ★ the write ACL's SILENT zero rows is not a transport failure", async () => {
+    // The repository answers a refused insert with a `ChatWriteError` that wraps a
+    // plain error and carries NO driver code — exactly what "inserted no row"
+    // looks like. Misreading that as a transport failure would make the service
+    // sleep 400ms and then confirm a write that never happened.
+    const f = fakeClient({ insertResults: [] });
+
+    const error = await f.service
+      .createMessage(USER, SESSION, INPUT)
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ChatServiceError);
+    expect((error as ChatServiceError).statusCode).toBe(500);
+    expect((error as ChatServiceError).message).toBe("Failed to save message.");
+    expect(f.inserts).toHaveLength(1);
+    expect(f.lookupCount()).toBe(0);
+    expect(f.touchCount()).toBe(0);
+  });
+
+  it("case 9: a real SQLSTATE is never confirmed and never replayed (insert=1, confirm=0, 500)", async () => {
+    // A duplicate primary key: a real answer from PostgreSQL, which would answer
+    // the same way again. It fails fast.
+    const duplicate = {
+      code: "23505",
+      message: 'duplicate key value violates unique constraint "chat_messages_pkey"',
+    };
+    const f = fakeClient({ insertResults: [{ error: duplicate }] });
+
+    const error = await f.service
+      .createMessage(USER, SESSION, INPUT)
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ChatServiceError);
+    expect((error as ChatServiceError).statusCode).toBe(500);
+    expect((error as ChatServiceError).message).not.toContain("duplicate key");
+    expect(f.inserts).toHaveLength(1);
+    expect(f.lookupCount()).toBe(0);
+    expect(f.touchCount()).toBe(0);
+  });
+
+  it("case 10: ★ a 0-row touch does not turn a stored message into an error (T-34)", async () => {
+    const f = fakeReadClient({ rows: [], touch: { affectedRows: 0 } });
+
+    const created = await f.service.createMessage(USER, SESSION, {
+      role: "user",
+      content: "stored anyway",
+    } as never);
+
+    // The message is stored and returned; the session row simply was not this
+    // actor's to touch.
+    expect(created.content).toBe("stored anyway");
+    expect(f.inserts).toHaveLength(1);
+    expect(f.touchCount()).toBe(1);
+    // Zero rows is a legal answer, so it is not reported as a failure either.
+    expect(f.logs.join("\n")).not.toContain("touch failed");
+    expect(() => messageCreateResponseSchema.parse({ message: created })).not.toThrow();
+  });
+
+  it("case 11: ★ a touch that FAILS is swallowed and logged without the driver's text", async () => {
+    const f = fakeReadClient({
+      rows: [],
+      touch: {
+        error: Object.assign(new Error("deadlock detected"), { code: "40P01" }),
+      },
+    });
+
+    const created = await f.service.createMessage(USER, SESSION, {
+      role: "assistant",
+      content: "already stored",
+    } as never);
+
+    // The write already succeeded; a touch failure must not undo that.
+    expect(created.content).toBe("already stored");
+    expect(f.inserts).toHaveLength(1);
+    expect(f.logs.join("\n")).toContain("session touch failed");
+    expect(f.logs.join("\n")).toContain(TOUCH_SESSION);
+    // The driver's own text never reaches a log line — it can embed SQL.
+    expect(f.logs.join("\n")).not.toContain("deadlock");
+  });
+
+  it("case 12: the projection is unchanged, and the write path performs no Storage write", async () => {
+    const f = fakeReadClient({
+      rows: [],
+      assets: [
+        { id: "asset-1", object_path: "ws-team/p/a.png", bucket: "project-assets" },
+      ],
+    });
+
+    const created = await f.service.createMessage(USER, SESSION, {
+      role: "user",
+      content: "look",
+      contentBlocks: [
+        {
+          type: "image",
+          assetId: "asset-1",
+          objectPath: "ws-team/p/a.png",
+          mimeType: "image/png",
+          source: "upload",
+          url: "https://proj.test/storage/v1/object/sign/project-assets/ws/a.png?token=stale",
+        },
+      ],
+    } as never);
+
+    // What was stored keeps identity only: no url, no stale token, no rewrite.
+    const stored = f.inserts[0]?.content_blocks as Array<Record<string, unknown>>;
+    expect(stored[0]).not.toHaveProperty("url");
+    expect(JSON.stringify(stored)).not.toContain("token=");
+
+    // What was returned is this caller's fresh projection, through the same
+    // signing path as the list response.
+    const blocks = created.contentBlocks as Array<Record<string, unknown>>;
+    expect(String(blocks[0]?.url)).toContain("token=fresh");
+
+    // Exactly the three write operations, and nothing else: no extra write, no
+    // Storage WRITE of any kind on this path.
+    expect(f.inserts).toHaveLength(1);
+    expect(f.lookupCount()).toBe(0);
+    expect(f.touchCount()).toBe(1);
+    expect(messageCreateResponseSchema.parse({ message: created })).toBeDefined();
   });
 });

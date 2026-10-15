@@ -342,11 +342,14 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // reads behind the team member list (team workspace, members, profiles) into
     // one statement, and workorder 20F-B moved the last runtime PostgREST lookup
     // of `TeamAdminService.addMember` (the profile behind an email) into that
-    // repository. The write RPC and the cache invalidation after it are unchanged.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(139);
+    // repository. Workorder 21B then moved the three writes of
+    // `ChatService.createMessage` — the message insert (139→136), the same-id
+    // confirmation read and the session touch — into `ChatWriteRepository`. The
+    // write RPC and the cache invalidation after it are unchanged.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(136);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(139);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(136);
   }, AUDIT_TEST_TIMEOUT_MS);
 });

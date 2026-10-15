@@ -68,6 +68,10 @@ import {
   type ChatReadRepository,
 } from "./db/chat-read-repository.js";
 import {
+  createChatWriteRepository,
+  type ChatWriteRepository,
+} from "./db/chat-write-repository.js";
+import {
   createProjectReadRepository,
   type ProjectReadRepository,
 } from "./db/project-read-repository.js";
@@ -144,6 +148,7 @@ export type BuildAppOptions = {
   canvasReadRepository?: CanvasReadRepository;
   canvasService?: CanvasService;
   chatReadRepository?: ChatReadRepository;
+  chatWriteRepository?: ChatWriteRepository;
   chatService?: ChatService;
   connectionManager?: ConnectionManager;
   creditService?: CreditService;
@@ -238,6 +243,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createChatReadRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 21B: the chat write path (message insert, the
+  // lost-response confirmation, the session touch) goes through its own narrow
+  // repository, built lazily against the same pool. It is built here and handed
+  // to the chat service below, so the runtime has no PostgREST fallback to fall
+  // back TO: with no pool the write fails closed as a `ChatWriteError`.
+  const chatWriteRepository =
+    options.chatWriteRepository ??
+    createChatWriteRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   // ADR-0001 / workorder 20E: the read-only lookups the WRITE flows perform (the
   // project existence/ownership check before an upload or an archive, and the
   // asset row the upload reads back) go through the same lazily-built pool. The
@@ -295,7 +310,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.threadService ?? createThreadService({ chatReadRepository });
   const chatService =
     options.chatService ??
-    createChatService({ createUserClient, chatReadRepository, threadService });
+    createChatService({
+      createUserClient,
+      chatReadRepository,
+      chatWriteRepository,
+      threadService,
+    });
   const agentRunMetadataService =
     options.agentRunMetadataService ??
     createAgentRunMetadataService({ getAdminClient });
