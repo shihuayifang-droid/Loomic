@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { PgmqClient } from "../../queue/pgmq-client.js";
-import { createJobService, type JobService } from "./job-service.js";
+import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
+import { JobServiceError, createJobService, type JobService } from "./job-service.js";
+import type { ExecutorContext, JobExecutor } from "./job-executor.js";
+import { processJobMessage } from "./process-job-message.js";
 
 type Op =
   | { kind: "update"; patch: Record<string, unknown> }
@@ -31,11 +34,21 @@ type HarnessConfig = {
   /** Row the job insert reports back. */
   insertedJob?: Record<string, unknown> | null;
   insertError?: { message: string } | null;
+  /**
+   * ADR-0001 / workorder 21F: what the attempt counter repository answers.
+   * `null` is the "no such job row" answer; omit for a plain `1/3` row.
+   */
+  attemptRow?: { attemptCount: number; maxAttempts: number } | null;
+  /** The repository throws this instead of answering. */
+  attemptError?: Error;
+  /** Build the service with NO attempt repository at all (fail-closed path). */
+  withoutAttemptRepository?: boolean;
 };
 
 function makeHarness(config: HarnessConfig = {}) {
   const ops: Op[] = [];
   const rpcCalls: Array<{ name: string; params: unknown }> = [];
+  const attemptCalls: Array<{ jobId: string }> = [];
 
   function makeBuilder(table: string) {
     const builder = {
@@ -101,6 +114,20 @@ function makeHarness(config: HarnessConfig = {}) {
     },
   };
 
+  // ADR-0001 / workorder 21F: the atomic attempt counter. The harness records
+  // the exact argument object the service passed down, so "the count is read
+  // from the repository" and "the argument carries nothing else" are observable
+  // rather than asserted in prose.
+  const jobAttemptRepository: JobAttemptRepository = {
+    async incrementAttempt(input) {
+      attemptCalls.push(input);
+      if (config.attemptError) throw config.attemptError;
+      return config.attemptRow === undefined
+        ? { attemptCount: 1, maxAttempts: 3 }
+        : config.attemptRow;
+    },
+  };
+
   const service: JobService = createJobService({
     createUserClient: () => client as unknown as UserSupabaseClient,
     getAdminClient: () => client as unknown as AdminSupabaseClient,
@@ -110,6 +137,7 @@ function makeHarness(config: HarnessConfig = {}) {
         return 1;
       },
     } as unknown as PgmqClient,
+    ...(config.withoutAttemptRepository ? {} : { jobAttemptRepository }),
   });
 
   const inOp = () => ops.find((op): op is Extract<Op, { kind: "in" }> => op.kind === "in");
@@ -118,7 +146,7 @@ function makeHarness(config: HarnessConfig = {}) {
   const insertOp = () =>
     ops.find((op): op is Extract<Op, { kind: "insert" }> => op.kind === "insert");
 
-  return { service, ops, rpcCalls, sentMessages, inOp, updateOp, insertOp };
+  return { service, ops, rpcCalls, attemptCalls, sentMessages, inOp, updateOp, insertOp };
 }
 
 describe("job service state guards", () => {
@@ -178,30 +206,67 @@ describe("job service state guards", () => {
     );
   });
 
-  it("case 6: a failing attempt RPC throws instead of inventing a count", async () => {
-    const harness = makeHarness({ rpc: { data: null, error: { message: "rpc down" } } });
+  it("case 6: a failing attempt write throws job_query_failed instead of inventing a count", async () => {
+    // The driver's own text names a host and a credential: it must not travel
+    // with the service error.
+    const harness = makeHarness({
+      attemptError: new Error(
+        "connection reset: postgres://loomic:secret@10.210.134.37:5432/loomic",
+      ),
+    });
 
-    await expect(harness.service.incrementAttempt("job-1")).rejects.toThrow(/rpc down/);
-    expect(harness.rpcCalls).toEqual([
-      { name: "increment_job_attempt", params: { p_job_id: "job-1" } },
-    ]);
+    const error = await harness.service
+      .incrementAttempt("job-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_query_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toContain("increment_job_attempt failed for job-1");
+    expect(error?.message).not.toMatch(/postgres:\/\/|secret|10\.210\.134\.37/);
+    // And the count really was asked for: the refusal is not a short circuit.
+    expect(harness.attemptCalls).toEqual([{ jobId: "job-1" }]);
+    // No PostgREST fallback behind the repository.
+    expect(harness.rpcCalls).toEqual([]);
   });
 
-  it("case 7: an attempt RPC with no rows returns null", async () => {
-    const harness = makeHarness({ rpc: { data: [], error: null } });
+  it("case 7: a missing job row is null, not an error", async () => {
+    const harness = makeHarness({ attemptRow: null });
 
     expect(await harness.service.incrementAttempt("job-1")).toBeNull();
+    expect(harness.attemptCalls).toEqual([{ jobId: "job-1" }]);
+    expect(harness.rpcCalls).toEqual([]);
   });
 
-  it("case 7b: an attempt RPC with a row returns the counts", async () => {
-    const harness = makeHarness({
-      rpc: { data: [{ attempt_count: 2, max_attempts: 3 }], error: null },
-    });
+  it("case 7b: a counted job returns the repository's row in the wire shape", async () => {
+    const harness = makeHarness({ attemptRow: { attemptCount: 2, maxAttempts: 3 } });
 
     expect(await harness.service.incrementAttempt("job-1")).toEqual({
       attempt_count: 2,
       max_attempts: 3,
     });
+    // Exactly one argument, and it is the job id: no token, no workspace, no
+    // generic patch a caller could widen the write with.
+    expect(harness.attemptCalls).toEqual([{ jobId: "job-1" }]);
+    expect(harness.rpcCalls).toEqual([]);
+  });
+
+  it("case 7c: no attempt repository at all fails closed, never back to the RPC", async () => {
+    const harness = makeHarness({ withoutAttemptRepository: true });
+
+    const error = await harness.service
+      .incrementAttempt("job-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_query_failed");
+    expect(error?.statusCode).toBe(500);
+    // Nothing was asked of the repository (there is none) and nothing at all of
+    // the admin client: a missing dependency cannot resurrect the old call.
+    expect(harness.attemptCalls).toEqual([]);
+    expect(harness.rpcCalls).toEqual([]);
   });
 
   it("case 8: a legacy dead_letter row is read as failed", async () => {
@@ -366,5 +431,189 @@ describe("createJob resolves the project from the canvas", () => {
 
     expect(error?.statusCode).toBe(403);
     expect(harness.insertOp()).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR-0001 / workorder 21F: the two attempt thresholds and the increment
+// failure path, driven through the REAL JobService — and therefore through the
+// attempt repository — instead of a hand-written stand-in for it.
+//
+// `process-job-message.test.ts` keeps its mock-level cases (it is untouched by
+// this ticket); what is added here is the wiring half: the count the retry
+// decision is made from really comes from the repository, so a broken counter
+// cannot quietly look like a healthy one.
+// ---------------------------------------------------------------------------
+
+const PROCESS_JOB_ID = "job-21f";
+
+type ProcessScenario = {
+  attemptRow?: { attemptCount: number; maxAttempts: number } | null;
+  attemptError?: Error;
+  executorThrows?: { code?: string; message: string };
+  hasExecutor?: boolean;
+};
+
+function makeProcessHarness(scenario: ProcessScenario = {}) {
+  const jobHarness = makeHarness({
+    updatedRows: 1,
+    ...(scenario.attemptRow === undefined ? {} : { attemptRow: scenario.attemptRow }),
+    ...(scenario.attemptError === undefined
+      ? {}
+      : { attemptError: scenario.attemptError }),
+  });
+
+  const calls: string[] = [];
+  const logs: string[] = [];
+  let refunds = 0;
+
+  const executor: JobExecutor = async () => {
+    calls.push("executor");
+    if (scenario.executorThrows) {
+      throw Object.assign(new Error(scenario.executorThrows.message), {
+        ...(scenario.executorThrows.code ? { code: scenario.executorThrows.code } : {}),
+      });
+    }
+    return { ok: true };
+  };
+
+  const deps = {
+    jobService: jobHarness.service,
+    pgmq: {
+      async archive() {
+        calls.push("archive");
+      },
+      async deleteMsg() {
+        calls.push("deleteMsg");
+      },
+    } as never,
+    getExecutor: () => (scenario.hasExecutor === false ? undefined : executor),
+    refundJob: async () => {
+      calls.push("refundJob");
+      refunds += 1;
+    },
+    log: (message: string) => {
+      logs.push(message);
+    },
+  };
+
+  const args = {
+    queue: "image_generation",
+    queueJobType: "image_generation" as const,
+    msg: {
+      msg_id: 7,
+      message: { job_id: PROCESS_JOB_ID, job_type: "image_generation" },
+    } as never,
+    ctx: {} as ExecutorContext,
+  };
+
+  /** Every guarded status write the real JobService performed, in order. */
+  const patches = () =>
+    jobHarness.ops
+      .filter((op): op is Extract<Op, { kind: "update" }> => op.kind === "update")
+      .map((op) => op.patch);
+
+  return {
+    run: () => processJobMessage(deps, args),
+    calls,
+    logs,
+    patches,
+    refunds: () => refunds,
+    attemptCalls: jobHarness.attemptCalls,
+    rpcCalls: jobHarness.rpcCalls,
+  };
+}
+
+describe("processJobMessage with the real JobService: the 21F attempt thresholds", () => {
+  it("case 1: a failing increment touches nothing — no execute, no archive, no refund, no status write", async () => {
+    const harness = makeProcessHarness({
+      attemptError: new Error("job attempt write failed (incrementAttempt)"),
+    });
+
+    await harness.run();
+
+    // Nothing at all: no status transition, no executor, no archive, no delete,
+    // no refund. The message stays invisible and comes back when its visibility
+    // timeout expires — that is the whole point of not touching it.
+    expect(harness.calls).toEqual([]);
+    expect(harness.patches()).toEqual([]);
+    expect(harness.refunds()).toBe(0);
+    expect(harness.logs.join(" ")).toContain("incrementAttempt failed");
+    // And the count really was asked of the repository, not of anything else.
+    expect(harness.attemptCalls).toEqual([{ jobId: PROCESS_JOB_ID }]);
+    expect(harness.rpcCalls).toEqual([]);
+  });
+
+  it("case 2: the check right after an increment is `>` — a spent budget still runs", async () => {
+    const harness = makeProcessHarness({
+      attemptRow: { attemptCount: 3, maxAttempts: 3 },
+    });
+
+    await harness.run();
+
+    // The count was JUST incremented, so 3/3 is the last attempt and it must
+    // run. `>=` here would fail every job on its final attempt.
+    expect(harness.calls).toEqual(["executor", "deleteMsg"]);
+    expect(harness.patches().map((patch) => patch.status)).toEqual([
+      "running",
+      "succeeded",
+    ]);
+    expect(harness.refunds()).toBe(0);
+  });
+
+  it("case 3: one past the budget fails before executing, then refunds once and archives", async () => {
+    const harness = makeProcessHarness({
+      attemptRow: { attemptCount: 4, maxAttempts: 3 },
+    });
+
+    await harness.run();
+
+    expect(harness.calls).toEqual(["refundJob", "archive"]);
+    expect(harness.calls).not.toContain("executor");
+    expect(harness.patches().map((patch) => patch.status)).toEqual(["failed"]);
+    expect(harness.patches()[0]?.error_code).toBe("max_attempts_exceeded");
+    expect(String(harness.patches()[0]?.error_message)).toContain("4/3");
+    expect(harness.refunds()).toBe(1);
+  });
+
+  it("case 4: the check after an execution failure is `>=` — the last attempt fails terminally", async () => {
+    const harness = makeProcessHarness({
+      attemptRow: { attemptCount: 3, maxAttempts: 3 },
+      executorThrows: { message: "provider still down" },
+    });
+
+    await harness.run();
+
+    // Unlike case 2, this decision is made AFTER the failure: there is no
+    // attempt left to spend, so it is terminal — failed, refunded once, archived.
+    expect(harness.patches().map((patch) => patch.status)).toEqual([
+      "running",
+      "failed",
+    ]);
+    expect(harness.patches()[1]?.error_code).toBe("executor_error");
+    expect(harness.calls).toEqual(["executor", "refundJob", "archive"]);
+    expect(harness.calls).not.toContain("deleteMsg");
+    expect(harness.refunds()).toBe(1);
+  });
+
+  it("case 5: one attempt short of the budget is retried, never failed and never archived", async () => {
+    const harness = makeProcessHarness({
+      attemptRow: { attemptCount: 2, maxAttempts: 3 },
+      executorThrows: { message: "provider hiccup" },
+    });
+
+    await harness.run();
+
+    // A retryable failure writes `retrying`, never `failed`: writing `failed`
+    // would tell the user the generation is over while the worker is still going
+    // to retry it. The message is deliberately NOT archived.
+    expect(harness.patches().map((patch) => patch.status)).toEqual([
+      "running",
+      "retrying",
+    ]);
+    expect(harness.patches()[1]?.error_code).toBe("executor_error");
+    expect(harness.calls).toEqual(["executor"]);
+    expect(harness.calls).not.toContain("archive");
+    expect(harness.refunds()).toBe(0);
   });
 });

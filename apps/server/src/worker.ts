@@ -14,6 +14,8 @@ import { randomUUID } from "node:crypto";
 import { loadServerEnv } from "./config/env.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import { createJobService } from "./features/jobs/job-service.js";
+import { createJobAttemptRepository } from "./db/job-attempt-repository.js";
+import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
 import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
 import { getExecutor, type ExecutorContext } from "./features/jobs/job-executor.js";
@@ -59,7 +61,22 @@ async function main() {
     return adminClient;
   };
 
-  const jobService = createJobService({ createUserClient, getAdminClient, pgmq });
+  const jobService = createJobService({
+    createUserClient,
+    getAdminClient,
+    pgmq,
+    // ADR-0001 / workorder 21F: the atomic `attempt_count` move is the worker's
+    // own write, so the worker builds the repository itself — lazily, against
+    // `DATABASE_URL`, exactly as `app.ts` does. With no reachable pool the call
+    // fails closed, `processJobMessage` leaves the message for a later retry and
+    // nothing here can reach the old `increment_job_attempt` RPC.
+    jobAttemptRepository: createJobAttemptRepository({
+      getTransactionPool: () =>
+        getTransactionPool(
+          env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
+        ),
+    }),
+  });
   const creditService = createCreditService({ getAdminClient });
 
   // Base context — per-message fields (queue, msgId, renewVt) are added per message below

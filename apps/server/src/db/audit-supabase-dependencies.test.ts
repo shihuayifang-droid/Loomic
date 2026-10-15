@@ -171,6 +171,25 @@ function buildTypedRpcProbeSource(): string {
 }
 
 /**
+ * The type-asserted form, twice.
+ *
+ * Workorder 21F removed one runtime RPC, so a mirror of the repository measures
+ * 17 runtime / 21 total while the frozen baseline still publishes 22. ONE extra
+ * call therefore lands exactly ON the baseline — which the auditor correctly
+ * reports as "not an increase" — so a probe that has to cross it carries two,
+ * and the two counters move by exactly two.
+ */
+function buildTypedRpcRiseProbeSource(): string {
+  return [
+    "declare const admin: any;",
+    'await (admin.rpc as any)("grant_plan_credits", { p_workspace_id: "w" });',
+    'await (admin.rpc as any)("invalidate_credit_cache", { p_workspace_id: "w" });',
+    "export {};",
+    "",
+  ].join("\n");
+}
+
+/**
  * Every way the literal `.rpc(` appears WITHOUT being a call: a line comment, a
  * block comment, string/template/regex literal contents, a property read, a
  * destructured property name, and type assertions that are never invoked. The
@@ -434,25 +453,37 @@ describe("audit-supabase-dependencies: typed RPC call forms", () => {
     );
   }, AUDIT_TEST_TIMEOUT_MS);
 
-  it("flags one more type-asserted RPC as a rise and returns to zero once removed", () => {
+  it("flags a rise once the type-asserted form crosses the frozen baseline and returns to zero once removed", () => {
     const root = buildMirror("rpc-rise");
     const probePath = join(root, RUNTIME_PROBE_RELATIVE_PATH);
 
     const before = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
     expect(before.status).toBe(0);
     expect(problemCount(before.stdout)).toBe(0);
+    // Workorder 21F moved `increment_job_attempt` into the pure `pg`
+    // repository, so a mirror of the repository now sits one BELOW the frozen
+    // baseline: 17 runtime / 21 total against a published 22.
+    expect(metricValue(before.stdout, "server.rpcCallsAll")).toBe(21);
 
+    // One extra type-asserted call lands exactly ON the baseline. That is not an
+    // increase, and the auditor must not report one.
     writeFileSync(probePath, buildTypedRpcProbeSource(), "utf8");
+    const atBaseline = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+    expect(atBaseline.status).toBe(0);
+    expect(problemCount(atBaseline.stdout)).toBe(0);
+    expect(metricValue(atBaseline.stdout, "server.rpcCallsAll")).toBe(22);
+
+    // The second one crosses it, and both counters are reported as risen.
+    writeFileSync(probePath, buildTypedRpcRiseProbeSource(), "utf8");
     const injected = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
 
     expect(injected.status).toBe(1);
     expect(problemCount(injected.stdout)).toBeGreaterThanOrEqual(1);
-    expect(injected.stdout).toContain(
-      "[!] metric server.rpcCallsRuntime increased",
-    );
+    expect(injected.stdout).toContain("[!] metric server.rpcCallsRuntime increased");
     expect(metricValue(injected.stdout, "server.rpcCallsRuntime")).toBe(
-      metricValue(before.stdout, "server.rpcCallsRuntime") + 1,
+      metricValue(before.stdout, "server.rpcCallsRuntime") + 2,
     );
+    expect(metricValue(injected.stdout, "server.rpcCallsAll")).toBe(23);
 
     rmSync(probePath);
     const restored = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
@@ -518,19 +549,33 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // `(admin.rpc as any)("grant_plan_credits", ...)` in
     // `features/credits/credit-service.ts` — which the pre-ticket auditor never
     // matched. The call itself is untouched and predates this ticket, so the
-    // runtime observation moves 17 -> 18 and, with the four CLI call sites
+    // runtime observation moved 17 -> 18 and, with the four CLI call sites
     // unchanged, all 21 -> 22. Everything downstream of the write stays put.
-    expect(metricValue(run.stdout, "server.rpcCallsRuntime")).toBe(18);
-    expect(metricValue(run.stdout, "server.rpcCallsAll")).toBe(22);
+    //
+    // Workorder 21F then moved the LAST runtime RPC of the job pipeline —
+    // `increment_job_attempt`, called from `features/jobs/job-service.ts` — into
+    // `JobAttemptRepository` (pure `pg`), so the runtime observation moves back
+    // DOWN 18 -> 17 and, with the four CLI call sites unchanged, all 22 -> 21.
+    // This is a real coupling removal rather than a counting change: no RPC call
+    // site of any form is left in that file. `fromCalls` and every other counter
+    // stay exactly where workorder 21E1 left them.
+    expect(metricValue(run.stdout, "server.rpcCallsRuntime")).toBe(17);
+    expect(metricValue(run.stdout, "server.rpcCallsAll")).toBe(21);
 
-    // Workorder 21C-preflight D pins the audit's own anchor to that observation:
-    // `ANCHORS.server.runtimeRpc` and the baseline anchor now read 18, so the
-    // published line must report the frozen anchor agreeing with the live
-    // measurement instead of the stale `anchor=17 ... (DIFFERS by 1)`. Matched
-    // as a whole line: a differing anchor or a moved counter cannot pass by
-    // appearing anywhere else in the output.
+    // The published anchor is a CONSTANT of the audit script
+    // (`ANCHORS.server.runtimeRpc`) and is mirrored by the baseline's
+    // `anchors.server.runtimeRpc`. Both files are outside workorder 21F's write
+    // list, so this ticket cannot pin the anchor to 17 — and it must not pretend
+    // otherwise. The line it really publishes is the honest "differs" one: the
+    // frozen anchor still reads 18 while the live measurement reads 17, and the
+    // mismatch is reported as an information line, not a problem.
+    //
+    // Pinning 18 -> 17 is a separate fixup ticket, exactly symmetric to how
+    // workorder 21C-preflight D pinned 17 -> 18 (`8308315`). Matched as a whole
+    // line, so a silently moved counter or a re-baselined anchor cannot pass by
+    // appearing somewhere else in the output.
     expect(run.stdout).toMatch(
-      /^\[anchor\] server\.runtimeRpc: anchor=18 measured\[server\.rpcCallsRuntime\]=18 \(match\)$/m,
+      /^\[anchor\] server\.runtimeRpc: anchor=18 measured\[server\.rpcCallsRuntime\]=17 \(DIFFERS by -1\)$/m,
     );
 
     expect(metricValue(run.stdout, "server.storageCalls")).toBe(23);

@@ -95,6 +95,10 @@ import {
   createWorkspaceSettingsWriteRepository,
   type WorkspaceSettingsWriteRepository,
 } from "./db/workspace-settings-write-repository.js";
+import {
+  createJobAttemptRepository,
+  type JobAttemptRepository,
+} from "./db/job-attempt-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -197,6 +201,13 @@ export type BuildAppOptions = {
    * actor and which workspace the route passed down.
    */
   workspaceSettingsWriteRepository?: WorkspaceSettingsWriteRepository;
+  /**
+   * ADR-0001 / workorder 21F: the worker's atomic attempt counter. Injectable
+   * for the same reason the other repositories are — a test can hand the app its
+   * own double and observe that the count is read from it (and that nothing
+   * reaches PostgREST).
+   */
+  jobAttemptRepository?: JobAttemptRepository;
 };
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -320,6 +331,19 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createWorkspaceSettingsWriteRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 21F: the atomic attempt counter the worker runs before
+  // it starts a job. It is built here, lazily, exactly like the other
+  // repositories, and handed to the job service below. The worker process builds
+  // its own instance from the same getter (`worker.ts`); the app needs one only
+  // because `buildApp` is also the entry point tests drive the job service
+  // through. With no pool the call fails closed as a `JobAttemptWriteError` and
+  // the service reports its existing `job_query_failed` — the old
+  // `increment_job_attempt` RPC is no longer reachable from either entry point.
+  const jobAttemptRepository =
+    options.jobAttemptRepository ??
+    createJobAttemptRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   // ADR-0001 / workorder 20E: the read-only lookups the WRITE flows perform (the
   // project existence/ownership check before an upload or an archive, and the
   // asset row the upload reads back) go through the same lazily-built pool. The
@@ -410,7 +434,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const jobService =
     options.jobService ??
     (pgmq
-      ? createJobService({ createUserClient, getAdminClient, pgmq })
+      ? createJobService({
+          createUserClient,
+          getAdminClient,
+          pgmq,
+          jobAttemptRepository,
+        })
       : undefined);
   const creditService =
     options.creditService ?? createCreditService({ getAdminClient });

@@ -7,6 +7,7 @@ import type {
 } from "@loomic/shared";
 
 import type { PgmqClient } from "../../queue/pgmq-client.js";
+import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -75,6 +76,15 @@ export function createJobService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
   pgmq: PgmqClient;
+  /**
+   * ADR-0001 / workorder 21F: the atomic attempt counter the worker runs before
+   * it starts a job. It is the only writer of `background_jobs.attempt_count`.
+   *
+   * Optional so a caller CAN build the service without one; there is
+   * deliberately no fallback behind it. A missing repository is handled exactly
+   * like a failing one — the same `job_query_failed` 500 and no count.
+   */
+  jobAttemptRepository?: JobAttemptRepository;
 }): JobService {
   function mapJobRow(row: Record<string, unknown>): BackgroundJob {
     return {
@@ -386,32 +396,54 @@ export function createJobService(options: {
     },
 
     async incrementAttempt(jobId) {
-      const admin = options.getAdminClient();
-      // NOTE: increment_job_attempt may not be in generated Supabase types yet
-      const { data, error } = await (admin as any).rpc("increment_job_attempt", {
-        p_job_id: jobId,
-      });
-
-      if (error) {
-        // Never invent a count here: a made-up attempt_count silently disables
-        // the retry limit (and the caller would archive a job that was paid for).
-        throw new JobServiceError(
-          "job_query_failed",
-          `increment_job_attempt failed for ${jobId}: ${error.message}`,
-          500,
-        );
+      // ADR-0001 / workorder 21F: the atomic counter moved from the
+      // `increment_job_attempt` RPC to a narrow `pg` repository. What did NOT
+      // move is the contract — a failure is thrown rather than answered with an
+      // invented count (a made-up `attempt_count` silently disables the retry
+      // limit, and the caller would archive a job that was paid for), and `null`
+      // still means "no such job row".
+      //
+      // There is no PostgREST fallback behind this: with no repository wired the
+      // call fails closed with exactly the error a broken write produces, so a
+      // missing dependency can never resurrect the RPC.
+      const repository = options.jobAttemptRepository;
+      if (!repository) {
+        throw incrementAttemptFailed(jobId);
       }
 
-      const row = Array.isArray(data) ? data[0] : data;
-      if (row && typeof row === "object") {
-        return {
-          attempt_count: (row as any).attempt_count as number,
-          max_attempts: (row as any).max_attempts as number,
-        };
+      let row;
+      try {
+        row = await repository.incrementAttempt({ jobId });
+      } catch {
+        throw incrementAttemptFailed(jobId);
       }
 
       // No such job row — the caller decides what that means.
-      return null;
+      if (row === null) return null;
+
+      return {
+        attempt_count: row.attemptCount,
+        max_attempts: row.maxAttempts,
+      };
     },
   };
+}
+
+/**
+ * The one failure the attempt counter can report. It is a function rather than a
+ * constant so every caller gets its own error, and it is the ONLY place the
+ * code, the wording and the status live: a repository that threw, a repository
+ * whose pool could not be resolved and a repository that was never injected must
+ * be indistinguishable from the outside.
+ *
+ * The driver's own text is deliberately NOT concatenated any more: it can name
+ * the statement, the host or a credential, and the repository already carries the
+ * raw failure as `cause` for whoever needs to classify it.
+ */
+function incrementAttemptFailed(jobId: string): JobServiceError {
+  return new JobServiceError(
+    "job_query_failed",
+    `increment_job_attempt failed for ${jobId}`,
+    500,
+  );
 }
