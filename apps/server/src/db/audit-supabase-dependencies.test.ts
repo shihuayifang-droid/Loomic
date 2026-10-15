@@ -521,11 +521,20 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // write from `SettingsService` — the READ of the same table is untouched and
     // is still counted here. The Supabase-RPC write of the credits rules and the
     // cache invalidation after it are unchanged.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(131);
+    //
+    // Workorder 21G then moved the last two server-only `agent_runs` writes — the
+    // accepted INSERT and the run metadata UPDATE behind
+    // `AgentRunMetadataService` (131→129) — into
+    // `AgentRunWriteRepository`, which leaves that service with no PostgREST path
+    // at all: it no longer receives an admin client, and a missing repository is a
+    // persistence failure rather than a fallback. Both counters move together
+    // because both files are production source, and no READ of `agent_runs` ever
+    // existed here to be left behind.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(129);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(131);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(129);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
@@ -541,7 +550,8 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // DOWN 18 -> 17 and, with the four CLI call sites unchanged, all 22 -> 21.
     // This is a real coupling removal rather than a counting change: no RPC call
     // site of any form is left in that file. `fromCalls` and every other counter
-    // stay exactly where workorder 21E1 left them.
+    // stay exactly where workorder 21E1 left them — workorder 21G moved only the
+    // two PostgREST writes counted above, and touched no RPC call site.
     expect(metricValue(run.stdout, "server.rpcCallsRuntime")).toBe(17);
     expect(metricValue(run.stdout, "server.rpcCallsAll")).toBe(21);
 

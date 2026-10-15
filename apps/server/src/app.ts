@@ -99,6 +99,10 @@ import {
   createJobAttemptRepository,
   type JobAttemptRepository,
 } from "./db/job-attempt-repository.js";
+import {
+  createAgentRunWriteRepository,
+  type AgentRunWriteRepository,
+} from "./db/agent-run-write-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -159,6 +163,13 @@ export type BuildAppOptions = {
   agentModel?: BaseLanguageModel | string;
   agentPersistenceService?: AgentPersistenceService;
   agentRunMetadataService?: AgentRunMetadataService;
+  /**
+   * ADR-0001 / workorder 21G: the only writer of `agent_runs` metadata, the
+   * accepted insert and the run update. Injectable for the same reason the other
+   * repositories are — a test can hand the app its own double and observe which
+   * run was written (and that nothing reaches PostgREST).
+   */
+  agentRunWriteRepository?: AgentRunWriteRepository;
   auth?: RequestAuthenticator;
   assetReadRepository?: AssetReadRepository;
   brandKitService?: BrandKitService;
@@ -344,6 +355,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createJobAttemptRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 21G: the two server-only `agent_runs` writes — the
+  // accepted insert and the run metadata update — go through their own narrow
+  // repository, built lazily against the same pool and handed to the agent run
+  // metadata service below. Like the 21B/21C/21D/21E1/21F write paths it has no
+  // PostgREST fallback to fall back TO: with no pool, or with no repository, the
+  // write fails closed as an `AgentRunWriteError` and the service keeps its
+  // existing `AgentRunPersistenceError` projection.
+  const agentRunWriteRepository =
+    options.agentRunWriteRepository ??
+    createAgentRunWriteRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   // ADR-0001 / workorder 20E: the read-only lookups the WRITE flows perform (the
   // project existence/ownership check before an upload or an archive, and the
   // asset row the upload reads back) go through the same lazily-built pool. The
@@ -410,7 +433,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     });
   const agentRunMetadataService =
     options.agentRunMetadataService ??
-    createAgentRunMetadataService({ getAdminClient });
+    createAgentRunMetadataService({ agentRunWriteRepository });
   const agentPersistenceService =
     options.agentPersistenceService ?? createAgentPersistenceService(env);
   const settingsService =
