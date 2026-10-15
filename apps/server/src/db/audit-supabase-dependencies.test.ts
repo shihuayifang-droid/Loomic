@@ -56,6 +56,15 @@ const MIRROR_FILES = ["package.json", "apps/server/package.json"];
 
 const PROBE_RELATIVE_PATH = "apps/server/scripts/probe.mjs";
 
+/**
+ * A runtime-scope probe: a `.ts` file under `apps/server/src` that is neither a
+ * test nor CLI tooling, so it moves `server.rpcCallsRuntime` (and with it
+ * `server.rpcCallsAll`) and never a `tooling.*` metric. It only ever exists
+ * inside a temp mirror - writing it into the repository would be a real
+ * coupling change, which is exactly what this audit is there to prevent.
+ */
+const RUNTIME_PROBE_RELATIVE_PATH = "apps/server/src/audit-rpc-probe.ts";
+
 const SUPABASE_SDK_PACKAGE = ["@supabase", "supabase-js"].join("/");
 const FROM_CALL = "." + "from(";
 
@@ -132,6 +141,63 @@ function buildProbeSource(): string {
     `await client.storage${FROM_CALL}"bucket").upload("key", "body");`,
     'await client.rpc("touch_credit_balance");',
     "await client.auth.getUser();",
+    "export {};",
+    "",
+  ].join("\n");
+}
+
+/**
+ * One chained RPC and one parenthesised, TypeScript-asserted RPC. Both are real
+ * call syntax, so a runtime counter must see exactly two calls.
+ */
+function buildRpcFormProbeSource(): string {
+  return [
+    "declare const admin: any;",
+    'await admin.rpc("deduct_credits", { p_workspace_id: "w" });',
+    'await (admin.rpc as any)("grant_plan_credits", { p_workspace_id: "w" });',
+    "export {};",
+    "",
+  ].join("\n");
+}
+
+/** The type-asserted form on its own, for the rise-and-restore probe. */
+function buildTypedRpcProbeSource(): string {
+  return [
+    "declare const admin: any;",
+    'await (admin.rpc as any)("grant_plan_credits", { p_workspace_id: "w" });',
+    "export {};",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Every way the literal `.rpc(` appears WITHOUT being a call: a line comment, a
+ * block comment, string/template/regex literal contents, a property read, a
+ * destructured property name, and type assertions that are never invoked. The
+ * file ends with exactly one real chained call as the control, so the counter
+ * must move by exactly one: anything the four prose categories contributed
+ * would push the delta above one, and a detector that stopped working would
+ * drop it below one.
+ */
+function buildRpcProseProbeSource(): string {
+  return [
+    "declare const admin: any;",
+    "",
+    '// comment: admin.rpc("grant_plan_credits") is never executed',
+    '/* block comment: admin.rpc("grant_plan_credits") is never executed */',
+    "",
+    "const single = 'admin.rpc(\"grant_plan_credits\")';",
+    "const double = \"admin.rpc('grant_plan_credits')\";",
+    "const template = `admin.rpc(\"grant_plan_credits\")`;",
+    "const pattern = /\\.rpc\\(/;",
+    "",
+    "const propertyName = admin.rpc;",
+    "const { rpc: aliased } = admin;",
+    "",
+    "const asserted = (admin.rpc as any);",
+    "const alsoAsserted = admin.rpc as any;",
+    "",
+    'await admin.rpc("deduct_credits", { p_workspace_id: "w" });',
     "export {};",
     "",
   ].join("\n");
@@ -317,6 +383,91 @@ describe("audit-supabase-dependencies: scripts are inside the audit", () => {
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 
+describe("audit-supabase-dependencies: typed RPC call forms", () => {
+  it("counts the type-asserted RPC form beside the chained form as runtime RPCs", () => {
+    const root = buildMirror("rpc-forms");
+    const probePath = join(root, RUNTIME_PROBE_RELATIVE_PATH);
+
+    const before = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+    expect(before.status).toBe(0);
+    expect(problemCount(before.stdout)).toBe(0);
+
+    writeFileSync(probePath, buildRpcFormProbeSource(), "utf8");
+    const after = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+
+    // One chained call plus one type-asserted call: the chained form must still
+    // count, and the cast form must count for the first time, so each counter
+    // moves by exactly two and the rise is reported as a problem.
+    expect(metricValue(after.stdout, "server.rpcCallsRuntime")).toBe(
+      metricValue(before.stdout, "server.rpcCallsRuntime") + 2,
+    );
+    expect(metricValue(after.stdout, "server.rpcCallsAll")).toBe(
+      metricValue(before.stdout, "server.rpcCallsAll") + 2,
+    );
+    expect(after.status).toBe(1);
+    expect(after.stdout).toContain("[!] metric server.rpcCallsRuntime increased");
+  }, AUDIT_TEST_TIMEOUT_MS);
+
+  it("ignores `.rpc(` in comments, strings, property names and uncalled assertions", () => {
+    const root = buildMirror("rpc-prose");
+    const probePath = join(root, RUNTIME_PROBE_RELATIVE_PATH);
+    const source = buildRpcProseProbeSource();
+
+    // Guard against a vacuous pass: the fixture really does carry the token in
+    // every non-call shape it claims to cover.
+    expect(source).toContain(".rpc(");
+
+    const before = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+    expect(before.status).toBe(0);
+
+    writeFileSync(probePath, source, "utf8");
+    const after = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+
+    // The file holds exactly one real call, so a delta of exactly one proves
+    // that comments, strings, regex contents, property names and uncalled
+    // assertions all contributed zero.
+    expect(metricValue(after.stdout, "server.rpcCallsRuntime")).toBe(
+      metricValue(before.stdout, "server.rpcCallsRuntime") + 1,
+    );
+    expect(metricValue(after.stdout, "server.rpcCallsAll")).toBe(
+      metricValue(before.stdout, "server.rpcCallsAll") + 1,
+    );
+  }, AUDIT_TEST_TIMEOUT_MS);
+
+  it("flags one more type-asserted RPC as a rise and returns to zero once removed", () => {
+    const root = buildMirror("rpc-rise");
+    const probePath = join(root, RUNTIME_PROBE_RELATIVE_PATH);
+
+    const before = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+    expect(before.status).toBe(0);
+    expect(problemCount(before.stdout)).toBe(0);
+
+    writeFileSync(probePath, buildTypedRpcProbeSource(), "utf8");
+    const injected = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+
+    expect(injected.status).toBe(1);
+    expect(problemCount(injected.stdout)).toBeGreaterThanOrEqual(1);
+    expect(injected.stdout).toContain(
+      "[!] metric server.rpcCallsRuntime increased",
+    );
+    expect(metricValue(injected.stdout, "server.rpcCallsRuntime")).toBe(
+      metricValue(before.stdout, "server.rpcCallsRuntime") + 1,
+    );
+
+    rmSync(probePath);
+    const restored = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+
+    expect(restored.status).toBe(0);
+    expect(problemCount(restored.stdout)).toBe(0);
+    expect(metricValue(restored.stdout, "server.rpcCallsRuntime")).toBe(
+      metricValue(before.stdout, "server.rpcCallsRuntime"),
+    );
+    expect(metricValue(restored.stdout, "server.rpcCallsAll")).toBe(
+      metricValue(before.stdout, "server.rpcCallsAll"),
+    );
+  }, AUDIT_TEST_TIMEOUT_MS);
+});
+
 describe("audit-supabase-dependencies: real repository root", () => {
   it("passes with zero problems and unchanged server counters", () => {
     const run = runAudit([`--baseline=${BASELINE}`]);
@@ -351,5 +502,18 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
     expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(136);
+
+    // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
+    // `grant_plan_credits` through a parenthesised type assertion —
+    // `(admin.rpc as any)("grant_plan_credits", ...)` in
+    // `features/credits/credit-service.ts` — which the pre-ticket auditor never
+    // matched. The call itself is untouched and predates this ticket, so the
+    // runtime observation moves 17 -> 18 and, with the four CLI call sites
+    // unchanged, all 21 -> 22. Everything downstream of the write stays put.
+    expect(metricValue(run.stdout, "server.rpcCallsRuntime")).toBe(18);
+    expect(metricValue(run.stdout, "server.rpcCallsAll")).toBe(22);
+    expect(metricValue(run.stdout, "server.storageCalls")).toBe(23);
+    expect(metricValue(run.stdout, "server.authGetUserCalls")).toBe(1);
+    expect(metricValue(run.stdout, "server.supabaseSdkImportHits")).toBe(3);
   }, AUDIT_TEST_TIMEOUT_MS);
 });

@@ -2,7 +2,16 @@
   "version": 1,
   "generatedBy": "apps/server/scripts/audit-supabase-dependencies.mjs",
   "generatedAt": "2026-10-14T06:18:30.819Z",
-  "note": "Supabase coupling baseline (ticket 19). Counts are textual over the scopes documented in the script header. A later ticket may only lower a number; an increase fails the audit.",
+  "note": "Supabase coupling baseline (ticket 19). Counts are textual over the scopes documented in the script header. A later ticket may only lower a number; an increase fails the audit. Exception (ticket 21-preflight B): the two RPC counters and the server.runtimeRpc anchor observation were corrected for the type-asserted call form - `grant_plan_credits` in apps/server/src/features/credits/credit-service.ts was already a runtime RPC before that ticket, so server.rpcCallsRuntime 17 -> 18 and server.rpcCallsAll 21 -> 22 record an observation gap being closed, not a new dependency.",
+  "observationCorrections": [
+    {
+      "ticket": "21-preflight B (T-35)",
+      "keys": ["server.rpcCallsRuntime", "server.rpcCallsAll"],
+      "from": [17, 21],
+      "to": [18, 22],
+      "reason": "The auditor only matched the chained `.rpc(` form, so the pre-existing runtime call `(admin.rpc as any)(\"grant_plan_credits\", ...)` was invisible. The call, the credits rule and every production RPC call site are unchanged; only recognition changed. Edited by hand on purpose: `--update-baseline` would also have re-baselined every other metric (for example server.fromCalls 163 -> 136), which is outside this ticket's scope."
+    }
+  ],
   "anchors": {
     "web.Auth": 9,
     "web.PostgREST": 4,
@@ -29,8 +38,8 @@
     "server.supabaseSdkImportHits": 3,
     "server.fromCalls": 163,
     "server.fromCallsIncludingTests": 163,
-    "server.rpcCallsRuntime": 17,
-    "server.rpcCallsAll": 21,
+    "server.rpcCallsRuntime": 18,
+    "server.rpcCallsAll": 22,
     "server.storageCalls": 23,
     "server.authGetUserCalls": 1,
     "server.testSupabaseSdkImportHits": 1,

@@ -16,7 +16,8 @@
  * Exit code: 0 when `[PROBLEMS] 0`, otherwise 1.
  *
  * Counting rules (textual, deliberately conservative - a comment or string
- * match still counts, so the baseline can never be lowered by rewording):
+ * match still counts, so the baseline can never be lowered by rewording; the
+ * four RPC counters are the one deliberate exception, see "RPC recognition"):
  *
  * - Scopes are explicit. The audit counts production code only:
  *   `apps/web/src/**` and `apps/server/src/**` (server production excludes
@@ -24,6 +25,19 @@
  * - `Array.from(` / `Object.from(` / `Buffer.from(` are not PostgREST calls.
  * - `rpcCallsRuntime` excludes `apps/server/src/cli/**` (operator tooling, not
  *   the runtime surface) and is reported next to the all-files number.
+ * - RPC recognition (ticket 21-preflight B / T-35). An RPC call site is
+ *   counted in BOTH source forms this repository actually uses: the chained
+ *   `client.rpc("name", ...)` and the parenthesised TypeScript type assertion
+ *   `(client.rpc as any)("name", ...)`. Only the second form used to be
+ *   missed, which hid `grant_plan_credits` in
+ *   `features/credits/credit-service.ts` - an RPC call that already existed at
+ *   runtime before this ticket. The runtime baseline therefore moved 17 -> 18
+ *   as an OBSERVATION fix (a counting gap closed), never because a new
+ *   dependency was allowed in. Unlike every other counter, the RPC counters
+ *   read code with comments, string/template contents and regex literals
+ *   blanked out, so prose that merely mentions `.rpc(` cannot raise them.
+ *   `web.postgrestRpcCalls`, `server.rpcCallsRuntime`, `server.rpcCallsAll`
+ *   and `tooling.rpcCalls` all use that rule through `countRpcCalls`.
  * - The Supabase env family is the fixed allow-list below, matched as whole
  *   tokens (so `NEXT_PUBLIC_SUPABASE_URL` is one name, not `SUPABASE_URL`).
  *   Any other `SUPABASE_*` token in active config is counted separately as
@@ -249,6 +263,220 @@ function countMatches(text, pattern) {
   return (text.match(new RegExp(pattern.source, flags)) ?? []).length;
 }
 
+/** Quote characters that open a string or template literal. */
+const QUOTE_CHARS = new Set(['"', "'", "`"]);
+
+/**
+ * A `/` only starts a regex literal where an expression is expected - never
+ * after an identifier, a number or a closing bracket (there it is division).
+ */
+const REGEX_LEAD_CHARS = new Set([
+  "(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";",
+  "+", "-", "*", "%", "~", "^", "<", ">", "\n",
+]);
+
+/** Keywords an expression may follow, so a `/` after them opens a regex. */
+const REGEX_LEAD_KEYWORDS = new Set([
+  "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+  "case", "do", "else", "yield", "await",
+]);
+
+function regexCanStartAt(text, index) {
+  let cursor = index - 1;
+  while (cursor >= 0 && /\s/.test(text[cursor])) cursor -= 1;
+  if (cursor < 0) return true;
+
+  const char = text[cursor];
+  if (REGEX_LEAD_CHARS.has(char)) return true;
+  if (!/[A-Za-z0-9_$]/.test(char)) return false;
+
+  let start = cursor;
+  while (start >= 0 && /[A-Za-z0-9_$]/.test(text[start])) start -= 1;
+  return REGEX_LEAD_KEYWORDS.has(text.slice(start + 1, cursor + 1));
+}
+
+/**
+ * Index of the `}` closing the `${` whose brace sits at `openIndex`, or -1 when
+ * the template expression is unterminated.
+ */
+function matchTemplateBrace(text, openIndex) {
+  const length = text.length;
+  let depth = 0;
+  let index = openIndex;
+
+  while (index < length) {
+    const char = text[index];
+    if (char === "\\") {
+      index += 2;
+      continue;
+    }
+    if (QUOTE_CHARS.has(char)) {
+      index = findLiteralEnd(text, index, []);
+      continue;
+    }
+    if (char === "/" && text[index + 1] === "/") {
+      const newline = text.indexOf("\n", index + 2);
+      index = newline === -1 ? length : newline;
+      continue;
+    }
+    if (char === "/" && text[index + 1] === "*") {
+      const close = text.indexOf("*/", index + 2);
+      index = close === -1 ? length : close + 2;
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+      index += 1;
+      continue;
+    }
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+      index += 1;
+      continue;
+    }
+    index += 1;
+  }
+
+  return -1;
+}
+
+/**
+ * Index just past the quoted literal starting at `start`. `${ ... }` holes are
+ * collected so a backtick inside them is not read as the end of the literal.
+ */
+function findLiteralEnd(text, start, holes) {
+  const quote = text[start];
+  const length = text.length;
+  let index = start + 1;
+
+  while (index < length) {
+    const char = text[index];
+    if (char === "\\") {
+      index += 2;
+      continue;
+    }
+    if (char === quote) return index + 1;
+    if (quote === "`" && char === "$" && text[index + 1] === "{") {
+      const close = matchTemplateBrace(text, index + 1);
+      if (close === -1) return length;
+      holes.push([index + 2, close]);
+      index = close + 1;
+      continue;
+    }
+    index += 1;
+  }
+
+  return length;
+}
+
+/**
+ * Same-length copy of `text` in which everything that is not executable code -
+ * line/block comments, string and template contents, regex literals - is
+ * replaced by spaces. Newlines survive so line structure is unchanged, and
+ * `${ ... }` holes stay code (stripped recursively).
+ *
+ * Only the RPC counters use this: a mention of `.rpc(` in prose is not a call,
+ * so it must not raise a coupling metric (ticket 21-preflight B, requirement 3).
+ * Known limit: JSX text is not understood, so an apostrophe in `.tsx` markup can
+ * read as a string opener. No `.tsx` file here contains an RPC call today, and
+ * `web.postgrestRpcCalls` is published, so such a call would be visible.
+ */
+function stripNonCode(text) {
+  const out = text.split("");
+  const length = text.length;
+
+  const blank = (from, to) => {
+    for (let index = from; index < to && index < length; index += 1) {
+      const char = out[index];
+      if (char !== "\n" && char !== "\r") out[index] = " ";
+    }
+  };
+
+  let index = 0;
+  while (index < length) {
+    const char = text[index];
+    const next = text[index + 1];
+
+    if (char === "/" && next === "/") {
+      const newline = text.indexOf("\n", index + 2);
+      const end = newline === -1 ? length : newline;
+      blank(index, end);
+      index = end;
+      continue;
+    }
+
+    if (char === "/" && next === "*") {
+      const close = text.indexOf("*/", index + 2);
+      const end = close === -1 ? length : close + 2;
+      blank(index, end);
+      index = end;
+      continue;
+    }
+
+    if (char === "/" && regexCanStartAt(text, index)) {
+      let end = index + 1;
+      let inClass = false;
+      let closed = false;
+      while (end < length) {
+        const inner = text[end];
+        if (inner === "\\") {
+          end += 2;
+          continue;
+        }
+        if (inner === "\n") break;
+        if (inner === "[") inClass = true;
+        else if (inner === "]") inClass = false;
+        else if (inner === "/" && !inClass) {
+          end += 1;
+          closed = true;
+          break;
+        }
+        end += 1;
+      }
+      if (closed) {
+        blank(index, end);
+        index = end;
+        continue;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (QUOTE_CHARS.has(char)) {
+      const holes = [];
+      const end = findLiteralEnd(text, index, holes);
+      blank(index, end);
+      for (const [from, to] of holes) {
+        const inner = stripNonCode(text.slice(from, to));
+        for (let offset = 0; offset < inner.length; offset += 1) {
+          out[from + offset] = inner[offset];
+        }
+      }
+      index = end;
+      continue;
+    }
+
+    index += 1;
+  }
+
+  return out.join("");
+}
+
+/**
+ * RPC call sites in both source forms this repository uses: the chained
+ * `client.rpc("name", ...)` and the parenthesised type assertion
+ * `(client.rpc as any)("name", ...)`. The assertion body is deliberately
+ * narrow - no parentheses, braces, semicolons or line breaks - so a mere
+ * mention cannot be mistaken for a call.
+ */
+const RPC_CALL_PATTERN = /\.rpc\s*\(|\.rpc\s+as\s+[^(){};\n]*\)\s*\(/;
+
+/** Counts RPC call sites in code, ignoring comments/strings/regex literals. */
+function countRpcCalls(text) {
+  return countMatches(stripNonCode(text), RPC_CALL_PATTERN);
+}
+
 function readAll(files) {
   return files.map((file) => readText(file)).join("\n");
 }
@@ -290,7 +518,7 @@ function collect(root, baselinePath) {
     webText,
     /(?<!Array)(?<!Object)(?<!Buffer)\.from\s*\(/,
   );
-  metrics["web.postgrestRpcCalls"] = countMatches(webText, /\.rpc\s*\(/);
+  metrics["web.postgrestRpcCalls"] = countRpcCalls(webText);
   metrics["web.realtimeChannelCalls"] = countMatches(webText, /\.channel\s*\(/);
   metrics["web.storageApiCalls"] = countMatches(
     webText,
@@ -326,8 +554,8 @@ function collect(root, baselinePath) {
   metrics["server.fromCallsIncludingTests"] =
     metrics["server.fromCalls"] +
     countMatches(serverTestText, /(?<!Array)(?<!Object)(?<!Buffer)\.from\s*\(/);
-  metrics["server.rpcCallsRuntime"] = countMatches(runtimeText, /\.rpc\s*\(/);
-  metrics["server.rpcCallsAll"] = countMatches(serverProdText, /\.rpc\s*\(/);
+  metrics["server.rpcCallsRuntime"] = countRpcCalls(runtimeText);
+  metrics["server.rpcCallsAll"] = countRpcCalls(serverProdText);
   metrics["server.storageCalls"] = countMatches(serverProdText, /\.storage\b/);
   metrics["server.authGetUserCalls"] = countMatches(
     serverProdText,
@@ -506,7 +734,7 @@ function collect(root, baselinePath) {
     toolingText,
     /(?<!Array)(?<!Object)(?<!Buffer)\.from\s*\(/,
   );
-  metrics["tooling.rpcCalls"] = countMatches(toolingText, /\.rpc\s*\(/);
+  metrics["tooling.rpcCalls"] = countRpcCalls(toolingText);
   metrics["tooling.storageCalls"] = countMatches(toolingText, /\.storage\b/);
   metrics["tooling.authGetUserCalls"] = countMatches(
     toolingText,
@@ -648,6 +876,15 @@ function main() {
       `[skip] ${skipped.join(", ")} (archive/scratch output is never counted)`,
     );
     lines.push(...toolingReport);
+    lines.push(
+      "[rpc] rule: an RPC call site is counted in both `client.rpc(...)` and " +
+        "`(client.rpc as any)(...)` form, with comments/strings/regex literals " +
+        "ignored. `grant_plan_credits` (features/credits/credit-service.ts) was " +
+        "already a runtime call before ticket 21-preflight B: the type-asserted " +
+        "form was a counting gap, so server.rpcCallsRuntime moved 17 -> 18 (and " +
+        "server.rpcCallsAll 21 -> 22) as an OBSERVATION fix, not as a new " +
+        "dependency. No production RPC call, credits rule or schema changed.",
+    );
     lines.push(formatTable(metrics));
 
     for (const anchor of ANCHORS) {
