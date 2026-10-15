@@ -144,7 +144,7 @@ async function bufferWithLimit(
   return rebuildResponse(merged, response);
 }
 
-function rebuildResponse(bytes: Uint8Array, source: Response): Response {
+function rebuildResponse(bytes: Uint8Array<ArrayBuffer>, source: Response): Response {
   if (NULL_BODY_STATUSES.has(source.status)) {
     return new Response(null, {
       status: source.status,
