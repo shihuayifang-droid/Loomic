@@ -1,30 +1,50 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
+import {
+  CreditServiceError,
+  type CreditService,
+} from "../credits/credit-service.js";
+import type { TierGuard } from "../credits/tier-guard.js";
+import { withBilling, type BillingRejection } from "../credits/with-billing.js";
 import { JobServiceError, createJobService, type JobService } from "./job-service.js";
 import type { ExecutorContext, JobExecutor } from "./job-executor.js";
 import { processJobMessage } from "./process-job-message.js";
 
-type Op =
+/** Which client produced an operation: the caller's (RLS) or the admin one. */
+type ClientKind = "user" | "admin";
+
+type Op = (
   | { kind: "update"; patch: Record<string, unknown> }
   | { kind: "insert"; table: string; row: Record<string, unknown> }
+  | { kind: "delete" }
   | { kind: "select"; columns: string | undefined }
   | { kind: "eq"; column: string; value: unknown }
   | { kind: "in"; column: string; values: unknown[] }
   | { kind: "order" }
   | { kind: "limit" }
   | { kind: "maybeSingle"; table: string }
-  | { kind: "single"; table: string };
+  | { kind: "single"; table: string }
+) & { via: ClientKind };
 
 type HarnessConfig = {
   /** Rows the guarded update reports as changed. */
   updatedRows?: number;
   updateError?: { message: string } | null;
-  /** Row returned by `.maybeSingle()` (getJobAdmin). */
+  /**
+   * Per-call outcomes for successive AWAITED update chains (the worker's
+   * transitions, `setCreditsInfo`), consumed in order. `reject` models a
+   * transport failure, which is a different thing from an `error` reported in
+   * the resolved answer.
+   */
+  updateOutcomes?: Array<{ rows?: number; reject?: Error }>;
+  /** Row returned by `.maybeSingle()` (getJobAdmin / cancelJob). */
   jobRow?: Record<string, unknown> | null;
+  /** Error reported by `.maybeSingle()` on `background_jobs`. */
+  jobRowError?: { message: string } | null;
   rpc?: { data: unknown; error: { message: string } | null };
   /** Row returned by `.maybeSingle()` on `canvases` / `projects` (createJob). */
   canvasRow?: Record<string, unknown> | null;
@@ -34,6 +54,11 @@ type HarnessConfig = {
   /** Row the job insert reports back. */
   insertedJob?: Record<string, unknown> | null;
   insertError?: { message: string } | null;
+  /** The enqueue throws (the compensation path of createJob). */
+  sendError?: Error;
+  /** Rows the compensation DELETE reports, and its resolved error. */
+  deleteRows?: number;
+  deleteError?: { message: string } | null;
   /**
    * ADR-0001 / workorder 21F: what the attempt counter repository answers.
    * `null` is the "no such job row" answer; omit for a plain `1/3` row.
@@ -49,70 +74,127 @@ function makeHarness(config: HarnessConfig = {}) {
   const ops: Op[] = [];
   const rpcCalls: Array<{ name: string; params: unknown }> = [];
   const attemptCalls: Array<{ jobId: string }> = [];
+  const clientTokens: string[] = [];
+  /** Every PGMQ call the service made: send, deleteMsg, archive. */
+  const messageLifecycle: string[] = [];
+  /**
+   * The service's own statements in the order they were issued, so "authorize,
+   * then insert, then enqueue" is measured rather than asserted in prose.
+   */
+  const trace: string[] = [];
+  /**
+   * A one-table stand-in for `background_jobs`, so a compensation delete that
+   * was refused leaves a row behind that a case can point at.
+   */
+  const jobRows = new Map<string, Record<string, unknown>>();
 
-  function makeBuilder(table: string) {
-    const builder = {
-      update: (patch: Record<string, unknown>) => {
-        ops.push({ kind: "update", patch });
-        return builder;
+  function makeClient(via: ClientKind) {
+    function makeBuilder(table: string) {
+      let chain: "update" | "insert" | "delete" | "select" = "select";
+      let targetId: unknown;
+
+      const builder = {
+        update: (patch: Record<string, unknown>) => {
+          chain = "update";
+          ops.push({ kind: "update", patch, via });
+          trace.push(`update:${table}`);
+          return builder;
+        },
+        insert: (row: Record<string, unknown>) => {
+          chain = "insert";
+          ops.push({ kind: "insert", table, row, via });
+          trace.push(`insert:${table}`);
+          return builder;
+        },
+        delete: () => {
+          chain = "delete";
+          ops.push({ kind: "delete", via });
+          trace.push(`delete:${table}`);
+          return builder;
+        },
+        select: (columns?: string) => {
+          ops.push({ kind: "select", columns, via });
+          return builder;
+        },
+        eq: (column: string, value: unknown) => {
+          if (column === "id") targetId = value;
+          ops.push({ kind: "eq", column, value, via });
+          return builder;
+        },
+        in: (column: string, values: unknown[]) => {
+          ops.push({ kind: "in", column, values, via });
+          return builder;
+        },
+        order: () => {
+          ops.push({ kind: "order", via });
+          return builder;
+        },
+        limit: () => {
+          ops.push({ kind: "limit", via });
+          return builder;
+        },
+        maybeSingle: async () => {
+          ops.push({ kind: "maybeSingle", table, via });
+          trace.push(`read:${table}`);
+          if (table === "canvases") {
+            return { data: config.canvasRow ?? null, error: config.canvasError ?? null };
+          }
+          if (table === "projects") {
+            return { data: config.projectRow ?? null, error: config.projectError ?? null };
+          }
+          return { data: config.jobRow ?? null, error: config.jobRowError ?? null };
+        },
+        single: async () => {
+          ops.push({ kind: "single", table, via });
+          const row = config.insertedJob ?? null;
+          if (table === "background_jobs" && row && row.id !== undefined) {
+            jobRows.set(String(row.id), row);
+          }
+          return { data: row, error: config.insertError ?? null };
+        },
+        then: (
+          resolve: (value: unknown) => unknown,
+          reject?: (reason: unknown) => unknown,
+        ) => {
+          if (chain === "delete") {
+            const error = config.deleteError ?? null;
+            const rows = error === null ? (config.deleteRows ?? 1) : 0;
+            if (rows > 0 && table === "background_jobs") jobRows.delete(String(targetId));
+            return Promise.resolve({
+              data: Array.from({ length: rows }, () => ({ id: targetId })),
+              error,
+            }).then(resolve, reject);
+          }
+
+          const outcome = config.updateOutcomes?.shift();
+          if (outcome?.reject) {
+            return Promise.reject(outcome.reject).then(resolve, reject);
+          }
+
+          const rows = outcome?.rows ?? config.updatedRows ?? 0;
+          return Promise.resolve({
+            data: Array.from({ length: rows }, () => ({ id: "job-1" })),
+            error: config.updateError ?? null,
+          }).then(resolve, reject);
+        },
+      };
+
+      return builder;
+    }
+
+    return {
+      from: (table: string) => makeBuilder(table),
+      rpc: async (name: string, params: unknown) => {
+        rpcCalls.push({ name, params });
+        return config.rpc ?? { data: null, error: null };
       },
-      insert: (row: Record<string, unknown>) => {
-        ops.push({ kind: "insert", table, row });
-        return builder;
-      },
-      select: (columns?: string) => {
-        ops.push({ kind: "select", columns });
-        return builder;
-      },
-      eq: (column: string, value: unknown) => {
-        ops.push({ kind: "eq", column, value });
-        return builder;
-      },
-      in: (column: string, values: unknown[]) => {
-        ops.push({ kind: "in", column, values });
-        return builder;
-      },
-      order: () => {
-        ops.push({ kind: "order" });
-        return builder;
-      },
-      limit: () => {
-        ops.push({ kind: "limit" });
-        return builder;
-      },
-      maybeSingle: async () => {
-        ops.push({ kind: "maybeSingle", table });
-        if (table === "canvases") {
-          return { data: config.canvasRow ?? null, error: config.canvasError ?? null };
-        }
-        if (table === "projects") {
-          return { data: config.projectRow ?? null, error: config.projectError ?? null };
-        }
-        return { data: config.jobRow ?? null, error: null };
-      },
-      single: async () => {
-        ops.push({ kind: "single", table });
-        return { data: config.insertedJob ?? null, error: config.insertError ?? null };
-      },
-      then: (resolve: (value: unknown) => unknown) =>
-        Promise.resolve({
-          data: Array.from({ length: config.updatedRows ?? 0 }, () => ({ id: "job-1" })),
-          error: config.updateError ?? null,
-        }).then(resolve),
     };
-
-    return builder;
   }
 
-  const sentMessages: Array<{ queue: string; message: unknown }> = [];
+  const userClient = makeClient("user");
+  const adminClient = makeClient("admin");
 
-  const client = {
-    from: (table: string) => makeBuilder(table),
-    rpc: async (name: string, params: unknown) => {
-      rpcCalls.push({ name, params });
-      return config.rpc ?? { data: null, error: null };
-    },
-  };
+  const sentMessages: Array<{ queue: string; message: unknown }> = [];
 
   // ADR-0001 / workorder 21F: the atomic attempt counter. The harness records
   // the exact argument object the service passed down, so "the count is read
@@ -129,12 +211,26 @@ function makeHarness(config: HarnessConfig = {}) {
   };
 
   const service: JobService = createJobService({
-    createUserClient: () => client as unknown as UserSupabaseClient,
-    getAdminClient: () => client as unknown as AdminSupabaseClient,
+    createUserClient: (accessToken: string) => {
+      clientTokens.push(accessToken);
+      return userClient as unknown as UserSupabaseClient;
+    },
+    getAdminClient: () => adminClient as unknown as AdminSupabaseClient,
     pgmq: {
       send: async (queue: string, message: unknown) => {
         sentMessages.push({ queue, message });
+        messageLifecycle.push(`send:${queue}`);
+        trace.push(`send:${queue}`);
+        if (config.sendError) throw config.sendError;
         return 1;
+      },
+      deleteMsg: async (queue: string, msgId: number) => {
+        messageLifecycle.push(`deleteMsg:${queue}:${msgId}`);
+        return true;
+      },
+      archive: async (queue: string, msgId: number) => {
+        messageLifecycle.push(`archive:${queue}:${msgId}`);
+        return true;
       },
     } as unknown as PgmqClient,
     ...(config.withoutAttemptRepository ? {} : { jobAttemptRepository }),
@@ -145,8 +241,29 @@ function makeHarness(config: HarnessConfig = {}) {
     ops.find((op): op is Extract<Op, { kind: "update" }> => op.kind === "update");
   const insertOp = () =>
     ops.find((op): op is Extract<Op, { kind: "insert" }> => op.kind === "insert");
+  /** Every status/credits patch the service wrote, in order. */
+  const patches = () =>
+    ops
+      .filter((op): op is Extract<Op, { kind: "update" }> => op.kind === "update")
+      .map((op) => op.patch);
+  const deletes = () => ops.filter((op) => op.kind === "delete");
 
-  return { service, ops, rpcCalls, attemptCalls, sentMessages, inOp, updateOp, insertOp };
+  return {
+    service,
+    ops,
+    rpcCalls,
+    attemptCalls,
+    sentMessages,
+    messageLifecycle,
+    clientTokens,
+    trace,
+    jobRows,
+    inOp,
+    updateOp,
+    insertOp,
+    patches,
+    deletes,
+  };
 }
 
 describe("job service state guards", () => {
@@ -452,6 +569,8 @@ type ProcessScenario = {
   attemptError?: Error;
   executorThrows?: { code?: string; message: string };
   hasExecutor?: boolean;
+  /** Per-call outcomes for the guarded status writes of the real JobService. */
+  updateOutcomes?: Array<{ rows?: number; reject?: Error }>;
 };
 
 function makeProcessHarness(scenario: ProcessScenario = {}) {
@@ -461,6 +580,9 @@ function makeProcessHarness(scenario: ProcessScenario = {}) {
     ...(scenario.attemptError === undefined
       ? {}
       : { attemptError: scenario.attemptError }),
+    ...(scenario.updateOutcomes === undefined
+      ? {}
+      : { updateOutcomes: [...scenario.updateOutcomes] }),
   });
 
   const calls: string[] = [];
@@ -615,5 +737,807 @@ describe("processJobMessage with the real JobService: the 21F attempt thresholds
     expect(harness.calls).toEqual(["executor"]);
     expect(harness.calls).not.toContain("archive");
     expect(harness.refunds()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 工单21H0 — the background job WRITE PROTOCOL baseline.
+//
+// These cases pin what createJob / cancelJob DO today and in what order:
+// authorize -> insert -> enqueue, with a compensation delete when the enqueue
+// fails; the money's place in that sequence; and the guarded cancel. They are
+// baselines, NOT fixes — where the current behaviour is a risk (a refused
+// compensation is silent, a credits-info failure cancels a paid job and refunds
+// nothing) the case pins THAT, so a later workorder has to change this file on
+// purpose instead of drifting past it.
+//
+// `case H<n>` numbering keeps them apart from the earlier blocks in this file.
+// ---------------------------------------------------------------------------
+
+const WRITE_USER = {
+  accessToken: "token-21h0",
+  email: "job-write@hahart.test",
+  id: "user-21h0",
+  userMetadata: {},
+};
+
+const WRITE_JOB_ROW: Record<string, unknown> = {
+  id: "job-21h0",
+  workspace_id: "ws-1",
+  project_id: "project-1",
+  canvas_id: "canvas-1",
+  session_id: null,
+  thread_id: null,
+  queue_name: "image_generation_jobs",
+  job_type: "image_generation",
+  status: "queued",
+  payload: {},
+  result: null,
+  error_code: null,
+  error_message: null,
+  attempt_count: 0,
+  max_attempts: 3,
+  created_by: "user-21h0",
+  created_at: "2026-10-16T00:00:00.000Z",
+  updated_at: "2026-10-16T00:00:00.000Z",
+  started_at: null,
+  completed_at: null,
+  failed_at: null,
+  canceled_at: null,
+};
+
+describe("createJob: authorize, then insert, then enqueue (工单21H0)", () => {
+  it("case H1: the three steps happen in that order, and the enqueue is last", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: "project-1" },
+      insertedJob: WRITE_JOB_ROW,
+    });
+
+    await harness.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      canvasId: "canvas-1",
+      jobType: "image_generation",
+      payload: { prompt: "a red fox" },
+    });
+
+    // The authorization READ is what makes the INSERT legal, so it cannot move
+    // after it; and nothing is enqueued before the row exists.
+    expect(harness.trace).toEqual([
+      "read:canvases",
+      "insert:background_jobs",
+      "send:image_generation_jobs",
+    ]);
+  });
+
+  it("case H2: a failed authorization read is a 500, with no insert and no enqueue", async () => {
+    for (const failing of ["canvas", "project"] as const) {
+      const harness = makeHarness({
+        insertedJob: WRITE_JOB_ROW,
+        ...(failing === "canvas"
+          ? { canvasError: { message: "permission denied for table canvases" } }
+          : { projectError: { message: "permission denied for table projects" } }),
+      });
+
+      const error = await harness.service
+        .createJob(WRITE_USER, {
+          workspaceId: "ws-1",
+          ...(failing === "canvas"
+            ? { canvasId: "canvas-1" }
+            : { projectId: "project-1" }),
+          jobType: "image_generation",
+          payload: { prompt: "x" },
+        })
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as JobServiceError);
+
+      expect(error).toBeInstanceOf(JobServiceError);
+      expect(error?.code).toBe("job_create_failed");
+      expect(error?.statusCode).toBe(500);
+      // A read failure is NOT the same answer as "you may not use this canvas":
+      // it is reported as a server fault, with the database text left out.
+      expect(error?.message).toBe(
+        failing === "canvas"
+          ? "Failed to verify the job canvas."
+          : "Failed to verify the job project.",
+      );
+      expect(harness.insertOp()).toBeUndefined();
+      expect(harness.deletes()).toHaveLength(0);
+      expect(harness.sentMessages).toHaveLength(0);
+    }
+  });
+
+  it("case H3: every step runs through the CALLER's client, with the caller's token", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: "project-1" },
+      insertedJob: WRITE_JOB_ROW,
+    });
+
+    await harness.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      canvasId: "canvas-1",
+      jobType: "image_generation",
+      payload: { prompt: "x" },
+    });
+
+    expect(harness.ops.length).toBeGreaterThan(0);
+    expect(harness.ops.every((op) => op.via === "user")).toBe(true);
+    // The client is built from the caller's access token, so RLS decides what
+    // the authorization read can see. The admin client is not used here at all.
+    expect(harness.clientTokens).toEqual(["token-21h0"]);
+
+    // cancelJob is the caller's client too...
+    const cancelHarness = makeHarness({ jobRow: WRITE_JOB_ROW });
+    await cancelHarness.service.cancelJob(WRITE_USER, "job-21h0");
+    expect(cancelHarness.ops.every((op) => op.via === "user")).toBe(true);
+    expect(cancelHarness.clientTokens).toEqual(["token-21h0"]);
+
+    // ...while the worker's guarded transitions are the admin client's.
+    const adminHarness = makeHarness({ updatedRows: 1 });
+    await adminHarness.service.markRunning("job-21h0");
+    expect(adminHarness.ops.every((op) => op.via === "admin")).toBe(true);
+    expect(adminHarness.clientTokens).toEqual([]);
+  });
+
+  it("case H4: an insert that fails - or answers no row - is a 500 and nothing is enqueued", async () => {
+    for (const inserted of [
+      makeHarness({
+        insertError: { message: "duplicate key value violates unique constraint" },
+      }),
+      makeHarness({ insertedJob: null }),
+    ]) {
+      const error = await inserted.service
+        .createJob(WRITE_USER, {
+          workspaceId: "ws-1",
+          jobType: "image_generation",
+          payload: { prompt: "x" },
+        })
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as JobServiceError);
+
+      expect(error).toBeInstanceOf(JobServiceError);
+      expect(error?.code).toBe("job_create_failed");
+      expect(error?.statusCode).toBe(500);
+      expect(error?.message).toBe("Failed to create job record.");
+
+      // Nothing to enqueue, and nothing to compensate: the row never existed.
+      expect(inserted.sentMessages).toHaveLength(0);
+      expect(inserted.deletes()).toHaveLength(0);
+      expect(inserted.jobRows.size).toBe(0);
+    }
+  });
+
+  it("case H5: the inserted row is shaped here - including the queue, which comes from the job type", async () => {
+    const image = makeHarness({
+      canvasRow: { project_id: "project-from-canvas" },
+      insertedJob: WRITE_JOB_ROW,
+    });
+    await image.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      canvasId: "canvas-1",
+      sessionId: "session-1",
+      threadId: "thread-1",
+      jobType: "image_generation",
+      payload: { prompt: "a red fox" },
+    });
+
+    // The exact key set, so a field added or dropped by a later workorder is a
+    // visible change: status/attempt_count/max_attempts are left to the server
+    // defaults and are deliberately NOT in this object.
+    expect(image.insertOp()?.row).toEqual({
+      workspace_id: "ws-1",
+      project_id: "project-from-canvas",
+      canvas_id: "canvas-1",
+      session_id: "session-1",
+      thread_id: "thread-1",
+      queue_name: "image_generation_jobs",
+      job_type: "image_generation",
+      payload: { prompt: "a red fox" },
+      created_by: "user-21h0",
+    });
+
+    const video = makeHarness({ insertedJob: WRITE_JOB_ROW });
+    await video.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      jobType: "video_generation",
+      payload: { prompt: "a slow pan" },
+    });
+
+    expect(video.insertOp()?.row).toEqual({
+      workspace_id: "ws-1",
+      project_id: null,
+      canvas_id: null,
+      session_id: null,
+      thread_id: null,
+      queue_name: "video_generation_jobs",
+      job_type: "video_generation",
+      payload: { prompt: "a slow pan" },
+      created_by: "user-21h0",
+    });
+  });
+
+  it("case H6: the queue message carries ids only - no payload, no project, no token", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: "project-1" },
+      insertedJob: WRITE_JOB_ROW,
+    });
+    await harness.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      canvasId: "canvas-1",
+      sessionId: "session-1",
+      jobType: "image_generation",
+      payload: { prompt: "a secret prompt the queue must not repeat" },
+    });
+
+    expect(harness.sentMessages).toEqual([
+      {
+        queue: "image_generation_jobs",
+        message: {
+          job_id: "job-21h0",
+          job_type: "image_generation",
+          workspace_id: "ws-1",
+          canvas_id: "canvas-1",
+          session_id: "session-1",
+        },
+      },
+    ]);
+    const message = harness.sentMessages[0]?.message as Record<string, unknown>;
+    expect(Object.keys(message).sort()).toEqual([
+      "canvas_id",
+      "job_id",
+      "job_type",
+      "session_id",
+      "workspace_id",
+    ]);
+
+    // A job with no canvas and no session omits those two keys entirely (they
+    // are spread in conditionally), rather than sending nulls.
+    const projectOnly = makeHarness({
+      projectRow: { id: "project-9" },
+      insertedJob: WRITE_JOB_ROW,
+    });
+    await projectOnly.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      projectId: "project-9",
+      threadId: "thread-1",
+      jobType: "image_generation",
+      payload: {},
+    });
+
+    expect(projectOnly.sentMessages).toEqual([
+      {
+        queue: "image_generation_jobs",
+        message: {
+          job_id: "job-21h0",
+          job_type: "image_generation",
+          workspace_id: "ws-1",
+        },
+      },
+    ]);
+  });
+
+  it("case H7: a failed enqueue compensates by deleting the row and reports job_create_failed", async () => {
+    const logged: unknown[][] = [];
+    const spy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => {
+        logged.push(args);
+      });
+
+    try {
+      const harness = makeHarness({
+        insertedJob: WRITE_JOB_ROW,
+        sendError: new Error("pgmq is down"),
+      });
+
+      const error = await harness.service
+        .createJob(WRITE_USER, {
+          workspaceId: "ws-1",
+          jobType: "image_generation",
+          payload: { prompt: "x" },
+        })
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as JobServiceError);
+
+      expect(error).toBeInstanceOf(JobServiceError);
+      expect(error?.code).toBe("job_create_failed");
+      expect(error?.statusCode).toBe(500);
+      expect(error?.message).toBe("Failed to enqueue job.");
+
+      // One attempt, no retry.
+      expect(harness.sentMessages).toHaveLength(1);
+      // The compensation: exactly one DELETE, on this table, by this job id,
+      // through the caller's client (so RLS decides whether it can land).
+      expect(harness.deletes()).toHaveLength(1);
+      expect(harness.deletes()[0]?.via).toBe("user");
+      expect(
+        harness.ops.some(
+          (op) => op.kind === "eq" && op.column === "id" && op.value === "job-21h0",
+        ),
+      ).toBe(true);
+      expect(harness.jobRows.has("job-21h0")).toBe(false);
+      // The only trace of the enqueue failure is a console.error naming it.
+      expect(logged).toHaveLength(1);
+      expect(String(logged[0]?.[0])).toContain("[job-service] pgmq.send failed:");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("case H8: a REFUSED compensation is silent - the orphan row stays and the caller only hears about the enqueue", async () => {
+    // Zero rows: RLS filtered the delete out (the row is not the caller's), or
+    // it was already gone. The service never reads that answer.
+    const zeroRows = makeHarness({
+      insertedJob: WRITE_JOB_ROW,
+      sendError: new Error("pgmq is down"),
+      deleteRows: 0,
+    });
+    const zeroRowsError = await zeroRows.service
+      .createJob(WRITE_USER, {
+        workspaceId: "ws-1",
+        jobType: "image_generation",
+        payload: { prompt: "x" },
+      })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(zeroRowsError?.message).toBe("Failed to enqueue job.");
+    expect(zeroRows.deletes()).toHaveLength(1);
+    // CURRENT BEHAVIOUR, PINNED AS A RISK: the job row that could not be removed
+    // survives, and nothing in the response or the log says so.
+    expect(zeroRows.jobRows.has("job-21h0")).toBe(true);
+
+    // The same holds when the delete itself reports a database error: it is not
+    // checked, not retried and not logged.
+    const deleteFailed = makeHarness({
+      insertedJob: WRITE_JOB_ROW,
+      sendError: new Error("pgmq is down"),
+      deleteError: { message: "permission denied for table background_jobs" },
+    });
+    const deleteFailedError = await deleteFailed.service
+      .createJob(WRITE_USER, {
+        workspaceId: "ws-1",
+        jobType: "image_generation",
+        payload: { prompt: "x" },
+      })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(deleteFailedError?.message).toBe("Failed to enqueue job.");
+    expect(deleteFailed.deletes()).toHaveLength(1);
+    expect(deleteFailed.jobRows.has("job-21h0")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// withBilling driven through the REAL JobService: with-billing.test.ts pins the
+// money rules against a stub job service, and these cases pin the same run
+// against the statements createJob/cancelJob actually issue.
+// ---------------------------------------------------------------------------
+
+type BillingScenario = {
+  balance?: number;
+  cost?: number;
+  deductError?: Error;
+  deductTxId?: string;
+  /** Resolved error reported by the awaited UPDATE chain (setCreditsInfo). */
+  updateError?: { message: string } | null;
+  /** Per-call outcomes for the awaited UPDATE chains. */
+  updateOutcomes?: Array<{ rows?: number; reject?: Error }>;
+  /** `false` models a cancel whose guard matched no row (404, swallowed). */
+  cancelSeesRow?: boolean;
+};
+
+function makeBillingHarness(scenario: BillingScenario = {}) {
+  const harness = makeHarness({
+    insertedJob: WRITE_JOB_ROW,
+    canvasRow: { project_id: "project-1" },
+    jobRow: scenario.cancelSeesRow === false ? null : WRITE_JOB_ROW,
+    ...(scenario.updateError === undefined ? {} : { updateError: scenario.updateError }),
+    ...(scenario.updateOutcomes === undefined
+      ? {}
+      : { updateOutcomes: [...scenario.updateOutcomes] }),
+  });
+
+  // Billing markers go into the SAME trace as the service's own statements, so
+  // "the balance was checked before the job existed" is one ordered list.
+  const mark = (entry: string): void => {
+    harness.trace.push(entry);
+  };
+
+  const creditService = {
+    async getBalance() {
+      mark("billing:getBalance");
+      return {
+        balance: scenario.balance ?? 1000,
+        plan: "pro" as const,
+        dailyClaimed: false,
+      };
+    },
+    async getSubscription() {
+      mark("billing:getSubscription");
+      return {
+        plan: "pro" as const,
+        billingPeriod: null,
+        stripeCustomerId: null,
+        stripeSubscriptionId: null,
+        currentPeriodStart: null,
+        currentPeriodEnd: null,
+        canceledAt: null,
+      };
+    },
+    async deductCredits(
+      _workspaceId: string,
+      _userId: string,
+      amount: number,
+      jobId?: string,
+    ) {
+      mark(`billing:deductCredits:${amount}:${jobId ?? "none"}`);
+      if (scenario.deductError) throw scenario.deductError;
+      return scenario.deductTxId ?? "tx-21h0";
+    },
+    async refundCredits(_workspaceId: string, _userId: string, amount: number) {
+      mark(`billing:refundCredits:${amount}`);
+      return "tx-refund";
+    },
+    async claimDailyCredits() {
+      return { success: false };
+    },
+    async getTransactions() {
+      return [];
+    },
+    async updatePlan() {
+      mark("billing:updatePlan");
+    },
+  } as unknown as CreditService;
+
+  const tierGuard = {
+    checkModelAccess(plan: string, modelId: string) {
+      mark(`billing:checkModelAccess:${plan}:${modelId}`);
+    },
+    checkResolution(_plan: string, quality: string) {
+      mark(`billing:checkResolution:${quality}`);
+    },
+    checkVideoResolution() {},
+    async checkConcurrency(workspaceId: string) {
+      mark(`billing:checkConcurrency:${workspaceId}`);
+    },
+    calculateCreditCost() {
+      mark(`billing:calculateCreditCost:${scenario.cost ?? 10}`);
+      return scenario.cost ?? 10;
+    },
+  } as unknown as TierGuard;
+
+  const bill = (options: { onRejected?: (rejection: BillingRejection) => void } = {}) =>
+    withBilling(
+      { creditService, tierGuard, jobService: harness.service },
+      {
+        user: WRITE_USER,
+        workspaceId: "ws-1",
+        modelId: "model-21h0",
+        guard: { jobType: "image_generation", quality: "hd" },
+        description: "Image generation: model-21h0",
+        job: { payload: { prompt: "a red fox" }, refs: { canvasId: "canvas-1" } },
+        ...(options.onRejected ? { onRejected: options.onRejected } : {}),
+      },
+      async (outcome) => {
+        harness.trace.push("run:body");
+        return { jobId: outcome.job?.id ?? null, creditsCost: outcome.creditsCost };
+      },
+    );
+
+  return { harness, bill };
+}
+
+describe("withBilling through the real JobService: where the money sits in the write (工单21H0)", () => {
+  it("case H9: a balance below the price is refused BEFORE any job row or queue message exists", async () => {
+    const { harness, bill } = makeBillingHarness({ balance: 3, cost: 10 });
+    const rejections: BillingRejection[] = [];
+
+    const error = await bill({ onRejected: (r) => rejections.push(r) })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as CreditServiceError);
+
+    expect(error).toBeInstanceOf(CreditServiceError);
+    expect(error?.code).toBe("insufficient_credits");
+    expect(error?.statusCode).toBe(402);
+    expect(rejections).toEqual([
+      {
+        kind: "insufficient_credits",
+        currentBalance: 3,
+        requiredAmount: 10,
+        plan: "pro",
+        dailyClaimed: false,
+      },
+    ]);
+
+    // The whole run stopped at the pre-check: no canvas read, no insert, no
+    // enqueue, no charge, no cancel. This is why the job is not created first
+    // and cancelled afterwards any more.
+    expect(harness.trace).toEqual([
+      "billing:getSubscription",
+      "billing:checkModelAccess:pro:model-21h0",
+      "billing:checkResolution:hd",
+      "billing:checkConcurrency:ws-1",
+      "billing:calculateCreditCost:10",
+      "billing:getBalance",
+    ]);
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.patches()).toEqual([]);
+  });
+
+  it("case H10: a failed charge cancels the job it just created, and the charge error survives", async () => {
+    const { harness, bill } = makeBillingHarness({
+      deductError: new CreditServiceError("credit_deduct_failed", "deduct exploded", 500),
+    });
+
+    const error = await bill()
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as CreditServiceError);
+
+    expect(error?.message).toBe("deduct exploded");
+
+    // The job existed and was enqueued BEFORE the charge was attempted: the
+    // charge carries its id, which is why the id has to exist first.
+    expect(harness.sentMessages).toHaveLength(1);
+    expect(harness.trace).toContain("billing:deductCredits:10:job-21h0");
+    expect(harness.trace.indexOf("send:image_generation_jobs")).toBeLessThan(
+      harness.trace.indexOf("billing:deductCredits:10:job-21h0"),
+    );
+
+    // The reaction to a failed charge is the guarded cancel, and nothing else:
+    // no PGMQ lifecycle, no compensation delete, no refund.
+    expect(harness.patches()).toEqual([
+      { status: "canceled", canceled_at: expect.any(String) },
+    ]);
+    expect(harness.inOp()?.values).toEqual(["queued", "running"]);
+    expect(harness.deletes()).toHaveLength(0);
+    expect(harness.messageLifecycle).toEqual(["send:image_generation_jobs"]);
+    expect(harness.trace).not.toContain("billing:refundCredits:10");
+    // The row is NOT deleted: the cancelled job is the record of the attempt.
+    expect(harness.jobRows.has("job-21h0")).toBe(true);
+    // And the credits bookkeeping was never reached: the cancel's update is the
+    // only row write in the whole run.
+    expect(harness.trace.filter((entry) => entry === "update:background_jobs")).toHaveLength(1);
+  });
+
+  it("case H11: when the charge fails AND the cancel is refused, the cancel failure is swallowed", async () => {
+    const { harness, bill } = makeBillingHarness({
+      deductError: new CreditServiceError("credit_deduct_failed", "deduct exploded", 500),
+      cancelSeesRow: false,
+    });
+
+    const error = await bill()
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as CreditServiceError);
+
+    // The caller learns about the charge, never about the cancel: the promise
+    // rejection of the cancel is caught with an empty handler.
+    expect(error?.message).toBe("deduct exploded");
+
+    // The cancel WAS attempted - the guarded update was built and sent - and it
+    // is the guard that matched nothing, so the job stays `queued` and the
+    // worker will still pick it up after a charge that failed.
+    expect(harness.patches()).toEqual([
+      { status: "canceled", canceled_at: expect.any(String) },
+    ]);
+    expect(harness.jobRows.has("job-21h0")).toBe(true);
+    expect(harness.trace).not.toContain("billing:refundCredits:10");
+  });
+
+  it("case H12: a credits-info write that reports a DATABASE ERROR is dropped on the floor", async () => {
+    const { harness, bill } = makeBillingHarness({
+      updateError: { message: "permission denied for table background_jobs" },
+    });
+
+    const result = await bill();
+
+    // The charge went through and the body ran...
+    expect(result).toEqual({ jobId: "job-21h0", creditsCost: 10 });
+    expect(harness.trace).toContain("billing:deductCredits:10:job-21h0");
+    expect(harness.trace).toContain("run:body");
+
+    // ...while the write that records WHICH transaction paid for the job
+    // reported an error nobody reads: `setCreditsInfo` awaits the statement and
+    // never inspects its `error`, so the job keeps a null
+    // credits_transaction_id and no cancel or refund is triggered.
+    expect(harness.patches()).toEqual([
+      { credits_cost: 10, credits_transaction_id: "tx-21h0" },
+    ]);
+    expect(harness.trace).not.toContain("billing:refundCredits:10");
+    expect(harness.jobRows.has("job-21h0")).toBe(true);
+  });
+
+  it("case H13: a credits-info write that THROWS cancels a job that was already paid for", async () => {
+    const transport = new Error("fetch failed: connection reset by peer");
+    const { harness, bill } = makeBillingHarness({
+      updateOutcomes: [{ reject: transport }],
+    });
+
+    const error = await bill()
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as Error);
+
+    expect(error).toBe(transport);
+
+    // CURRENT BEHAVIOUR, PINNED AS A RISK: the money was already taken, and the
+    // only reaction is to cancel the job. The catch around the charge covers
+    // this write too, so the job is cancelled and NOBODY refunds: this workorder
+    // does not change that, it records it.
+    expect(harness.trace).toContain("billing:deductCredits:10:job-21h0");
+    expect(harness.patches()).toEqual([
+      { credits_cost: 10, credits_transaction_id: "tx-21h0" },
+      { status: "canceled", canceled_at: expect.any(String) },
+    ]);
+    expect(harness.trace).not.toContain("billing:refundCredits:10");
+    expect(harness.jobRows.has("job-21h0")).toBe(true);
+    expect(harness.trace).not.toContain("run:body");
+  });
+
+  it("case H14: the full order - guards, balance, job, enqueue, charge, credits info, body", async () => {
+    const { harness, bill } = makeBillingHarness({});
+
+    const result = await bill();
+
+    expect(result).toEqual({ jobId: "job-21h0", creditsCost: 10 });
+    expect(harness.trace).toEqual([
+      "billing:getSubscription",
+      "billing:checkModelAccess:pro:model-21h0",
+      "billing:checkResolution:hd",
+      "billing:checkConcurrency:ws-1",
+      "billing:calculateCreditCost:10",
+      "billing:getBalance",
+      "read:canvases",
+      "insert:background_jobs",
+      "send:image_generation_jobs",
+      "billing:deductCredits:10:job-21h0",
+      "update:background_jobs",
+      "run:body",
+    ]);
+  });
+});
+
+describe("cancelJob: the guarded update and what it deliberately does not do (工单21H0)", () => {
+  it("case H15: cancel writes two columns for queued/running only, and touches neither PGMQ nor credits", async () => {
+    const harness = makeHarness({
+      jobRow: { ...WRITE_JOB_ROW, status: "canceled", canceled_at: "2026-10-16T00:00:00.000Z" },
+    });
+
+    const job = await harness.service.cancelJob(WRITE_USER, "job-21h0");
+
+    expect(job.status).toBe("canceled");
+    // Exactly two keys, and `canceled_at` is a timestamp this process produced.
+    expect(harness.updateOp()?.patch).toEqual({
+      status: "canceled",
+      canceled_at: expect.any(String),
+    });
+    // The guard list is exactly queued/running: `retrying` is NOT cancelable,
+    // and neither is a terminal state. Everything else answers 404.
+    expect(harness.inOp()?.column).toBe("status");
+    expect(harness.inOp()?.values).toEqual(["queued", "running"]);
+    // maybeSingle, so a guard that matched nothing is "no job", not a 500.
+    expect(
+      harness.ops.some((op) => op.kind === "maybeSingle" && op.table === "background_jobs"),
+    ).toBe(true);
+
+    // Cancelling does not consume the queue message, does not delete the row and
+    // does not move any money: the worker's own guard handles the message.
+    expect(harness.messageLifecycle).toEqual([]);
+    expect(harness.deletes()).toHaveLength(0);
+    expect(harness.patches()).toHaveLength(1);
+    expect(harness.rpcCalls).toEqual([]);
+  });
+
+  it("case H16: a job the guard does not match is a 404 with the fixed message", async () => {
+    // The harness answers "no row" exactly as PostgreSQL does for a status
+    // outside queued/running - the PGlite baseline measures that per status.
+    const harness = makeHarness({ jobRow: null });
+
+    const error = await harness.service
+      .cancelJob(WRITE_USER, "job-21h0")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_not_found");
+    expect(error?.statusCode).toBe(404);
+    expect(error?.message).toBe("Job not found or already completed.");
+    // The same guard was applied; the refusal is the row count, not an error.
+    expect(harness.inOp()?.values).toEqual(["queued", "running"]);
+    expect(harness.messageLifecycle).toEqual([]);
+  });
+
+  it("case H17: a cancel that cannot reach the database is a 500 job_cancel_failed", async () => {
+    const harness = makeHarness({ jobRowError: { message: "connection reset" } });
+
+    const error = await harness.service
+      .cancelJob(WRITE_USER, "job-21h0")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_cancel_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to cancel job.");
+  });
+});
+
+describe("processJobMessage with the real JobService: single-ownership boundaries (工单21H0)", () => {
+  it("case H18: a missing row, and a job that can no longer start, are archived without executing or refunding", async () => {
+    // The job row is gone: nothing to execute, nothing to refund, nothing to
+    // write - only the message is retired.
+    const gone = makeProcessHarness({ attemptRow: null });
+    await gone.run();
+
+    expect(gone.calls).toEqual(["archive"]);
+    expect(gone.patches()).toEqual([]);
+    expect(gone.refunds()).toBe(0);
+
+    // Cancelled meanwhile: markRunning changed no row, so the message is
+    // archived and the job keeps the status somebody else gave it.
+    const noLongerStartable = makeProcessHarness({ updateOutcomes: [{ rows: 0 }] });
+    await noLongerStartable.run();
+
+    expect(noLongerStartable.calls).toEqual(["archive"]);
+    expect(noLongerStartable.calls).not.toContain("executor");
+    expect(noLongerStartable.patches().map((patch) => patch.status)).toEqual([
+      "running",
+    ]);
+    expect(noLongerStartable.refunds()).toBe(0);
+  });
+
+  it("case H19: a status write that changed no row never refunds and never re-marks", async () => {
+    // markFailed changed nothing: another writer already moved the job out of a
+    // markable state, so refunding here would pay the same charge twice.
+    const lostRace = makeProcessHarness({
+      attemptRow: { attemptCount: 3, maxAttempts: 3 },
+      executorThrows: { message: "provider down" },
+      updateOutcomes: [{ rows: 1 }, { rows: 0 }],
+    });
+    await lostRace.run();
+
+    expect(lostRace.patches().map((patch) => patch.status)).toEqual([
+      "running",
+      "failed",
+    ]);
+    expect(lostRace.calls).toEqual(["executor", "archive"]);
+    expect(lostRace.refunds()).toBe(0);
+
+    // Cancelled while the executor was running: the message is DELETED (not
+    // archived), the cancelled status is left alone, and no refund is issued.
+    const cancelledWhileRunning = makeProcessHarness({
+      updateOutcomes: [{ rows: 1 }, { rows: 0 }],
+    });
+    await cancelledWhileRunning.run();
+
+    expect(cancelledWhileRunning.patches().map((patch) => patch.status)).toEqual([
+      "running",
+      "succeeded",
+    ]);
+    expect(cancelledWhileRunning.calls).toEqual(["executor", "deleteMsg"]);
+    expect(cancelledWhileRunning.calls).not.toContain("archive");
+    expect(cancelledWhileRunning.refunds()).toBe(0);
+  });
+
+  it("case H20: a non-retryable code fails terminally on the FIRST attempt, refunding once and archiving", async () => {
+    const harness = makeProcessHarness({
+      attemptRow: { attemptCount: 1, maxAttempts: 3 },
+      executorThrows: { code: "safety_filter", message: "blocked by policy" },
+    });
+
+    await harness.run();
+
+    // A code that can only fail the same way does not get a second attempt:
+    // failed with the executor's own code, one refund, one archive, no delete.
+    expect(harness.patches().map((patch) => patch.status)).toEqual([
+      "running",
+      "failed",
+    ]);
+    expect(harness.patches()[1]?.error_code).toBe("safety_filter");
+    expect(String(harness.patches()[1]?.error_message)).toContain("blocked by policy");
+    expect(harness.patches()[1]?.failed_at).toEqual(expect.any(String));
+    expect(harness.calls).toEqual(["executor", "refundJob", "archive"]);
+    expect(harness.calls).not.toContain("deleteMsg");
+    expect(harness.refunds()).toBe(1);
   });
 });
