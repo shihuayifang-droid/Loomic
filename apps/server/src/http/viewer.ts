@@ -17,16 +17,29 @@ import {
 } from "../features/bootstrap/ensure-user-foundation.js";
 import type { CreditService } from "../features/credits/credit-service.js";
 import type {
-  RequestAuthenticator,
-  UserSupabaseClient,
-} from "../supabase/user.js";
+  ProfileWriteRepository,
+  ProfileWriteRow,
+} from "../db/profile-write-repository.js";
+import type { RequestAuthenticator } from "../supabase/user.js";
 
 export async function registerViewerRoutes(
   app: FastifyInstance,
   options: {
     auth: RequestAuthenticator;
-    createUserClient: (accessToken: string) => UserSupabaseClient;
     creditService?: CreditService;
+    /**
+     * ADR-0001 / workorder 21D: the only writer of `profiles.display_name`.
+     *
+     * Optional so a caller CAN build the app without one; there is deliberately
+     * no fallback behind it. A missing repository is handled exactly like a
+     * failing one — the route answers the same 500 and writes nothing.
+     *
+     * There is no user-scoped Supabase factory in this signature any more (the
+     * parameter was removed by workorder 21D). That is the structural half of
+     * "the profile write never goes back to PostgREST": the route cannot reach
+     * a PostgREST client even by mistake.
+     */
+    profileWriteRepository?: ProfileWriteRepository;
     viewerService: ViewerService;
   },
 ) {
@@ -110,32 +123,36 @@ export async function registerViewerRoutes(
       }
 
       const payload = profileUpdateRequestSchema.parse(request.body);
-      const client = options.createUserClient(user.accessToken);
-      const { data, error } = await client
-        .from("profiles")
-        .update({ display_name: payload.displayName })
-        .eq("id", user.id)
-        .select("id, email, display_name, avatar_url")
-        .single();
 
-      if (error || !data) {
-        return reply.code(500).send(
-          applicationErrorResponseSchema.parse({
-            error: {
-              code: "profile_update_failed",
-              message: "Unable to update profile.",
-            },
-          }),
-        );
+      // ADR-0001 / workorder 21D: the display-name write moved from the
+      // user-scoped PostgREST client to the pure `pg` repository. What did NOT
+      // move is the projection: authentication first, the request schema second,
+      // and every failure of the write — zero rows, a broken row shape, a SQL or
+      // connection error, or no repository at all — is the SAME fixed 500 the
+      // PostgREST path answered when it returned no data. No 404/403, and no
+      // SQL, host or "does this profile exist" information reaches the client.
+      const repository = options.profileWriteRepository;
+      if (!repository) {
+        return reply.code(500).send(profileUpdateFailed());
+      }
+
+      let profile: ProfileWriteRow;
+      try {
+        profile = await repository.updateDisplayName({
+          actorId: user.id,
+          displayName: payload.displayName,
+        });
+      } catch {
+        return reply.code(500).send(profileUpdateFailed());
       }
 
       return reply.code(200).send(
         profileUpdateResponseSchema.parse({
           profile: {
-            id: data.id,
-            email: data.email ?? "",
-            displayName: data.display_name ?? "",
-            avatarUrl: data.avatar_url ?? null,
+            id: profile.id,
+            email: profile.email ?? "",
+            displayName: profile.displayName,
+            avatarUrl: profile.avatarUrl ?? null,
           },
         }),
       );
@@ -154,6 +171,22 @@ export async function registerViewerRoutes(
         "Internal server error.",
       );
     }
+  });
+}
+
+/**
+ * The one failure body the profile PATCH can answer. It is a function rather
+ * than a constant so every caller gets its own parsed object, and it is the ONLY
+ * place the code and wording live: the zero-row refusal, a repository that threw
+ * and a repository that was never injected must be indistinguishable from the
+ * outside.
+ */
+function profileUpdateFailed() {
+  return applicationErrorResponseSchema.parse({
+    error: {
+      code: "profile_update_failed",
+      message: "Unable to update profile.",
+    },
   });
 }
 

@@ -76,6 +76,10 @@ import {
   type ChatWriteRepository,
 } from "./db/chat-write-repository.js";
 import {
+  createProfileWriteRepository,
+  type ProfileWriteRepository,
+} from "./db/profile-write-repository.js";
+import {
   createProjectReadRepository,
   type ProjectReadRepository,
 } from "./db/project-read-repository.js";
@@ -139,6 +143,7 @@ import {
   createSupabaseRequestAuthenticator,
   createUserSupabaseClientFactory,
   type RequestAuthenticator,
+  type UserSupabaseClient,
 } from "./supabase/user.js";
 
 export type BuildAppOptions = {
@@ -157,10 +162,19 @@ export type BuildAppOptions = {
   chatService?: ChatService;
   connectionManager?: ConnectionManager;
   creditService?: CreditService;
+  /**
+   * ADR-0001 / workorder 21D: the user-scoped Supabase client factory is
+   * injectable so a test can hand the app a factory that RECORDS its calls (and
+   * throws), which is how "the profile write no longer goes through PostgREST"
+   * is observed instead of asserted in prose. Production passes nothing here and
+   * gets the real factory built from the environment.
+   */
+  createUserClient?: (accessToken: string) => UserSupabaseClient;
   env?: Partial<ServerEnv>;
   identityReadRepository?: IdentityReadRepository;
   jobService?: JobService;
   paymentService?: PaymentService;
+  profileWriteRepository?: ProfileWriteRepository;
   tierGuard?: TierGuard;
   uploadService?: UploadService;
   mockEventDelayMs?: number;
@@ -202,7 +216,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     });
   });
   const auth = options.auth ?? createSupabaseRequestAuthenticator(env);
-  const createUserClient = createUserSupabaseClientFactory(env);
+  const createUserClient =
+    options.createUserClient ?? createUserSupabaseClientFactory(env);
   let adminClient:
     | ReturnType<typeof createAdminSupabaseClient>
     | undefined;
@@ -266,6 +281,17 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const chatSessionWriteRepository =
     options.chatSessionWriteRepository ??
     createChatSessionWriteRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
+  // ADR-0001 / workorder 21D: the display-name write behind
+  // `PATCH /api/viewer/profile` goes through its own narrow repository, built
+  // lazily against the same pool and handed to the viewer routes below. Like the
+  // 21B/21C write paths it has no PostgREST fallback to fall back TO: with no
+  // pool, or with a missing profile row, the call fails closed as a
+  // `ProfileWriteError` and the route keeps its existing 500 projection.
+  const profileWriteRepository =
+    options.profileWriteRepository ??
+    createProfileWriteRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
   // ADR-0001 / workorder 20E: the read-only lookups the WRITE flows perform (the
@@ -454,8 +480,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   });
   void registerViewerRoutes(app, {
     auth,
-    createUserClient,
     creditService,
+    profileWriteRepository,
     viewerService,
   });
   void registerBrandKitRoutes(app, {
