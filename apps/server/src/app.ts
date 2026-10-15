@@ -91,6 +91,10 @@ import {
   createTeamAdminReadRepository,
   type TeamAdminReadRepository,
 } from "./db/team-admin-read-repository.js";
+import {
+  createWorkspaceSettingsWriteRepository,
+  type WorkspaceSettingsWriteRepository,
+} from "./db/workspace-settings-write-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -186,6 +190,13 @@ export type BuildAppOptions = {
   teamMembershipService?: TeamMembershipService;
   threadService?: ThreadService;
   viewerService?: ViewerService;
+  /**
+   * ADR-0001 / workorder 21E1: the only writer of
+   * `workspace_settings.default_model`. Injectable for the same reason the other
+   * repositories are — a test can hand the app its own double and observe which
+   * actor and which workspace the route passed down.
+   */
+  workspaceSettingsWriteRepository?: WorkspaceSettingsWriteRepository;
 };
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -294,6 +305,21 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createProfileWriteRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 21E1: the single-key `workspace_settings.default_model`
+  // upsert behind `PUT /api/workspace/settings` goes through its own narrow
+  // repository, built lazily against the same pool and handed to the settings
+  // service below. Like the 21B/21C/21D write paths it has no PostgREST fallback
+  // to fall back TO: with no pool, with no repository, or with a caller that is
+  // not an owner/admin member of the target workspace, the write fails closed as
+  // a `WorkspaceSettingsWriteError` and the route keeps its existing 500
+  // `settings_update_failed` projection. The READ path
+  // (`getWorkspaceSettings`) is untouched and still runs on the user-scoped
+  // client.
+  const workspaceSettingsWriteRepository =
+    options.workspaceSettingsWriteRepository ??
+    createWorkspaceSettingsWriteRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   // ADR-0001 / workorder 20E: the read-only lookups the WRITE flows perform (the
   // project existence/ownership check before an upload or an archive, and the
   // asset row the upload reads back) go through the same lazily-built pool. The
@@ -368,6 +394,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       createSettingsService({
         createUserClient,
         defaultModel: resolveDefaultAgentModel(env),
+        workspaceSettingsWriteRepository,
       });
   const uploadService =
     options.uploadService ??

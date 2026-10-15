@@ -500,14 +500,18 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // (136→133), the title update and the delete — into
     // `ChatSessionWriteRepository`, and workorder 21D moved the LAST single-table
     // write, the `profiles` display-name update behind
-    // `PATCH /api/viewer/profile` (133→132), into `ProfileWriteRepository`. The
-    // Supabase-RPC write of the credits rules and the cache invalidation after
-    // it are unchanged.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(132);
+    // `PATCH /api/viewer/profile` (133→132), into `ProfileWriteRepository`.
+    // Workorder 21E1 then moved the single-key `workspace_settings.default_model`
+    // upsert behind `PUT /api/workspace/settings` (132→131) into
+    // `WorkspaceSettingsWriteRepository`, which also removed the last PostgREST
+    // write from `SettingsService` — the READ of the same table is untouched and
+    // is still counted here. The Supabase-RPC write of the credits rules and the
+    // cache invalidation after it are unchanged.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(131);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(132);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(131);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
