@@ -171,25 +171,6 @@ function buildTypedRpcProbeSource(): string {
 }
 
 /**
- * The type-asserted form, twice.
- *
- * Workorder 21F removed one runtime RPC, so a mirror of the repository measures
- * 17 runtime / 21 total while the frozen baseline still publishes 22. ONE extra
- * call therefore lands exactly ON the baseline — which the auditor correctly
- * reports as "not an increase" — so a probe that has to cross it carries two,
- * and the two counters move by exactly two.
- */
-function buildTypedRpcRiseProbeSource(): string {
-  return [
-    "declare const admin: any;",
-    'await (admin.rpc as any)("grant_plan_credits", { p_workspace_id: "w" });',
-    'await (admin.rpc as any)("invalidate_credit_cache", { p_workspace_id: "w" });',
-    "export {};",
-    "",
-  ].join("\n");
-}
-
-/**
  * Every way the literal `.rpc(` appears WITHOUT being a call: a line comment, a
  * block comment, string/template/regex literal contents, a property read, a
  * destructured property name, and type assertions that are never invoked. The
@@ -461,29 +442,31 @@ describe("audit-supabase-dependencies: typed RPC call forms", () => {
     expect(before.status).toBe(0);
     expect(problemCount(before.stdout)).toBe(0);
     // Workorder 21F moved `increment_job_attempt` into the pure `pg`
-    // repository, so a mirror of the repository now sits one BELOW the frozen
-    // baseline: 17 runtime / 21 total against a published 22.
+    // repository, and workorder 21F-fixup re-baselined the frozen numbers to the
+    // measurement that produced (17 runtime / 21 total). A mirror of the
+    // repository therefore now sits EXACTLY ON the baseline — which is the lower
+    // edge of the boundary: equal is not an increase, and the auditor must not
+    // report one.
+    expect(metricValue(before.stdout, "server.rpcCallsRuntime")).toBe(17);
     expect(metricValue(before.stdout, "server.rpcCallsAll")).toBe(21);
 
-    // One extra type-asserted call lands exactly ON the baseline. That is not an
-    // increase, and the auditor must not report one.
+    // ONE extra type-asserted call is therefore enough to cross the baseline by
+    // exactly one, and both counters must be reported as risen. That is the upper
+    // edge, and it is the tightest crossing the auditor can be asked to notice: a
+    // single-call probe fails if the comparison is off by one in either direction
+    // (a `>=` comparison would report the equal case above, and a `<`/off-by-one
+    // ceiling would miss this one).
     writeFileSync(probePath, buildTypedRpcProbeSource(), "utf8");
-    const atBaseline = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
-    expect(atBaseline.status).toBe(0);
-    expect(problemCount(atBaseline.stdout)).toBe(0);
-    expect(metricValue(atBaseline.stdout, "server.rpcCallsAll")).toBe(22);
-
-    // The second one crosses it, and both counters are reported as risen.
-    writeFileSync(probePath, buildTypedRpcRiseProbeSource(), "utf8");
     const injected = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
 
     expect(injected.status).toBe(1);
     expect(problemCount(injected.stdout)).toBeGreaterThanOrEqual(1);
     expect(injected.stdout).toContain("[!] metric server.rpcCallsRuntime increased");
+    expect(injected.stdout).toContain("[!] metric server.rpcCallsAll increased");
     expect(metricValue(injected.stdout, "server.rpcCallsRuntime")).toBe(
-      metricValue(before.stdout, "server.rpcCallsRuntime") + 2,
+      metricValue(before.stdout, "server.rpcCallsRuntime") + 1,
     );
-    expect(metricValue(injected.stdout, "server.rpcCallsAll")).toBe(23);
+    expect(metricValue(injected.stdout, "server.rpcCallsAll")).toBe(22);
 
     rmSync(probePath);
     const restored = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
@@ -563,19 +546,19 @@ describe("audit-supabase-dependencies: real repository root", () => {
     expect(metricValue(run.stdout, "server.rpcCallsAll")).toBe(21);
 
     // The published anchor is a CONSTANT of the audit script
-    // (`ANCHORS.server.runtimeRpc`) and is mirrored by the baseline's
-    // `anchors.server.runtimeRpc`. Both files are outside workorder 21F's write
-    // list, so this ticket cannot pin the anchor to 17 — and it must not pretend
-    // otherwise. The line it really publishes is the honest "differs" one: the
-    // frozen anchor still reads 18 while the live measurement reads 17, and the
-    // mismatch is reported as an information line, not a problem.
+    // (`ANCHORS.server.runtimeRpc`) mirrored by the baseline's
+    // `anchors.server.runtimeRpc`. Workorder 21F-fixup pins BOTH to the
+    // observation above (18 -> 17), so the published line must report the frozen
+    // anchor agreeing with the live measurement instead of the previous
+    // `anchor=18 ... (DIFFERS by -1)`. Matched as a whole line: a stale anchor or
+    // a silently moved counter cannot pass by appearing somewhere else in the
+    // output.
     //
-    // Pinning 18 -> 17 is a separate fixup ticket, exactly symmetric to how
-    // workorder 21C-preflight D pinned 17 -> 18 (`8308315`). Matched as a whole
-    // line, so a silently moved counter or a re-baselined anchor cannot pass by
-    // appearing somewhere else in the output.
+    // This is the exact reverse of workorder 21C-preflight D, which pinned
+    // 17 -> 18 (`8308315`) when the anchor was frozen ABOVE the measurement; the
+    // anchor now follows the real coupling down instead of being left behind.
     expect(run.stdout).toMatch(
-      /^\[anchor\] server\.runtimeRpc: anchor=18 measured\[server\.rpcCallsRuntime\]=17 \(DIFFERS by -1\)$/m,
+      /^\[anchor\] server\.runtimeRpc: anchor=17 measured\[server\.rpcCallsRuntime\]=17 \(match\)$/m,
     );
 
     expect(metricValue(run.stdout, "server.storageCalls")).toBe(23);

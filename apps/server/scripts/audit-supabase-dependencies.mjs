@@ -202,7 +202,7 @@ const ANCHORS = [
   { label: "web.Auth", value: 9, key: "web.authSdkDistinctMethods" },
   { label: "web.PostgREST", value: 4, key: "web.postgrestFromCalls" },
   { label: "web.Realtime", value: 0, key: "web.realtimeChannelCalls" },
-  { label: "server.runtimeRpc", value: 18, key: "server.rpcCallsRuntime" },
+  { label: "server.runtimeRpc", value: 17, key: "server.rpcCallsRuntime" },
   { label: "sql.rlsTables", value: 32, key: "sql.rlsEnabledTables" },
   { label: "config.envFamily", value: 8, key: "config.supabaseEnvVariableFamily" },
   { label: "manifests", value: 3, key: "manifests.withSupabaseSdk" },

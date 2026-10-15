@@ -2,7 +2,7 @@
   "version": 1,
   "generatedBy": "apps/server/scripts/audit-supabase-dependencies.mjs",
   "generatedAt": "2026-10-14T06:18:30.819Z",
-  "note": "Supabase coupling baseline (ticket 19). Counts are textual over the scopes documented in the script header. A later ticket may only lower a number; an increase fails the audit. Exception (ticket 21-preflight B): the two RPC counters were corrected for the type-asserted call form - `grant_plan_credits` in apps/server/src/features/credits/credit-service.ts was already a runtime RPC before that ticket, so server.rpcCallsRuntime 17 -> 18 and server.rpcCallsAll 21 -> 22 record an observation gap being closed, not a new dependency.",
+  "note": "Supabase coupling baseline (ticket 19). Counts are textual over the scopes documented in the script header. A later ticket may only lower a number; an increase fails the audit. Exception (ticket 21-preflight B): the two RPC counters were corrected for the type-asserted call form - `grant_plan_credits` in apps/server/src/features/credits/credit-service.ts was already a runtime RPC before that ticket, so server.rpcCallsRuntime 17 -> 18 and server.rpcCallsAll 21 -> 22 record an observation gap being closed, not a new dependency. Reduction (ticket 21F): server.rpcCallsRuntime 18 -> 17 and server.rpcCallsAll 22 -> 21 record an ACTUAL dependency decrease, not an observation correction - `increment_job_attempt` stopped being called from apps/server/src/features/jobs/job-service.ts when the atomic counter moved into JobAttemptRepository (pure `pg`), so that runtime RPC call site no longer exists. The four CLI call sites are untouched, which is why only the runtime/all pair moves; no scan rule changed and nothing was re-counted. The 21-preflight B entry in observationCorrections below stays as the record of the earlier observation gap.",
   "observationCorrections": [
     {
       "ticket": "21-preflight B (T-35)",
@@ -16,7 +16,7 @@
     "web.Auth": 9,
     "web.PostgREST": 4,
     "web.Realtime": 0,
-    "server.runtimeRpc": 18,
+    "server.runtimeRpc": 17,
     "sql.rlsTables": 32,
     "config.envFamily": 8,
     "manifests": 3,
@@ -38,8 +38,8 @@
     "server.supabaseSdkImportHits": 3,
     "server.fromCalls": 163,
     "server.fromCallsIncludingTests": 163,
-    "server.rpcCallsRuntime": 18,
-    "server.rpcCallsAll": 22,
+    "server.rpcCallsRuntime": 17,
+    "server.rpcCallsAll": 21,
     "server.storageCalls": 23,
     "server.authGetUserCalls": 1,
     "server.testSupabaseSdkImportHits": 1,
