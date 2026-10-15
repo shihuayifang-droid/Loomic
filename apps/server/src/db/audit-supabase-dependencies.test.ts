@@ -495,13 +495,16 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // of `TeamAdminService.addMember` (the profile behind an email) into that
     // repository. Workorder 21B then moved the three writes of
     // `ChatService.createMessage` — the message insert (139→136), the same-id
-    // confirmation read and the session touch — into `ChatWriteRepository`. The
-    // write RPC and the cache invalidation after it are unchanged.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(136);
+    // confirmation read and the session touch — into `ChatWriteRepository`, and
+    // workorder 21C moved the chat SESSION CRUD — the `chat_sessions` insert
+    // (136→133), the title update and the delete — into
+    // `ChatSessionWriteRepository`. The write RPC and the cache invalidation
+    // after it are unchanged.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(133);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(136);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(133);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

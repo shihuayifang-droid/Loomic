@@ -34,6 +34,14 @@ import {
   type ChatSessionReadRow,
 } from "../../db/chat-read-repository.js";
 import {
+  CREATE_SESSION,
+  DELETE_SESSION,
+  UPDATE_SESSION_TITLE,
+  ChatSessionWriteError,
+  type ChatSessionWriteRepository,
+  type ChatSessionWriteRow,
+} from "../../db/chat-session-write-repository.js";
+import {
   FIND_MESSAGE_FOR_RECOVERY,
   INSERT_MESSAGE,
   TOUCH_SESSION,
@@ -248,6 +256,141 @@ function writeRepositoryStub(script: WriteScript): {
  * repository above, the asset identities come from the chat read repository
  * (workorder 20D), and the storage signing still goes through the user client.
  */
+/**
+ * What the SESSION write repository should answer, scripted per call
+ * (workorder 21C).
+ *
+ * An entry with `error` makes the call FAIL the way the repository fails: it
+ * throws `ChatSessionWriteError` wrapping that driver error. An entry with `data`
+ * is the row the insert's `RETURNING` echoed back.
+ */
+type SessionWriteScript = {
+  create?: { data?: ChatSessionWriteRow; error?: unknown };
+  update?: { affectedRows?: number; error?: unknown };
+  delete?: { affectedRows?: number; error?: unknown };
+};
+
+type SessionWriteCalls = {
+  creates: Array<{
+    actorId: string;
+    canvasId: string;
+    threadId: string;
+    title: string | null;
+    createdBy: string | null;
+  }>;
+  updates: Array<{ actorId: string; sessionId: string; title: string }>;
+  deletes: Array<{ actorId: string; sessionId: string }>;
+};
+
+/**
+ * The session write repository as this service sees it. The recorded CALLS are
+ * the thing under test: which actor, which canvas/session, and the thread id and
+ * `createdBy` the service decided to hand over.
+ */
+function sessionWriteRepositoryStub(script: SessionWriteScript = {}): {
+  repository: ChatSessionWriteRepository;
+  calls: SessionWriteCalls;
+} {
+  const calls: SessionWriteCalls = { creates: [], updates: [], deletes: [] };
+
+  const repository: ChatSessionWriteRepository = {
+    async createSession(input) {
+      calls.creates.push({ ...input });
+
+      if (script.create?.error) {
+        throw new ChatSessionWriteError(CREATE_SESSION, script.create.error);
+      }
+
+      if (!script.create?.data) {
+        // What the real repository does when the write ACL answers zero rows.
+        throw new ChatSessionWriteError(
+          CREATE_SESSION,
+          new Error("chat session write created no row"),
+        );
+      }
+
+      return script.create.data;
+    },
+
+    async updateSessionTitle(input) {
+      calls.updates.push({ ...input });
+      if (script.update?.error) {
+        throw new ChatSessionWriteError(UPDATE_SESSION_TITLE, script.update.error);
+      }
+      return { affectedRows: script.update?.affectedRows ?? 1 };
+    },
+
+    async deleteSession(input) {
+      calls.deletes.push({ ...input });
+      if (script.delete?.error) {
+        throw new ChatSessionWriteError(DELETE_SESSION, script.delete.error);
+      }
+      return { affectedRows: script.delete?.affectedRows ?? 1 };
+    },
+  };
+
+  return { repository, calls };
+}
+
+function sessionWriteRow(
+  id: string,
+  title: string | null,
+  updatedAt: string,
+): ChatSessionWriteRow {
+  return { id, title, updatedAt };
+}
+
+/**
+ * A harness for the session CRUD only (workorder 21C).
+ *
+ * `createUserClient` THROWS on purpose: the three session writes moved into the
+ * repository, so reaching for the caller's PostgREST client here is a regression
+ * — there is no fallback transport — and any case that would do it fails loudly
+ * instead of quietly succeeding.
+ *
+ * `threadService.createThreadId` is a counter, so a case can prove the id came
+ * from the service and was passed through untouched.
+ */
+function sessionService(script: SessionWriteScript = {}) {
+  const logs: string[] = [];
+  const spy = vi
+    .spyOn(console, "log")
+    .mockImplementation((...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+    });
+
+  const { repository: chatReadRepository } = repositoryStub({});
+  const { repository: chatWriteRepository } = writeRepositoryStub({ insertResults: [] });
+  const { repository: chatSessionWriteRepository, calls } =
+    sessionWriteRepositoryStub(script);
+
+  let threadIds = 0;
+  const service = createChatService({
+    createUserClient: () => {
+      throw new Error(
+        "the session CRUD must not reach the user client (21C: the session writes have a repository)",
+      );
+    },
+    chatReadRepository,
+    chatWriteRepository,
+    chatSessionWriteRepository,
+    threadService: {
+      createThreadId: () => {
+        threadIds += 1;
+        return `thread-${threadIds}`;
+      },
+    },
+  });
+
+  return {
+    service,
+    calls,
+    logs,
+    threadIds: () => threadIds,
+    restore: () => spy.mockRestore(),
+  };
+}
+
 function fakeClient(script: {
   insertResults: Array<{ data?: unknown; error?: unknown }>;
   /** Result of the "did it land?" lookup, when one happens. */
@@ -298,12 +441,14 @@ function fakeClient(script: {
     ...(script.lookup ? { lookup: script.lookup } : {}),
     ...(script.touch ? { touch: script.touch } : {}),
   });
+  const { repository: chatSessionWriteRepository } = sessionWriteRepositoryStub();
 
   return {
     service: createChatService({
       createUserClient: () => client as never,
       chatReadRepository: repository,
       chatWriteRepository,
+      chatSessionWriteRepository,
       threadService: { createThreadId: () => "th" },
     }),
     inserts: writeCalls.inserts,
@@ -473,11 +618,13 @@ function fakeReadClient(options: {
     echo: true,
     ...(options.touch ? { touch: options.touch } : {}),
   });
+  const { repository: chatSessionWriteRepository } = sessionWriteRepositoryStub();
 
   const service = createChatService({
     createUserClient: () => client as never,
     chatReadRepository: repository,
     chatWriteRepository,
+    chatSessionWriteRepository,
     threadService: { createThreadId: () => "th" },
   });
 
@@ -1478,5 +1625,195 @@ describe("createMessage write state machine through the repository (21B)", () =>
     expect(f.lookupCount()).toBe(0);
     expect(f.touchCount()).toBe(1);
     expect(messageCreateResponseSchema.parse({ message: created })).toBeDefined();
+  });
+});
+
+describe("chat session CRUD through the repository (21C)", () => {
+  it("case 1: createSession passes the REAL actor and canvas, and maps the row it gets back", async () => {
+    const h = sessionService({
+      create: { data: sessionWriteRow("s-new", "New Chat", "2026-10-15T00:00:00.000Z") },
+    });
+
+    const created = await h.service.createSession(USER, "canvas-1");
+
+    expect(created).toEqual({
+      id: "s-new",
+      title: "New Chat",
+      updatedAt: "2026-10-15T00:00:00.000Z",
+    });
+
+    expect(h.calls.creates).toHaveLength(1);
+    expect(h.calls.creates[0]).toMatchObject({
+      actorId: "u1",
+      canvasId: "canvas-1",
+    });
+    h.restore();
+  });
+
+  it("case 2: the thread id is minted by the thread service and stored as handed over", async () => {
+    const h = sessionService({ create: { data: sessionWriteRow("s-new", "t", "2026-10-15T00:00:00.000Z") } });
+
+    await h.service.createSession(USER, "canvas-1");
+
+    // The repository stores the value; it never produces one — so the id has to
+    // come from `threadService.createThreadId()` exactly once per create.
+    expect(h.threadIds()).toBe(1);
+    expect(h.calls.creates[0]?.threadId).toBe("thread-1");
+    h.restore();
+  });
+
+  it("case 3: createdBy is the caller's own id — passed as data, not as authority", async () => {
+    const h = sessionService({ create: { data: sessionWriteRow("s-new", "t", "2026-10-15T00:00:00.000Z") } });
+
+    await h.service.createSession(USER, "canvas-1");
+
+    // The write ACL is the PROJECT's author; this column only records who asked.
+    expect(h.calls.creates[0]?.createdBy).toBe("u1");
+    h.restore();
+  });
+
+  it("case 4: a falsy title becomes null, so the schema's DEFAULT decides", async () => {
+    const h = sessionService({ create: { data: sessionWriteRow("s-new", "New Chat", "2026-10-15T00:00:00.000Z") } });
+
+    // No title at all, and an empty one: both used to omit the column from the
+    // PostgREST insert (`...(title ? {title} : {})`), and `null` is the value
+    // that keeps that meaning in the repository.
+    await h.service.createSession(USER, "canvas-1");
+    await h.service.createSession(USER, "canvas-1", "");
+    await h.service.createSession(USER, "canvas-1", "Named");
+
+    expect(h.calls.creates.map((call) => call.title)).toEqual([null, null, "Named"]);
+    h.restore();
+  });
+
+  it("case 5: a repository failure is the existing 500, and the log carries no driver text", async () => {
+    const h = sessionService({
+      create: {
+        error: Object.assign(new Error('insert into "chat_sessions" failed at db.internal'), {
+          code: "42501",
+        }),
+      },
+    });
+
+    const error = await h.service
+      .createSession(USER, "canvas-1")
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ChatServiceError);
+    expect((error as ChatServiceError).statusCode).toBe(500);
+    expect((error as ChatServiceError).message).toBe("Failed to create session.");
+    expect((error as ChatServiceError).code).toBe("chat_error");
+
+    const logged = h.logs.join("\n");
+    expect(logged).toContain("createSession failed");
+    expect(logged).toContain(CREATE_SESSION);
+    // The driver's message embeds the statement and the host; neither may be logged.
+    expect(logged).not.toContain("db.internal");
+    expect(logged).not.toContain("chat_sessions");
+    h.restore();
+  });
+
+  it("case 6: a null title from the repository is not served — the route's schema must never blame the client", async () => {
+    const h = sessionService({ create: { data: sessionWriteRow("s-new", null, "2026-10-15T00:00:00.000Z") } });
+
+    const error = await h.service
+      .createSession(USER, "canvas-1")
+      .catch((reason: unknown) => reason);
+
+    // `ChatSessionSummary.title` is a string, so serving the null would make the
+    // route's own response parse fail and surface as a 400 blaming the caller.
+    expect(error).toBeInstanceOf(ChatServiceError);
+    expect((error as ChatServiceError).statusCode).toBe(500);
+    expect((error as ChatServiceError).message).toBe("Failed to create session.");
+    expect(h.logs.join("\n")).toContain("returned no title");
+    h.restore();
+  });
+
+  it("case 7: updateSessionTitle passes the real actor, session and title, and returns nothing", async () => {
+    const h = sessionService({ update: { affectedRows: 1 } });
+
+    await expect(
+      h.service.updateSessionTitle(USER, "s-1", "Renamed"),
+    ).resolves.toBeUndefined();
+
+    expect(h.calls.updates).toEqual([
+      { actorId: "u1", sessionId: "s-1", title: "Renamed" },
+    ]);
+    h.restore();
+  });
+
+  it("case 8: ★ a 0-row title update stays a SILENT success (T-34)", async () => {
+    const h = sessionService({ update: { affectedRows: 0 } });
+
+    // The session is gone, or this actor may not write it. The old update never
+    // inspected its result either, so the count must not become control flow.
+    await expect(h.service.updateSessionTitle(USER, "s-1", "x")).resolves.toBeUndefined();
+    expect(h.calls.updates).toHaveLength(1);
+    expect(h.logs.join("\n")).not.toContain("updateSessionTitle failed");
+    h.restore();
+  });
+
+  it("case 9: an update failure keeps the existing 500 text and the fixed operation name", async () => {
+    const h = sessionService({
+      update: { error: Object.assign(new Error("deadlock detected"), { code: "40P01" }) },
+    });
+
+    const error = await h.service
+      .updateSessionTitle(USER, "s-1", "x")
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ChatServiceError);
+    expect((error as ChatServiceError).statusCode).toBe(500);
+    expect((error as ChatServiceError).message).toBe("Failed to update session title.");
+    expect(h.logs.join("\n")).toContain(UPDATE_SESSION_TITLE);
+    expect(h.logs.join("\n")).not.toContain("deadlock");
+    h.restore();
+  });
+
+  it("case 10: deleteSession passes the real actor and session, and a 0-row delete is silent", async () => {
+    const h = sessionService({ delete: { affectedRows: 0 } });
+
+    await expect(h.service.deleteSession(USER, "s-1")).resolves.toBeUndefined();
+
+    expect(h.calls.deletes).toEqual([{ actorId: "u1", sessionId: "s-1" }]);
+    expect(h.logs.join("\n")).not.toContain("deleteSession failed");
+    h.restore();
+  });
+
+  it("case 11: a delete failure keeps the EXISTING 404 wording and status", async () => {
+    const h = sessionService({
+      delete: { error: Object.assign(new Error("connection terminated"), { code: "" }) },
+    });
+
+    const error = await h.service
+      .deleteSession(USER, "s-1")
+      .catch((reason: unknown) => reason);
+
+    // The route's contract is unchanged by the migration: same code, same text,
+    // same status — nothing new is enumerable through the endpoint.
+    expect(error).toBeInstanceOf(ChatServiceError);
+    expect((error as ChatServiceError).code).toBe("session_not_found");
+    expect((error as ChatServiceError).statusCode).toBe(404);
+    expect((error as ChatServiceError).message).toBe("Session not found.");
+    expect(h.logs.join("\n")).toContain(DELETE_SESSION);
+    expect(h.logs.join("\n")).not.toContain("connection terminated");
+    h.restore();
+  });
+
+  it("case 12: no session write reaches the caller's PostgREST client — there is no fallback", async () => {
+    // `sessionService` builds `createUserClient` to THROW, so all three calls
+    // below would fail if any of them still went out through the user client.
+    const h = sessionService({
+      create: { data: sessionWriteRow("s-new", "New Chat", "2026-10-15T00:00:00.000Z") },
+    });
+
+    await h.service.createSession(USER, "canvas-1");
+    await h.service.updateSessionTitle(USER, "s-1", "Renamed");
+    await h.service.deleteSession(USER, "s-1");
+
+    expect(h.calls.creates).toHaveLength(1);
+    expect(h.calls.updates).toHaveLength(1);
+    expect(h.calls.deletes).toHaveLength(1);
+    h.restore();
   });
 });

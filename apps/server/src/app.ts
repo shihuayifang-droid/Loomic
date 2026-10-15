@@ -68,6 +68,10 @@ import {
   type ChatReadRepository,
 } from "./db/chat-read-repository.js";
 import {
+  createChatSessionWriteRepository,
+  type ChatSessionWriteRepository,
+} from "./db/chat-session-write-repository.js";
+import {
   createChatWriteRepository,
   type ChatWriteRepository,
 } from "./db/chat-write-repository.js";
@@ -148,6 +152,7 @@ export type BuildAppOptions = {
   canvasReadRepository?: CanvasReadRepository;
   canvasService?: CanvasService;
   chatReadRepository?: ChatReadRepository;
+  chatSessionWriteRepository?: ChatSessionWriteRepository;
   chatWriteRepository?: ChatWriteRepository;
   chatService?: ChatService;
   connectionManager?: ConnectionManager;
@@ -253,6 +258,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createChatWriteRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 21C: the session CRUD (open, rename, delete a
+  // conversation) goes through its own narrow repository, built lazily against
+  // the same pool and handed to the chat service below. Like 21B's write path it
+  // has no PostgREST fallback to fall back TO: with no pool the call fails closed
+  // as a `ChatSessionWriteError`.
+  const chatSessionWriteRepository =
+    options.chatSessionWriteRepository ??
+    createChatSessionWriteRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   // ADR-0001 / workorder 20E: the read-only lookups the WRITE flows perform (the
   // project existence/ownership check before an upload or an archive, and the
   // asset row the upload reads back) go through the same lazily-built pool. The
@@ -314,6 +329,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       createUserClient,
       chatReadRepository,
       chatWriteRepository,
+      chatSessionWriteRepository,
       threadService,
     });
   const agentRunMetadataService =

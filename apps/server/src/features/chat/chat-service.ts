@@ -16,6 +16,11 @@ import {
   type ChatSessionReadRow,
 } from "../../db/chat-read-repository.js";
 import {
+  ChatSessionWriteError,
+  type ChatSessionWriteRepository,
+  type ChatSessionWriteRow,
+} from "../../db/chat-session-write-repository.js";
+import {
   ChatWriteError,
   chatWriteCause,
   chatWriteFailureCode,
@@ -399,6 +404,12 @@ export function createChatService(options: {
    * repository or it fails. A missing repository must not fall back to PostgREST.
    */
   chatWriteRepository: ChatWriteRepository;
+  /**
+   * Required for the same reason (workorder 21C): the session CRUD — create,
+   * rename, delete — goes through its own narrow repository, and a missing one
+   * is a failed call rather than a fallback to PostgREST.
+   */
+  chatSessionWriteRepository: ChatSessionWriteRepository;
   threadService: Pick<ThreadService, "createThreadId">;
 }): ChatService {
   return {
@@ -439,49 +450,113 @@ export function createChatService(options: {
     },
 
     async createSession(user, canvasId, title) {
-      const client = options.createUserClient(user.accessToken);
-      const { data, error } = await client
-        .from("chat_sessions")
-        .insert({
-          canvas_id: canvasId,
-          created_by: user.id,
-          thread_id: options.threadService.createThreadId(),
-          ...(title ? { title } : {}),
-        })
-        .select("id, title, updated_at")
-        .single();
+      // ADR-0001 / workorder 21C: the insert goes through the pure `pg`
+      // repository, so `canvas → project → workspace_members` and
+      // `projects.created_by = actor` are the statement's own predicate. An
+      // archived project is NOT filtered: an archived project's author can still
+      // open a conversation (T-34).
+      //
+      // The thread id is still minted HERE, by the thread service, and handed to
+      // the repository as a value: the repository stores what it is given and
+      // never produces an id of its own.
+      //
+      // `createdBy` is the caller's own id, but it is passed as DATA, not as
+      // authority — the write ACL is the project's author, so the column carries
+      // no weight and the repository is free to store whatever it is handed.
+      const actorId = user.id;
+      const threadId = options.threadService.createThreadId();
 
-      if (error || !data) {
+      let data: ChatSessionWriteRow;
+      try {
+        data = await options.chatSessionWriteRepository.createSession({
+          actorId,
+          canvasId,
+          threadId,
+          // The old insert omitted the column for a falsy title, which let the
+          // schema's `DEFAULT 'New Chat'` decide. `null` keeps that exact
+          // meaning; the default stays in the migration instead of being copied
+          // here where the two would drift.
+          title: title ? title : null,
+          createdBy: actorId,
+        });
+      } catch (error) {
+        // Only the fixed operation name is logged: the driver's message embeds
+        // the statement and its bind values, and this line is read by operators.
+        console.log(
+          "[chat-service] createSession failed",
+          "canvasId=" + canvasId,
+          "operation=" +
+            String(error instanceof ChatSessionWriteError ? error.operation : "unknown"),
+        );
+        throw new ChatServiceError("chat_error", "Failed to create session.", 500);
+      }
+
+      // `chat_sessions.title` is `text NOT NULL DEFAULT 'New Chat'`, so this
+      // cannot happen against the schema this repository was written for. If the
+      // column ever stops being NOT NULL, serving the null would make the route's
+      // own response schema fail and come back as a 400 blaming the CLIENT for a
+      // server-side shape drift — so it fails here instead, as the same 500 the
+      // write failure above uses.
+      if (data.title === null) {
+        console.log(
+          "[chat-service] createSession returned no title",
+          "canvasId=" + canvasId,
+          "operation=createSession",
+        );
         throw new ChatServiceError("chat_error", "Failed to create session.", 500);
       }
 
       return {
         id: data.id,
         title: data.title,
-        updatedAt: data.updated_at,
+        updatedAt: data.updatedAt,
       };
     },
 
     async updateSessionTitle(user, sessionId, title) {
-      const client = options.createUserClient(user.accessToken);
-      const { error } = await client
-        .from("chat_sessions")
-        .update({ title })
-        .eq("id", sessionId);
-
-      if (error) {
+      try {
+        // ADR-0001 / workorder 21C: the rename re-walks `session → canvas →
+        // project` and requires the project's author. A 0-row result — the
+        // session is gone, or this actor may not write it — stays a SILENT
+        // success (T-34), exactly as the old PostgREST update behaved: it never
+        // inspected its result either. `affectedRows` is deliberately not turned
+        // into control flow, so nothing new is enumerable through the route.
+        await options.chatSessionWriteRepository.updateSessionTitle({
+          actorId: user.id,
+          sessionId,
+          title,
+        });
+      } catch (error) {
+        console.log(
+          "[chat-service] updateSessionTitle failed",
+          "sessionId=" + sessionId,
+          "operation=" +
+            String(error instanceof ChatSessionWriteError ? error.operation : "unknown"),
+        );
         throw new ChatServiceError("chat_error", "Failed to update session title.", 500);
       }
     },
 
     async deleteSession(user, sessionId) {
-      const client = options.createUserClient(user.accessToken);
-      const { error } = await client
-        .from("chat_sessions")
-        .delete()
-        .eq("id", sessionId);
-
-      if (error) {
+      try {
+        // ADR-0001 / workorder 21C: the delete removes the session row under the
+        // same write ACL, and the schema's own `ON DELETE CASCADE` decides what
+        // happens to the messages. A 0-row delete is the same legal silent
+        // success as the rename above.
+        await options.chatSessionWriteRepository.deleteSession({
+          actorId: user.id,
+          sessionId,
+        });
+      } catch (error) {
+        // The existing wording and status are kept verbatim: the route's contract
+        // is unchanged, and a repository failure must not become a new way to
+        // probe whether a session exists.
+        console.log(
+          "[chat-service] deleteSession failed",
+          "sessionId=" + sessionId,
+          "operation=" +
+            String(error instanceof ChatSessionWriteError ? error.operation : "unknown"),
+        );
         throw new ChatServiceError("session_not_found", "Session not found.", 404);
       }
     },
