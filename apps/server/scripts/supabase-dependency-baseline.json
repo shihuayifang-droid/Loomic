@@ -2,7 +2,7 @@
   "version": 1,
   "generatedBy": "apps/server/scripts/audit-supabase-dependencies.mjs",
   "generatedAt": "2026-10-14T06:18:30.819Z",
-  "note": "Supabase coupling baseline (ticket 19). Counts are textual over the scopes documented in the script header. A later ticket may only lower a number; an increase fails the audit. Exception (ticket 21-preflight B): the two RPC counters and the server.runtimeRpc anchor observation were corrected for the type-asserted call form - `grant_plan_credits` in apps/server/src/features/credits/credit-service.ts was already a runtime RPC before that ticket, so server.rpcCallsRuntime 17 -> 18 and server.rpcCallsAll 21 -> 22 record an observation gap being closed, not a new dependency.",
+  "note": "Supabase coupling baseline (ticket 19). Counts are textual over the scopes documented in the script header. A later ticket may only lower a number; an increase fails the audit. Exception (ticket 21-preflight B): the two RPC counters were corrected for the type-asserted call form - `grant_plan_credits` in apps/server/src/features/credits/credit-service.ts was already a runtime RPC before that ticket, so server.rpcCallsRuntime 17 -> 18 and server.rpcCallsAll 21 -> 22 record an observation gap being closed, not a new dependency.",
   "observationCorrections": [
     {
       "ticket": "21-preflight B (T-35)",
@@ -16,7 +16,7 @@
     "web.Auth": 9,
     "web.PostgREST": 4,
     "web.Realtime": 0,
-    "server.runtimeRpc": 17,
+    "server.runtimeRpc": 18,
     "sql.rlsTables": 32,
     "config.envFamily": 8,
     "manifests": 3,

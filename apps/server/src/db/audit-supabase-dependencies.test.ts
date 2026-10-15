@@ -515,6 +515,17 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // unchanged, all 21 -> 22. Everything downstream of the write stays put.
     expect(metricValue(run.stdout, "server.rpcCallsRuntime")).toBe(18);
     expect(metricValue(run.stdout, "server.rpcCallsAll")).toBe(22);
+
+    // Workorder 21C-preflight D pins the audit's own anchor to that observation:
+    // `ANCHORS.server.runtimeRpc` and the baseline anchor now read 18, so the
+    // published line must report the frozen anchor agreeing with the live
+    // measurement instead of the stale `anchor=17 ... (DIFFERS by 1)`. Matched
+    // as a whole line: a differing anchor or a moved counter cannot pass by
+    // appearing anywhere else in the output.
+    expect(run.stdout).toMatch(
+      /^\[anchor\] server\.runtimeRpc: anchor=18 measured\[server\.rpcCallsRuntime\]=18 \(match\)$/m,
+    );
+
     expect(metricValue(run.stdout, "server.storageCalls")).toBe(23);
     expect(metricValue(run.stdout, "server.authGetUserCalls")).toBe(1);
     expect(metricValue(run.stdout, "server.supabaseSdkImportHits")).toBe(3);
