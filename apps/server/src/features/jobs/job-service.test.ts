@@ -10,6 +10,7 @@ import type {
 } from "../../db/job-admin-read-repository.js";
 import type { JobBillingGateRepository } from "../../db/job-billing-gate-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
+import type { JobTransitionRepository } from "../../db/job-transition-repository.js";
 import {
   CreditServiceError,
   type CreditService,
@@ -37,14 +38,17 @@ type Op = (
 ) & { via: ClientKind };
 
 type HarnessConfig = {
-  /** Rows the guarded update reports as changed. */
-  updatedRows?: number;
-  updateError?: { message: string } | null;
   /**
-   * Per-call outcomes for successive AWAITED update chains (the worker's
-   * transitions, `setCreditsInfo`), consumed in order. `reject` models a
-   * transport failure, which is a different thing from an `error` reported in
-   * the resolved answer.
+   * Rows the guard reports as changed, when no per-call outcome is queued.
+   *
+   * Workorder 21M: this is what the TRANSITION double answers, because the four
+   * guarded status writes no longer reach the admin client at all.
+   */
+  updatedRows?: number;
+  /**
+   * Per-call outcomes for successive AWAITED row writes (the four worker
+   * transitions), consumed in order. `reject` models a transport failure, which
+   * is a different thing from a `rows: 0` answer the guard produced.
    */
   updateOutcomes?: Array<{ rows?: number; reject?: Error }>;
   /** Row returned by `.maybeSingle()` on `background_jobs` (cancelJob). */
@@ -103,6 +107,11 @@ type HarnessConfig = {
   adminJobError?: Error;
   /** Build the service with NO admin read repository at all (fail-closed). */
   withoutJobAdminReadRepository?: boolean;
+  /**
+   * ADR-0001 / workorder 21M: build the service with NO transition repository at
+   * all (the fail-closed path of the four `mark*` methods).
+   */
+  withoutJobTransitionRepository?: boolean;
 };
 
 /**
@@ -146,6 +155,29 @@ function makeHarness(config: HarnessConfig = {}) {
   const rpcCalls: Array<{ name: string; params: unknown }> = [];
   const attemptCalls: Array<{ jobId: string }> = [];
   const clientTokens: string[] = [];
+  /** How many times the service asked for the admin client. */
+  let adminClientCalls = 0;
+  /**
+   * Every guarded status write the service performed, in the order it issued
+   * them, recorded in the SAME shape the PostgREST patch used to have
+   * (`{status: "running", started_at: <ISO>}`).
+   *
+   * Workorder 21M: the four transitions moved into `jobTransitionRepository`, so
+   * this list is now filled from the repository double instead of from a client
+   * update — which is exactly why the processJobMessage cases of 21F/21H0 can
+   * keep asserting `patches()` byte for byte. The one client-side write that is
+   * still here (the guarded cancel) lands in the same list, so "which row writes
+   * did this run make, in what order" stays one ordered answer.
+   */
+  const rowWrites: Array<Record<string, unknown>> = [];
+  /**
+   * The same calls with their operation name and arguments, so a case can pin
+   * WHICH transition was asked for rather than only what it would have written.
+   */
+  const transitionCalls: Array<{
+    operation: string;
+    input: Record<string, unknown>;
+  }> = [];
   /** Every PGMQ call the service made: send, deleteMsg, archive. */
   const messageLifecycle: string[] = [];
   /**
@@ -168,6 +200,7 @@ function makeHarness(config: HarnessConfig = {}) {
         update: (patch: Record<string, unknown>) => {
           chain = "update";
           ops.push({ kind: "update", patch, via });
+          rowWrites.push(patch);
           trace.push(`update:${table}`);
           return builder;
         },
@@ -237,16 +270,22 @@ function makeHarness(config: HarnessConfig = {}) {
             }).then(resolve, reject);
           }
 
-          const outcome = config.updateOutcomes?.shift();
-          if (outcome?.reject) {
-            return Promise.reject(outcome.reject).then(resolve, reject);
+          if (chain === "update") {
+            // Workorder 21M: every guarded status transition goes through
+            // `jobTransitionRepository` now, and the only client-side update
+            // left in the service (the guarded cancel) ends in `maybeSingle`.
+            // An awaited update chain therefore means the service reached a
+            // client path it no longer owns — fail loudly instead of answering a
+            // row count that would hide the regression.
+            return Promise.reject(
+              new Error(
+                "the harness has no awaiting client-side update path: status transitions belong to the job transition repository",
+              ),
+            ).then(resolve, reject);
           }
 
-          const rows = outcome?.rows ?? config.updatedRows ?? 0;
-          return Promise.resolve({
-            data: Array.from({ length: rows }, () => ({ id: "job-1" })),
-            error: config.updateError ?? null,
-          }).then(resolve, reject);
+          // A selection awaited directly (`listJobs`).
+          return Promise.resolve({ data: [], error: null }).then(resolve, reject);
         },
       };
 
@@ -337,12 +376,70 @@ function makeHarness(config: HarnessConfig = {}) {
     },
   };
 
+  // ADR-0001 / workorder 21M: the four guarded status transitions. The double
+  // keeps the SAME outward shape the old client update had — it records the
+  // patch the transition would have written and answers the same row-count
+  // channel (`updateOutcomes`, then `updatedRows`) — so the processJobMessage
+  // pins of 21F/21H0 and the refund boundaries of 21H2 keep measuring the same
+  // behaviour. What is new is that each call is also recorded by NAME, so a case
+  // can pin which transition the service asked for instead of pinning the `from`
+  // list a caller used to pass.
+  function recordTransition(
+    operation: string,
+    input: Record<string, unknown>,
+    patch: Record<string, unknown>,
+  ): boolean {
+    transitionCalls.push({ operation, input });
+    rowWrites.push(patch);
+    trace.push("update:background_jobs");
+
+    const outcome = config.updateOutcomes?.shift();
+    if (outcome?.reject) throw outcome.reject;
+
+    const rows = outcome?.rows ?? config.updatedRows ?? 0;
+    return rows === 1;
+  }
+
+  const jobTransitionRepository: JobTransitionRepository = {
+    async markRunning(input) {
+      return recordTransition("markRunning", { ...input }, {
+        status: "running",
+        started_at: input.startedAt,
+      });
+    },
+    async markRetrying(input) {
+      return recordTransition("markRetrying", { ...input }, {
+        status: "retrying",
+        error_code: input.errorCode,
+        error_message: input.errorMessage,
+      });
+    },
+    async markSucceeded(input) {
+      return recordTransition("markSucceeded", { ...input }, {
+        status: "succeeded",
+        result: input.result,
+        completed_at: input.completedAt,
+      });
+    },
+    async markFailed(input) {
+      return recordTransition("markFailed", { ...input }, {
+        status: "failed",
+        error_code: input.errorCode,
+        error_message: input.errorMessage,
+        failed_at: input.failedAt,
+      });
+    },
+  };
+
   const service: JobService = createJobService({
     createUserClient: (accessToken: string) => {
       clientTokens.push(accessToken);
       return userClient as unknown as UserSupabaseClient;
     },
-    getAdminClient: () => adminClient as unknown as AdminSupabaseClient,
+    getAdminClient: () => {
+      adminClientCalls += 1;
+      return adminClient as unknown as AdminSupabaseClient;
+    },
     pgmq: {
       send: async (queue: string, message: unknown) => {
         sentMessages.push({ queue, message });
@@ -367,6 +464,9 @@ function makeHarness(config: HarnessConfig = {}) {
     ...(config.withoutJobAdminReadRepository
       ? {}
       : { jobAdminReadRepository }),
+    ...(config.withoutJobTransitionRepository
+      ? {}
+      : { jobTransitionRepository }),
   });
 
   const inOp = () => ops.find((op): op is Extract<Op, { kind: "in" }> => op.kind === "in");
@@ -374,11 +474,11 @@ function makeHarness(config: HarnessConfig = {}) {
     ops.find((op): op is Extract<Op, { kind: "update" }> => op.kind === "update");
   const insertOp = () =>
     ops.find((op): op is Extract<Op, { kind: "insert" }> => op.kind === "insert");
-  /** Every status/credits patch the service wrote, in order. */
-  const patches = () =>
-    ops
-      .filter((op): op is Extract<Op, { kind: "update" }> => op.kind === "update")
-      .map((op) => op.patch);
+  /**
+   * Every guarded status write the service performed, in order, in the shape the
+   * PostgREST patch used to have.
+   */
+  const patches = () => [...rowWrites];
   const deletes = () => ops.filter((op) => op.kind === "delete");
 
   return {
@@ -393,6 +493,8 @@ function makeHarness(config: HarnessConfig = {}) {
     jobRows,
     creditsLinkCalls,
     jobAdminReadCalls,
+    transitionCalls,
+    adminClientCalls: () => adminClientCalls,
     /** The credits-link operations in the order the service issued them. */
     creditsLinkOperations: () =>
       creditsLinkCalls.map((call) => call.operation),
@@ -405,12 +507,21 @@ function makeHarness(config: HarnessConfig = {}) {
 }
 
 describe("job service state guards", () => {
-  it("case 1: markRunning only accepts queued/retrying and reports whether it changed a row", async () => {
+  it("case 1: markRunning calls the one transition that owns queued/retrying, and reports whether it changed a row", async () => {
     const changed = makeHarness({ updatedRows: 1 });
     expect(await changed.service.markRunning("job-1")).toBe(true);
-    expect(changed.inOp()?.column).toBe("status");
-    expect(changed.inOp()?.values).toEqual(["queued", "retrying"]);
-    expect(changed.updateOp()?.patch.status).toBe("running");
+    // OLD ASSERTION (pre-21M): the service handed the guard in —
+    // `in("status", ["queued","retrying"])` plus `patch.status === "running"`.
+    // NEW ASSERTION: it calls the ONE method whose SQL carries that guard, so
+    // there is no `from` list and no patch object left for a caller to choose.
+    expect(changed.transitionCalls).toEqual([
+      { operation: "markRunning", input: { jobId: "job-1", startedAt: expect.any(String) } },
+    ]);
+    expect(changed.inOp()).toBeUndefined();
+    expect(changed.updateOp()).toBeUndefined();
+    expect(changed.patches()).toEqual([
+      { status: "running", started_at: expect.any(String) },
+    ]);
 
     const missed = makeHarness({ updatedRows: 0 });
     expect(await missed.service.markRunning("job-1")).toBe(false);
@@ -421,44 +532,174 @@ describe("job service state guards", () => {
 
     expect(await harness.service.markRetrying("job-1", "executor_error", "boom")).toBe(true);
 
-    expect(harness.inOp()?.values).toEqual(["running"]);
-    const patch = harness.updateOp()?.patch ?? {};
+    expect(harness.transitionCalls).toEqual([
+      {
+        operation: "markRetrying",
+        input: { jobId: "job-1", errorCode: "executor_error", errorMessage: "boom" },
+      },
+    ]);
+    // OLD ASSERTION: `in("status", ["running"])`. The guard is the repository's
+    // `where ... and status = 'running'` now; the shape of what it writes is
+    // unchanged, including the absence of `failed_at`.
+    const patch = harness.patches()[0] ?? {};
     expect(patch.status).toBe("retrying");
     expect(patch.error_code).toBe("executor_error");
     expect(patch.error_message).toBe("boom");
     expect("failed_at" in patch).toBe(false);
   });
 
-  it("case 3: markSucceeded only accepts running", async () => {
+  it("case 3: markSucceeded calls the running-only success transition", async () => {
     const harness = makeHarness({ updatedRows: 0 });
 
     expect(await harness.service.markSucceeded("job-1", { url: "x" })).toBe(false);
-    expect(harness.inOp()?.values).toEqual(["running"]);
-    expect(harness.updateOp()?.patch.status).toBe("succeeded");
+    expect(harness.transitionCalls.map((call) => call.operation)).toEqual([
+      "markSucceeded",
+    ]);
+    expect(harness.transitionCalls[0]?.input).toEqual({
+      jobId: "job-1",
+      result: { url: "x" },
+      completedAt: expect.any(String),
+    });
+    const patch = harness.patches()[0] ?? {};
+    expect(patch.status).toBe("succeeded");
+    expect(patch.result).toEqual({ url: "x" });
+    expect(typeof patch.completed_at).toBe("string");
   });
 
-  it("case 4: markFailed accepts every non-terminal state and stamps failed_at", async () => {
+  it("case 4: markFailed calls the transition that accepts every non-terminal state and stamps failed_at", async () => {
     const harness = makeHarness({ updatedRows: 1 });
 
     expect(await harness.service.markFailed("job-1", "safety_filter", "blocked")).toBe(true);
 
-    expect(harness.inOp()?.values).toEqual(["queued", "running", "retrying"]);
-    const patch = harness.updateOp()?.patch ?? {};
+    expect(harness.transitionCalls).toEqual([
+      {
+        operation: "markFailed",
+        input: {
+          jobId: "job-1",
+          errorCode: "safety_filter",
+          errorMessage: "blocked",
+          failedAt: expect.any(String),
+        },
+      },
+    ]);
+    const patch = harness.patches()[0] ?? {};
     expect(patch.status).toBe("failed");
+    expect(patch.error_code).toBe("safety_filter");
     expect(typeof patch.failed_at).toBe("string");
   });
 
-  it("case 5: a database error from any mark* is thrown, not swallowed", async () => {
-    const harness = makeHarness({ updatedRows: 0, updateError: { message: "connection reset" } });
+  it("case 5 (FLIPPED 21M): a failing transition is the service's FIXED 500, with no driver text", async () => {
+    // OLD ASSERTION (pre-21M): `mark*` rejected with the driver's own message
+    // (`connection reset`), because the service concatenated `error.message`.
+    //
+    // NEW ASSERTION (21M): the repository's failure is answered by one fixed
+    // message. The driver's text can name the statement, the host or a
+    // credential — it stays in the repository's `cause` and never reaches a
+    // caller. The message names the JOB and nothing else.
+    const transport =
+      "connection reset: postgres://loomic:secret@10.210.134.37:5432/loomic";
+    const calls = [
+      {
+        operation: "markRunning",
+        run: (harness: ReturnType<typeof makeHarness>) =>
+          harness.service.markRunning("job-1"),
+      },
+      {
+        operation: "markRetrying",
+        run: (harness: ReturnType<typeof makeHarness>) =>
+          harness.service.markRetrying("job-1", "e", "m"),
+      },
+      {
+        operation: "markSucceeded",
+        run: (harness: ReturnType<typeof makeHarness>) =>
+          harness.service.markSucceeded("job-1", {}),
+      },
+      {
+        operation: "markFailed",
+        run: (harness: ReturnType<typeof makeHarness>) =>
+          harness.service.markFailed("job-1", "e", "m"),
+      },
+    ] as const;
 
-    await expect(harness.service.markRunning("job-1")).rejects.toThrow(/connection reset/);
-    await expect(
+    for (const call of calls) {
+      const harness = makeHarness({ updateOutcomes: [{ reject: new Error(transport) }] });
+
+      const error = await call.run(harness)
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as JobServiceError);
+
+      expect(error).toBeInstanceOf(JobServiceError);
+      expect(error?.code).toBe("job_query_failed");
+      expect(error?.statusCode).toBe(500);
+      expect(error?.message).toBe("Failed to update job job-1.");
+      expect(error?.message).not.toMatch(
+        /connection reset|postgres:\/\/|secret|10\.210\.134\.37/,
+      );
+      // The refusal is not a short circuit: the transition really was asked for,
+      // and nothing reached the client it used to be written through.
+      expect(harness.transitionCalls.map((entry) => entry.operation)).toEqual([
+        call.operation,
+      ]);
+      expect(harness.ops.filter((op) => op.via === "admin")).toEqual([]);
+    }
+  });
+
+  it("case 5b: with no transition repository all four marks fail closed", async () => {
+    const harness = makeHarness({
+      withoutJobTransitionRepository: true,
+      updatedRows: 1,
+    });
+
+    const calls = [
+      harness.service.markRunning("job-1"),
       harness.service.markRetrying("job-1", "e", "m"),
-    ).rejects.toThrow(/connection reset/);
-    await expect(harness.service.markSucceeded("job-1", {})).rejects.toThrow(/connection reset/);
-    await expect(harness.service.markFailed("job-1", "e", "m")).rejects.toThrow(
-      /connection reset/,
-    );
+      harness.service.markSucceeded("job-1", {}),
+      harness.service.markFailed("job-1", "e", "m"),
+    ];
+
+    for (const call of calls) {
+      const error = await call
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as JobServiceError);
+
+      expect(error).toBeInstanceOf(JobServiceError);
+      expect(error?.code).toBe("job_query_failed");
+      expect(error?.statusCode).toBe(500);
+      // A missing dependency is indistinguishable from a broken one: same code,
+      // same status, same fixed message.
+      expect(error?.message).toBe("Failed to update job job-1.");
+    }
+
+    // Fail-closed means nothing happened at all: no transition, no row write,
+    // no client of either kind.
+    expect(harness.transitionCalls).toEqual([]);
+    expect(harness.patches()).toEqual([]);
+    expect(harness.ops).toEqual([]);
+    expect(harness.adminClientCalls()).toBe(0);
+    expect(harness.clientTokens).toEqual([]);
+  });
+
+  it("case 5c: the four marks never ask for a client at all", async () => {
+    // The point of the migration, stated as a measurement: the guarded writes
+    // used to be an ADMIN PostgREST update, and neither client is reachable from
+    // them now.
+    const harness = makeHarness({ updatedRows: 1 });
+
+    await harness.service.markRunning("job-1");
+    await harness.service.markRetrying("job-1", "e", "m");
+    await harness.service.markSucceeded("job-1", {});
+    await harness.service.markFailed("job-1", "e", "m");
+
+    expect(harness.transitionCalls.map((entry) => entry.operation)).toEqual([
+      "markRunning",
+      "markRetrying",
+      "markSucceeded",
+      "markFailed",
+    ]);
+    expect(harness.adminClientCalls()).toBe(0);
+    expect(harness.ops.filter((op) => op.via === "admin")).toEqual([]);
+    // No user client either: the worker's own writes carry no caller's token.
+    expect(harness.clientTokens).toEqual([]);
   });
 
   it("case 6: a failing attempt write throws job_query_failed instead of inventing a count", async () => {
@@ -1075,10 +1316,7 @@ function makeProcessHarness(scenario: ProcessScenario = {}) {
   };
 
   /** Every guarded status write the real JobService performed, in order. */
-  const patches = () =>
-    jobHarness.ops
-      .filter((op): op is Extract<Op, { kind: "update" }> => op.kind === "update")
-      .map((op) => op.patch);
+  const patches = () => jobHarness.patches();
 
   return {
     run: () => processJobMessage(deps, args),
@@ -1316,11 +1554,17 @@ describe("createJob: authorize, then insert, then enqueue (工单21H0)", () => {
     expect(cancelHarness.ops.every((op) => op.via === "user")).toBe(true);
     expect(cancelHarness.clientTokens).toEqual(["token-21h0"]);
 
-    // ...while the worker's guarded transitions are the admin client's.
+    // ...while the worker's guarded transitions go through the transition
+    // repository: they reach no client at all now (workorder 21M), which is
+    // asserted by name rather than by an `every()` over an empty list.
     const adminHarness = makeHarness({ updatedRows: 1 });
     await adminHarness.service.markRunning("job-21h0");
-    expect(adminHarness.ops.every((op) => op.via === "admin")).toBe(true);
+    expect(adminHarness.transitionCalls.map((call) => call.operation)).toEqual([
+      "markRunning",
+    ]);
+    expect(adminHarness.ops).toEqual([]);
     expect(adminHarness.clientTokens).toEqual([]);
+    expect(adminHarness.adminClientCalls()).toBe(0);
   });
 
   it("case H4: an insert that fails - or answers no row - is a 500 and nothing is enqueued", async () => {

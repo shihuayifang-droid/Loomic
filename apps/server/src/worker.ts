@@ -15,6 +15,7 @@ import { loadServerEnv } from "./config/env.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import { createJobService } from "./features/jobs/job-service.js";
 import { createJobAttemptRepository } from "./db/job-attempt-repository.js";
+import { createJobTransitionRepository } from "./db/job-transition-repository.js";
 import { createJobBillingGateRepository } from "./db/job-billing-gate-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
@@ -72,6 +73,19 @@ async function main() {
     // fails closed, `processJobMessage` leaves the message for a later retry and
     // nothing here can reach the old `increment_job_attempt` RPC.
     jobAttemptRepository: createJobAttemptRepository({
+      getTransactionPool: () =>
+        getTransactionPool(
+          env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
+        ),
+    }),
+    // ADR-0001 / workorder 21M: the four guarded status transitions the worker
+    // performs on a job it is executing (`queued|retrying -> running`,
+    // `running -> retrying`, `running -> succeeded`, `* -> failed`). Built here,
+    // lazily and against the same `DATABASE_URL` as the attempt counter above.
+    // With no reachable pool each transition fails closed and
+    // `processJobMessage` treats it as a failure instead of assuming the row
+    // moved — nothing here can reach the update this replaces.
+    jobTransitionRepository: createJobTransitionRepository({
       getTransactionPool: () =>
         getTransactionPool(
           env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},

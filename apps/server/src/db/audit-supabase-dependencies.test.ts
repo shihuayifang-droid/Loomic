@@ -590,11 +590,24 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // default model rather than a 403). Its three new test files name no client
     // method, so `fromCallsIncludingTests` follows `fromCalls` down again. The
     // RPC counters are untouched: this migration removed no RPC call site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(123);
+    //
+    // Workorder 21M then moved the LAST PostgREST writes of
+    // `features/jobs/job-service.ts` — the four guarded status transitions
+    // (`markRunning`/`markRetrying`/`markSucceeded`/`markFailed`, which all went
+    // through one caller-parameterised update) — into `JobTransitionRepository`
+    // (123->122), so both counters below move down together one last time. That
+    // is a real coupling removal rather than a counting change: those four
+    // methods no longer receive an admin client at all, and the repository that
+    // replaces them can only reach PostgreSQL, where the `from` set and the
+    // target status are SQL literals of that one file instead of arguments. Its
+    // two new test files name no client method, so `fromCallsIncludingTests`
+    // follows `fromCalls` down again. The RPC counters are untouched: this
+    // migration removed no RPC call site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(122);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(123);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(122);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

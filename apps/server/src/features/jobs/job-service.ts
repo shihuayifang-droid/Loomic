@@ -2,7 +2,6 @@ import type {
   BackgroundJob,
   BackgroundJobStatus,
   BackgroundJobType,
-  Database,
   Json,
 } from "@loomic/shared";
 
@@ -10,15 +9,13 @@ import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
 import type { JobAdminReadRepository } from "../../db/job-admin-read-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
+import type { JobTransitionRepository } from "../../db/job-transition-repository.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
 } from "../../supabase/user.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { queueForJobType } from "./job-registry.js";
-
-type BackgroundJobUpdate = Database["public"]["Tables"]["background_jobs"]["Update"];
-type BackgroundJobStatuses = BackgroundJob["status"][];
 
 export class JobServiceError extends Error {
   readonly statusCode: number;
@@ -156,6 +153,19 @@ export function createJobService(options: {
    * be able to bring it back.
    */
   jobAdminReadRepository?: JobAdminReadRepository;
+  /**
+   * ADR-0001 / workorder 21M: the four guarded status transitions of the worker
+   * (`markRunning`, `markRetrying`, `markSucceeded`, `markFailed`). It is the
+   * only writer of a job's `status` and of the four stamps that go with it.
+   *
+   * Optional for the same reason the other repositories are, and with the same
+   * consequence: with no repository wired, or with a failing one, every one of
+   * the four fails closed as the same `job_query_failed` 500. There is
+   * deliberately no PostgREST fallback — the caller-chosen `from` list and patch
+   * object this replaces are exactly the shape workorder 21M removes, and a
+   * missing dependency must not be able to bring them back.
+   */
+  jobTransitionRepository?: JobTransitionRepository;
 }): JobService {
   function mapJobRow(row: Record<string, unknown>): BackgroundJob {
     return {
@@ -190,32 +200,30 @@ export function createJobService(options: {
   }
 
   /**
-   * Guarded status transition: only a row whose current status is in `from` is
-   * updated, so a job that was cancelled (or already finished) cannot be
-   * rewritten by a late worker. Returns whether exactly one row changed.
+   * One guarded status transition, through the repository that owns them
+   * (workorder 21M).
+   *
+   * The timestamps stay THIS process's clock: each input object is built here
+   * with `new Date().toISOString()` and passed down, exactly as the removed
+   * update built its patch. What moved is the guard and the write — the `from`
+   * set, the columns and the row predicate are the repository's fixed SQL now,
+   * so no call site decides them any more.
+   *
+   * A missing repository throws exactly what a failing one throws: there is no
+   * fallback that could reach the update this replaces.
    */
-  async function transition(
+  async function runTransition(
     jobId: string,
-    from: BackgroundJobStatuses,
-    patch: BackgroundJobUpdate,
+    run: (repository: JobTransitionRepository) => Promise<boolean>,
   ): Promise<boolean> {
-    const admin = options.getAdminClient();
-    const { data, error } = await admin
-      .from("background_jobs")
-      .update(patch)
-      .eq("id", jobId)
-      .in("status", from)
-      .select("id");
+    const repository = options.jobTransitionRepository;
+    if (!repository) throw jobTransitionFailed(jobId);
 
-    if (error) {
-      throw new JobServiceError(
-        "job_query_failed",
-        `Failed to update job ${jobId}: ${error.message}`,
-        500,
-      );
+    try {
+      return await run(repository);
+    } catch {
+      throw jobTransitionFailed(jobId);
     }
-
-    return (data?.length ?? 0) === 1;
   }
 
   return {
@@ -502,36 +510,49 @@ export function createJobService(options: {
     },
 
     async markRunning(jobId) {
-      return transition(jobId, ["queued", "retrying"], {
-        status: "running",
-        started_at: new Date().toISOString(),
-      });
+      // ADR-0001 / workorder 21M: `queued|retrying -> running`, with the
+      // `from` set and the columns now owned by `JobTransitionRepository`
+      // instead of by this call site.
+      return runTransition(jobId, (repository) =>
+        repository.markRunning({
+          jobId,
+          startedAt: new Date().toISOString(),
+        }),
+      );
     },
 
     async markRetrying(jobId, errorCode, errorMessage) {
-      // Still retrying, so this is NOT a terminal failure: no failed_at.
-      return transition(jobId, ["running"], {
-        status: "retrying",
-        error_code: errorCode,
-        error_message: errorMessage,
-      });
+      // Still retrying, so this is NOT a terminal failure: no failed_at. The
+      // repository's statement has no such column at all.
+      return runTransition(jobId, (repository) =>
+        repository.markRetrying({ jobId, errorCode, errorMessage }),
+      );
     },
 
     async markSucceeded(jobId, result) {
-      return transition(jobId, ["running"], {
-        status: "succeeded",
-        result: result as Json,
-        completed_at: new Date().toISOString(),
-      });
+      // `result` reaches the repository as the caller's document; the repository
+      // is what serialises it for the jsonb column, once, for every caller.
+      return runTransition(jobId, (repository) =>
+        repository.markSucceeded({
+          jobId,
+          result,
+          completedAt: new Date().toISOString(),
+        }),
+      );
     },
 
     async markFailed(jobId, errorCode, errorMessage) {
-      return transition(jobId, ["queued", "running", "retrying"], {
-        status: "failed",
-        error_code: errorCode,
-        error_message: errorMessage,
-        failed_at: new Date().toISOString(),
-      });
+      // This boolean is the refund's only authorisation (see the JobService
+      // header): the repository answers `false` when the guard matched no row,
+      // and that answer is passed through unchanged.
+      return runTransition(jobId, (repository) =>
+        repository.markFailed({
+          jobId,
+          errorCode,
+          errorMessage,
+          failedAt: new Date().toISOString(),
+        }),
+      );
     },
 
     async incrementAttempt(jobId) {
@@ -599,6 +620,29 @@ function incrementAttemptFailed(jobId: string): JobServiceError {
   return new JobServiceError(
     "job_query_failed",
     `increment_job_attempt failed for ${jobId}`,
+    500,
+  );
+}
+
+/**
+ * The one failure the four status transitions can report (workorder 21M).
+ *
+ * Like `incrementAttemptFailed`, it is a function rather than a constant so
+ * every caller gets its own error, and it is the ONLY place the code, the
+ * wording and the status live: a repository that threw, a repository whose pool
+ * could not be resolved and a repository that was never injected must be
+ * indistinguishable from the outside.
+ *
+ * The driver's own text is deliberately NOT concatenated any more (the removed
+ * update appended `error.message`, which can name the statement, the host or a
+ * credential); the repository already carries the raw failure as `cause` for
+ * whoever needs to classify it. The job id stays in the message because a failed
+ * transition is otherwise unattributable in a log.
+ */
+function jobTransitionFailed(jobId: string): JobServiceError {
+  return new JobServiceError(
+    "job_query_failed",
+    `Failed to update job ${jobId}.`,
     500,
   );
 }
