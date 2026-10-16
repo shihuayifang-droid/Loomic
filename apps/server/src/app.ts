@@ -100,6 +100,7 @@ import {
   type JobAttemptRepository,
 } from "./db/job-attempt-repository.js";
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
+import { createJobConcurrencyRepository } from "./db/job-concurrency-repository.js";
 import {
   createJobCreditsLinkRepository,
   type JobCreditsLinkRepository,
@@ -503,8 +504,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       : undefined);
   const creditService =
     options.creditService ?? createCreditService({ getAdminClient });
+  // ADR-0001 / workorder 21J: the plan's concurrency count goes through the
+  // pure `pg` repository, built lazily against the same pool as the repositories
+  // above. `createTierGuard` no longer receives a Supabase client at all: with no
+  // pool the count fails, and `checkConcurrency` keeps its existing fail-open
+  // behaviour (log a fixed line, allow the request) instead of falling back.
   const tierGuard =
-    options.tierGuard ?? createTierGuard({ getAdminClient });
+    options.tierGuard ??
+    createTierGuard({
+      jobConcurrencyRepository: createJobConcurrencyRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
+    });
 
   // Payment service — only created when Lemon Squeezy is configured
   let paymentService: PaymentService | undefined = options.paymentService;

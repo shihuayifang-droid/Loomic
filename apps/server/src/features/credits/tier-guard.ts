@@ -15,7 +15,7 @@ import {
   PLAN_CONFIGS,
 } from "@loomic/shared";
 
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type { JobConcurrencyRepository } from "../../db/job-concurrency-repository.js";
 
 // ── Error ────────────────────────────────────────────────────
 
@@ -57,7 +57,7 @@ export type TierGuard = {
 // ── Factory ──────────────────────────────────────────────────
 
 export function createTierGuard(options: {
-  getAdminClient: () => AdminSupabaseClient;
+  jobConcurrencyRepository: JobConcurrencyRepository;
 }): TierGuard {
   return {
     checkModelAccess(plan, modelId) {
@@ -91,27 +91,26 @@ export function createTierGuard(options: {
     },
 
     async checkConcurrency(workspaceId, plan) {
-      const admin = options.getAdminClient();
       const maxConcurrent = PLAN_CONFIGS[plan].maxConcurrentJobs;
 
-      const { count, error } = await admin
-        .from("background_jobs")
-        .select("id", { count: "exact", head: true })
-        .eq("workspace_id", workspaceId)
-        // A retrying job still holds its slot (and its pre-charged credits), so
-        // it has to count towards concurrency too.
-        .in("status", ["queued", "running", "retrying"]);
-
-      if (error) {
-        // Log but don't block — fail open on query errors
+      let activeCount: number;
+      try {
+        // The count carries the same three statuses the admin read used: a
+        // retrying job still holds its slot (and its pre-charged credits), so it
+        // has to count towards concurrency too.
+        activeCount =
+          await options.jobConcurrencyRepository.countActiveJobs({ workspaceId });
+      } catch {
+        // Log but don't block — fail open on query errors. The logged text is
+        // FIXED: the repository's own message is fixed too, and its `cause` may
+        // carry a host or a statement, so neither is passed on here.
         console.error(
           "[tier-guard] Failed to check concurrency:",
-          error.message,
+          "concurrency count unavailable",
         );
         return;
       }
 
-      const activeCount = count ?? 0;
       if (activeCount >= maxConcurrent) {
         throw new TierGuardError(
           "concurrency_limit",

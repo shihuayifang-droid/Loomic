@@ -548,11 +548,23 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // is why `fromCallsIncludingTests` follows `fromCalls` down instead of
     // parting from it. The RPC counters are untouched: this migration removed no
     // RPC call site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(127);
+    //
+    // Workorder 21J then moved the LAST PostgREST read of
+    // `features/credits/tier-guard.ts` — the plan's active-job count behind
+    // `TierGuard.checkConcurrency` — into `JobConcurrencyRepository` (127→126), so
+    // both counters below move down together one last time. That is a real
+    // coupling removal rather than a counting change: `createTierGuard` no longer
+    // receives an admin client at all, and the repository that replaces it can
+    // only reach PostgreSQL, where the three slot-holding statuses are written
+    // into the statement instead of being bound as a `text[]`. Its three new test
+    // files name no client method, so `fromCallsIncludingTests` follows
+    // `fromCalls` down again. The RPC counters are untouched: this migration
+    // removed no RPC call site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(126);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(127);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(126);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
