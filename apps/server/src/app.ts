@@ -99,6 +99,7 @@ import {
   createJobAttemptRepository,
   type JobAttemptRepository,
 } from "./db/job-attempt-repository.js";
+import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
 import {
   createJobCreditsLinkRepository,
   type JobCreditsLinkRepository,
@@ -488,6 +489,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           pgmq,
           jobAttemptRepository,
           jobCreditsLinkRepository,
+          // ADR-0001 / workorder 21I: the admin single-row read behind
+          // `getJobAdmin` — the job watcher's poll and the agent runtime's
+          // re-read. Built lazily against the same pool as the repositories
+          // above, and with the same consequence: no repository means the read
+          // fails closed as the service's existing `job_query_failed` 500,
+          // because the admin client it used to read through is no longer
+          // reachable from that method.
+          jobAdminReadRepository: createJobAdminReadRepository({
+            getTransactionPool: () => getTransactionPool(databaseEnv),
+          }),
         })
       : undefined);
   const creditService =

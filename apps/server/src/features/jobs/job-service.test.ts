@@ -4,6 +4,10 @@ import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
+import type {
+  JobAdminReadRepository,
+  JobAdminReadRow,
+} from "../../db/job-admin-read-repository.js";
 import type { JobBillingGateRepository } from "../../db/job-billing-gate-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import {
@@ -43,7 +47,7 @@ type HarnessConfig = {
    * the resolved answer.
    */
   updateOutcomes?: Array<{ rows?: number; reject?: Error }>;
-  /** Row returned by `.maybeSingle()` (getJobAdmin / cancelJob). */
+  /** Row returned by `.maybeSingle()` on `background_jobs` (cancelJob). */
   jobRow?: Record<string, unknown> | null;
   /** Error reported by `.maybeSingle()` on `background_jobs`. */
   jobRowError?: { message: string } | null;
@@ -88,7 +92,54 @@ type HarnessConfig = {
   };
   /** Build the service with NO credits-link repository at all (fail-closed). */
   withoutCreditsLinkRepository?: boolean;
+  /**
+   * ADR-0001 / workorder 21I: what the admin read repository answers for
+   * `getJobAdmin`. `null` (or omitting it) is the "no such job" answer;
+   * `adminJobError` is the rejected-promise channel. Both are answers the
+   * service must handle — the old admin PostgREST read expressed them as
+   * `data: null` and `error`.
+   */
+  adminJobRow?: Record<string, unknown> | null;
+  adminJobError?: Error;
+  /** Build the service with NO admin read repository at all (fail-closed). */
+  withoutJobAdminReadRepository?: boolean;
 };
+
+/**
+ * ADR-0001 / workorder 21I: a row shaped the way `JobAdminReadRepository`
+ * answers it — all 22 columns, keyed by column name, every timestamp already
+ * normalised to an ISO string — so a case hands `getJobAdmin` exactly what the
+ * migrated read produces instead of a PostgREST-shaped partial row.
+ */
+function adminJobFixture(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    id: "job-1",
+    workspace_id: "ws-1",
+    project_id: "project-1",
+    canvas_id: "canvas-1",
+    session_id: "session-1",
+    thread_id: "thread-1",
+    queue_name: "image_generation_jobs",
+    job_type: "image_generation",
+    status: "queued",
+    payload: { prompt: "a cat" },
+    result: null,
+    error_code: null,
+    error_message: null,
+    attempt_count: 0,
+    max_attempts: 3,
+    created_by: "user-1",
+    created_at: "2026-09-30T00:00:00.000Z",
+    updated_at: "2026-09-30T00:00:00.000Z",
+    started_at: null,
+    completed_at: null,
+    failed_at: null,
+    canceled_at: null,
+    ...overrides,
+  };
+}
 
 function makeHarness(config: HarnessConfig = {}) {
   const ops: Op[] = [];
@@ -271,6 +322,21 @@ function makeHarness(config: HarnessConfig = {}) {
     },
   };
 
+  // ADR-0001 / workorder 21I: the admin single-row read of `getJobAdmin`. The
+  // harness records the exact argument object the service passed down, so "the
+  // read goes through the repository, carrying the job id and nothing else" is
+  // observable — and an `ops` list free of any admin read is what proves nothing
+  // reaches PostgREST any more.
+  const jobAdminReadCalls: Array<{ jobId: string }> = [];
+
+  const jobAdminReadRepository: JobAdminReadRepository = {
+    async readJob(input) {
+      jobAdminReadCalls.push({ ...input });
+      if (config.adminJobError) throw config.adminJobError;
+      return (config.adminJobRow ?? null) as JobAdminReadRow | null;
+    },
+  };
+
   const service: JobService = createJobService({
     createUserClient: (accessToken: string) => {
       clientTokens.push(accessToken);
@@ -298,6 +364,9 @@ function makeHarness(config: HarnessConfig = {}) {
     ...(config.withoutCreditsLinkRepository
       ? {}
       : { jobCreditsLinkRepository }),
+    ...(config.withoutJobAdminReadRepository
+      ? {}
+      : { jobAdminReadRepository }),
   });
 
   const inOp = () => ops.find((op): op is Extract<Op, { kind: "in" }> => op.kind === "in");
@@ -323,6 +392,7 @@ function makeHarness(config: HarnessConfig = {}) {
     trace,
     jobRows,
     creditsLinkCalls,
+    jobAdminReadCalls,
     /** The credits-link operations in the order the service issued them. */
     creditsLinkOperations: () =>
       creditsLinkCalls.map((call) => call.operation),
@@ -580,25 +650,21 @@ describe("job service state guards", () => {
   });
 
   it("case 8: a legacy dead_letter row is read as failed", async () => {
+    // Workorder 21I moved this read to `JobAdminReadRepository`, so the row now
+    // arrives from the repository double instead of the admin client's
+    // `.maybeSingle()`. The assertion is unchanged on purpose: the migration is
+    // not allowed to move what callers see.
     const harness = makeHarness({
-      jobRow: {
-        id: "job-1",
-        workspace_id: "ws-1",
-        status: "dead_letter",
-        job_type: "image_generation",
-        queue_name: "q",
-        payload: {},
-        attempt_count: 3,
-        max_attempts: 3,
-        created_by: "user-1",
-        created_at: "2026-09-30T00:00:00.000Z",
-        updated_at: "2026-09-30T00:00:00.000Z",
-      },
+      adminJobRow: adminJobFixture({ status: "dead_letter" }),
     });
 
     const job = await harness.service.getJobAdmin("job-1");
 
     expect(job.status).toBe("failed");
+    // Exactly one read, through the repository, carrying the job id and nothing
+    // else — and nothing at all through the admin client.
+    expect(harness.jobAdminReadCalls).toEqual([{ jobId: "job-1" }]);
+    expect(harness.ops.filter((op) => op.via === "admin")).toEqual([]);
   });
 
   it("case 9: listJobs by failed also matches legacy dead_letter rows", async () => {
@@ -625,6 +691,168 @@ describe("job service state guards", () => {
     expect(
       harness.ops.some((op) => op.kind === "eq" && op.column === "status" && op.value === "retrying"),
     ).toBe(true);
+  });
+});
+
+// ADR-0001 / workorder 21I: the admin single-row read of `getJobAdmin` moved from
+// the admin PostgREST client to `JobAdminReadRepository`. What these cases pin is
+// that the MOVE changed no answer: the same row comes back through `mapJobRow`,
+// the same `job_not_found` 404 and the same `job_query_failed` 500 come out of
+// the other two outcomes, and with no repository wired the method fails closed
+// instead of reaching for the client it used to read through.
+describe("getJobAdmin: the read goes through the repository, and nothing else (工单21I)", () => {
+  it("case 10: the repository's row is mapped and returned unchanged", async () => {
+    const harness = makeHarness({
+      adminJobRow: adminJobFixture({
+        project_id: null,
+        canvas_id: "canvas-1",
+        session_id: null,
+        thread_id: null,
+        status: "running",
+        payload: { prompt: "a cat", steps: [1, 2, { depth: "deep" }] },
+        result: { url: "oss://bucket/key.png" },
+        error_code: null,
+        error_message: null,
+        attempt_count: 2,
+        max_attempts: 3,
+        started_at: "2026-09-30T00:01:00.000Z",
+      }),
+    });
+
+    const job = await harness.service.getJobAdmin("job-1");
+
+    expect(job).toEqual({
+      id: "job-1",
+      workspace_id: "ws-1",
+      project_id: null,
+      canvas_id: "canvas-1",
+      session_id: null,
+      thread_id: null,
+      queue_name: "image_generation_jobs",
+      job_type: "image_generation",
+      status: "running",
+      payload: { prompt: "a cat", steps: [1, 2, { depth: "deep" }] },
+      result: { url: "oss://bucket/key.png" },
+      error_code: null,
+      error_message: null,
+      attempt_count: 2,
+      max_attempts: 3,
+      created_by: "user-1",
+      created_at: "2026-09-30T00:00:00.000Z",
+      updated_at: "2026-09-30T00:00:00.000Z",
+      started_at: "2026-09-30T00:01:00.000Z",
+      completed_at: null,
+      failed_at: null,
+      canceled_at: null,
+    });
+
+    expect(harness.jobAdminReadCalls).toEqual([{ jobId: "job-1" }]);
+    // No access token was needed for an admin read: no user client was built.
+    expect(harness.clientTokens).toEqual([]);
+    expect(harness.ops.filter((op) => op.via === "admin")).toEqual([]);
+  });
+
+  it("case 11: no such job is the existing 404", async () => {
+    const harness = makeHarness({ adminJobRow: null });
+
+    const error = await harness.service
+      .getJobAdmin("job-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_not_found");
+    expect(error?.statusCode).toBe(404);
+    expect(error?.message).toBe("Job not found.");
+    expect(harness.jobAdminReadCalls).toEqual([{ jobId: "job-1" }]);
+  });
+
+  it("case 12: a failing repository is the existing 500, never a 404", async () => {
+    const harness = makeHarness({
+      adminJobError: new Error(
+        "connect ECONNREFUSED 10.210.134.37:5432 " +
+          "select ... from public.background_jobs",
+      ),
+    });
+
+    const error = await harness.service
+      .getJobAdmin("job-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_query_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to query job.");
+    // The driver's own text is not concatenated: it can name the statement, the
+    // host or a credential. The repository carries it as `cause`.
+    expect(error?.message).not.toMatch(
+      /ECONNREFUSED|10\.210\.134\.37|public\.|background_jobs/,
+    );
+  });
+
+  it("case 13: with no repository wired the read fails closed, and the admin client is never used", async () => {
+    // The double would answer with a row if it were consulted, so the 500 below
+    // can only come from the missing dependency — not from a missing job.
+    const harness = makeHarness({
+      withoutJobAdminReadRepository: true,
+      adminJobRow: adminJobFixture(),
+      jobRow: adminJobFixture(),
+    });
+
+    const error = await harness.service
+      .getJobAdmin("job-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_query_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to query job.");
+
+    // Fail-closed means nothing happened: no repository call, and — the point of
+    // the migration — no admin PostgREST read either.
+    expect(harness.jobAdminReadCalls).toEqual([]);
+    expect(harness.ops).toEqual([]);
+  });
+
+  it("case 14: the job id is passed verbatim, and it is the only argument", async () => {
+    const harness = makeHarness({ adminJobRow: adminJobFixture() });
+
+    await harness.service.getJobAdmin("job-with-odd-id-42");
+
+    // One call, one field: there is no token, no workspace and no filter a
+    // caller could widen the read with.
+    expect(harness.jobAdminReadCalls).toEqual([
+      { jobId: "job-with-odd-id-42" },
+    ]);
+    expect(Object.keys(harness.jobAdminReadCalls[0] ?? {})).toEqual(["jobId"]);
+  });
+
+  it("case 15: every status is passed through, and only dead_letter is rewritten", async () => {
+    const statuses = [
+      "queued",
+      "running",
+      "succeeded",
+      "failed",
+      "canceled",
+      "retrying",
+    ];
+
+    for (const status of statuses) {
+      const harness = makeHarness({ adminJobRow: adminJobFixture({ status }) });
+
+      const job = await harness.service.getJobAdmin("job-1");
+
+      expect([status, job.status]).toEqual([status, status]);
+    }
+
+    // The legacy terminal value is the ONE translation, and it lives in
+    // `mapJobRow` — not in the repository, which reports the raw column.
+    const legacy = makeHarness({
+      adminJobRow: adminJobFixture({ status: "dead_letter" }),
+    });
+    expect((await legacy.service.getJobAdmin("job-1")).status).toBe("failed");
   });
 });
 

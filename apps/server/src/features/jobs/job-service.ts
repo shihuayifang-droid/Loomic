@@ -8,6 +8,7 @@ import type {
 
 import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
+import type { JobAdminReadRepository } from "../../db/job-admin-read-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import type {
   AuthenticatedUser,
@@ -103,6 +104,19 @@ export type JobService = {
   incrementAttempt(jobId: string): Promise<{ attempt_count: number; max_attempts: number } | null>;
 };
 
+/**
+ * The projection every `background_jobs` read in this file asks for, in one
+ * place so no read can quietly widen or narrow it.
+ *
+ * Workorder 21I: `getJobAdmin` no longer passes this string to a client — its
+ * read moved into `JobAdminReadRepository`, whose SQL names the same 22 columns
+ * explicitly (and whose test holds the two lists against each other, so a column
+ * added here and not there is a failure rather than a silently missing field).
+ * It stays exported for exactly that comparison.
+ */
+export const SELECT_COLS =
+  "id, workspace_id, project_id, canvas_id, session_id, thread_id, queue_name, job_type, status, payload, result, error_code, error_message, attempt_count, max_attempts, created_by, created_at, updated_at, started_at, completed_at, failed_at, canceled_at";
+
 export function createJobService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
@@ -129,6 +143,19 @@ export function createJobService(options: {
    * defect (21H0 H12) workorder 21H2 removes.
    */
   jobCreditsLinkRepository?: JobCreditsLinkRepository;
+  /**
+   * ADR-0001 / workorder 21I: the admin single-row read behind `getJobAdmin`.
+   * It is the only reader of a job row for an admin caller (the job watcher's
+   * poll and the agent runtime's re-read).
+   *
+   * Optional for the same reason the two repositories above are, and with the
+   * same consequence: with no repository wired, or with a failing one, the read
+   * fails closed as the same `job_query_failed` 500 with the same message. There
+   * is deliberately no admin-client fallback — the read this replaces is exactly
+   * the PostgREST path workorder 21I removes, and a missing dependency must not
+   * be able to bring it back.
+   */
+  jobAdminReadRepository?: JobAdminReadRepository;
 }): JobService {
   function mapJobRow(row: Record<string, unknown>): BackgroundJob {
     return {
@@ -161,9 +188,6 @@ export function createJobService(options: {
       canceled_at: (row.canceled_at as string) ?? null,
     };
   }
-
-  const SELECT_COLS =
-    "id, workspace_id, project_id, canvas_id, session_id, thread_id, queue_name, job_type, status, payload, result, error_code, error_message, attempt_count, max_attempts, created_by, created_at, updated_at, started_at, completed_at, failed_at, canceled_at";
 
   /**
    * Guarded status transition: only a row whose current status is in `from` is
@@ -377,20 +401,35 @@ export function createJobService(options: {
     },
 
     async getJobAdmin(jobId) {
-      const admin = options.getAdminClient();
-      const { data: job, error } = await admin
-        .from("background_jobs")
-        .select(SELECT_COLS)
-        .eq("id", jobId)
-        .maybeSingle();
+      // ADR-0001 / workorder 21I: the admin single-row read moved from the admin
+      // PostgREST client to the narrow `pg` repository. What did NOT move is the
+      // contract: `null` from the repository is this method's existing
+      // `job_not_found` 404, and a repository that threw (a connect failure, a
+      // SQL error, or the 22P02 a malformed uuid raises) is its existing
+      // `job_query_failed` 500 — a bad argument is not a missing job, so it is
+      // NOT turned into a 404 here.
+      //
+      // There is deliberately no admin-client fallback behind this: with no
+      // repository wired, the call fails closed with exactly the error a broken
+      // read produces, so a missing dependency can never revive the old read.
+      const repository = options.jobAdminReadRepository;
+      if (!repository) throw jobAdminQueryFailed();
 
-      if (error) {
-        throw new JobServiceError("job_query_failed", "Failed to query job.", 500);
+      let row: Record<string, unknown> | null;
+      try {
+        row = await repository.readJob({ jobId });
+      } catch {
+        throw jobAdminQueryFailed();
       }
-      if (!job) {
+
+      if (row === null) {
         throw new JobServiceError("job_not_found", "Job not found.", 404);
       }
-      return mapJobRow(job as unknown as Record<string, unknown>);
+
+      // `mapJobRow` stays the server's single mapping point (workorder 21I §6):
+      // this row arrives keyed by column name precisely so the legacy
+      // `dead_letter` → `failed` translation happens here and nowhere else.
+      return mapJobRow(row);
     },
 
     // --- Admin-only methods (admin client, bypasses RLS) ---
@@ -527,6 +566,22 @@ export function createJobService(options: {
       };
     },
   };
+}
+
+/**
+ * The one failure the admin job read can report (workorder 21I).
+ *
+ * Like `incrementAttemptFailed`, it is a function rather than a constant so
+ * every caller gets its own error, and the message is the FIXED text the method
+ * has always published — the driver's own text is deliberately not concatenated,
+ * because it can name the statement, the host or a credential. The repository
+ * already carries the raw failure as `cause` for whoever needs to classify it.
+ *
+ * A repository that threw, a repository whose pool could not be resolved and a
+ * repository that was never injected must be indistinguishable from the outside.
+ */
+function jobAdminQueryFailed(): JobServiceError {
+  return new JobServiceError("job_query_failed", "Failed to query job.", 500);
 }
 
 /**

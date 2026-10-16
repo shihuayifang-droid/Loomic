@@ -536,11 +536,23 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // `JobCreditsLinkRepository` (129→128), so both counters below move down
     // together. The credits RULE invocation further down is a Supabase RPC with
     // its own counter and is untouched.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(128);
+    //
+    // Workorder 21I then moved the admin single-row READ behind
+    // `JobService.getJobAdmin` — the job watcher's poll and the agent runtime's
+    // re-read of a job it is about to settle — into `JobAdminReadRepository`
+    // (128→127), so both counters below move down together again. That is a real
+    // coupling removal rather than a counting change: `getJobAdmin` no longer
+    // receives an admin client at all, and the repository that replaces it can
+    // only reach PostgreSQL. The two new test files of that workorder carry no
+    // PostgREST call of their own — their fixtures name no client method — which
+    // is why `fromCallsIncludingTests` follows `fromCalls` down instead of
+    // parting from it. The RPC counters are untouched: this migration removed no
+    // RPC call site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(127);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(128);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(127);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
