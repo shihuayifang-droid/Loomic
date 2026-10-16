@@ -6,6 +6,14 @@ import type {
 } from "@loomic/shared";
 
 import type { PgmqClient } from "../../queue/pgmq-client.js";
+import type {
+  CanvasProjectLinkRow,
+  CanvasReadRepository,
+} from "../../db/canvas-read-repository.js";
+import type {
+  ProjectReadRepository,
+  ProjectWorkspaceLookupRow,
+} from "../../db/project-read-repository.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
 import type { JobAdminReadRepository } from "../../db/job-admin-read-repository.js";
 import type { JobOwnerReadRepository } from "../../db/job-owner-read-repository.js";
@@ -204,6 +212,40 @@ export function createJobService(options: {
    * missing dependency must not be able to bring them back.
    */
   jobTransitionRepository?: JobTransitionRepository;
+  /**
+   * ADR-0001 / workorder 21V: the canvas → project authorization read `createJob`
+   * performs before it inserts anything, for a job submitted FROM a canvas. It is
+   * the same question the Agent runtime asks (workorder 21R), through the same
+   * method, so a canvas resolves to a project the same way on both paths.
+   *
+   * Its ACL is `private.can_read_project` verbatim and it deliberately carries NO
+   * `archived_at` filter — the RLS policy it replaces has none either, and adding
+   * one would refuse every generation submitted from an archived project's canvas
+   * (the defect workorder 21R already hit).
+   *
+   * Optional for the same reason the repositories above are, and with the same
+   * consequence: with no repository wired, or with a failing one, the read fails
+   * closed as this method's existing `job_create_failed` 500 ("Failed to verify
+   * the job canvas."). There is deliberately no user-client fallback — the
+   * PostgREST read this replaces is exactly what workorder 21V removes, and a
+   * missing dependency must not be able to bring it back.
+   */
+  canvasReadRepository?: CanvasReadRepository;
+  /**
+   * ADR-0001 / workorder 21V: the project authorization read `createJob` performs
+   * for a job submitted with a project and NO canvas.
+   *
+   * `findReadableProjectWorkspaceForMutation` is the no-archive-filter read on
+   * purpose: its ACL is the one the `projects_select_owner_or_admin` policy
+   * applied (membership, then author or `admin`/`owner`), and the archived clause
+   * belongs to the READ contract, not to this write-authorization question.
+   *
+   * Optional for the same reason the repositories above are, and with the same
+   * consequence: with no repository wired, or with a failing one, the read fails
+   * closed as this method's existing `job_create_failed` 500 ("Failed to verify
+   * the job project."). There is deliberately no user-client fallback.
+   */
+  projectReadRepository?: ProjectReadRepository;
 }): JobService {
   function mapJobRow(row: Record<string, unknown>): BackgroundJob {
     return {
@@ -274,25 +316,36 @@ export function createJobService(options: {
       // project is wrong (or absent) produces media a private bucket can no
       // longer authorise for the project that asked for it.
       //
-      // The canvas is read through the CALLER's client, so the same query answers
-      // both "does this canvas exist" and "may this user use it" — RLS returns no
-      // row for a canvas they cannot see. Nothing is enqueued on rejection.
+      // ADR-0001 / workorder 21V: both authorization reads moved from the
+      // CALLER's PostgREST client to the existing repositories, so the ACL each
+      // one applied is now statement text in SQL rather than a policy PostgreSQL
+      // applies for us. What did NOT move is the answer for answer contract: a
+      // `null` row is still the same 403 ("not found or not accessible"), a read
+      // that threw — or a repository that was never wired — is still the same 500
+      // ("Failed to verify ..."), the canvas/project mismatch is still the same
+      // 400, and nothing is inserted or enqueued on any of those paths.
+      //
+      // `client` is still built here (and still the caller's): the INSERT below
+      // and the compensation DELETE of a failed enqueue both run through it.
       let projectId = input.projectId;
 
       if (input.canvasId) {
-        const { data: canvas, error: canvasError } = await client
-          .from("canvases")
-          .select("project_id")
-          .eq("id", input.canvasId)
-          .maybeSingle();
+        // The canvas is read through the repository, whose statement applies
+        // `private.can_read_project` — the same rule the `canvases` RLS policy
+        // applied — and, deliberately, no `archived_at` filter.
+        const repository = options.canvasReadRepository;
+        if (!repository) throw jobCanvasNotVerified();
 
-        if (canvasError) {
-          throw new JobServiceError(
-            "job_create_failed",
-            "Failed to verify the job canvas.",
-            500,
-          );
+        let canvas: CanvasProjectLinkRow | null;
+        try {
+          canvas = await repository.findReadableCanvasProjectLink({
+            actorId: user.id,
+            canvasId: input.canvasId,
+          });
+        } catch {
+          throw jobCanvasNotVerified();
         }
+
         if (!canvas?.project_id) {
           throw new JobServiceError(
             "job_create_failed",
@@ -310,19 +363,22 @@ export function createJobService(options: {
 
         projectId = canvas.project_id;
       } else if (projectId) {
-        const { data: project, error: projectError } = await client
-          .from("projects")
-          .select("id")
-          .eq("id", projectId)
-          .maybeSingle();
+        // The no-archive-filter read again: the archived clause belongs to the
+        // read contract, and this is the write-authorization question the
+        // `projects` RLS policy answered.
+        const repository = options.projectReadRepository;
+        if (!repository) throw jobProjectNotVerified();
 
-        if (projectError) {
-          throw new JobServiceError(
-            "job_create_failed",
-            "Failed to verify the job project.",
-            500,
-          );
+        let project: ProjectWorkspaceLookupRow | null;
+        try {
+          project = await repository.findReadableProjectWorkspaceForMutation({
+            actorId: user.id,
+            projectId,
+          });
+        } catch {
+          throw jobProjectNotVerified();
         }
+
         if (!project) {
           throw new JobServiceError(
             "job_create_failed",
@@ -746,6 +802,37 @@ function jobTransitionFailed(jobId: string): JobServiceError {
  * compensation path handles — and folding them into one string would erase that
  * from every log line.
  */
+/**
+ * The two failures the authorization reads of `createJob` can report (workorder
+ * 21V).
+ *
+ * Like the helpers above they are functions rather than constants, so every
+ * caller gets its own error, and each message is FIXED text: the driver's own
+ * text is deliberately not concatenated, because it can name the statement, the
+ * host or a credential — and the repository already carries the raw failure as
+ * `cause` for whoever needs to classify it.
+ *
+ * The two are separate messages on purpose. "The canvas could not be verified"
+ * and "the project could not be verified" are different reads, and each one is
+ * also deliberately kept apart from its 403: a read that failed is a server
+ * fault, while a read that answered no row is "you may not use this".
+ */
+function jobCanvasNotVerified(): JobServiceError {
+  return new JobServiceError(
+    "job_create_failed",
+    "Failed to verify the job canvas.",
+    500,
+  );
+}
+
+function jobProjectNotVerified(): JobServiceError {
+  return new JobServiceError(
+    "job_create_failed",
+    "Failed to verify the job project.",
+    500,
+  );
+}
+
 function jobCreditsNotRecorded(jobId: string): JobServiceError {
   return new JobServiceError(
     "job_query_failed",

@@ -546,6 +546,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           jobTransitionRepository: createJobTransitionRepository({
             getTransactionPool: () => getTransactionPool(databaseEnv),
           }),
+          // ADR-0001 / workorder 21V: the two authorization reads behind
+          // `createJob` — "which project is this canvas's?" and "may this caller
+          // use this project?" — now go through the repositories that already
+          // answer those two questions elsewhere: `canvasReadRepository` is the
+          // instance the canvas service and the Agent runtime use, and
+          // `projectReadRepository` the one the project and upload flows use.
+          // Both are reused as-is rather than rebuilt, so there is one statement
+          // per question in the process. With neither of them the reads fail
+          // closed as the service's existing `job_create_failed` 500, because the
+          // caller's client is no longer reachable from those two branches.
+          canvasReadRepository,
+          projectReadRepository,
         })
       : undefined);
   // ADR-0001 / workorder 21K: the transaction list and the subscription row go

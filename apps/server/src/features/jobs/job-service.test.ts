@@ -3,6 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { PgmqClient } from "../../queue/pgmq-client.js";
+import type {
+  CanvasProjectLinkRow,
+  CanvasReadRepository,
+} from "../../db/canvas-read-repository.js";
+import type {
+  ProjectReadRepository,
+  ProjectWorkspaceLookupRow,
+} from "../../db/project-read-repository.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
 import type {
   JobAdminReadRepository,
@@ -29,8 +37,12 @@ import { JobServiceError, createJobService, type JobService } from "./job-servic
 import type { ExecutorContext, JobExecutor } from "./job-executor.js";
 import { processJobMessage } from "./process-job-message.js";
 
-/** Which client produced an operation: the caller's (RLS) or the admin one. */
-type ClientKind = "user" | "admin";
+/**
+ * Which layer produced an operation: the caller's Supabase client (RLS), the
+ * admin one, or — workorder 21V — a repository, which answers with its own SQL
+ * and names no client method at all.
+ */
+type ClientKind = "user" | "admin" | "repository";
 
 type Op = (
   | { kind: "update"; patch: Record<string, unknown> }
@@ -72,11 +84,26 @@ type HarnessConfig = {
   /** Build the service with NO owner write repository at all (fail-closed). */
   withoutJobOwnerWriteRepository?: boolean;
   rpc?: { data: unknown; error: { message: string } | null };
-  /** Row returned by `.maybeSingle()` on `canvases` / `projects` (createJob). */
+  /**
+   * The answer of createJob's two authorization reads, in the shape the PostgREST
+   * reads answered them: a `{project_id}` / `{id}` row, `null` for "no row", and
+   * the `*Error` channel for a read that failed.
+   *
+   * Workorder 21V moved both reads to the repositories, so these now drive the
+   * DOUBLES of `findReadableCanvasProjectLink` and
+   * `findReadableProjectWorkspaceForMutation` instead of a client `maybeSingle`.
+   * The doubles answer the repositories' own shapes (a link row / a workspace row,
+   * or `null`) and keep pushing the same `read:canvases` / `read:projects` trace
+   * markers, which is why every ordering pin above still measures the same run.
+   */
   canvasRow?: Record<string, unknown> | null;
   projectRow?: Record<string, unknown> | null;
   canvasError?: { code?: string; message: string } | null;
   projectError?: { code?: string; message: string } | null;
+  /** Build the service with NO canvas authorization repository (fail-closed). */
+  withoutCanvasReadRepository?: boolean;
+  /** Build the service with NO project authorization repository (fail-closed). */
+  withoutProjectReadRepository?: boolean;
   /** Row the job insert reports back. */
   insertedJob?: Record<string, unknown> | null;
   insertError?: { message: string } | null;
@@ -196,6 +223,46 @@ function ownerJobFixture(
  */
 function caller(id = "user-1") {
   return { accessToken: "t", email: "a@t", id, userMetadata: {} };
+}
+
+/**
+ * Workorder 21V: `canvasRow` as `findReadableCanvasProjectLink` answers it.
+ *
+ * The mapping is the SERVICE's own question, kept identical: the old read handed
+ * the guard whatever row PostgreSQL returned and `!canvas?.project_id` turned a
+ * missing or empty project into the 403. A configured row without a usable
+ * `project_id` is therefore still the 403, and a configured `null` is still the
+ * 403 — only the layer that answered changed.
+ *
+ * `workspace_id` / `brand_kit_id` are the rest of the repository's row: the
+ * service writes neither, so a case that sets them proves they cannot leak into
+ * the insert.
+ */
+function canvasLinkRow(
+  row: Record<string, unknown> | null,
+): CanvasProjectLinkRow | null {
+  if (row === null || typeof row.project_id !== "string" || row.project_id === "") {
+    return null;
+  }
+  return {
+    project_id: row.project_id,
+    workspace_id: typeof row.workspace_id === "string" ? row.workspace_id : "ws-1",
+    brand_kit_id: typeof row.brand_kit_id === "string" ? row.brand_kit_id : null,
+  };
+}
+
+/**
+ * Workorder 21V: `projectRow` as `findReadableProjectWorkspaceForMutation`
+ * answers it — one `{workspace_id}` row, or `null`. The service's guard was
+ * `!project`, so any configured row is an answer and only `null` is the 403.
+ */
+function projectWorkspaceRow(
+  row: Record<string, unknown> | null,
+): ProjectWorkspaceLookupRow | null {
+  if (row === null) return null;
+  return {
+    workspace_id: typeof row.workspace_id === "string" ? row.workspace_id : "ws-1",
+  };
 }
 
 function makeHarness(config: HarnessConfig = {}) {
@@ -546,6 +613,88 @@ function makeHarness(config: HarnessConfig = {}) {
     },
   };
 
+  // ADR-0001 / workorder 21V: the two authorization reads `createJob` performs
+  // before it inserts anything. Both doubles keep the SAME outward shape the two
+  // PostgREST reads had — driven by `canvasRow` / `projectRow` and their `*Error`
+  // channels, answering a row or `null`, and pushing the same `read:canvases` /
+  // `read:projects` trace marker BEFORE they can throw — so H1's, H14's, H2's and
+  // the six "project from the canvas" pins keep measuring the same run in the same
+  // order. What is new is that each call is also recorded by its exact argument
+  // object, which is what makes "the actor is the caller, and the id is the only
+  // other argument" observable rather than asserted in prose.
+  const canvasReadCalls: Array<{ actorId: string; canvasId: string }> = [];
+  const projectReadCalls: Array<{ actorId: string; projectId: string }> = [];
+
+  /**
+   * The rest of each repository's surface, refused loudly. `createJob` authorizes
+   * through exactly one method per repository, so an unexpected call is a
+   * regression and must not be answered with a row that would hide it.
+   */
+  function unusedRepositoryMethod(repository: string, method: string): Error {
+    return new Error(
+      `the harness does not stand in for ${repository}.${method}: createJob authorizes through one method per repository`,
+    );
+  }
+
+  const canvasReadRepository: CanvasReadRepository = {
+    async findReadableCanvasProjectLink(input) {
+      canvasReadCalls.push({ ...input });
+      trace.push("read:canvases");
+      // Deliberately not recorded in `ops`: that list is "operations handed to a
+      // Supabase client", and H3 pins `ops.every(op => op.via === "user")` for a
+      // canvas submission. This read reaches no client at all any more, so
+      // tagging it as one would be the very lie H3 exists to catch. The project
+      // read below is the mirror image: an existing pin asks for a by-id
+      // single-row read of `projects`, and it stays honest by recording the entry
+      // under `via: "repository"`.
+      if (config.canvasError) throw config.canvasError;
+      return canvasLinkRow(config.canvasRow ?? null);
+    },
+    async findReadableCanvasContent() {
+      throw unusedRepositoryMethod(
+        "canvasReadRepository",
+        "findReadableCanvasContent",
+      );
+    },
+    async listReadableSucceededImageJobs() {
+      throw unusedRepositoryMethod(
+        "canvasReadRepository",
+        "listReadableSucceededImageJobs",
+      );
+    },
+    async listReadableCanvasAssets() {
+      throw unusedRepositoryMethod(
+        "canvasReadRepository",
+        "listReadableCanvasAssets",
+      );
+    },
+  };
+
+  const projectReadRepository: ProjectReadRepository = {
+    async findReadableProjectWorkspaceForMutation(input) {
+      projectReadCalls.push({ ...input });
+      trace.push("read:projects");
+      // The by-id single-row read of `projects` that case 5 pins still happens —
+      // through the repository now — so it lands in the same `ops` list, tagged
+      // with the layer that issued it.
+      ops.push({ kind: "maybeSingle", table: "projects", via: "repository" });
+      if (config.projectError) throw config.projectError;
+      return projectWorkspaceRow(config.projectRow ?? null);
+    },
+    async findReadableProject() {
+      throw unusedRepositoryMethod("projectReadRepository", "findReadableProject");
+    },
+    async listOwnProjects() {
+      throw unusedRepositoryMethod("projectReadRepository", "listOwnProjects");
+    },
+    async listReadablePrimaryCanvases() {
+      throw unusedRepositoryMethod(
+        "projectReadRepository",
+        "listReadablePrimaryCanvases",
+      );
+    },
+  };
+
   const service: JobService = createJobService({
     createUserClient: (accessToken: string) => {
       clientTokens.push(accessToken);
@@ -588,6 +737,8 @@ function makeHarness(config: HarnessConfig = {}) {
     ...(config.withoutJobTransitionRepository
       ? {}
       : { jobTransitionRepository }),
+    ...(config.withoutCanvasReadRepository ? {} : { canvasReadRepository }),
+    ...(config.withoutProjectReadRepository ? {} : { projectReadRepository }),
   });
 
   /**
@@ -643,6 +794,8 @@ function makeHarness(config: HarnessConfig = {}) {
     jobOwnerReadCalls,
     jobOwnerWriteCalls,
     transitionCalls,
+    canvasReadCalls,
+    projectReadCalls,
     adminClientCalls: () => adminClientCalls,
     /** The credits-link operations in the order the service issued them. */
     creditsLinkOperations: () =>
@@ -2315,6 +2468,426 @@ describe("createJob: authorize, then insert, then enqueue (工单21H0)", () => {
     expect(deleteFailedError?.message).toBe("Failed to enqueue job.");
     expect(deleteFailed.deletes()).toHaveLength(1);
     expect(deleteFailed.jobRows.has("job-21h0")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR-0001 / workorder 21V: createJob's two authorization reads moved off the
+// caller's PostgREST client and onto the repositories that already answer those
+// two questions — the canvas → project link of 21R and the no-archive-filter
+// project lookup of 20B. These cases pin the WIRING: which method is called,
+// with exactly which arguments, what a missing or failing repository answers,
+// and that neither read travels through a client any more. The answer-for-answer
+// contract (403 for "not accessible", 400 for a canvas/project mismatch, 500 for
+// a broken read, and nothing inserted or enqueued on any of them) is pinned by
+// the cases above and is deliberately not restated here.
+// ---------------------------------------------------------------------------
+
+describe("createJob: the two authorization reads reuse the existing repositories (工单21V)", () => {
+  const CANVAS_ID = "canvas-21v";
+  const PROJECT_ID = "project-21v";
+  const jobRow: Record<string, unknown> = {
+    id: "job-21v",
+    status: "queued",
+    job_type: "image_generation",
+  };
+
+  /** A canvas submission: the branch that authorizes through the canvas link. */
+  function submitCanvas(
+    harness: ReturnType<typeof makeHarness>,
+    input: Record<string, unknown> = {},
+  ) {
+    return harness.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      canvasId: CANVAS_ID,
+      jobType: "image_generation",
+      payload: { prompt: "x" },
+      ...input,
+    });
+  }
+
+  /** A project-only submission: the branch that authorizes through the project. */
+  function submitProject(
+    harness: ReturnType<typeof makeHarness>,
+    input: Record<string, unknown> = {},
+  ) {
+    return harness.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      projectId: PROJECT_ID,
+      jobType: "image_generation",
+      payload: { prompt: "x" },
+      ...input,
+    });
+  }
+
+  /** The fixed error a case expects, or `null` if the call resolved. */
+  function rejection(run: Promise<unknown>) {
+    return run.then(() => null).catch((thrown: unknown) => thrown as JobServiceError);
+  }
+
+  it("case V1: a canvas submission reads the link through the canvas repository, with the actor and the canvas id only", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    await submitCanvas(harness);
+
+    // The exact argument object, so "the actor is the caller and the canvas id is
+    // the only other value" is measured rather than asserted in prose.
+    expect(harness.canvasReadCalls).toEqual([
+      { actorId: "user-21h0", canvasId: CANVAS_ID },
+    ]);
+    // A canvas decides the project, so the project lookup is not a second
+    // authorization step: it is not reached at all.
+    expect(harness.projectReadCalls).toEqual([]);
+    expect(harness.insertOp()?.row.project_id).toBe(PROJECT_ID);
+  });
+
+  it("case V2: only the link's project_id reaches the insert — not its workspace and not its brand kit", async () => {
+    const harness = makeHarness({
+      canvasRow: {
+        project_id: PROJECT_ID,
+        workspace_id: "ws-from-the-link",
+        brand_kit_id: "brand-kit-from-the-link",
+      },
+      insertedJob: jobRow,
+    });
+
+    await submitCanvas(harness);
+
+    const row = harness.insertOp()?.row ?? {};
+    expect(row.project_id).toBe(PROJECT_ID);
+    // The job's workspace stays the one the CALLER asked for: the link answers
+    // "which project", and nothing else.
+    expect(row.workspace_id).toBe("ws-1");
+    expect(Object.keys(row)).not.toContain("brand_kit_id");
+  });
+
+  it("case V3: a project-only submission reads the workspace through the project repository, with the actor and the project id only", async () => {
+    const harness = makeHarness({
+      projectRow: { id: PROJECT_ID, workspace_id: "ws-from-the-project" },
+      insertedJob: jobRow,
+    });
+
+    await submitProject(harness);
+
+    expect(harness.projectReadCalls).toEqual([
+      { actorId: "user-21h0", projectId: PROJECT_ID },
+    ]);
+    expect(harness.canvasReadCalls).toEqual([]);
+    expect(harness.insertOp()?.row.project_id).toBe(PROJECT_ID);
+    expect(harness.insertOp()?.row.workspace_id).toBe("ws-1");
+  });
+
+  it("case V4: the project read still happens before the insert and before the enqueue", async () => {
+    const harness = makeHarness({
+      projectRow: { id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    await submitProject(harness);
+
+    expect(harness.trace).toEqual([
+      "read:projects",
+      "insert:background_jobs",
+      "send:image_generation_jobs",
+    ]);
+  });
+
+  it("case V5: with NO canvas repository wired a canvas submission is the 500, with no insert, no send and no compensation delete", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: PROJECT_ID },
+      insertedJob: jobRow,
+      withoutCanvasReadRepository: true,
+    });
+
+    const error = await rejection(submitCanvas(harness));
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_create_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to verify the job canvas.");
+    expect(harness.canvasReadCalls).toEqual([]);
+    expect(harness.projectReadCalls).toEqual([]);
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.deletes()).toHaveLength(0);
+  });
+
+  it("case V6: with NO project repository wired a project-only submission is the 500, with no insert, no send and no compensation delete", async () => {
+    const harness = makeHarness({
+      projectRow: { id: PROJECT_ID },
+      insertedJob: jobRow,
+      withoutProjectReadRepository: true,
+    });
+
+    const error = await rejection(submitProject(harness));
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_create_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to verify the job project.");
+    expect(harness.projectReadCalls).toEqual([]);
+    expect(harness.canvasReadCalls).toEqual([]);
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.deletes()).toHaveLength(0);
+  });
+
+  it("case V7: a canvas repository that THROWS is the 500 and never the 403, and its text stays out of the message", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: PROJECT_ID },
+      insertedJob: jobRow,
+      canvasError: new Error(
+        "select project_id from public.canvases failed on db-21v.internal:5432",
+      ),
+    });
+
+    const error = await rejection(submitCanvas(harness));
+
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to verify the job canvas.");
+    expect(error?.message).not.toContain("db-21v.internal");
+    expect(error?.message).not.toContain("public.canvases");
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.deletes()).toHaveLength(0);
+  });
+
+  it("case V8: a project repository that THROWS is the 500 and never the 403, and its text stays out of the message", async () => {
+    const harness = makeHarness({
+      projectRow: { id: PROJECT_ID },
+      insertedJob: jobRow,
+      projectError: new Error(
+        "workspace lookup for public.projects failed on db-21v.internal:5432",
+      ),
+    });
+
+    const error = await rejection(submitProject(harness));
+
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to verify the job project.");
+    expect(error?.message).not.toContain("db-21v.internal");
+    expect(error?.message).not.toContain("public.projects");
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.deletes()).toHaveLength(0);
+  });
+
+  it("case V9: a link of null is still the 403, and the canvas branch never falls through to the project read", async () => {
+    const harness = makeHarness({
+      canvasRow: null,
+      projectRow: { id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    // The caller passed a project as well: a fallback to the project lookup would
+    // have answered a row here, which is exactly what must NOT happen.
+    const error = await rejection(submitCanvas(harness, { projectId: PROJECT_ID }));
+
+    expect(error?.statusCode).toBe(403);
+    expect(error?.message).toBe("Canvas not found or not accessible to this user.");
+    expect(harness.projectReadCalls).toEqual([]);
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.deletes()).toHaveLength(0);
+  });
+
+  it("case V10: a project read of null is still the 403, and the canvas repository is not consulted", async () => {
+    const harness = makeHarness({
+      projectRow: null,
+      canvasRow: { project_id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    const error = await rejection(submitProject(harness));
+
+    expect(error?.statusCode).toBe(403);
+    expect(error?.message).toBe("Project not found or not accessible to this user.");
+    expect(harness.canvasReadCalls).toEqual([]);
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.deletes()).toHaveLength(0);
+  });
+
+  it("case V11: with neither a canvas nor a project, NEITHER repository is called and the job is created with a null project", async () => {
+    // Both repositories are wired AND would answer a row: the point is that
+    // nothing asks them, not that they are absent.
+    const harness = makeHarness({
+      canvasRow: { project_id: PROJECT_ID },
+      projectRow: { id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    await harness.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      jobType: "image_generation",
+      payload: { prompt: "x" },
+    });
+
+    expect(harness.canvasReadCalls).toEqual([]);
+    expect(harness.projectReadCalls).toEqual([]);
+    expect(harness.insertOp()?.row.project_id).toBeNull();
+    expect(harness.sentMessages).toHaveLength(1);
+  });
+
+  it("case V12: the canvas authorization no longer goes through the caller's client, while the insert still does", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    await submitCanvas(harness);
+
+    // No client operation of any shape names `canvases` or `projects` on behalf
+    // of the caller: the read is the repository's own SQL now.
+    const clientTableReads = harness.ops.filter(
+      (op) =>
+        op.via === "user" &&
+        "table" in op &&
+        (op.table === "canvases" || op.table === "projects"),
+    );
+    expect(clientTableReads).toEqual([]);
+
+    // The insert is unchanged: it is still the caller's own client, built from
+    // the caller's token, so RLS still decides whether the row may land.
+    expect(harness.insertOp()?.via).toBe("user");
+    expect(harness.clientTokens).toEqual(["token-21h0"]);
+  });
+
+  it("case V13: the project authorization no longer goes through the caller's client, and the only projects entry is the repository's", async () => {
+    const harness = makeHarness({
+      projectRow: { id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    await submitProject(harness);
+
+    const clientTableReads = harness.ops.filter(
+      (op) =>
+        op.via === "user" &&
+        "table" in op &&
+        (op.table === "canvases" || op.table === "projects"),
+    );
+    expect(clientTableReads).toEqual([]);
+
+    // The by-id single-row read of `projects` still happened — and the entry
+    // records that a REPOSITORY issued it, which is the whole difference this
+    // workorder makes.
+    expect(
+      harness.ops.filter((op) => op.kind === "maybeSingle" && op.table === "projects"),
+    ).toEqual([{ kind: "maybeSingle", table: "projects", via: "repository" }]);
+
+    expect(harness.insertOp()?.via).toBe("user");
+    expect(harness.clientTokens).toEqual(["token-21h0"]);
+  });
+
+  it("case V14: the actor handed to both repositories is the authenticated user's id, never the access token", async () => {
+    const other = {
+      accessToken: "token-other-21v",
+      email: "other-21v@hahart.test",
+      id: "user-other-21v",
+      userMetadata: {},
+    };
+    const canvasHarness = makeHarness({
+      canvasRow: { project_id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+    const projectHarness = makeHarness({
+      projectRow: { id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    await canvasHarness.service.createJob(other, {
+      workspaceId: "ws-1",
+      canvasId: CANVAS_ID,
+      jobType: "image_generation",
+      payload: { prompt: "x" },
+    });
+    await projectHarness.service.createJob(other, {
+      workspaceId: "ws-1",
+      projectId: PROJECT_ID,
+      jobType: "image_generation",
+      payload: { prompt: "x" },
+    });
+
+    expect(canvasHarness.canvasReadCalls).toEqual([
+      { actorId: "user-other-21v", canvasId: CANVAS_ID },
+    ]);
+    expect(projectHarness.projectReadCalls).toEqual([
+      { actorId: "user-other-21v", projectId: PROJECT_ID },
+    ]);
+
+    // A token in an ACL argument would be a privilege escalation, not a typo.
+    const argumentsSeen = JSON.stringify([
+      ...canvasHarness.canvasReadCalls,
+      ...projectHarness.projectReadCalls,
+    ]);
+    expect(argumentsSeen).not.toContain("token-other-21v");
+  });
+
+  it("case V15: the canvas repository is asked exactly once per submission", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    await submitCanvas(harness);
+
+    // One authorization question, one answer: a second read would mean the
+    // service no longer trusts the row it just resolved the project from.
+    expect(harness.canvasReadCalls).toHaveLength(1);
+    expect(harness.projectReadCalls).toHaveLength(0);
+  });
+
+  it("case V16: a caller-supplied project that MATCHES the link does not make the project repository reachable", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: PROJECT_ID },
+      projectRow: { id: PROJECT_ID },
+      insertedJob: jobRow,
+    });
+
+    await submitCanvas(harness, { projectId: PROJECT_ID });
+
+    expect(harness.canvasReadCalls).toHaveLength(1);
+    expect(harness.projectReadCalls).toEqual([]);
+    expect(harness.insertOp()?.row.project_id).toBe(PROJECT_ID);
+    expect(harness.sentMessages).toHaveLength(1);
+  });
+
+  it("case V17: a link that contradicts the caller's project is the 400, before any project read, insert or send", async () => {
+    const harness = makeHarness({
+      canvasRow: { project_id: PROJECT_ID },
+      projectRow: { id: "project-other-21v" },
+      insertedJob: jobRow,
+    });
+
+    const error = await rejection(
+      submitCanvas(harness, { projectId: "project-other-21v" }),
+    );
+
+    expect(error?.statusCode).toBe(400);
+    expect(error?.message).toBe("Canvas and project do not match.");
+    expect(harness.projectReadCalls).toEqual([]);
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.deletes()).toHaveLength(0);
+  });
+
+  it("case V18: a link without a usable project is the 403, even though the repository answered a row", async () => {
+    const harness = makeHarness({
+      canvasRow: { workspace_id: "ws-from-the-link" },
+      insertedJob: jobRow,
+    });
+
+    const error = await rejection(submitCanvas(harness));
+
+    expect(error?.statusCode).toBe(403);
+    expect(error?.message).toBe("Canvas not found or not accessible to this user.");
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.deletes()).toHaveLength(0);
   });
 });
 

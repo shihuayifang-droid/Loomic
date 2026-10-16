@@ -718,11 +718,31 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // client method either, so `fromCallsIncludingTests` follows `fromCalls` down
     // again. The RPC counters are untouched: this migration removed no RPC call
     // site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(103);
+    // Workorder 21V then removed the LAST two PostgREST reads of
+    // `features/jobs/job-service.ts` — the two authorization reads `createJob`
+    // performs before it inserts anything: "which project is this canvas's?" (a
+    // `canvases` row) and "may this caller use this project?" (a `projects` row,
+    // for a submission with no canvas) — so both counters below move down
+    // together again (103->101). That is a real coupling removal rather than a
+    // counting change: both branches now call the repositories that already
+    // answer those two questions, `CanvasReadRepository.findReadableCanvasProjectLink`
+    // (workorder 21R) and
+    // `ProjectReadRepository.findReadableProjectWorkspaceForMutation` (workorder
+    // 20B), whose ACL is `private.can_read_project` verbatim and whose statements
+    // deliberately carry NO `archived_at` filter — which is why a generation
+    // submitted from an archived project's canvas is still authorized, as the
+    // real-SQL ACL cases of that workorder measure. The caller's client stays
+    // wired for what did NOT move: the job INSERT and the compensation DELETE of a
+    // failed enqueue are counted exactly as before, and a missing repository is
+    // the branch's existing 500 rather than a fallback to it. Its new cases name
+    // no client method either, so `fromCallsIncludingTests` follows `fromCalls`
+    // down again. The RPC counters are untouched: this migration removed no RPC
+    // call site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(101);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(103);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(101);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

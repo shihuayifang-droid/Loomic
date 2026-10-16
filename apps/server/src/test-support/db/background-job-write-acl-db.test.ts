@@ -1049,3 +1049,159 @@ describe("background job write ACL: refusal shape and transaction recovery", () 
     expect(await jobStatus(allowed.id)).toBe("queued");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Workorder 21V: `createJob` no longer authorizes its two reads through the
+// caller's client, so the RLS policies those reads relied on are not what
+// authorises a job any more — `CanvasReadRepository.findReadableCanvasProjectLink`
+// is. The two cases below measure the REAL repository against the REAL schema and
+// hold its answer against the policy's answer on the very same rows: the
+// statement is the ACL now, and any difference between the two would be a silent
+// authorization change on the job write path.
+//
+// Why the archived case is here at all: the two obvious repositories
+// (`findReadableCanvasContent`, `findReadableProject`) DO filter `archived_at`,
+// and reaching for one of them would refuse every generation submitted from an
+// archived project's canvas. The method this workorder uses deliberately has no
+// such filter, matching the policy verbatim — and that is a fact about SQL, so it
+// is measured here rather than asserted in prose.
+//
+// The two imports below are appended HERE instead of joining the import block at
+// the top of this file on purpose: this file's contract for this workorder is
+// append-only, because everything above it is a baseline that must not move a
+// single line. `createPGliteTransactionPool` is the adapter the sibling
+// repository-db tests use to run a repository's real SQL on this in-process
+// database.
+// ---------------------------------------------------------------------------
+
+import { createCanvasReadRepository } from "../../db/canvas-read-repository.js";
+import { createPGliteTransactionPool } from "./pglite-db.js";
+
+describe("background job write ACL: the canvas link read createJob authorizes through now (工单21V)", () => {
+  const ARCHIVED_AT = "2026-01-09T00:00:00.000Z";
+
+  /** The repository the service is wired with, on this same real database. */
+  function canvasRepository() {
+    return createCanvasReadRepository({
+      getTransactionPool: () => createPGliteTransactionPool(db),
+    });
+  }
+
+  it("case 22: a canvas of an ARCHIVED project still authorizes a job, and the link agrees with the policy", async () => {
+    const project = nextUuid("a3010000");
+    const canvas = nextUuid("b3010000");
+
+    await db.query(
+      `insert into public.projects
+         (id, workspace_id, name, slug, description, created_by, archived_at, created_at, updated_at)
+       values ($1, $2, $3, $4, $5, $6, $7,
+               '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+      [
+        project,
+        teamWorkspaceId,
+        "archived job project",
+        "archived-job-project",
+        "archived on purpose",
+        OWNER_ID,
+        ARCHIVED_AT,
+      ],
+    );
+    await db.query(
+      `insert into public.canvases (id, project_id, name, is_primary, created_by, content, version)
+       values ($1, $2, 'canvas of an archived project', false, $3,
+               '{"elements":[],"appState":{},"files":{}}'::jsonb, 1)`,
+      [canvas, project, OWNER_ID],
+    );
+
+    // Guard against a vacuous pass: the project really is archived, so a
+    // statement carrying an `archived_at` filter would answer null below.
+    const archived = firstRow(
+      (
+        await db.query<{ archived_at: string | null }>(
+          "select archived_at from public.projects where id = $1",
+          [project],
+        )
+      ).rows,
+    );
+    expect(archived.archived_at).not.toBeNull();
+
+    // The repository's statement: no archived filter, so the link resolves.
+    const link = await canvasRepository().findReadableCanvasProjectLink({
+      actorId: OWNER_ID,
+      canvasId: canvas,
+    });
+    expect(link).toEqual({
+      project_id: project,
+      workspace_id: teamWorkspaceId,
+      brand_kit_id: null,
+    });
+
+    // The read the service used to perform through the caller's client — the
+    // `canvases` policy. Both answers must be the same row.
+    const viaPolicy = await asUser(db, OWNER_ID, (tx) =>
+      tx.query<{ project_id: string }>(
+        "select project_id from public.canvases where id = $1",
+        [canvas],
+      ),
+    );
+    expect(viaPolicy.rows.map((row) => row.project_id)).toEqual([project]);
+    expect(link?.project_id).toBe(project);
+
+    // And the job really can be created with the project that read resolved: the
+    // insert itself never looked at projects, so an archived parent changes
+    // nothing about it.
+    const inserted = await insertAs(OWNER_ID, {
+      workspaceId: teamWorkspaceId,
+      projectId: project,
+      canvasId: canvas,
+    });
+    expect(inserted.affectedRows).toBe(1);
+    const stored = await requiresJobRow(inserted.id);
+    expect(stored.project_id).toBe(project);
+    expect(stored.canvas_id).toBe(canvas);
+    expect(stored.status).toBe("queued");
+  });
+
+  it("case 23: a plain member gets NO link for another author's canvas, and the policy refuses it the same way", async () => {
+    // The fixture makes OWNER a `member` of the team workspace while OTHER is its
+    // `owner` and the author of PROJECT_OTHER — so the only thing denying the read
+    // below is the author/admin/owner clause of `can_read_project`.
+    const membership = firstRow(
+      (
+        await db.query<{ role: string }>(
+          `select role from public.workspace_members
+            where workspace_id = $1 and user_id = $2`,
+          [teamWorkspaceId, OWNER_ID],
+        )
+      ).rows,
+    );
+    expect(membership.role).toBe("member");
+
+    const link = await canvasRepository().findReadableCanvasProjectLink({
+      actorId: OWNER_ID,
+      canvasId: CANVAS_OTHER,
+    });
+    expect(link).toBeNull();
+
+    const viaPolicy = await asUser(db, OWNER_ID, (tx) =>
+      tx.query<{ project_id: string }>(
+        "select project_id from public.canvases where id = $1",
+        [CANVAS_OTHER],
+      ),
+    );
+    expect(viaPolicy.rows).toEqual([]);
+
+    // The author is admitted through the same statement, so the null above is the
+    // ACL and not a query that could never match anything.
+    expect(
+      await canvasRepository().findReadableCanvasProjectLink({
+        actorId: OTHER_ID,
+        canvasId: CANVAS_OTHER,
+      }),
+    ).toEqual({
+      project_id: PROJECT_OTHER,
+      workspace_id: teamWorkspaceId,
+      brand_kit_id: null,
+    });
+  });
+});
