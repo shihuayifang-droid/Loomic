@@ -17,6 +17,7 @@ import { createJobService } from "./features/jobs/job-service.js";
 import { createJobAttemptRepository } from "./db/job-attempt-repository.js";
 import { createJobTransitionRepository } from "./db/job-transition-repository.js";
 import { createJobBillingGateRepository } from "./db/job-billing-gate-repository.js";
+import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
 import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
@@ -86,6 +87,18 @@ async function main() {
     // `processJobMessage` treats it as a failure instead of assuming the row
     // moved — nothing here can reach the update this replaces.
     jobTransitionRepository: createJobTransitionRepository({
+      getTransactionPool: () =>
+        getTransactionPool(
+          env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
+        ),
+    }),
+    // ADR-0001 / workorder 21N: the admin single-row read both generation
+    // executors now share. Workorder 21I moved `getJobAdmin` onto this repository
+    // but wired it into `app.ts` only, so without this line the worker's
+    // executors call a service with nothing behind the read and every job row
+    // read fails closed as `job_query_failed`. Built lazily against the same
+    // `DATABASE_URL` as the repositories above.
+    jobAdminReadRepository: createJobAdminReadRepository({
       getTransactionPool: () =>
         getTransactionPool(
           env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},

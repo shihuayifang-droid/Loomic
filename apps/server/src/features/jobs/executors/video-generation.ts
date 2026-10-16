@@ -1,4 +1,5 @@
 import { registerExecutor, type ExecutorContext } from "../job-executor.js";
+import { loadExecutorJob } from "./load-executor-job.js";
 import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateVideo } from "../../../generation/video-generation.js";
@@ -8,13 +9,7 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
   const t0 = Date.now();
 
   const admin = ctx.getAdminClient();
-  const { data: jobRow } = await admin
-    .from("background_jobs")
-    .select("created_by, workspace_id, canvas_id, project_id, session_id, payload")
-    .eq("id", jobId)
-    .single();
-
-  if (!jobRow) throw new Error(`Job ${jobId} not found in database`);
+  const jobRow = await loadExecutorJob(ctx, jobId);
 
   // Build log tag with traceability context: jobId + sessionId (if available)
   const sessionShort = (jobRow.session_id as string)?.slice(0, 8) ?? "no-session";
