@@ -10,13 +10,21 @@ import {
 import { buildApp } from "../app.js";
 import { DEFAULT_AGENT_MODEL } from "../config/env.js";
 import {
+  READ_DEFAULT_MODEL,
+  WorkspaceSettingsReadError,
+  type WorkspaceSettingsReadRepository,
+} from "../db/workspace-settings-read-repository.js";
+import {
   UPSERT_DEFAULT_MODEL,
   WorkspaceSettingsWriteError,
   type WorkspaceSettingsWriteRepository,
   type WorkspaceSettingsWriteRow,
 } from "../db/workspace-settings-write-repository.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
-import { createSettingsService } from "../features/settings/settings-service.js";
+import {
+  SettingsServiceError,
+  createSettingsService,
+} from "../features/settings/settings-service.js";
 import type { TeamMembershipService } from "../features/team/team-membership.js";
 import type {
   AuthenticatedUser,
@@ -26,30 +34,35 @@ import type {
 import { registerSettingsRoutes } from "./settings.js";
 
 /**
- * `PUT /api/workspace/settings` as the CLIENT sees it (workorder 21E1).
+ * `/api/workspace/settings` as the CLIENT sees it (workorders 21E1 and 21L).
  *
- * The Supabase upsert this route used to perform is gone; what this file pins is
- * that the ROUTE CONTRACT did not move with it — the 401 without a token, the 400
- * for an invalid body, the unchanged 200 `{ settings: { defaultModel } }`, and the
- * single 500 `settings_update_failed` that every failure of the write collapses
- * into.
+ * The Supabase upsert this route used to perform is gone (21E1), and so is the
+ * Supabase read (21L); what this file pins is that the ROUTE CONTRACT did not
+ * move with either of them — the 401 without a token, the 400 for an invalid
+ * body, the unchanged 200 `{ settings: { defaultModel } }`, the
+ * `settings_read_failed` 500 the GET answers when the read cannot be performed,
+ * and the single 500 `settings_update_failed` that every failure of the write
+ * collapses into.
  *
  * Three things are observed rather than asserted in prose:
  *
- * - `createUserClient` is injected as a factory whose calls are RECORDED. Every
- *   PUT case asserts it was never reached, which is the direct evidence that no
- *   success or failure path of the WRITE goes back to PostgREST. The very same
- *   factory is what the READ path uses in case 10, so "the write never touches
- *   it" is a measured difference and not a factory that simply cannot work.
- * - The repository is a DOUBLE, so the arguments the route passes down are
- *   recorded. These cases are therefore NOT authorization evidence: who may write
- *   which workspace row is proven against real SQL in
- *   `test-support/db/workspace-settings-write-repository-db.test.ts` (and the
- *   statement itself in `db/workspace-settings-write-repository.test.ts`). This
- *   file only proves the HTTP surface is unchanged, and that the route still
- *   hands the write the VIEWER's own workspace.
- * - The app is built through `buildApp` with the repository injected, so the real
- *   wiring of workorder 21E1 is part of what runs.
+ * - `createUserClient` is injected as a factory whose calls are RECORDED, and
+ *   since workorder 21L the settings service does not receive it at all. Every
+ *   case asserts it was never reached, which is the direct evidence that neither
+ *   the READ nor the WRITE has a PostgREST path left to fall back to.
+ * - The repositories are DOUBLES, so the arguments the route passes down are
+ *   recorded. These cases are therefore NOT authorization evidence: who may read
+ *   or write which workspace row is proven against real SQL in
+ *   `db/workspace-settings-read-repository.test.ts` and
+ *   `test-support/db/workspace-settings-read-repository-db.test.ts` (and the
+ *   21E1 pair for the write). This file only proves the HTTP surface is
+ *   unchanged, and that the route still hands both directions the VIEWER's own
+ *   workspace.
+ * - The app is built through `buildApp` with the write repository injected, so
+ *   the real wiring of workorder 21E1 is part of what runs. The GET cases build
+ *   the service explicitly instead, because workorder 21L deliberately did NOT
+ *   add an injectable read repository to `buildApp` — it is built inline at the
+ *   one call site that needs it.
  */
 
 const USER_ID = "00000000-0000-0000-0000-0000000000c1";
@@ -81,21 +94,30 @@ type WriteCall = {
   defaultModel: string;
 };
 
+type ReadCall = {
+  actorId: string;
+  workspaceId: string;
+};
+
 let userFactoryCalls: string[];
 let readCalls: string[];
 let writeCalls: WriteCall[];
+let readRepositoryCalls: ReadCall[];
 let writeRow: WorkspaceSettingsWriteRow | undefined;
 let writeError: unknown;
-let storedReadRow: { default_model: string } | null;
+let readModel: string | null;
+let readError: unknown;
 
 /**
  * The user-scoped Supabase client, as a recording stub.
  *
- * The factory itself is the observation point: it is called on every READ and
- * never on a write, and every call it makes is recorded in `readCalls`. The
- * `from` accessor is written as a computed key on purpose — a literal PostgREST
- * call token in this file would raise the dependency audit's text counter, which
- * this ticket has to keep at its measured value.
+ * The factory itself is the observation point, and since workorder 21L it is
+ * only a tripwire: the settings service no longer receives it, so a call here —
+ * recorded, with every step of the read chain it makes — means one of the two
+ * directions went back to PostgREST. The `from` accessor is written as a
+ * computed key on purpose: a literal PostgREST call token in this file would
+ * raise the dependency audit's text counter, which this ticket has to keep at
+ * its measured value.
  */
 function userClientFactory(accessToken: string): UserSupabaseClient {
   userFactoryCalls.push(accessToken);
@@ -111,7 +133,10 @@ function userClientFactory(accessToken: string): UserSupabaseClient {
     },
     async maybeSingle() {
       readCalls.push("maybeSingle");
-      return { data: storedReadRow, error: null };
+      // Nothing to serve: no settings path may reach this stub any more, so the
+      // only honest answer is an empty one, and the `readCalls` record above is
+      // what a caller would have to explain.
+      return { data: null, error: null };
     },
   };
 
@@ -123,7 +148,7 @@ function userClientFactory(accessToken: string): UserSupabaseClient {
   } as unknown as UserSupabaseClient;
 }
 
-/** A double for the repository that records the arguments the ROUTE passed down. */
+/** A double for the write repository that records the arguments the ROUTE passed down. */
 const workspaceSettingsWriteRepository: WorkspaceSettingsWriteRepository = {
   async upsertDefaultModel(input) {
     writeCalls.push({
@@ -138,6 +163,18 @@ const workspaceSettingsWriteRepository: WorkspaceSettingsWriteRepository = {
         defaultModel: input.defaultModel,
       }
     );
+  },
+};
+
+/** A double for the read repository, recording the same way. */
+const workspaceSettingsReadRepository: WorkspaceSettingsReadRepository = {
+  async readDefaultModel(input) {
+    readRepositoryCalls.push({
+      actorId: input.actorId,
+      workspaceId: input.workspaceId,
+    });
+    if (readError !== undefined) throw readError;
+    return readModel;
   },
 };
 
@@ -187,9 +224,11 @@ beforeEach(async () => {
   userFactoryCalls = [];
   readCalls = [];
   writeCalls = [];
+  readRepositoryCalls = [];
   writeRow = undefined;
   writeError = undefined;
-  storedReadRow = null;
+  readModel = null;
+  readError = undefined;
 
   app = buildApp({
     auth,
@@ -225,13 +264,25 @@ function putSettings(
   });
 }
 
-function getSettings(options: { token?: string | null } = {}) {
+function getSettings(
+  options: {
+    token?: string | null;
+    /** Defaults to the app built in `beforeEach`. */
+    instance?: FastifyInstance;
+    /** Appended verbatim, so a case can try to smuggle a workspace in. */
+    query?: string;
+  } = {},
+) {
   const headers =
     options.token === null || options.token === undefined
       ? {}
       : { authorization: `Bearer ${options.token}` };
 
-  return app.inject({ method: "GET", url: "/api/workspace/settings", headers });
+  return (options.instance ?? app).inject({
+    method: "GET",
+    url: `/api/workspace/settings${options.query ?? ""}`,
+    headers,
+  });
 }
 
 describe("PUT /api/workspace/settings: authentication and validation", () => {
@@ -438,7 +489,6 @@ describe("PUT /api/workspace/settings: every write failure is the same 500", () 
     await registerSettingsRoutes(bare, {
       auth,
       settingsService: createSettingsService({
-        createUserClient: userClientFactory,
         defaultModel: DEFAULT_AGENT_MODEL,
       }),
       viewerService,
@@ -468,58 +518,292 @@ describe("PUT /api/workspace/settings: every write failure is the same 500", () 
   });
 });
 
-describe("GET /api/workspace/settings: the read path did not move", () => {
-  it("case 10: the read still runs on the user-scoped client, and the write still never touches it", async () => {
-    // A stored row is served through the user-scoped client...
-    storedReadRow = { default_model: "stored-model" };
-    const stored = await getSettings({ token: TOKEN });
+describe("GET /api/workspace/settings: the read now runs on its repository", () => {
+  /**
+   * STOP POINT (workorder 21L §7) — the wire body of a FAILED read, measured.
+   *
+   * `getWorkspaceSettings` throws
+   * `SettingsServiceError("settings_read_failed", "Unable to load workspace
+   * settings.", 500)` — it always has, and this workorder keeps it. The route
+   * answers a `SettingsServiceError` through
+   * `applicationErrorResponseSchema.parse(...)`, and that schema's code enum
+   * (`applicationErrorCodeSchema`, `packages/shared/src/http.ts:120-193`) does
+   * NOT contain `settings_read_failed`. The parse therefore throws INSIDE the
+   * error path, and Fastify replaces the intended body with its own generic 500
+   * plus the raw zod dump. The STATUS is still the required 500; the `code` never
+   * reaches the client.
+   *
+   * This is a PRE-EXISTING defect, not one this workorder introduced: the
+   * PostgREST read it replaces threw the very same code on any read failure, and
+   * the same class of defect is what the three "LOCAL FORK" codes further down
+   * that enum were added to fix. It is only MEASURED now, because case 10
+   * exercises a failing read for the first time.
+   *
+   * It cannot be fixed from inside this workorder. The two files that would fix
+   * it are both outside the 7-file whitelist:
+   *   (A) `packages/shared/src/http.ts` — add `settings_read_failed` to
+   *       `applicationErrorCodeSchema` (one line, backward compatible: widening
+   *       an enum only accepts more). RECOMMENDED, and the same fix the three
+   *       LOCAL FORK codes got.
+   *   (B) `http/settings.ts` — stop putting this one code through the shared
+   *       parse. Not recommended: it drops the shared response contract.
+   *
+   * So the wire body is PINNED AS IT IS — with the failing assertion's intent
+   * written out in full — and the decision is reported as a stop point rather
+   * than taken here. When the enum is widened, the two `expect(response.json())`
+   * blocks below become:
+   *
+   *   expect(response.json()).toEqual({
+   *     error: { code: "settings_read_failed", message: "Unable to load workspace settings." },
+   *   });
+   *   expect(applicationErrorResponseSchema.parse(response.json())).toBeDefined();
+   *
+   * The service-level half of the same requirement is asserted directly in case
+   * 13, where it IS reachable.
+   */
+  function expectPinnedReadFailureBody(body: unknown): void {
+    const payload = body as { error?: unknown; message?: unknown; statusCode?: unknown };
 
-    expect(stored.statusCode).toBe(200);
-    expect(stored.json()).toEqual({ settings: { defaultModel: "stored-model" } });
+    expect(payload.statusCode).toBe(500);
+    expect(payload.error).toBe("Internal Server Error");
+    expect(String(payload.message)).toContain("Invalid enum value");
+    // The intended body is NOT what a client receives today: there is no
+    // structured error object at all, and the service code is only visible inside
+    // the zod dump.
+    expect(payload).not.toHaveProperty("error.code");
+    expect((payload as { error: { code?: unknown } }).error).not.toEqual(
+      expect.objectContaining({ code: "settings_read_failed" }),
+    );
+  }
 
-    // ...and with no row at all the fallback model is still used, exactly as the
-    // untouched read path did before this ticket.
-    storedReadRow = null;
-    const fallback = await getSettings({ token: TOKEN });
-    expect(fallback.statusCode).toBe(200);
-    expect(fallback.json()).toEqual({
-      settings: { defaultModel: DEFAULT_AGENT_MODEL },
+  /**
+   * The same real app, with the settings service built around the two repository
+   * doubles. `buildApp` deliberately has no injectable read repository (21L built
+   * it inline at its one call site), so the read half is observed from here.
+   */
+  async function buildReadApp(): Promise<FastifyInstance> {
+    const readsApp = buildApp({
+      auth,
+      createUserClient: userClientFactory,
+      env: {},
+      settingsService: createSettingsService({
+        defaultModel: DEFAULT_AGENT_MODEL,
+        workspaceSettingsReadRepository,
+        workspaceSettingsWriteRepository,
+      }),
+      teamMembershipService,
+      viewerService,
     });
+    await readsApp.ready();
+    return readsApp;
+  }
 
-    // The READ is what reaches the user-scoped client, and it is the only thing
-    // that does: the factory was called for the reads, with the caller's token.
-    expect(userFactoryCalls).toEqual([TOKEN, TOKEN]);
-    expect(readCalls).toEqual([
-      "from workspace_settings",
-      "select default_model",
-      `eq workspace_id=${PERSONAL_WORKSPACE_ID}`,
-      "maybeSingle",
-      "from workspace_settings",
-      "select default_model",
-      `eq workspace_id=${PERSONAL_WORKSPACE_ID}`,
-      "maybeSingle",
-    ]);
+  it("case 10: the stored model is served from the repository, a null answer falls back to the default, and any read failure is the existing 500", async () => {
+    const readsApp = await buildReadApp();
 
-    // Now the same app performs the WRITE: the recorded read/factory counts do
-    // not move by one, so the write has no PostgREST path at all.
-    const before = { factory: userFactoryCalls.length, read: readCalls.length };
-    const written = await putSettings({
-      token: TOKEN,
-      payload: { defaultModel: "written-after-the-reads" },
+    try {
+      // A stored row is served from the repository... The query string names
+      // another workspace on purpose: the route may only ever read the VIEWER's.
+      readModel = "stored-model";
+      const stored = await getSettings({
+        instance: readsApp,
+        query: `?workspaceId=${OTHER_WORKSPACE_ID}`,
+        token: TOKEN,
+      });
+
+      expect(stored.statusCode).toBe(200);
+      expect(stored.json()).toEqual({ settings: { defaultModel: "stored-model" } });
+
+      // ...and with `null` — no settings row, or a caller who is not a member of
+      // that workspace, the two answers this read cannot tell apart — the
+      // fallback model is still used, exactly as the untouched read path did
+      // before this ticket. NOT a 403: a non-member must still get a model, or
+      // `/api/agent/runs` and the websocket handler would stop starting runs.
+      readModel = null;
+      const fallback = await getSettings({ instance: readsApp, token: TOKEN });
+
+      expect(fallback.statusCode).toBe(200);
+      expect(fallback.json()).toEqual({
+        settings: { defaultModel: DEFAULT_AGENT_MODEL },
+      });
+      expect([403, 404]).not.toContain(fallback.statusCode);
+
+      // Every failure of the read — the repository's own error and anything it
+      // never throws — is the same 500 the PostgREST error used to produce, and
+      // it answers nothing about the workspace.
+      const failures: unknown[] = [
+        new WorkspaceSettingsReadError(
+          READ_DEFAULT_MODEL,
+          Object.assign(
+            new Error(
+              "select s.default_model from public.workspace_settings s failed: " +
+                "connect ECONNREFUSED db.internal:5432",
+            ),
+            { code: "42501" },
+          ),
+        ),
+        new Error("something the read repository never throws"),
+      ];
+
+      for (const failure of failures) {
+        readError = failure;
+
+        const response = await getSettings({ instance: readsApp, token: TOKEN });
+
+        expect(response.statusCode).toBe(500);
+        // NOT a 403 and NOT a 404: the failure may not answer whether the
+        // workspace exists or whether the caller is a member of it.
+        expect([403, 404]).not.toContain(response.statusCode);
+        expectPinnedReadFailureBody(response.json());
+        for (const leak of [
+          PERSONAL_WORKSPACE_ID,
+          "workspace_settings",
+          "workspace_members",
+          "42501",
+          "row-level security",
+          "ECONNREFUSED",
+          "db.internal",
+          "something the read repository never throws",
+        ]) {
+          expect(response.body).not.toContain(leak);
+        }
+      }
+
+      // The route passed the AUTHENTICATED actor and the VIEWER's workspace down
+      // on every read, and the query string could not retarget it.
+      expect(readRepositoryCalls).toEqual([
+        { actorId: USER_ID, workspaceId: PERSONAL_WORKSPACE_ID },
+        { actorId: USER_ID, workspaceId: PERSONAL_WORKSPACE_ID },
+        { actorId: USER_ID, workspaceId: PERSONAL_WORKSPACE_ID },
+        { actorId: USER_ID, workspaceId: PERSONAL_WORKSPACE_ID },
+      ]);
+      expect(
+        readRepositoryCalls.every(
+          (call) => call.workspaceId === PERSONAL_WORKSPACE_ID,
+        ),
+      ).toBe(true);
+      expect(readRepositoryCalls.map((call) => call.workspaceId)).not.toContain(
+        OTHER_WORKSPACE_ID,
+      );
+
+      // No part of the read went back to PostgREST: the user-scoped factory was
+      // never called and its read chain recorded nothing.
+      expect(userFactoryCalls).toHaveLength(0);
+      expect(readCalls).toHaveLength(0);
+
+      // Now the WRITE on the same app: it never touches the read repository, and
+      // it is still what the read repository is NOT allowed to become.
+      readError = undefined;
+      const readsBefore = readRepositoryCalls.length;
+      const written = await readsApp.inject({
+        method: "PUT",
+        url: "/api/workspace/settings",
+        headers: { authorization: `Bearer ${TOKEN}` },
+        payload: { defaultModel: "written-after-the-reads" },
+      });
+
+      expect(written.statusCode).toBe(200);
+      expect(written.json()).toEqual({
+        settings: { defaultModel: "written-after-the-reads" },
+      });
+      expect(readRepositoryCalls).toHaveLength(readsBefore);
+      expect(userFactoryCalls).toHaveLength(0);
+      expect(readCalls).toHaveLength(0);
+      expect(writeCalls).toEqual([
+        {
+          actorId: USER_ID,
+          workspaceId: PERSONAL_WORKSPACE_ID,
+          defaultModel: "written-after-the-reads",
+        },
+      ]);
+    } finally {
+      await readsApp.close();
+    }
+  });
+
+  it("case 11: with NO read repository injected the GET fails closed — no PostgREST fallback", async () => {
+    // The route is registered on its own here, with a settings service built
+    // WITHOUT a read repository, so the option really is absent rather than
+    // replaced by a default. This is the case a missing DATABASE_URL would hit in
+    // production, and it must not be answered from PostgREST.
+    const bare = Fastify();
+    await registerSettingsRoutes(bare, {
+      auth,
+      settingsService: createSettingsService({
+        defaultModel: DEFAULT_AGENT_MODEL,
+      }),
+      viewerService,
     });
+    await bare.ready();
 
-    expect(written.statusCode).toBe(200);
-    expect(written.json()).toEqual({
-      settings: { defaultModel: "written-after-the-reads" },
-    });
-    expect(userFactoryCalls).toHaveLength(before.factory);
-    expect(readCalls).toHaveLength(before.read);
-    expect(writeCalls).toEqual([
-      {
-        actorId: USER_ID,
-        workspaceId: PERSONAL_WORKSPACE_ID,
-        defaultModel: "written-after-the-reads",
-      },
-    ]);
+    try {
+      const response = await getSettings({ instance: bare, token: TOKEN });
+
+      expect(response.statusCode).toBe(500);
+      expect([403, 404]).not.toContain(response.statusCode);
+      // Pinned, not designed: see the stop-point note above `expectPinnedReadFailureBody`.
+      expectPinnedReadFailureBody(response.json());
+      for (const leak of [
+        PERSONAL_WORKSPACE_ID,
+        "workspace_settings",
+        "workspace_members",
+      ]) {
+        expect(response.body).not.toContain(leak);
+      }
+
+      // A missing repository is not a reason to fall back: nothing reached the
+      // user-scoped client, and no read repository existed to be reached either.
+      expect(userFactoryCalls).toHaveLength(0);
+      expect(readCalls).toHaveLength(0);
+      expect(readRepositoryCalls).toHaveLength(0);
+    } finally {
+      await bare.close();
+    }
+  });
+
+  it("case 12: a GET without a token is the existing 401 and reaches neither repository", async () => {
+    // The read repository must not be consulted before the caller is known: an
+    // anonymous request may not be turned into a workspace read.
+    const response = await getSettings({ token: null });
+
+    expect(response.statusCode).toBe(401);
+    expect(unauthenticatedErrorResponseSchema.parse(response.json())).toBeDefined();
+    expect(readRepositoryCalls).toHaveLength(0);
+    expect(userFactoryCalls).toHaveLength(0);
+    expect(readCalls).toHaveLength(0);
+  });
+
+  it("case 13: the read-failure contract the SERVICE owns is `settings_read_failed` / 500 / the untouched message", async () => {
+    // Case 10 measures the wire, case 13 measures the contract behind it — the
+    // half of workorder 21L's requirement that is reachable today. A missing
+    // repository and a repository that threw must be indistinguishable, and both
+    // must stay exactly what the removed PostgREST read produced.
+    const failures: Array<unknown | undefined> = [
+      undefined,
+      new WorkspaceSettingsReadError(
+        READ_DEFAULT_MODEL,
+        new Error("connect ECONNREFUSED db.internal:5432"),
+      ),
+      new Error("something the read repository never throws"),
+    ];
+
+    for (const failure of failures) {
+      readError = failure;
+      const service = createSettingsService({
+        defaultModel: DEFAULT_AGENT_MODEL,
+        ...(failure === undefined ? {} : { workspaceSettingsReadRepository }),
+      });
+
+      const error = await service
+        .getWorkspaceSettings(USER, PERSONAL_WORKSPACE_ID)
+        .catch((reason: unknown) => reason);
+
+      expect(error).toBeInstanceOf(SettingsServiceError);
+      expect((error as SettingsServiceError).code).toBe("settings_read_failed");
+      expect((error as SettingsServiceError).message).toBe(
+        "Unable to load workspace settings.",
+      );
+      expect((error as SettingsServiceError).statusCode).toBe(500);
+    }
   });
 });

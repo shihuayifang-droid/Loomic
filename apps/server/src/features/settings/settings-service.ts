@@ -1,7 +1,8 @@
 import type { WorkspaceSettings } from "@loomic/shared";
 
+import type { WorkspaceSettingsReadRepository } from "../../db/workspace-settings-read-repository.js";
 import type { WorkspaceSettingsWriteRepository } from "../../db/workspace-settings-write-repository.js";
-import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
+import type { AuthenticatedUser } from "../../supabase/user.js";
 
 const FALLBACK_MODEL = "gpt-5.4-mini";
 
@@ -41,27 +42,41 @@ export type SettingsService = {
 /**
  * Workspace settings, split by direction since workorder 21E1.
  *
- * READ (`getWorkspaceSettings`) is unchanged: it still runs on the caller's own
- * user-scoped PostgREST client, under RLS, and still falls back to
- * `defaultModel` when no row exists. Nothing about the read path moved.
+ * Neither direction goes through PostgREST any more. The READ was the last one
+ * left, and since workorder 21L `getWorkspaceSettings` runs on
+ * `WorkspaceSettingsReadRepository` — one privileged, parameterised statement
+ * whose membership predicate is the `workspace_settings_select` policy
+ * translated into SQL. This service therefore has no user-scoped client at all:
+ * a missing repository and a failing repository are the SAME
+ * `settings_read_failed` 500, exactly as a PostgREST error used to be, and there
+ * is deliberately nothing to fall back to.
  *
- * WRITE (`updateWorkspaceSettings`) no longer goes through PostgREST at all. It
- * is the single-key `workspace_settings.default_model` upsert, and since
- * workorder 21E1 it goes through `WorkspaceSettingsWriteRepository` — one
- * privileged, parameterised statement whose membership gate is inside it. This
- * service therefore has no user-scoped write left to fall back to: a missing
- * repository, a refusal, or any repository failure is the SAME
- * `settings_update_failed`, exactly as a PostgREST error used to be. The
- * projection the HTTP route publishes did not move with the write.
+ * WRITE (`updateWorkspaceSettings`) is unchanged by 21L: it is the single-key
+ * `workspace_settings.default_model` upsert through
+ * `WorkspaceSettingsWriteRepository` (workorder 21E1), and a missing repository,
+ * a refusal, or any repository failure is the SAME `settings_update_failed`. The
+ * projection the HTTP route publishes did not move with either direction.
+ *
+ * What also did NOT move is what "no row" means. The repository answers `null`
+ * both when the workspace has no settings row AND when the caller is not a
+ * member of it — the two were never distinguishable through RLS either — and
+ * that null is answered with `defaultModel`. A non-member is therefore served the
+ * default model, not a 403: `/api/agent/runs` and the websocket handler start
+ * agent runs through this read, and they must keep working for a caller whose
+ * workspace has simply never saved a setting.
  */
 export function createSettingsService(options: {
-  /**
-   * Used by the READ path only. The write path never calls it, and cannot: the
-   * repository above is the only writer this service knows about.
-   */
-  createUserClient: (accessToken: string) => UserSupabaseClient;
   /** Override the fallback model when no workspace setting exists. */
   defaultModel?: string;
+  /**
+   * ADR-0001 / workorder 21L: the only reader of
+   * `workspace_settings.default_model`.
+   *
+   * Optional so a caller CAN build the service without one; there is
+   * deliberately no fallback behind it. A missing repository is handled exactly
+   * like a failing one — the same 500 and no read.
+   */
+  workspaceSettingsReadRepository?: WorkspaceSettingsReadRepository;
   /**
    * ADR-0001 / workorder 21E1: the only writer of
    * `workspace_settings.default_model`.
@@ -76,24 +91,31 @@ export function createSettingsService(options: {
 
   return {
     async getWorkspaceSettings(user, workspaceId) {
-      const client = options.createUserClient(user.accessToken);
-      const { data, error } = await client
-        .from("workspace_settings")
-        .select("default_model")
-        .eq("workspace_id", workspaceId)
-        .maybeSingle();
-
-      if (error) {
-        throw new SettingsServiceError(
-          "settings_read_failed",
-          "Unable to load workspace settings.",
-          500,
-        );
+      // ADR-0001 / workorder 21L: the read moved from the user-scoped PostgREST
+      // client to the pure `pg` repository. What did NOT move is the projection:
+      // every failure of the read — a broken connection, a SQL error, a row the
+      // statement and the mapper disagree about, or no repository at all — is the
+      // SAME fixed `settings_read_failed` 500, and no SQL, host or membership
+      // information reaches the client.
+      const repository = options.workspaceSettingsReadRepository;
+      if (!repository) {
+        throw settingsReadFailed();
       }
 
-      return {
-        defaultModel: data?.default_model ?? defaultModel,
-      };
+      let stored;
+      try {
+        stored = await repository.readDefaultModel({
+          actorId: user.id,
+          workspaceId,
+        });
+      } catch {
+        throw settingsReadFailed();
+      }
+
+      // `null` is not a failure: it is "nothing this caller may see", the answer
+      // the read gave for a non-member and for a workspace without a settings row
+      // alike. Only a stored string overrides the fallback.
+      return { defaultModel: stored ?? defaultModel };
     },
 
     async updateWorkspaceSettings(user, workspaceId, settings) {
@@ -126,6 +148,23 @@ export function createSettingsService(options: {
       return { defaultModel: row.defaultModel };
     },
   };
+}
+
+/**
+ * The one failure the settings read can report. It is a function rather than a
+ * constant so every caller gets its own error, and it is the ONLY place the code,
+ * the wording and the status live: a repository that threw and a repository that
+ * was never injected must be indistinguishable from the outside.
+ *
+ * The wording is the one the removed PostgREST read answered with: an admin or a
+ * client that saw this message before sees exactly the same one now.
+ */
+function settingsReadFailed(): SettingsServiceError {
+  return new SettingsServiceError(
+    "settings_read_failed",
+    "Unable to load workspace settings.",
+    500,
+  );
 }
 
 /**

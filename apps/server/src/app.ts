@@ -92,6 +92,9 @@ import {
   type TeamAdminReadRepository,
 } from "./db/team-admin-read-repository.js";
 import {
+  createWorkspaceSettingsReadRepository,
+} from "./db/workspace-settings-read-repository.js";
+import {
   createWorkspaceSettingsWriteRepository,
   type WorkspaceSettingsWriteRepository,
 } from "./db/workspace-settings-write-repository.js";
@@ -349,8 +352,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // not an owner/admin member of the target workspace, the write fails closed as
   // a `WorkspaceSettingsWriteError` and the route keeps its existing 500
   // `settings_update_failed` projection. The READ path
-  // (`getWorkspaceSettings`) is untouched and still runs on the user-scoped
-  // client.
+  // (`getWorkspaceSettings`) followed it off the user-scoped client in workorder
+  // 21L: it is wired at the settings service below, and the service no longer
+  // receives a user client at all.
   const workspaceSettingsWriteRepository =
     options.workspaceSettingsWriteRepository ??
     createWorkspaceSettingsWriteRepository({
@@ -467,9 +471,17 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const settingsService =
     options.settingsService ??
       createSettingsService({
-        createUserClient,
         defaultModel: resolveDefaultAgentModel(env),
         workspaceSettingsWriteRepository,
+        // ADR-0001 / workorder 21L: the READ of the same table moved off the
+        // user-scoped PostgREST client and onto its own narrow repository, built
+        // lazily against the same pool as the repositories above. It is built
+        // inline here on purpose: it has exactly one caller. With no pool, or
+        // with a caller who is not a member of that workspace, the read fails
+        // closed or answers the default model — never PostgREST.
+        workspaceSettingsReadRepository: createWorkspaceSettingsReadRepository({
+          getTransactionPool: () => getTransactionPool(databaseEnv),
+        }),
       });
   const uploadService =
     options.uploadService ??

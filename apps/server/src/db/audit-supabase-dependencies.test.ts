@@ -518,9 +518,10 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // Workorder 21E1 then moved the single-key `workspace_settings.default_model`
     // upsert behind `PUT /api/workspace/settings` (132→131) into
     // `WorkspaceSettingsWriteRepository`, which also removed the last PostgREST
-    // write from `SettingsService` — the READ of the same table is untouched and
-    // is still counted here. The Supabase-RPC write of the credits rules and the
-    // cache invalidation after it are unchanged.
+    // write from `SettingsService` — the READ of the same table was left behind
+    // by that ticket and is still counted here until workorder 21L moves it (see
+    // below). The Supabase-RPC write of the credits rules and the cache
+    // invalidation after it are unchanged.
     //
     // Workorder 21G then moved the last two server-only `agent_runs` writes — the
     // accepted INSERT and the run metadata UPDATE behind
@@ -574,11 +575,26 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // RPC counters are untouched: this migration removed no RPC call site — the
     // remaining RPC of that service is the plan grant, whose counter is
     // unchanged.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(124);
+    //
+    // Workorder 21L then moved the LAST PostgREST read of
+    // `features/settings/settings-service.ts` — the `workspace_settings` row
+    // behind `GET /api/workspace/settings` (which `http/runs.ts` and
+    // `ws/handler.ts` also read to pick the model an agent run starts on) — into
+    // `WorkspaceSettingsReadRepository` (124->123), so both counters below move
+    // down together one last time. That is a real coupling removal rather than a
+    // counting change: `createSettingsService` no longer receives a user-scoped
+    // client at all, and the repository that replaces it can only reach
+    // PostgreSQL, where the membership predicate of the replaced
+    // `workspace_settings_select` policy is written into the statement verbatim
+    // (any role reads; a non-member gets `null`, which the service turns into its
+    // default model rather than a 403). Its three new test files name no client
+    // method, so `fromCallsIncludingTests` follows `fromCalls` down again. The
+    // RPC counters are untouched: this migration removed no RPC call site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(123);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(124);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(123);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
