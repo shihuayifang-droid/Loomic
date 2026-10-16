@@ -1,14 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  BALANCE_SNAPSHOT_COLUMNS,
   CREDIT_TRANSACTION_COLUMNS,
   CREDIT_TRANSACTION_LIMIT_MAX,
   CREDIT_TRANSACTION_LIMIT_MIN,
   CreditReadError,
   LIST_TRANSACTIONS,
+  READ_BALANCE_SNAPSHOT,
   READ_SUBSCRIPTION,
   SUBSCRIPTION_COLUMNS,
   createCreditReadRepository,
+  type BalanceSnapshotReadRow,
   type CreditReadRepository,
   type CreditTransactionReadRow,
   type SubscriptionReadRow,
@@ -22,16 +25,18 @@ import {
 
 /**
  * These tests drive the real repository against a recording fake pool. No
- * database and no `DATABASE_URL` are involved: the point is the two statements
+ * database and no `DATABASE_URL` are involved: the point is the three statements
  * the repository can issue, the actor context they carry (none), the columns
- * they project, the two bind parameters of the list read, and how every way
- * those statements can answer is classified.
+ * they project, the bind parameters of the list read and of the balance
+ * snapshot, and how every way those statements can answer is classified.
  *
  * The unit tests prove WHICH statements are built — one SELECT each, one table
- * each, no batch, `limit` bound and never concatenated. The PGlite file beside
- * them (`test-support/db/credit-read-repository-db.test.ts`) proves PostgreSQL
+ * each, no batch, `limit` bound and never concatenated, the claim date bound as
+ * `$2::date` and never as `current_date`. The PGlite file beside them
+ * (`test-support/db/credit-read-repository-db.test.ts`) proves PostgreSQL
  * actually parses and executes them against the real tables, that a malformed
- * uuid rolls back and leaves the pool usable, and that neither read moves a row.
+ * uuid rolls back and leaves the pool usable, and that none of the three reads
+ * moves a row.
  */
 
 const WORKSPACE_ID = "00000000-0000-0000-0000-0000000021b1";
@@ -41,6 +46,10 @@ const JOB_ID = "00000000-0000-0000-0000-0000000021c2";
 
 /** A limit that cannot appear inside either statement by coincidence. */
 const LIMIT = 37;
+
+/** The day the snapshot is asked about, and a day it must not answer for. */
+const CLAIM_DATE = "2026-10-17";
+const OTHER_CLAIM_DATE = "2026-10-16";
 
 type QueryRecord = { sql: string; params?: readonly unknown[] };
 
@@ -231,6 +240,44 @@ function requireRow<T>(row: T | null): T {
   return row;
 }
 
+/**
+ * The one row the balance snapshot answers, in the shape the statement produces
+ * it: `integer` for the balance, the plan enum as its text and a real boolean
+ * from `exists`.
+ */
+function balanceSnapshotRow(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { balance: 42, plan: "pro", daily_claimed: true, ...overrides };
+}
+
+/**
+ * The same row for a workspace with neither a balance row nor a subscription
+ * row: the two columns are explicit SQL NULLs and `exists` still answers false.
+ */
+function absentBalanceSnapshotRow(): Record<string, unknown> {
+  return balanceSnapshotRow({ balance: null, plan: null, daily_claimed: false });
+}
+
+function snapshot(
+  repository: CreditReadRepository,
+  input: { workspaceId?: unknown; claimDate?: unknown } = {},
+) {
+  // `in` rather than `??`: an EXPLICIT `undefined` is one of the refused
+  // arguments, so it must not be replaced by the default here.
+  return repository.readBalanceSnapshot({
+    workspaceId: ("workspaceId" in input
+      ? input.workspaceId
+      : WORKSPACE_ID) as string,
+    claimDate: ("claimDate" in input ? input.claimDate : CLAIM_DATE) as string,
+  });
+}
+
+/** The statement with every run of whitespace collapsed, for shape assertions. */
+function normalized(sql: string): string {
+  return sql.replace(/\s+/g, " ").trim();
+}
+
 describe("credit-read-repository: the statements it issues", () => {
   it("case 1: listTransactions reads inside one privileged transaction with NO actor", async () => {
     const harness = createHarness(() => [transactionRow()]);
@@ -392,18 +439,22 @@ describe("credit-read-repository: the statements it issues", () => {
     ]);
   });
 
-  it("case 7: the repository exposes two reads and nothing else", () => {
+  it("case 7: the repository exposes three reads and nothing else", () => {
     const harness = createHarness(() => [transactionRow()]);
     const repository = repositoryFor(harness);
 
     // There is no access token, no table name and no generic filter entry point
-    // a caller could widen either read with.
+    // a caller could widen any read with.
     expect(Object.keys(repository)).toEqual([
       LIST_TRANSACTIONS,
       READ_SUBSCRIPTION,
+      READ_BALANCE_SNAPSHOT,
     ]);
     expect(repository.listTransactions).toHaveLength(1);
     expect(repository.readSubscription).toHaveLength(1);
+    // One argument object: the snapshot cannot be asked for without the date it
+    // is about, and the date travels in the same call as the workspace.
+    expect(repository.readBalanceSnapshot).toHaveLength(1);
   });
 });
 
@@ -875,5 +926,331 @@ describe("credit-read-repository: zero rows, many rows and failures", () => {
       subscription(guarded, { workspaceId: "" }),
     ).rejects.toBeInstanceOf(CreditReadError);
     expect(reachedPool).toBe(0);
+  });
+});
+
+describe("credit-read-repository: the balance snapshot statement", () => {
+  it("case 31: one privileged statement, two bind parameters and NO actor", async () => {
+    const harness = createHarness(() => [balanceSnapshotRow()]);
+
+    await snapshot(repositoryFor(harness));
+
+    const statements = harness.queries.map((entry) => entry.sql);
+    expect(statements[0]).toBe(TRANSACTION_STATEMENTS.begin);
+    expect(statements.at(-1)).toBe(TRANSACTION_STATEMENTS.commit);
+    // ONE domain statement: the three answers are not three round trips, so a
+    // claim cannot land between them and make the row describe two instants.
+    expect(domainCalls(harness.queries)).toHaveLength(1);
+    expect(harness.connectAttempts()).toBe(1);
+
+    const isTransactionStatement = (sql: string): boolean =>
+      sql === TRANSACTION_STATEMENTS.begin ||
+      sql === TRANSACTION_STATEMENTS.commit ||
+      sql === TRANSACTION_STATEMENTS.setLocalSetting;
+    const domainStatements = statements.filter(
+      (sql) => !isTransactionStatement(sql),
+    );
+    expect(domainStatements).toHaveLength(1);
+
+    // Between BEGIN and the read there is context and nothing else, and COMMIT
+    // follows the read immediately.
+    const selectIndex = statements.findIndex(
+      (sql) => !isTransactionStatement(sql),
+    );
+    expect(
+      statements
+        .slice(1, selectIndex)
+        .every((sql) => sql === TRANSACTION_STATEMENTS.setLocalSetting),
+    ).toBe(true);
+    expect(statements[selectIndex + 1]).toBe(TRANSACTION_STATEMENTS.commit);
+
+    // A system read on behalf of an already-authorised caller: no acting user is
+    // forged, and the mode is the explicit privileged label.
+    expect(contextParams(harness.queries)).toEqual([
+      [TRANSACTION_SETTING_NAMES.userId, ""],
+      [TRANSACTION_SETTING_NAMES.workspaceId, ""],
+      [TRANSACTION_SETTING_NAMES.role, ""],
+      [TRANSACTION_SETTING_NAMES.executionMode, "privileged"],
+    ]);
+  });
+
+  it("case 32: the statement is exactly three scalar subqueries plus exists", async () => {
+    const harness = createHarness(() => [balanceSnapshotRow()]);
+
+    await snapshot(repositoryFor(harness));
+
+    const sql = normalized(statementText(harness.queries));
+    expect(sql).toBe(
+      "select " +
+        "(select b.balance from public.credit_balances b " +
+        "where b.workspace_id = $1::uuid) as balance, " +
+        "(select s.plan from public.subscriptions s " +
+        "where s.workspace_id = $1::uuid) as plan, " +
+        "exists (select 1 from public.daily_credit_claims d " +
+        "where d.workspace_id = $1::uuid and d.claim_date = $2::date) " +
+        "as daily_claimed",
+    );
+
+    // Three tables, each read once, each behind the caller's own workspace id.
+    expect(sql.match(/public\.[a-z_]+/g)).toEqual([
+      "public.credit_balances",
+      "public.subscriptions",
+      "public.daily_credit_claims",
+    ]);
+    // `exists` is SQL, NOT `count(*)`: `count` returns `bigint`, which both
+    // drivers hand back as a STRING, so the boolean would have to be rebuilt
+    // outside the statement.
+    expect(sql).not.toMatch(/count\s*\(/i);
+    expect(sql).toContain("exists (select 1");
+    // One row, always: no ordering, no limit, no offset narrows or widens it.
+    expect(sql).not.toMatch(/\border by\b|\blimit\b|\boffset\b/i);
+    expect(sql).not.toContain(";");
+    expect(sql).not.toMatch(/\bjoin\b/i);
+    // The date is the CALLER's, bound as `$2::date`. `current_date` would move
+    // the day into the database's timezone, which is a different question.
+    expect(sql).toContain("d.claim_date = $2::date");
+    expect(sql).not.toContain("current_date");
+  });
+
+  it("case 33: the workspace id and the claim date are bind parameters, never statement text", async () => {
+    const harness = createHarness(() => [balanceSnapshotRow()]);
+
+    await snapshot(repositoryFor(harness), { claimDate: OTHER_CLAIM_DATE });
+
+    const statement = domainCalls(harness.queries)[0];
+    expect(statement?.params).toEqual([WORKSPACE_ID, OTHER_CLAIM_DATE]);
+    expect(statement?.sql).toContain("$1::uuid");
+    expect(statement?.sql).toContain("$2::date");
+    // Neither value appears in the statement, and nothing is interpolated.
+    expect(statement?.sql).not.toContain(WORKSPACE_ID);
+    expect(statement?.sql).not.toContain(OTHER_CLAIM_DATE);
+    expect(statement?.sql).not.toContain("${");
+  });
+
+  it("case 34: a claim date that is not YYYY-MM-DD is refused before any connection", async () => {
+    const refusals: unknown[] = [
+      "2026-1-5",
+      "2026/01/05",
+      "",
+      "2026-01-05T00:00",
+      "2026-01-05T00:00:00.000Z",
+      "05-01-2026",
+      " 2026-01-05",
+      "2026-01-05 ",
+      undefined,
+      null,
+      20260105,
+      {},
+      new Date("2026-01-05T00:00:00.000Z"),
+    ];
+
+    for (const claimDate of refusals) {
+      const harness = createHarness(() => [balanceSnapshotRow()]);
+      const error = await snapshot(repositoryFor(harness), { claimDate }).catch(
+        (reason: unknown) => reason,
+      );
+
+      expect([claimDate, error instanceof CreditReadError]).toEqual([
+        claimDate,
+        true,
+      ]);
+      expect((error as CreditReadError).operation).toBe(READ_BALANCE_SNAPSHOT);
+      // Nothing was connected, nothing was begun and nothing was sent: a value
+      // that is not a date of the agreed shape must never become a query, and
+      // the failure must not be reported as a database one.
+      expect(harness.connectAttempts()).toBe(0);
+      expect(harness.queries).toHaveLength(0);
+    }
+  });
+
+  it("case 35: a refused claim date never resolves the pool", async () => {
+    let reachedPool = 0;
+    const guarded = createCreditReadRepository({
+      getTransactionPool: () => {
+        reachedPool += 1;
+        throw new Error("the pool must not be resolved for a refused date");
+      },
+    });
+
+    for (const claimDate of ["2026-1-5", "2026/01/05", "", "2026-01-05T00:00"]) {
+      await expect(
+        snapshot(guarded, { claimDate }),
+      ).rejects.toBeInstanceOf(CreditReadError);
+    }
+    await expect(
+      snapshot(guarded, { workspaceId: "" }),
+    ).rejects.toBeInstanceOf(CreditReadError);
+
+    expect(reachedPool).toBe(0);
+  });
+});
+
+describe("credit-read-repository: the balance snapshot row", () => {
+  it("case 36: the row is read by name, keys in column order", async () => {
+    const harness = createHarness(() => [balanceSnapshotRow()]);
+
+    const row = await snapshot(repositoryFor(harness));
+
+    expect(Object.keys(row)).toEqual([...BALANCE_SNAPSHOT_COLUMNS]);
+    expect(row).toEqual({
+      balance: 42,
+      plan: "pro",
+      daily_claimed: true,
+    } satisfies BalanceSnapshotReadRow);
+    // A balance of zero is a VALUE, not an absence: the two must not be folded
+    // together, because the service turns the absence into the same zero.
+    const zero = createHarness(() => [
+      balanceSnapshotRow({ balance: 0, daily_claimed: false }),
+    ]);
+    await expect(snapshot(repositoryFor(zero))).resolves.toEqual({
+      balance: 0,
+      plan: "pro",
+      daily_claimed: false,
+    });
+  });
+
+  it("case 37: balance drift — a string, a negative, a float, NaN, an infinity, an absent column", async () => {
+    // Each answer is a COMPLETE row, because `removeColumn` has to be the last
+    // word on the key it removes: spreading a partial override onto the default
+    // row would put the removed column straight back.
+    const answers: Array<Record<string, unknown>> = [
+      balanceSnapshotRow({ balance: "5" }),
+      // `CHECK (balance >= 0)` makes a negative impossible, so it is drift.
+      balanceSnapshotRow({ balance: -1 }),
+      balanceSnapshotRow({ balance: 42.5 }),
+      balanceSnapshotRow({ balance: Number.NaN }),
+      balanceSnapshotRow({ balance: Number.POSITIVE_INFINITY }),
+      balanceSnapshotRow({ balance: {} }),
+      removeColumn(balanceSnapshotRow(), "balance"),
+    ];
+
+    for (const drift of answers) {
+      const harness = createHarness(() => [drift]);
+      const error = await snapshot(repositoryFor(harness)).catch(
+        (reason: unknown) => reason,
+      );
+
+      expect([drift, error instanceof CreditReadError]).toEqual([drift, true]);
+      expect((error as CreditReadError).operation).toBe(READ_BALANCE_SNAPSHOT);
+      // The shape refusal happens INSIDE the transaction, so it rolls back on
+      // exactly the same path as a real SQL failure.
+      expect(lastStatement(harness)).toBe(TRANSACTION_STATEMENTS.rollback);
+    }
+  });
+
+  it("case 38: plan drift — a non-string, an empty string and an absent column", async () => {
+    const answers: Array<Record<string, unknown>> = [
+      balanceSnapshotRow({ plan: 7 }),
+      balanceSnapshotRow({ plan: "" }),
+      balanceSnapshotRow({ plan: false }),
+      removeColumn(balanceSnapshotRow(), "plan"),
+    ];
+
+    for (const drift of answers) {
+      const harness = createHarness(() => [drift]);
+
+      await expect(snapshot(repositoryFor(harness))).rejects.toBeInstanceOf(
+        CreditReadError,
+      );
+      expect(lastStatement(harness)).toBe(TRANSACTION_STATEMENTS.rollback);
+    }
+  });
+
+  it("case 39: daily_claimed drift — text, a number, null and an absent column", async () => {
+    // `"t"` is what a `count(*) > 0` or a `boolean::text` projection produces;
+    // accepting it would turn a broken projection into "already claimed today".
+    const answers: Array<Record<string, unknown>> = [
+      balanceSnapshotRow({ daily_claimed: "t" }),
+      balanceSnapshotRow({ daily_claimed: "true" }),
+      balanceSnapshotRow({ daily_claimed: 1 }),
+      balanceSnapshotRow({ daily_claimed: 0 }),
+      balanceSnapshotRow({ daily_claimed: null }),
+      removeColumn(balanceSnapshotRow(), "daily_claimed"),
+    ];
+
+    for (const drift of answers) {
+      const harness = createHarness(() => [drift]);
+
+      await expect(snapshot(repositoryFor(harness))).rejects.toBeInstanceOf(
+        CreditReadError,
+      );
+      expect(lastStatement(harness)).toBe(TRANSACTION_STATEMENTS.rollback);
+    }
+  });
+
+  it("case 40: an all-absent row is a legal answer and the transaction commits", async () => {
+    const harness = createHarness(() => [absentBalanceSnapshotRow()]);
+
+    await expect(snapshot(repositoryFor(harness))).resolves.toEqual({
+      balance: null,
+      plan: null,
+      daily_claimed: false,
+    });
+
+    // A workspace that has neither row is not an error: the service turns the
+    // two nulls into `0` and `"free"`, and the read must not roll back.
+    expect(lastStatement(harness)).toBe(TRANSACTION_STATEMENTS.commit);
+    expect(harness.queries.map((entry) => entry.sql)).not.toContain(
+      TRANSACTION_STATEMENTS.rollback,
+    );
+  });
+
+  it("case 41: zero rows and more than one row are both failures, and both roll back", async () => {
+    // The statement has no `from` clause of its own, so it answers exactly one
+    // row for EVERY workspace; any other count is a disagreement between the
+    // statement and this mapper rather than a value.
+    for (const rows of [
+      [],
+      [balanceSnapshotRow(), balanceSnapshotRow()],
+      [balanceSnapshotRow(), balanceSnapshotRow(), balanceSnapshotRow()],
+    ]) {
+      const harness = createHarness(() => rows);
+      const error = await snapshot(repositoryFor(harness)).catch(
+        (reason: unknown) => reason,
+      );
+
+      expect(error).toBeInstanceOf(CreditReadError);
+      expect((error as CreditReadError).operation).toBe(READ_BALANCE_SNAPSHOT);
+      expect(lastStatement(harness)).toBe(TRANSACTION_STATEMENTS.rollback);
+    }
+  });
+
+  it("case 42: a SQL failure rolls back, keeps its cause and leaks nothing", async () => {
+    const failure = new Error(
+      "select ... from public.credit_balances failed: " +
+        "postgres://loomic:secret@10.210.134.37:5432/loomic",
+    );
+    const harness = createHarness(() => {
+      throw failure;
+    });
+
+    const error = await snapshot(repositoryFor(harness)).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(CreditReadError);
+    const readError = error as CreditReadError;
+    expect(readError.operation).toBe(READ_BALANCE_SNAPSHOT);
+    expect(readError.message).toBe(
+      `credit read failed (${READ_BALANCE_SNAPSHOT})`,
+    );
+    expect(readError.cause).toBe(failure);
+    expect(lastStatement(harness)).toBe(TRANSACTION_STATEMENTS.rollback);
+    expect(readError.message).not.toMatch(
+      /public\.|credit_balances|postgres:\/\/|10\.210\.134\.37|secret/i,
+    );
+    expect(readError.message).not.toContain(WORKSPACE_ID);
+    expect(readError.message).not.toContain(CLAIM_DATE);
+  });
+
+  it("case 43: a row that is not an object is a failure, not a value", async () => {
+    for (const answer of [null, "not a row", [balanceSnapshotRow()], 42, true]) {
+      const harness = createHarness(() => [answer]);
+
+      await expect(snapshot(repositoryFor(harness))).rejects.toBeInstanceOf(
+        CreditReadError,
+      );
+      expect(lastStatement(harness)).toBe(TRANSACTION_STATEMENTS.rollback);
+    }
   });
 });

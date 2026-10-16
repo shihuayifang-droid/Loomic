@@ -627,11 +627,25 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // files name no client method either, so `fromCallsIncludingTests` follows
     // `fromCalls` down again. The RPC counters are untouched: `refund_credits` is
     // still the one RPC of this path and this migration removed no RPC call site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(119);
+    //
+    // Workorder 21P then removed the LAST three admin PostgREST reads of
+    // `features/credits/credit-service.ts` — the parallel `Promise.all` behind
+    // `getBalance` (the workspace balance, the workspace subscription and the
+    // day's claim row) — so both counters below move down together again
+    // (119->116). That is a real coupling removal rather than a counting change:
+    // `getBalance` no longer receives an admin client at all, and the ONE
+    // statement that replaces the three reads can only reach PostgreSQL, where
+    // the workspace predicate is `$1::uuid`, the day is bound as `$2::date` and
+    // the claim answer is an `exists` inside the statement instead of a row that
+    // may or may not come back. Its three test files name no client method, so
+    // `fromCallsIncludingTests` follows `fromCalls` down again. The RPC counters
+    // are untouched: this migration removed no RPC call site — the remaining RPC
+    // of that service is still the plan grant.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(116);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(119);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(116);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

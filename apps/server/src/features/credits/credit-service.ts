@@ -86,11 +86,12 @@ export type CreditService = {
 // ── Factory ──────────────────────────────────────────────────
 
 /**
- * `creditReadRepository` is OPTIONAL on purpose (workorder 21K): the two reads
- * it serves are the only ones that moved, and the remaining methods still work
- * through the admin client. When it is absent those two reads fail closed as
- * their existing `credit_query_failed` 500 — there is no PostgREST fallback and
- * the admin client is no longer reachable from them at all.
+ * `creditReadRepository` is OPTIONAL on purpose (workorders 21K and 21P): the
+ * three reads it serves — the transaction list, the subscription row and the
+ * balance snapshot — are the only ones that moved, and the remaining methods
+ * still work through the admin client. When it is absent those three reads fail
+ * closed as their existing `credit_query_failed` 500 — there is no PostgREST
+ * fallback and the admin client is no longer reachable from them at all.
  */
 export function createCreditService(options: {
   getAdminClient: () => AdminSupabaseClient;
@@ -98,41 +99,33 @@ export function createCreditService(options: {
 }): CreditService {
   return {
     async getBalance(workspaceId) {
-      const admin = options.getAdminClient();
+      try {
+        const repository = options.creditReadRepository;
+        if (!repository) {
+          throw new Error("credit balance read needs a repository");
+        }
 
-      const [balanceResult, subscriptionResult, dailyClaimResult] =
-        await Promise.all([
-          admin
-            .from("credit_balances")
-            .select("balance")
-            .eq("workspace_id", workspaceId)
-            .maybeSingle(),
-          admin
-            .from("subscriptions")
-            .select("plan")
-            .eq("workspace_id", workspaceId)
-            .maybeSingle(),
-          admin
-            .from("daily_credit_claims")
-            .select("id")
-            .eq("workspace_id", workspaceId)
-            .eq("claim_date", new Date().toISOString().slice(0, 10))
-            .maybeSingle(),
-        ]);
+        // The date is computed HERE, exactly as it always was: the JavaScript
+        // UTC date, not the database's `current_date`. The two disagree whenever
+        // the database timezone is not UTC — a known, separately registered
+        // problem this migration deliberately does not touch.
+        const row = await repository.readBalanceSnapshot({
+          workspaceId,
+          claimDate: new Date().toISOString().slice(0, 10),
+        });
 
-      if (balanceResult.error || subscriptionResult.error) {
+        return {
+          balance: row.balance ?? 0,
+          plan: (row.plan as SubscriptionPlan) ?? "free",
+          dailyClaimed: row.daily_claimed,
+        };
+      } catch {
         throw new CreditServiceError(
           "credit_query_failed",
           "Failed to query credit balance.",
           500,
         );
       }
-
-      return {
-        balance: balanceResult.data?.balance ?? 0,
-        plan: (subscriptionResult.data?.plan as SubscriptionPlan) ?? "free",
-        dailyClaimed: dailyClaimResult.data !== null,
-      };
     },
 
     async deductCredits(workspaceId, userId, amount, jobId, description) {

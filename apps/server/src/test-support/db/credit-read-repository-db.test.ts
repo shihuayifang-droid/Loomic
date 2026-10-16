@@ -1,11 +1,13 @@
 import type { PGlite } from "@electric-sql/pglite";
 import { creditTransactionSchema, creditTransactionsResponseSchema } from "@loomic/shared";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
+  BALANCE_SNAPSHOT_COLUMNS,
   CREDIT_TRANSACTION_COLUMNS,
   CreditReadError,
   LIST_TRANSACTIONS,
+  READ_BALANCE_SNAPSHOT,
   READ_SUBSCRIPTION,
   SUBSCRIPTION_COLUMNS,
   createCreditReadRepository,
@@ -25,7 +27,7 @@ import {
 } from "./pglite-db.js";
 
 /**
- * Real-SQL integration for the credits read repository (workorder 21K).
+ * Real-SQL integration for the credits read repository (workorders 21K and 21P).
  *
  * The unit tests beside the repository prove WHICH statements are built. This
  * file proves PostgreSQL actually parses and executes them against the real
@@ -42,12 +44,17 @@ import {
  *     columns are never null;
  *   - the subscription row is the workspace's own, at most one by
  *     `UNIQUE (workspace_id)`, and an absent row is `null` rather than defaults;
+ *   - the balance snapshot is ONE row for every workspace — including one that
+ *     does not exist — carrying that workspace's own balance, its own plan and
+ *     whether ITS row for the requested day is there; a workspace whose two rows
+ *     were deleted answers `null`/`null`/`false`, which the service turns into
+ *     `0`/`"free"`/`false`;
  *   - a malformed uuid is a real SQL error that rolls back and leaves the same
- *     pool usable, for both reads;
- *   - neither read moves a row, and the transaction-local context of the read
+ *     pool usable, for all three reads;
+ *   - none of the reads moves a row, and the transaction-local context of a read
  *     does not survive COMMIT;
  *   - with no repository wired the service fails closed instead of reaching for
- *     the admin client it used to read through.
+ *     the admin client those reads used to go through.
  *
  * The database is PGlite: in-process, in-repo, no server, no socket, no
  * `DATABASE_URL`, no connection to any host. One instance is migrated in
@@ -58,6 +65,23 @@ import {
 const USER_ID = "00000000-0000-0000-0000-0000000021f0";
 const OTHER_USER_ID = "00000000-0000-0000-0000-0000000021f1";
 const EMPTY_USER_ID = "00000000-0000-0000-0000-0000000021f2";
+
+/**
+ * Four further workspaces for the balance snapshot, each with ONE job:
+ * `pristineWorkspaceId` is never written to, so the trigger's own defaults can
+ * be read back; `snapshotWorkspaceId` is the mutable subject; the other two
+ * exist so the isolation and "no rows at all" answers are measured on rows no
+ * earlier case touched.
+ */
+const PRISTINE_USER_ID = "00000000-0000-0000-0000-0000000021f3";
+const SNAPSHOT_USER_ID = "00000000-0000-0000-0000-0000000021f4";
+const NEIGHBOUR_USER_ID = "00000000-0000-0000-0000-0000000021f5";
+const GUTTED_USER_ID = "00000000-0000-0000-0000-0000000021f6";
+
+/** The days the snapshot cases ask about, and a day none of them claims. */
+const CLAIM_DATE = "2026-10-17";
+const PREVIOUS_CLAIM_DATE = "2026-10-16";
+const UNRELATED_CLAIM_DATE = "2000-01-01";
 
 const JOB_ID = "00000000-0000-0000-0000-000000002100";
 
@@ -135,6 +159,10 @@ let repository: CreditReadRepository;
 let workspaceId = "";
 let otherWorkspaceId = "";
 let emptyWorkspaceId = "";
+let pristineWorkspaceId = "";
+let snapshotWorkspaceId = "";
+let neighbourWorkspaceId = "";
+let guttedWorkspaceId = "";
 
 function firstRow<T>(rows: readonly T[]): T {
   const row = rows[0];
@@ -276,6 +304,71 @@ update public.subscriptions
  where workspace_id = $1::uuid
 `;
 
+/**
+ * The balance snapshot fixtures: the balance and the plan are UPDATEd rather
+ * than inserted, because `trg_init_workspace_credits` already gave every
+ * workspace one row of each, and the claim table starts empty.
+ */
+const UPDATE_BALANCE_SQL = `
+update public.credit_balances
+   set balance = $2
+ where workspace_id = $1::uuid
+`;
+
+/**
+ * Putting a DELETED balance row back. An `update` cannot do it — it matches no
+ * row — so the restore is an upsert, which also covers the case where the row is
+ * still there.
+ */
+const RESTORE_BALANCE_SQL = `
+insert into public.credit_balances (workspace_id, balance)
+values ($1::uuid, $2)
+on conflict (workspace_id) do update set balance = excluded.balance
+`;
+
+const UPDATE_PLAN_SQL = `
+update public.subscriptions
+   set plan = $2::public.subscription_plan
+ where workspace_id = $1::uuid
+`;
+
+const INSERT_CLAIM_SQL = `
+insert into public.daily_credit_claims (workspace_id, claim_date, amount)
+values ($1::uuid, $2::date, $3)
+`;
+
+const DELETE_CLAIMS_SQL =
+  "delete from public.daily_credit_claims where workspace_id = $1::uuid";
+
+const DELETE_BALANCE_SQL =
+  "delete from public.credit_balances where workspace_id = $1::uuid";
+
+const DELETE_SUBSCRIPTION_SQL =
+  "delete from public.subscriptions where workspace_id = $1::uuid";
+
+/**
+ * The balance, the subscription and the claim tables as ONE comparable text, for
+ * "the read moved nothing". Independent of the repository: it is the database's
+ * own rendering of every row of the three tables the snapshot touches.
+ */
+async function creditTablesSnapshot(): Promise<string> {
+  const row = firstRow(
+    (
+      await db.query<{ rows_text: string }>(
+        `select
+           (select coalesce(string_agg(b::text, '|' order by b.id), '')
+              from public.credit_balances as b) ||
+           (select coalesce(string_agg(s::text, '|' order by s.id), '')
+              from public.subscriptions as s) ||
+           (select coalesce(string_agg(d::text, '|' order by d.id), '')
+              from public.daily_credit_claims as d) as rows_text`,
+      )
+    ).rows,
+  );
+
+  return row.rows_text;
+}
+
 /** The database's own answer for one workspace's list, in the repository shape. */
 async function transactionTruth(
   workspace: string,
@@ -313,6 +406,16 @@ async function serviceRefusal(
   return error as CreditServiceError;
 }
 
+/** The balance snapshot read, over the real repository and real SQL. */
+function readSnapshot(
+  input: { workspaceId?: string; claimDate?: string } = {},
+) {
+  return repository.readBalanceSnapshot({
+    workspaceId: input.workspaceId ?? pristineWorkspaceId,
+    claimDate: input.claimDate ?? CLAIM_DATE,
+  });
+}
+
 async function personalWorkspaceId(userId: string): Promise<string> {
   return firstRow(
     (
@@ -337,9 +440,26 @@ beforeAll(async () => {
   await createUser(db, USER_ID, "credit-read@hahart.test");
   await createUser(db, OTHER_USER_ID, "credit-read-other@hahart.test");
   await createUser(db, EMPTY_USER_ID, "credit-read-empty@hahart.test");
+  await createUser(db, PRISTINE_USER_ID, "credit-read-pristine@hahart.test");
+  await createUser(db, SNAPSHOT_USER_ID, "credit-read-snapshot@hahart.test");
+  await createUser(db, NEIGHBOUR_USER_ID, "credit-read-neighbour@hahart.test");
+  await createUser(db, GUTTED_USER_ID, "credit-read-gutted@hahart.test");
   workspaceId = await personalWorkspaceId(USER_ID);
   otherWorkspaceId = await personalWorkspaceId(OTHER_USER_ID);
   emptyWorkspaceId = await personalWorkspaceId(EMPTY_USER_ID);
+  pristineWorkspaceId = await personalWorkspaceId(PRISTINE_USER_ID);
+  snapshotWorkspaceId = await personalWorkspaceId(SNAPSHOT_USER_ID);
+  neighbourWorkspaceId = await personalWorkspaceId(NEIGHBOUR_USER_ID);
+  guttedWorkspaceId = await personalWorkspaceId(GUTTED_USER_ID);
+
+  // `pristineWorkspaceId` is deliberately left exactly as the trigger built it:
+  // its `0` / `free` row is the "a new workspace starts here" answer.
+  //
+  // `guttedWorkspaceId` loses both rows, because the trigger guarantees a
+  // workspace HAS them: "no balance row and no subscription row" is only
+  // reachable once they are gone.
+  await db.query(DELETE_BALANCE_SQL, [guttedWorkspaceId]);
+  await db.query(DELETE_SUBSCRIPTION_SQL, [guttedWorkspaceId]);
 
   // The job one ledger row points at, so `job_id` can carry a real value
   // instead of NULL in the row that populates every column.
@@ -905,5 +1025,384 @@ describe("credit reads: through the real CreditService", () => {
     await expect(
       serviceRefusal(() => service.getSubscription(INVALID_ID)),
     ).resolves.toBeInstanceOf(CreditServiceError);
+  });
+});
+
+describe("credit balance snapshot: the row PostgreSQL answers", () => {
+  it("case 21: a workspace the trigger just built reads 0, free and no claim of the day", async () => {
+    const row = await readSnapshot({ workspaceId: pristineWorkspaceId });
+
+    // `trg_init_workspace_credits` creates BOTH rows for every new workspace
+    // (T-48), so "the defaults" are measured on rows this file never wrote.
+    expect(row).toEqual({ balance: 0, plan: "free", daily_claimed: false });
+    expect(Object.keys(row)).toEqual([...BALANCE_SNAPSHOT_COLUMNS]);
+
+    // The same three answers with a date the workspace has no row for at all.
+    await expect(
+      readSnapshot({ workspaceId: pristineWorkspaceId, claimDate: PREVIOUS_CLAIM_DATE }),
+    ).resolves.toEqual({
+      balance: 0,
+      plan: "free",
+      daily_claimed: false,
+    });
+  });
+
+  it("case 22: the balance and the plan are THIS workspace's own rows", async () => {
+    await db.query(UPDATE_BALANCE_SQL, [snapshotWorkspaceId, 42]);
+    await db.query(UPDATE_PLAN_SQL, [snapshotWorkspaceId, "pro"]);
+    await db.query(UPDATE_BALANCE_SQL, [neighbourWorkspaceId, 7]);
+    await db.query(UPDATE_PLAN_SQL, [neighbourWorkspaceId, "ultra"]);
+
+    await expect(readSnapshot({ workspaceId: snapshotWorkspaceId })).resolves.toEqual({
+      balance: 42,
+      plan: "pro",
+      daily_claimed: false,
+    });
+    await expect(readSnapshot({ workspaceId: neighbourWorkspaceId })).resolves.toEqual({
+      balance: 7,
+      plan: "ultra",
+      daily_claimed: false,
+    });
+    // A third workspace keeps the trigger's row while the other two moved: the
+    // predicate is the workspace id, not "any row of the table".
+    await expect(readSnapshot({ workspaceId: pristineWorkspaceId })).resolves.toEqual({
+      balance: 0,
+      plan: "free",
+      daily_claimed: false,
+    });
+  });
+
+  it("case 23: a claim in ANOTHER workspace is not this workspace's claim", async () => {
+    await db.query(DELETE_CLAIMS_SQL, [snapshotWorkspaceId]);
+    await db.query(DELETE_CLAIMS_SQL, [neighbourWorkspaceId]);
+    await db.query(INSERT_CLAIM_SQL, [neighbourWorkspaceId, CLAIM_DATE, 5]);
+
+    // The neighbour has the row; the subject does not.
+    await expect(readSnapshot({ workspaceId: snapshotWorkspaceId })).resolves.toMatchObject(
+      { daily_claimed: false },
+    );
+    await expect(readSnapshot({ workspaceId: neighbourWorkspaceId })).resolves.toMatchObject(
+      { daily_claimed: true },
+    );
+
+    // And now the other way round, so neither answer can come from a
+    // table-wide "does anyone hold this date" question.
+    await db.query(INSERT_CLAIM_SQL, [snapshotWorkspaceId, CLAIM_DATE, 3]);
+    await db.query(DELETE_CLAIMS_SQL, [neighbourWorkspaceId]);
+
+    await expect(readSnapshot({ workspaceId: snapshotWorkspaceId })).resolves.toMatchObject(
+      { daily_claimed: true },
+    );
+    await expect(readSnapshot({ workspaceId: neighbourWorkspaceId })).resolves.toMatchObject(
+      { daily_claimed: false },
+    );
+  });
+
+  it("case 24: a claim on the PREVIOUS day is not the claim of the asked day", async () => {
+    await db.query(DELETE_CLAIMS_SQL, [snapshotWorkspaceId]);
+    await db.query(INSERT_CLAIM_SQL, [snapshotWorkspaceId, PREVIOUS_CLAIM_DATE, 5]);
+
+    // The row is really there — reading the day it belongs to proves it — while
+    // the asked day must still answer false.
+    await expect(
+      readSnapshot({ workspaceId: snapshotWorkspaceId, claimDate: CLAIM_DATE }),
+    ).resolves.toMatchObject({ daily_claimed: false });
+    await expect(
+      readSnapshot({
+        workspaceId: snapshotWorkspaceId,
+        claimDate: PREVIOUS_CLAIM_DATE,
+      }),
+    ).resolves.toMatchObject({ daily_claimed: true });
+
+    // And with the asked day claimed as well, the two days answer differently
+    // from the very same table.
+    await db.query(INSERT_CLAIM_SQL, [snapshotWorkspaceId, CLAIM_DATE, 3]);
+
+    await expect(
+      readSnapshot({ workspaceId: snapshotWorkspaceId, claimDate: CLAIM_DATE }),
+    ).resolves.toMatchObject({ daily_claimed: true, balance: 42, plan: "pro" });
+    await expect(
+      readSnapshot({
+        workspaceId: snapshotWorkspaceId,
+        claimDate: UNRELATED_CLAIM_DATE,
+      }),
+    ).resolves.toMatchObject({ daily_claimed: false });
+  });
+
+  it("case 25: a missing balance row and a missing subscription row are null, not defaults", async () => {
+    const row = await readSnapshot({ workspaceId: guttedWorkspaceId });
+
+    // Both rows were deleted in `beforeAll`: the read answers `null` for the two
+    // columns rather than inventing the schema defaults, and `exists` — which has
+    // no row to find either — still answers a boolean.
+    expect(row).toEqual({ balance: null, plan: null, daily_claimed: false });
+    expect(Object.keys(row)).toEqual([...BALANCE_SNAPSHOT_COLUMNS]);
+  });
+
+  it("case 26: a workspace that does not exist answers the same single all-absent row", async () => {
+    // The statement has no `from` clause of its own, so "no such workspace" is
+    // not zero rows: it is one row of three absent answers.
+    const rows = (
+      await db.query(
+        `select
+           (select b.balance
+              from public.credit_balances b
+             where b.workspace_id = $1::uuid) as balance,
+           (select s.plan
+              from public.subscriptions s
+             where s.workspace_id = $1::uuid) as plan,
+           exists (select 1
+                     from public.daily_credit_claims d
+                    where d.workspace_id = $1::uuid
+                      and d.claim_date = $2::date) as daily_claimed`,
+        [UNKNOWN_WORKSPACE_ID, CLAIM_DATE],
+      )
+    ).rows;
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual({
+      balance: null,
+      plan: null,
+      daily_claimed: false,
+    });
+    await expect(
+      readSnapshot({ workspaceId: UNKNOWN_WORKSPACE_ID }),
+    ).resolves.toEqual(rows[0]);
+  });
+
+  it("case 27: a malformed uuid is a real SQL error, rolls back, and the pool stays usable", async () => {
+    const before = await creditTablesSnapshot();
+
+    // Independent of the repository: the server itself refuses the bind.
+    await expect(db.query("select $1::uuid as workspace_id", [INVALID_ID])).rejects.toThrow(
+      /invalid input syntax for type uuid/,
+    );
+
+    const error = await readSnapshot({ workspaceId: INVALID_ID }).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(error).toBeInstanceOf(CreditReadError);
+    const readError = error as CreditReadError;
+    expect(readError.operation).toBe(READ_BALANCE_SNAPSHOT);
+    // The fixed message carries no SQL, no host, no workspace id and no
+    // existence answer; the cause is the PostgreSQL parse failure.
+    expect(readError.message).toBe(
+      `credit read failed (${READ_BALANCE_SNAPSHOT})`,
+    );
+    expect(readError.message).not.toMatch(
+      /public\.|credit_balances|invalid input|postgres:\/\//i,
+    );
+    expect((readError.cause as Error).message).toMatch(
+      /invalid input syntax for type uuid/,
+    );
+
+    // The failed transaction moved nothing, and the very same pool answers.
+    expect(await creditTablesSnapshot()).toBe(before);
+    await expect(readSnapshot({ workspaceId: snapshotWorkspaceId })).resolves.toMatchObject(
+      { balance: 42, plan: "pro" },
+    );
+  });
+
+  it("case 28: the read is privileged, carries no actor, and its context does not leak", async () => {
+    const observed: SettingsRow[] = [];
+
+    // A pool that reads the four settings through the SAME connection, right
+    // after the repository's own statement: whatever it sees is the state of the
+    // transaction that statement ran in, not a reconstruction.
+    const observingPool: TransactionPool = {
+      async connect() {
+        const inner = await pool.connect();
+        return {
+          async query(sql: string, params?: readonly unknown[]) {
+            const result = await inner.query(sql, params);
+            if (sql.includes("public.credit_balances")) {
+              observed.push(
+                firstRow((await inner.query(READ_SETTINGS_SQL)).rows) as SettingsRow,
+              );
+            }
+            return result;
+          },
+          release(error?: Error | boolean) {
+            inner.release(error);
+          },
+        };
+      },
+    };
+
+    const observing = createCreditReadRepository({
+      getTransactionPool: () => observingPool,
+    });
+
+    await expect(
+      observing.readBalanceSnapshot({
+        workspaceId: pristineWorkspaceId,
+        claimDate: CLAIM_DATE,
+      }),
+    ).resolves.toEqual({ balance: 0, plan: "free", daily_claimed: false });
+
+    expect(observed).toHaveLength(1);
+    // No forged user: this is a system read on behalf of an already-authorised
+    // caller, so every actor setting is empty and the mode is explicit.
+    expect(observed[0]).toEqual({
+      user_id: "",
+      workspace_id: "",
+      role: "",
+      execution_mode: "privileged",
+    });
+
+    // And immediately after COMMIT the same four settings are gone, so the
+    // context of one read cannot become the context of the next statement.
+    const gone = firstRow((await db.query<SettingsGoneRow>(SETTINGS_GONE_SQL)).rows);
+    expect(gone).toEqual({
+      user_id: true,
+      workspace_id: true,
+      role: true,
+      execution_mode: true,
+    });
+  });
+
+  it("case 29: the read changes no row of any of the three tables", async () => {
+    const before = await creditTablesSnapshot();
+
+    await readSnapshot({ workspaceId: snapshotWorkspaceId });
+    await readSnapshot({ workspaceId: neighbourWorkspaceId });
+    await readSnapshot({ workspaceId: pristineWorkspaceId, claimDate: PREVIOUS_CLAIM_DATE });
+    await readSnapshot({ workspaceId: guttedWorkspaceId });
+
+    // Every row of all three tables as `::text`, before and after: no balance
+    // moved, no plan moved, no claim and no `updated_at` was touched.
+    expect(await creditTablesSnapshot()).toBe(before);
+  });
+});
+
+describe("credit balance snapshot: through the real CreditService", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("case 30: getBalance over the real statement and a frozen UTC clock", async () => {
+    await db.query(UPDATE_BALANCE_SQL, [snapshotWorkspaceId, 42]);
+    await db.query(UPDATE_PLAN_SQL, [snapshotWorkspaceId, "pro"]);
+    await db.query(DELETE_CLAIMS_SQL, [snapshotWorkspaceId]);
+    // The claim belongs to the 17th; the frozen instant is 23:30 on the 16th at
+    // UTC-8, which IS the 17th in UTC. Only the JS UTC date can find this row.
+    await db.query(INSERT_CLAIM_SQL, [snapshotWorkspaceId, CLAIM_DATE, 5]);
+
+    // Only `Date` is faked: PGlite keeps its real timers, so the database is not
+    // affected by the clock this test pins.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-16T23:30:00-08:00"));
+
+    const service = buildService();
+
+    expect(new Date().toISOString()).toBe("2026-10-17T07:30:00.000Z");
+    await expect(service.getBalance(snapshotWorkspaceId)).resolves.toEqual({
+      balance: 42,
+      plan: "pro",
+      dailyClaimed: true,
+    });
+    // A workspace with no claim of that day answers false through the same path.
+    await expect(service.getBalance(pristineWorkspaceId)).resolves.toEqual({
+      balance: 0,
+      plan: "free",
+      dailyClaimed: false,
+    });
+  });
+
+  it("case 31: a claim on the previous day answers false through the service", async () => {
+    await db.query(DELETE_CLAIMS_SQL, [snapshotWorkspaceId]);
+    await db.query(INSERT_CLAIM_SQL, [snapshotWorkspaceId, PREVIOUS_CLAIM_DATE, 5]);
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-16T23:30:00-08:00"));
+
+    const service = buildService();
+
+    const row = await service.getBalance(snapshotWorkspaceId);
+
+    expect(row).toEqual({ balance: 42, plan: "pro", dailyClaimed: false });
+    // The 16th's row exists — the 17th simply is not the 16th.
+    const claims = (
+      await db.query<{ n: number }>(
+        "select count(*)::int as n from public.daily_credit_claims where workspace_id = $1::uuid",
+        [snapshotWorkspaceId],
+      )
+    ).rows;
+    expect(firstRow(claims).n).toBe(1);
+  });
+
+  it("case 32: a deleted balance row still answers 0 while the claim stays true", async () => {
+    await db.query(DELETE_CLAIMS_SQL, [snapshotWorkspaceId]);
+    await db.query(INSERT_CLAIM_SQL, [snapshotWorkspaceId, CLAIM_DATE, 3]);
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-16T23:30:00-08:00"));
+
+    const service = buildService();
+
+    // The claim is a row of its OWN table, so removing the balance must not take
+    // the other two answers with it: 0 is the default, `true` is a real claim.
+    await db.query(DELETE_BALANCE_SQL, [snapshotWorkspaceId]);
+
+    await expect(service.getBalance(snapshotWorkspaceId)).resolves.toEqual({
+      balance: 0,
+      plan: "pro",
+      dailyClaimed: true,
+    });
+
+    // Put the balance back for the cases that follow. An update cannot restore a
+    // row that is gone, so this is an upsert.
+    await db.query(RESTORE_BALANCE_SQL, [snapshotWorkspaceId, 42]);
+  });
+
+  it("case 33: an unknown workspace answers 0, free and false rather than failing", async () => {
+    const service = buildService();
+
+    await expect(service.getBalance(UNKNOWN_WORKSPACE_ID)).resolves.toEqual({
+      balance: 0,
+      plan: "free",
+      dailyClaimed: false,
+    });
+    // The same answer the workspace whose rows were deleted gives: through the
+    // service the two are indistinguishable, exactly as they were before.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-16T23:30:00-08:00"));
+    await expect(service.getBalance(guttedWorkspaceId)).resolves.toEqual({
+      balance: 0,
+      plan: "free",
+      dailyClaimed: false,
+    });
+  });
+
+  it("case 34: with no repository wired the balance read fails closed too", async () => {
+    const service = buildService(true);
+
+    const error = await serviceRefusal(() =>
+      service.getBalance(snapshotWorkspaceId),
+    );
+
+    expect(error.code).toBe("credit_query_failed");
+    expect(error.statusCode).toBe(500);
+    expect(error.message).toBe("Failed to query credit balance.");
+
+    // The rows really are there — the refusal is the missing dependency, not a
+    // workspace without a balance, and nothing fell back to the admin client
+    // (whose stub would have thrown a different error).
+    await expect(readSnapshot({ workspaceId: snapshotWorkspaceId })).resolves.toMatchObject(
+      { balance: 42, plan: "pro" },
+    );
+  });
+
+  it("case 35: a malformed uuid is the same 500 through the service", async () => {
+    const service = buildService();
+
+    const error = await serviceRefusal(() => service.getBalance(INVALID_ID));
+
+    expect(error.code).toBe("credit_query_failed");
+    expect(error.statusCode).toBe(500);
+    expect(error.message).toBe("Failed to query credit balance.");
+    // The driver's own message never reaches the response.
+    expect(error.message).not.toMatch(/uuid|invalid input|public\./i);
   });
 });

@@ -1,7 +1,7 @@
 /**
  * Read-only credits repository (workorder 21K, ADR-0001 migration step 2).
  *
- * TWO admin PostgREST reads move here, both behind
+ * THREE admin PostgREST reads move here, all behind
  * `features/credits/credit-service.ts`:
  *
  * 1. the recent-transactions list of one workspace
@@ -9,15 +9,19 @@
  *    read by `GET /api/credits/transactions`;
  * 2. the single subscription row of one workspace (`subscriptions`, at most one
  *    row because `UNIQUE (workspace_id)` holds it), read by `getSubscription`
- *    on the billing gate's path.
+ *    on the billing gate's path;
+ * 3. the three answers `getBalance` needs — the balance, the plan and whether
+ *    one specific claim date has already been claimed — which used to be THREE
+ *    parallel PostgREST reads and are now ONE statement, so all three answers
+ *    belong to the same database snapshot.
  *
  * Rules this module keeps:
  *
- * - `listTransactions` and `readSubscription` are the entire interface. There is
- *   no access token, no table name, no generic predicate object and no column
- *   selector, so a caller cannot widen either read: the only rows these
- *   statements can return are the ones their own `workspace_id = $1::uuid`
- *   predicate selects.
+ * - `listTransactions`, `readSubscription` and `readBalanceSnapshot` are the
+ *   entire interface. There is no access token, no table name, no generic
+ *   predicate object and no column selector, so a caller cannot widen any read:
+ *   the only rows these statements can return are the ones their own
+ *   `workspace_id = $1::uuid` predicate selects.
  * - The projection names its columns explicitly, in the order the PostgREST
  *   select strings named them, and the row keeps the COLUMN names as its keys.
  *   The camelCase projection of the subscription belongs to `credit-service.ts`
@@ -35,6 +39,13 @@
  *   an integer — so a `NaN` limit is refused here rather than being sent to the
  *   database, while the service still answers its existing
  *   `credit_query_failed` 500.
+ * - `claimDate` is validated before the pool is touched as well, and unlike the
+ *   uuid it IS shape-checked: it must be a string of the exact form
+ *   `YYYY-MM-DD`, the one shape the caller computes from the system clock and
+ *   the only one `$2::date` can be trusted to read the same way everywhere. A
+ *   well-shaped but impossible date (`2026-02-31`) is deliberately left to
+ *   PostgreSQL, exactly as a malformed uuid is: the `$2::date` cast refuses it
+ *   inside the transaction, which rolls back and leaves the pool usable.
  * - Timestamps are NORMALISED, never passed through: `pg` and PGlite hand back
  *   `timestamptz` as a `Date`, while `created_at` in `creditTransactionSchema`
  *   is `z.string()` — a `Date` would fail that parse and turn a working read
@@ -53,6 +64,15 @@
  *   statement/mapper disagreement rather than a value, because
  *   `UNIQUE (workspace_id)` makes it impossible and a caller must not have to
  *   guess which row is the subscription.
+ * - The balance snapshot is the opposite case: its statement has no `from`
+ *   clause of its own, so its three scalar subqueries answer EXACTLY one row for
+ *   every workspace, known or not, and anything other than one row is a
+ *   disagreement between the statement and this module rather than a value.
+ *   Inside that row, `balance` and `plan` are `null` when the workspace has no
+ *   such row — a legal answer the service turns into `0` and `"free"` — while
+ *   `daily_claimed` is a real boolean from `exists`, never null and never a
+ *   text: folding a row count into the answer, or a `count(*)` bigint into a
+ *   boolean, is exactly what the shape checks below refuse.
  * - Both statements run through workorder 19's transaction entry point in
  *   `privileged` mode with a NULL actor. These are reads on behalf of a request
  *   whose authorization is decided above (the viewer's own workspace id is
@@ -115,6 +135,25 @@ export type SubscriptionReadRow = {
   canceled_at: string | null;
 };
 
+/**
+ * The one-row balance snapshot `getBalance` is built from, keyed by the column
+ * names the statement aliases: the workspace's `credit_balances.balance`, its
+ * `subscriptions.plan`, and whether `daily_credit_claims` holds the requested
+ * `claim_date` — all three read in ONE statement, so they cannot disagree about
+ * which instant they describe.
+ *
+ * `balance` and `plan` are `null` exactly when the workspace has no such row
+ * (both tables are `UNIQUE (workspace_id)`, so at most one each). That is the
+ * "absent" answer, and the defaults the HTTP contract publishes (`0`,
+ * `"free"`) are applied by the service, not here. `daily_claimed` is a real
+ * boolean and is never null: `exists` always answers true or false.
+ */
+export type BalanceSnapshotReadRow = {
+  balance: number | null;
+  plan: SubscriptionPlan | null;
+  daily_claimed: boolean;
+};
+
 export type CreditReadRepository = {
   /**
    * The newest `limit` transactions of that workspace, newest first. An empty
@@ -131,14 +170,25 @@ export type CreditReadRepository = {
   readSubscription(input: {
     workspaceId: string;
   }): Promise<SubscriptionReadRow | null>;
+  /**
+   * The balance, the plan and the claim answer of that workspace in ONE
+   * statement. `claimDate` is a `YYYY-MM-DD` string and is refused before any
+   * connection when it is not.
+   */
+  readBalanceSnapshot(input: {
+    workspaceId: string;
+    claimDate: string;
+  }): Promise<BalanceSnapshotReadRow>;
 };
 
 export const LIST_TRANSACTIONS = "listTransactions";
 export const READ_SUBSCRIPTION = "readSubscription";
+export const READ_BALANCE_SNAPSHOT = "readBalanceSnapshot";
 
 export type CreditReadOperation =
   | typeof LIST_TRANSACTIONS
-  | typeof READ_SUBSCRIPTION;
+  | typeof READ_SUBSCRIPTION
+  | typeof READ_BALANCE_SNAPSHOT;
 
 /**
  * The failure shape of this module. The message is built from the fixed
@@ -186,6 +236,17 @@ export const SUBSCRIPTION_COLUMNS = [
   "canceled_at",
 ] as const satisfies readonly (keyof SubscriptionReadRow)[];
 
+/**
+ * The balance snapshot projection: the three aliases of the one statement, in
+ * the order the service maps them. A snapshot that grew a fourth answer without
+ * the service learning about it is the drift this list is compared against.
+ */
+export const BALANCE_SNAPSHOT_COLUMNS = [
+  "balance",
+  "plan",
+  "daily_claimed",
+] as const satisfies readonly (keyof BalanceSnapshotReadRow)[];
+
 /** The inclusive bounds `limit` must sit in, matching the service's clamp. */
 export const CREDIT_TRANSACTION_LIMIT_MIN = 1;
 export const CREDIT_TRANSACTION_LIMIT_MAX = 100;
@@ -193,6 +254,10 @@ export const CREDIT_TRANSACTION_LIMIT_MAX = 100;
 /** Fixed row-shape labels: a refusal never carries SQL, a host or a workspace. */
 const TRANSACTION_LABEL = "credit transaction read";
 const SUBSCRIPTION_LABEL = "credit subscription read";
+const BALANCE_SNAPSHOT_LABEL = "credit balance snapshot read";
+
+/** The ONE shape `claimDate` may have: the caller's own `YYYY-MM-DD`. */
+const CLAIM_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
  * The transaction list. `where workspace_id = $1::uuid` is the only row
@@ -235,6 +300,43 @@ select
   canceled_at
 from public.subscriptions
 where workspace_id = $1::uuid
+`;
+
+/**
+ * The balance snapshot: THREE scalar subqueries, one statement, one row.
+ *
+ * The three answers `getBalance` publishes used to be three separate reads, so
+ * they could describe three different instants — a claim landing between them
+ * would be reported as "balance before the claim, already claimed". One
+ * statement makes that impossible: a single statement sees one snapshot.
+ *
+ * The date is the caller's, bound as `$2::date`, and NOT `current_date`: the
+ * service's date is the JavaScript UTC date, the credits rules use the
+ * database's own `current_date`, and the two disagree whenever the database
+ * timezone is not UTC. That disagreement is a separate, already-registered
+ * problem; this statement deliberately keeps the caller's date so the read
+ * answers for exactly the day the caller asked about.
+ *
+ * `exists` is written as SQL on purpose and NOT as `count(*)`: `count` returns
+ * `bigint`, which both drivers hand back as a STRING, so `count(*) > 0` would
+ * have to be folded back into a boolean somewhere else. `exists` is already a
+ * boolean and needs no such step.
+ *
+ * `$1::uuid` is the only row predicate of all three subqueries, so nothing a
+ * caller passes can widen the read.
+ */
+const READ_BALANCE_SNAPSHOT_SQL = `
+select
+  (select b.balance
+     from public.credit_balances b
+    where b.workspace_id = $1::uuid) as balance,
+  (select s.plan
+     from public.subscriptions s
+    where s.workspace_id = $1::uuid) as plan,
+  exists (select 1
+            from public.daily_credit_claims d
+           where d.workspace_id = $1::uuid
+             and d.claim_date = $2::date) as daily_claimed
 `;
 
 /**
@@ -314,6 +416,44 @@ export function createCreditReadRepository(options: {
         throw new CreditReadError(READ_SUBSCRIPTION, error);
       }
     },
+
+    async readBalanceSnapshot(input) {
+      // Arguments first: an unusable one must not open a connection, and it must
+      // not be reported as a database failure either.
+      const workspaceId = requireReadArgument(
+        READ_BALANCE_SNAPSHOT,
+        input.workspaceId,
+        "workspaceId",
+      );
+      const claimDate = requireClaimDate(input.claimDate);
+
+      try {
+        const pool = options.getTransactionPool();
+
+        return await withPrivilegedTransaction(pool, null, async (client) => {
+          const result = await client.query(READ_BALANCE_SNAPSHOT_SQL, [
+            workspaceId,
+            claimDate,
+          ]);
+
+          // The statement has no `from` clause of its own, so it answers exactly
+          // one row for EVERY workspace — the known one, an unknown one, and a
+          // workspace with no balance row and no subscription row alike. Zero
+          // rows and more than one row are therefore both a disagreement between
+          // the statement and this module rather than a value.
+          if (result.rows.length !== 1) {
+            throw new Error(
+              "credit balance snapshot read returned " +
+                `${result.rows.length} rows instead of one`,
+            );
+          }
+
+          return mapBalanceSnapshotRow(result.rows[0]);
+        });
+      } catch (error) {
+        throw new CreditReadError(READ_BALANCE_SNAPSHOT, error);
+      }
+    },
   };
 }
 
@@ -360,6 +500,37 @@ function requireReadLimit(value: unknown): number {
       new Error(
         "credit transaction read needs an integer limit between " +
           `${CREDIT_TRANSACTION_LIMIT_MIN} and ${CREDIT_TRANSACTION_LIMIT_MAX}`,
+      ),
+    );
+  }
+
+  return value;
+}
+
+/**
+ * The date the caller asks about. It reaches the statement as `$2::date`, so
+ * only the exact `YYYY-MM-DD` shape is bindable — the shape
+ * `Date.prototype.toISOString().slice(0, 10)` produces, which is the only date
+ * the service has ever queried with.
+ *
+ * Every other shape is refused HERE, before `getTransactionPool()` is called: a
+ * localized form (`2026/01/05`), a single-digit month or day (`2026-1-5`), a
+ * timestamp (`2026-01-05T00:00`), an empty string and a non-string would
+ * otherwise be read by PostgreSQL under whatever `DateStyle` the session
+ * happens to carry — and a timestamp would be cast to a day the caller never
+ * asked about. The comparison keeps the caller's own semantics only while the
+ * shape is guaranteed.
+ *
+ * A well-shaped but impossible date (`2026-02-31`) is NOT checked here: like a
+ * malformed uuid it is left to PostgreSQL, whose `$2::date` cast refuses it
+ * inside the transaction.
+ */
+function requireClaimDate(value: unknown): string {
+  if (typeof value !== "string" || !CLAIM_DATE_PATTERN.test(value)) {
+    throw new CreditReadError(
+      READ_BALANCE_SNAPSHOT,
+      new Error(
+        'credit balance snapshot read needs a "claimDate" of the form YYYY-MM-DD',
       ),
     );
   }
@@ -416,6 +587,41 @@ function mapSubscriptionRow(row: unknown): SubscriptionReadRow {
       SUBSCRIPTION_LABEL,
     ),
     canceled_at: optionalTimestamp(record, "canceled_at", SUBSCRIPTION_LABEL),
+  };
+}
+
+/**
+ * The three answers of the snapshot, each read from the row by name.
+ *
+ * `balance` and `plan` are the two columns a workspace can legitimately have no
+ * row for, so an explicit SQL NULL is the "absent" answer. An ABSENT column is
+ * still a failure: a projection that dropped `plan` must not read like a
+ * workspace without a subscription.
+ *
+ * `daily_claimed` is a boolean and nothing else. The old read answered this by
+ * asking whether a row came back at all; the statement answers it with `exists`,
+ * and TEXT — the `"t"` a `count(*)`/`boolean::text` projection would produce — is
+ * drift that must fail loud rather than become a truthy claim.
+ */
+function mapBalanceSnapshotRow(row: unknown): BalanceSnapshotReadRow {
+  const record = asReadRow(row, BALANCE_SNAPSHOT_LABEL);
+
+  return {
+    balance: optionalNonNegativeInteger(
+      record,
+      "balance",
+      BALANCE_SNAPSHOT_LABEL,
+    ),
+    plan: optionalEnumText(
+      record,
+      "plan",
+      BALANCE_SNAPSHOT_LABEL,
+    ) as SubscriptionPlan | null,
+    daily_claimed: requireBoolean(
+      record,
+      "daily_claimed",
+      BALANCE_SNAPSHOT_LABEL,
+    ),
   };
 }
 
@@ -510,6 +716,52 @@ function requireInteger(
 ): number {
   const value = row[field];
   if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new Error(`${label} returned no usable "${field}"`);
+  }
+
+  return value;
+}
+
+/**
+ * A nullable `integer` column that also carries the table's own rule
+ * `CHECK (balance >= 0)`.
+ *
+ * An explicit SQL NULL is a legal answer — the workspace has no balance row yet,
+ * which the service turns into `0` — while a NEGATIVE number is drift: the
+ * column's check constraint makes it impossible, so a negative means the row did
+ * not come from this schema, and reporting it as a balance would publish a debt
+ * the credits system cannot represent. A string, a float, `NaN` and an absent
+ * column are refused by `requireInteger`, which this reuses.
+ */
+function optionalNonNegativeInteger(
+  row: Readonly<Record<string, unknown>>,
+  field: string,
+  label: string,
+): number | null {
+  const value = row[field];
+  if (value === null) return null;
+
+  const integer = requireInteger(row, field, label);
+  if (integer < 0) {
+    throw new Error(`${label} returned a negative "${field}"`);
+  }
+
+  return integer;
+}
+
+/**
+ * A `boolean` column. `exists (...)` answers a real boolean in both drivers, so
+ * the text a `boolean::text` projection would produce, a number, and an absent
+ * column are all drift rather than a value — and folding them into a truthy
+ * answer would turn a broken read into "already claimed today".
+ */
+function requireBoolean(
+  row: Readonly<Record<string, unknown>>,
+  field: string,
+  label: string,
+): boolean {
+  const value = row[field];
+  if (typeof value !== "boolean") {
     throw new Error(`${label} returned no usable "${field}"`);
   }
 

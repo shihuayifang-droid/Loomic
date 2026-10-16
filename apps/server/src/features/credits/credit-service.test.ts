@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createCreditReadRepository,
+  type BalanceSnapshotReadRow,
   type CreditReadRepository,
   type CreditTransactionReadRow,
   type SubscriptionReadRow,
@@ -15,15 +16,19 @@ import {
 } from "./credit-service.js";
 
 /**
- * Workorder 21K: the two reads of `CreditService` that moved to the pure `pg`
- * repository. This file tests THOSE TWO METHODS and nothing else.
+ * Workorders 21K and 21P: the three reads of `CreditService` that moved to the
+ * pure `pg` repository — the transaction list, the subscription row and the
+ * balance snapshot behind `getBalance`. This file tests THOSE THREE METHODS and
+ * nothing else.
  *
  * The service is driven with a recording fake repository, so what is asserted is
  * the contract between the two modules: the clamped limit the service computes
  * and hands down, the untouched rows it hands back, the camelCase projection of
- * the subscription with its `free` + six-null default, and the single failure
- * code both methods answer with. The `getAdminClient` stub THROWS on contact, so
- * no case below can pass while a read still reaches PostgREST.
+ * the subscription with its `free` + six-null default, the `claimDate` the
+ * balance read computes from the system clock (JS UTC, never the local day), the
+ * `0`/`free` defaults of a workspace with no rows at all, and the single failure
+ * code all three methods answer with. The `getAdminClient` stub THROWS on
+ * contact, so no case below can pass while a read still reaches PostgREST.
  *
  * The database side of the same contract lives in
  * `test-support/db/credit-read-repository-db.test.ts` (real SQL over PGlite) and
@@ -54,10 +59,24 @@ const SUBSCRIPTION_ROW: SubscriptionReadRow = {
 
 type ListCall = { workspaceId: string; limit: number };
 
+/** One balance snapshot request, exactly as the service computed it. */
+type SnapshotCall = { workspaceId: string; claimDate: string };
+
+/** The row a workspace with a balance, a plan and no claim of the day answers. */
+const BALANCE_SNAPSHOT_ROW: BalanceSnapshotReadRow = {
+  balance: 42,
+  plan: "pro",
+  daily_claimed: false,
+};
+
+/** The ONE shape the real repository binds, mirrored so a fake cannot lie. */
+const CLAIM_DATE_GUARD = /^\d{4}-\d{2}-\d{2}$/;
+
 type FakeRepository = {
   repository: CreditReadRepository;
   listCalls: ListCall[];
   subscriptionCalls: string[];
+  snapshotCalls: SnapshotCall[];
 };
 
 /**
@@ -65,20 +84,28 @@ type FakeRepository = {
  * not an integer inside 1..100 is refused before the pool is touched. Without
  * that mirror a fake would happily answer a `NaN` limit, and the service's
  * `NaN` path would look green while the real chain answers 500.
+ *
+ * The claim date is mirrored the same way: the real repository binds
+ * `YYYY-MM-DD` and refuses every other shape before it opens a connection, so a
+ * service that started passing a localized or timestamped date would fail HERE
+ * rather than look healthy against a fake that accepts anything.
  */
 function createFakeRepository(
   options: {
     transactions?: CreditTransactionReadRow[];
     subscription?: SubscriptionReadRow | null;
+    snapshot?: BalanceSnapshotReadRow;
     failWith?: Error;
   } = {},
 ): FakeRepository {
   const listCalls: ListCall[] = [];
   const subscriptionCalls: string[] = [];
+  const snapshotCalls: SnapshotCall[] = [];
 
   return {
     listCalls,
     subscriptionCalls,
+    snapshotCalls,
     repository: {
       async listTransactions(input) {
         listCalls.push({ workspaceId: input.workspaceId, limit: input.limit });
@@ -102,6 +129,21 @@ function createFakeRepository(
         if (options.failWith) throw options.failWith;
 
         return options.subscription ?? null;
+      },
+      async readBalanceSnapshot(input) {
+        snapshotCalls.push({
+          workspaceId: input.workspaceId,
+          claimDate: input.claimDate,
+        });
+
+        if (options.failWith) throw options.failWith;
+        if (!CLAIM_DATE_GUARD.test(input.claimDate)) {
+          throw new Error(
+            'credit balance snapshot read needs a "claimDate" of the form YYYY-MM-DD',
+          );
+        }
+
+        return options.snapshot ?? BALANCE_SNAPSHOT_ROW;
       },
     },
   };
@@ -484,5 +526,191 @@ describe("credit-service: neither migrated read touches the admin client", () =>
 
     void (built.client as unknown as Record<string, unknown>)["someTable"];
     expect(built.adminReads).toEqual(["someTable"]);
+  });
+});
+
+describe("credit-service getBalance: the snapshot, its date and its defaults", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("case 19: the row's three answers are passed through, month and day included", async () => {
+    const fake = createFakeRepository({
+      snapshot: { balance: 7, plan: "ultra", daily_claimed: true },
+    });
+    const service = buildService({ repository: fake.repository });
+
+    const result = await service.getBalance(WORKSPACE_ID);
+
+    expect(result).toEqual({
+      balance: 7,
+      plan: "ultra",
+      dailyClaimed: true,
+    });
+    // Exactly the published key set, and the workspace id travels untouched.
+    expect(Object.keys(result)).toEqual(["balance", "plan", "dailyClaimed"]);
+    expect(fake.snapshotCalls).toHaveLength(1);
+    expect(fake.snapshotCalls[0]?.workspaceId).toBe(WORKSPACE_ID);
+
+    const other = createFakeRepository({
+      snapshot: { balance: 0, plan: "free", daily_claimed: false },
+    });
+    await expect(
+      buildService({ repository: other.repository }).getBalance(
+        "00000000-0000-0000-0000-0000000021ff",
+      ),
+    ).resolves.toEqual({ balance: 0, plan: "free", dailyClaimed: false });
+    expect(other.snapshotCalls[0]?.workspaceId).toBe(
+      "00000000-0000-0000-0000-0000000021ff",
+    );
+  });
+
+  it("case 20: an absent balance and an absent plan become 0 and free — the nulls are not published", async () => {
+    const fake = createFakeRepository({
+      snapshot: { balance: null, plan: null, daily_claimed: false },
+    });
+    const service = buildService({ repository: fake.repository });
+
+    const result = await service.getBalance(WORKSPACE_ID);
+
+    expect(result).toEqual({ balance: 0, plan: "free", dailyClaimed: false });
+    // The DEFAULTS are applied here, on the way out: the repository reports the
+    // absence as nulls rather than inventing values.
+    expect(result.balance).not.toBeNull();
+    expect(result.plan).not.toBeNull();
+    // A row that exists with a zero balance is indistinguishable at this
+    // boundary — which is the behaviour the three-read version had too.
+    const zero = createFakeRepository({
+      snapshot: { balance: 0, plan: "free", daily_claimed: false },
+    });
+    await expect(
+      buildService({ repository: zero.repository }).getBalance(WORKSPACE_ID),
+    ).resolves.toEqual(result);
+  });
+
+  it("case 21: the date handed down is the JS UTC date, not the local one", async () => {
+    vi.useFakeTimers();
+    // 23:30 on the 16th at UTC-8 is 07:30 on the 17th UTC: the LOCAL day and the
+    // UTC day disagree, so only one of them can be the answer.
+    vi.setSystemTime(new Date("2026-10-16T23:30:00-08:00"));
+
+    const fake = createFakeRepository();
+    const service = buildService({ repository: fake.repository });
+
+    await service.getBalance(WORKSPACE_ID);
+
+    expect(fake.snapshotCalls).toEqual([
+      { workspaceId: WORKSPACE_ID, claimDate: "2026-10-17" },
+    ]);
+    expect(new Date().toISOString()).toBe("2026-10-17T07:30:00.000Z");
+
+    // The other direction: 00:30 on the 5th at UTC+9 is still the 4th in UTC, so
+    // a local-date implementation would answer "2026-01-05" here.
+    vi.setSystemTime(new Date("2026-01-05T00:30:00+09:00"));
+
+    await service.getBalance(WORKSPACE_ID);
+
+    expect(fake.snapshotCalls.at(-1)).toEqual({
+      workspaceId: WORKSPACE_ID,
+      claimDate: "2026-01-04",
+    });
+    // Whatever the instant, what reaches the repository is the ONE shape its
+    // statement binds.
+    for (const call of fake.snapshotCalls) {
+      expect(CLAIM_DATE_GUARD.test(call.claimDate)).toBe(true);
+    }
+  });
+
+  it("case 22: the date asked about is the day of the call, never a fixed one", async () => {
+    vi.useFakeTimers();
+    const fake = createFakeRepository();
+    const service = buildService({ repository: fake.repository });
+
+    vi.setSystemTime(new Date("2026-03-04T12:00:00.000Z"));
+    await service.getBalance(WORKSPACE_ID);
+    vi.setSystemTime(new Date("2026-03-05T00:00:00.000Z"));
+    await service.getBalance(WORKSPACE_ID);
+
+    expect(fake.snapshotCalls.map((call) => call.claimDate)).toEqual([
+      "2026-03-04",
+      "2026-03-05",
+    ]);
+  });
+
+  it("case 23: a repository failure is the existing credit_query_failed 500", async () => {
+    const failure = new Error(
+      "connect ECONNREFUSED 10.210.134.37:5432 postgres://loomic:secret@host/db",
+    );
+    const fake = createFakeRepository({ failWith: failure });
+    const service = buildService({ repository: fake.repository });
+
+    const error = await refusal(() => service.getBalance(WORKSPACE_ID));
+
+    expect(error.code).toBe("credit_query_failed");
+    expect(error.statusCode).toBe(500);
+    expect(error.message).toBe("Failed to query credit balance.");
+    // The driver's message — host, port, credentials — stays out of the
+    // response; the repository already reduced it to a fixed text plus `cause`.
+    expect(error.message).not.toMatch(/ECONNREFUSED|10\.210\.134\.37|secret/i);
+    // The refusal happened on the snapshot read, not before it.
+    expect(fake.snapshotCalls).toHaveLength(1);
+  });
+
+  it("case 24: with no repository the read fails closed instead of falling back", async () => {
+    const service = buildService();
+
+    const error = await refusal(() => service.getBalance(WORKSPACE_ID));
+
+    expect(error.code).toBe("credit_query_failed");
+    expect(error.statusCode).toBe(500);
+    expect(error.message).toBe("Failed to query credit balance.");
+  });
+
+  it("case 25: getBalance resolves the admin client zero times on every path", async () => {
+    // The spy records both the getter and every property read on the client it
+    // would have returned, so a fallback to the three PostgREST reads this
+    // method used to make could not pass unnoticed.
+    const fake = createFakeRepository({
+      snapshot: { balance: 5, plan: "pro", daily_claimed: true },
+    });
+    const built = createService({ repository: fake.repository });
+
+    await expect(built.service.getBalance(WORKSPACE_ID)).resolves.toEqual({
+      balance: 5,
+      plan: "pro",
+      dailyClaimed: true,
+    });
+    expect(built.adminResolutions).toEqual([]);
+    expect(built.adminReads).toEqual([]);
+
+    const failing = createFakeRepository({
+      failWith: new Error("repository exploded"),
+    });
+    const broken = createService({ repository: failing.repository });
+    await expect(
+      refusal(() => broken.service.getBalance(WORKSPACE_ID)),
+    ).resolves.toBeInstanceOf(CreditServiceError);
+    expect(broken.adminResolutions).toEqual([]);
+    expect(broken.adminReads).toEqual([]);
+
+    const bare = createService();
+    await expect(
+      refusal(() => bare.service.getBalance(WORKSPACE_ID)),
+    ).resolves.toBeInstanceOf(CreditServiceError);
+    expect(bare.adminResolutions).toEqual([]);
+    expect(bare.adminReads).toEqual([]);
+  });
+
+  it("case 26: the balance read asks the repository once and touches nothing else", async () => {
+    const fake = createFakeRepository();
+    const service = buildService({ repository: fake.repository });
+
+    await service.getBalance(WORKSPACE_ID);
+
+    // ONE call, and the other two reads of the same repository stay untouched:
+    // this method must not become a second query surface.
+    expect(fake.snapshotCalls).toHaveLength(1);
+    expect(fake.listCalls).toEqual([]);
+    expect(fake.subscriptionCalls).toEqual([]);
   });
 });
