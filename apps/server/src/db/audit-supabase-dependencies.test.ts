@@ -701,11 +701,28 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // Its two new test files name no client method either, so
     // `fromCallsIncludingTests` follows `fromCalls` down again. The RPC counters
     // are untouched: this migration removed no RPC call site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(104);
+    //
+    // Workorder 21U then removed the LAST PostgREST write of
+    // `features/jobs/job-service.ts` — the caller's OWN job cancel behind
+    // `cancelJob` (`POST /api/jobs/:jobId/cancel`), which is also the reaction
+    // `withBilling` runs when a charge fails — so both counters below move down
+    // together again (104->103). That is a real coupling removal rather than a
+    // counting change: the method no longer builds a user client at all, and the
+    // repository that replaces it can only reach PostgreSQL, where the ACL the
+    // table's RLS policy applied is written into the statement verbatim as
+    // `created_by = $1::uuid`, the cancel guard (`status in ('queued', 'running')`,
+    // `retrying` excluded) and the two columns written are statement text rather
+    // than caller arguments, and `updated_at` is left to the table's trigger.
+    // `createUserClient` stays wired for `createJob`, which still reads and writes
+    // through it and is counted exactly as before. Its two new test files name no
+    // client method either, so `fromCallsIncludingTests` follows `fromCalls` down
+    // again. The RPC counters are untouched: this migration removed no RPC call
+    // site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(103);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(104);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(103);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

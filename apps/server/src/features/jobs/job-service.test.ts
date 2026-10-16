@@ -12,6 +12,10 @@ import type {
   JobOwnerReadRepository,
   JobOwnerReadRow,
 } from "../../db/job-owner-read-repository.js";
+import type {
+  JobOwnerWriteRepository,
+  JobOwnerWriteRow,
+} from "../../db/job-owner-write-repository.js";
 import type { JobBillingGateRepository } from "../../db/job-billing-gate-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import type { JobTransitionRepository } from "../../db/job-transition-repository.js";
@@ -55,10 +59,18 @@ type HarnessConfig = {
    * is a different thing from a `rows: 0` answer the guard produced.
    */
   updateOutcomes?: Array<{ rows?: number; reject?: Error }>;
-  /** Row returned by `.maybeSingle()` on `background_jobs` (cancelJob). */
-  jobRow?: Record<string, unknown> | null;
-  /** Error reported by `.maybeSingle()` on `background_jobs`. */
-  jobRowError?: { message: string } | null;
+  /**
+   * ADR-0001 / workorder 21U: what the OWNER-WRITE repository answers to
+   * `cancelJob`. `null` (or omitting it) is the "the guard matched no row"
+   * answer — somebody else's job, an unknown id, or a status that may not be
+   * cancelled — and `jobOwnerWriteError` is the rejected-promise channel. Both
+   * are answers the service must handle: the old PostgREST update expressed them
+   * as `data: null` and `error`.
+   */
+  jobOwnerWriteRow?: Record<string, unknown> | null;
+  jobOwnerWriteError?: Error;
+  /** Build the service with NO owner write repository at all (fail-closed). */
+  withoutJobOwnerWriteRepository?: boolean;
   rpc?: { data: unknown; error: { message: string } | null };
   /** Row returned by `.maybeSingle()` on `canvases` / `projects` (createJob). */
   canvasRow?: Record<string, unknown> | null;
@@ -282,7 +294,13 @@ function makeHarness(config: HarnessConfig = {}) {
           if (table === "projects") {
             return { data: config.projectRow ?? null, error: config.projectError ?? null };
           }
-          return { data: config.jobRow ?? null, error: config.jobRowError ?? null };
+          // ADR-0001 / workorder 21U: no method reads a `background_jobs` row
+          // through a client any more — cancelJob was the last one, and it goes
+          // through `JobOwnerWriteRepository` now. Fail loudly instead of
+          // answering a row that would hide a regression.
+          throw new Error(
+            "the harness has no client-side background_jobs read: the cancel belongs to the job owner write repository",
+          );
         },
         single: async () => {
           ops.push({ kind: "single", table, via });
@@ -492,6 +510,42 @@ function makeHarness(config: HarnessConfig = {}) {
     },
   };
 
+  // ADR-0001 / workorder 21U: the caller's OWN cancel behind `cancelJob`. The
+  // double keeps the SAME outward shape the old client update had — it records
+  // the patch the update would have written (`{status: "canceled", canceled_at:
+  // <ISO>}`, into the SAME `rowWrites` list the transitions use) and answers the
+  // same two channels (`data: null` / `error`) — so H10, H11, H15, H16 and H17
+  // keep measuring the same behaviour. What is new is that each call is also
+  // recorded by NAME and by the guard set the repository's SQL carries, because
+  // that guard is statement TEXT now: the double cannot read it off a caller's
+  // argument, so it records the value the statement spells out.
+  const jobOwnerWriteCalls: Array<{
+    operation: string;
+    input: Record<string, unknown>;
+  }> = [];
+  /** The guard set the write carried, per call: `status in ('queued','running')`. */
+  const cancelGuards: unknown[][] = [];
+  /** The patch the write would have written, per call. */
+  const cancelPatches: Array<Record<string, unknown>> = [];
+
+  const jobOwnerWriteRepository: JobOwnerWriteRepository = {
+    async cancelOwnJob(input) {
+      jobOwnerWriteCalls.push({ operation: "cancelOwnJob", input: { ...input } });
+
+      const patch = { status: "canceled", canceled_at: input.canceledAt };
+      // The cancel is a row write like any transition, so it lands in the same
+      // ordered list and under the same trace marker: H10's "the cancel's update
+      // is the only row write in the whole run" stays byte-identical.
+      cancelGuards.push(["queued", "running"]);
+      cancelPatches.push(patch);
+      rowWrites.push(patch);
+      trace.push("update:background_jobs");
+
+      if (config.jobOwnerWriteError) throw config.jobOwnerWriteError;
+      return (config.jobOwnerWriteRow ?? null) as JobOwnerWriteRow | null;
+    },
+  };
+
   const service: JobService = createJobService({
     createUserClient: (accessToken: string) => {
       clientTokens.push(accessToken);
@@ -528,14 +582,43 @@ function makeHarness(config: HarnessConfig = {}) {
     ...(config.withoutJobOwnerReadRepository
       ? {}
       : { jobOwnerReadRepository }),
+    ...(config.withoutJobOwnerWriteRepository
+      ? {}
+      : { jobOwnerWriteRepository }),
     ...(config.withoutJobTransitionRepository
       ? {}
       : { jobTransitionRepository }),
   });
 
-  const inOp = () => ops.find((op): op is Extract<Op, { kind: "in" }> => op.kind === "in");
-  const updateOp = () =>
-    ops.find((op): op is Extract<Op, { kind: "update" }> => op.kind === "update");
+  /**
+   * The `status in (...)` guard the service applied, in the shape the client's
+   * `in(column, values)` had — whichever path carried it: a client chain (nothing
+   * carries one any more) or the owner-write repository, whose SQL spells the set
+   * out as text, which is what the double records.
+   */
+  const inOp = (): { column: string; values: unknown[] } | undefined => {
+    const fromClient = ops.find(
+      (op): op is Extract<Op, { kind: "in" }> => op.kind === "in",
+    );
+    if (fromClient) return { column: fromClient.column, values: fromClient.values };
+
+    const recorded = cancelGuards.at(-1);
+    return recorded === undefined ? undefined : { column: "status", values: recorded };
+  };
+  /**
+   * The guarded row write the service performed, in the same shape: a client
+   * update (nothing carries one any more) or the cancel the owner-write
+   * repository was asked for.
+   */
+  const updateOp = (): { patch: Record<string, unknown> } | undefined => {
+    const fromClient = ops.find(
+      (op): op is Extract<Op, { kind: "update" }> => op.kind === "update",
+    );
+    if (fromClient) return { patch: fromClient.patch };
+
+    const recorded = cancelPatches.at(-1);
+    return recorded === undefined ? undefined : { patch: recorded };
+  };
   const insertOp = () =>
     ops.find((op): op is Extract<Op, { kind: "insert" }> => op.kind === "insert");
   /**
@@ -558,6 +641,7 @@ function makeHarness(config: HarnessConfig = {}) {
     creditsLinkCalls,
     jobAdminReadCalls,
     jobOwnerReadCalls,
+    jobOwnerWriteCalls,
     transitionCalls,
     adminClientCalls: () => adminClientCalls,
     /** The credits-link operations in the order the service issued them. */
@@ -1280,7 +1364,6 @@ describe("getJob and listJobs: the caller's own reads go through the repository 
       withoutJobOwnerReadRepository: true,
       ownJobRow: ownerJobFixture(),
       ownJobRows: [ownerJobFixture()],
-      jobRow: ownerJobFixture(),
     });
 
     const single = await harness.service
@@ -1454,7 +1537,6 @@ describe("getJobAdmin: the read goes through the repository, and nothing else (�
     const harness = makeHarness({
       withoutJobAdminReadRepository: true,
       adminJobRow: adminJobFixture(),
-      jobRow: adminJobFixture(),
     });
 
     const error = await harness.service
@@ -1964,11 +2046,34 @@ describe("createJob: authorize, then insert, then enqueue (工单21H0)", () => {
     // the authorization read can see. The admin client is not used here at all.
     expect(harness.clientTokens).toEqual(["token-21h0"]);
 
-    // cancelJob is the caller's client too...
-    const cancelHarness = makeHarness({ jobRow: WRITE_JOB_ROW });
+    // cancelJob is NOT the caller's client any more (workorder 21U)...
+    //
+    // OLD ASSERTION (pre-21U): `ops.every(op => op.via === "user")` plus
+    // `clientTokens` equal to the caller's token — the cancel was a user-client
+    // PostgREST update, so RLS decided it and the token was read to build that
+    // client.
+    // NEW ASSERTION: the cancel reaches the owner-write repository and NO client
+    // at all. `ops` is asserted EMPTY rather than "every op is a user one": an
+    // `every()` over an empty list passes for the wrong reason, which is exactly
+    // how a client fallback could come back unnoticed.
+    // WHY: the repository's statement carries `created_by = actor` itself, so the
+    // user client has nothing left to decide — and with no repository wired the
+    // method fails closed instead of reaching for it (case H15c below).
+    const cancelHarness = makeHarness({ jobOwnerWriteRow: WRITE_JOB_ROW });
     await cancelHarness.service.cancelJob(WRITE_USER, "job-21h0");
-    expect(cancelHarness.ops.every((op) => op.via === "user")).toBe(true);
-    expect(cancelHarness.clientTokens).toEqual(["token-21h0"]);
+    expect(cancelHarness.jobOwnerWriteCalls).toEqual([
+      {
+        operation: "cancelOwnJob",
+        input: {
+          actorId: "user-21h0",
+          jobId: "job-21h0",
+          canceledAt: expect.any(String),
+        },
+      },
+    ]);
+    expect(cancelHarness.ops).toEqual([]);
+    expect(cancelHarness.clientTokens).toEqual([]);
+    expect(cancelHarness.adminClientCalls()).toBe(0);
 
     // ...while the worker's guarded transitions go through the transition
     // repository: they reach no client at all now (workorder 21M), which is
@@ -2230,7 +2335,11 @@ type BillingScenario = {
    * "the write did not land" answer; `linkError` is the rejected-promise form.
    */
   creditsLink?: HarnessConfig["creditsLink"];
-  /** `false` models a cancel whose guard matched no row (404, swallowed). */
+  /**
+   * `false` models a cancel whose guard matched no row (404, swallowed) — the
+   * owner-write repository answers `null`, exactly as the RLS-filtered update
+   * answered `data: null` before workorder 21U.
+   */
   cancelSeesRow?: boolean;
 };
 
@@ -2238,7 +2347,8 @@ function makeBillingHarness(scenario: BillingScenario = {}) {
   const harness = makeHarness({
     insertedJob: WRITE_JOB_ROW,
     canvasRow: { project_id: "project-1" },
-    jobRow: scenario.cancelSeesRow === false ? null : WRITE_JOB_ROW,
+    jobOwnerWriteRow:
+      scenario.cancelSeesRow === false ? null : WRITE_JOB_ROW,
     ...(scenario.creditsLink === undefined
       ? {}
       : { creditsLink: scenario.creditsLink }),
@@ -2421,8 +2531,8 @@ describe("withBilling through the real JobService: where the money sits in the w
     // rejection of the cancel is caught with an empty handler.
     expect(error?.message).toBe("deduct exploded");
 
-    // The cancel WAS attempted - the guarded update was built and sent - and it
-    // is the guard that matched nothing, so the job stays `queued` and the
+    // The cancel WAS attempted — the owner-write repository was asked for it —
+    // and it is the guard that matched nothing, so the job stays `queued` and the
     // worker will still pick it up after a charge that failed.
     expect(harness.patches()).toEqual([
       { status: "canceled", canceled_at: expect.any(String) },
@@ -2568,10 +2678,14 @@ describe("withBilling through the real JobService: where the money sits in the w
   });
 });
 
-describe("cancelJob: the guarded update and what it deliberately does not do (工单21H0)", () => {
+describe("cancelJob: the guarded write and what it deliberately does not do (工单21H0 → 21U)", () => {
   it("case H15: cancel writes two columns for queued/running only, and touches neither PGMQ nor credits", async () => {
     const harness = makeHarness({
-      jobRow: { ...WRITE_JOB_ROW, status: "canceled", canceled_at: "2026-10-16T00:00:00.000Z" },
+      jobOwnerWriteRow: {
+        ...WRITE_JOB_ROW,
+        status: "canceled",
+        canceled_at: "2026-10-16T00:00:00.000Z",
+      },
     });
 
     const job = await harness.service.cancelJob(WRITE_USER, "job-21h0");
@@ -2586,10 +2700,27 @@ describe("cancelJob: the guarded update and what it deliberately does not do (�
     // and neither is a terminal state. Everything else answers 404.
     expect(harness.inOp()?.column).toBe("status");
     expect(harness.inOp()?.values).toEqual(["queued", "running"]);
-    // maybeSingle, so a guard that matched nothing is "no job", not a 500.
-    expect(
-      harness.ops.some((op) => op.kind === "maybeSingle" && op.table === "background_jobs"),
-    ).toBe(true);
+
+    // OLD ASSERTION (pre-21U): the whole chain — `update`, `eq`, `in`, `select`,
+    // `maybeSingle` — ran on the caller's client, which is why the case pinned a
+    // `maybeSingle` on `background_jobs` here.
+    // NEW ASSERTION: one call, through the owner-write repository, carrying the
+    // actor, the job and the stamp and nothing else — and NOTHING on any client.
+    // WHY: the statement owns the predicate and the guard now, so the service has
+    // no `.eq`/`.in`/`.select` to build and no row to await as `maybeSingle`.
+    expect(harness.jobOwnerWriteCalls).toEqual([
+      {
+        operation: "cancelOwnJob",
+        input: {
+          actorId: "user-21h0",
+          jobId: "job-21h0",
+          canceledAt: expect.any(String),
+        },
+      },
+    ]);
+    expect(harness.ops).toEqual([]);
+    expect(harness.clientTokens).toEqual([]);
+    expect(harness.adminClientCalls()).toBe(0);
 
     // Cancelling does not consume the queue message, does not delete the row and
     // does not move any money: the worker's own guard handles the message.
@@ -2600,9 +2731,9 @@ describe("cancelJob: the guarded update and what it deliberately does not do (�
   });
 
   it("case H16: a job the guard does not match is a 404 with the fixed message", async () => {
-    // The harness answers "no row" exactly as PostgreSQL does for a status
-    // outside queued/running - the PGlite baseline measures that per status.
-    const harness = makeHarness({ jobRow: null });
+    // The double answers "no row" exactly as PostgreSQL does for a status
+    // outside queued/running — the PGlite cases measure that per status.
+    const harness = makeHarness({ jobOwnerWriteRow: null });
 
     const error = await harness.service
       .cancelJob(WRITE_USER, "job-21h0")
@@ -2616,10 +2747,19 @@ describe("cancelJob: the guarded update and what it deliberately does not do (�
     // The same guard was applied; the refusal is the row count, not an error.
     expect(harness.inOp()?.values).toEqual(["queued", "running"]);
     expect(harness.messageLifecycle).toEqual([]);
+    // A guard that matched nothing is still a repository call, and still no
+    // client: the 404 path is not a fallback.
+    expect(harness.jobOwnerWriteCalls).toHaveLength(1);
+    expect(harness.ops).toEqual([]);
+    expect(harness.clientTokens).toEqual([]);
   });
 
   it("case H17: a cancel that cannot reach the database is a 500 job_cancel_failed", async () => {
-    const harness = makeHarness({ jobRowError: { message: "connection reset" } });
+    // The repository's rejected-promise channel is the transport failure the old
+    // client expressed as `error`.
+    const harness = makeHarness({
+      jobOwnerWriteError: new Error("connection reset"),
+    });
 
     const error = await harness.service
       .cancelJob(WRITE_USER, "job-21h0")
@@ -2630,6 +2770,38 @@ describe("cancelJob: the guarded update and what it deliberately does not do (�
     expect(error?.code).toBe("job_cancel_failed");
     expect(error?.statusCode).toBe(500);
     expect(error?.message).toBe("Failed to cancel job.");
+    // The driver's own text is not concatenated: it can name the statement, the
+    // host or a credential. The repository carries it as `cause`.
+    expect(error?.message).not.toMatch(/connection reset|background_jobs|public\./);
+    expect(harness.clientTokens).toEqual([]);
+  });
+
+  it("case H15b: with no owner-write repository wired the cancel FAILS CLOSED — never the client", async () => {
+    // The row the double would have answered is irrelevant: the missing
+    // dependency is refused before anything is attempted.
+    const harness = makeHarness({
+      withoutJobOwnerWriteRepository: true,
+      jobOwnerWriteRow: WRITE_JOB_ROW,
+    });
+
+    const error = await harness.service
+      .cancelJob(WRITE_USER, "job-21h0")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_cancel_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to cancel job.");
+
+    // Fail-closed means nothing happened: no repository call, and — the point of
+    // the migration — no user PostgREST write either, not even the token read
+    // that building the old client would have needed.
+    expect(harness.jobOwnerWriteCalls).toEqual([]);
+    expect(harness.ops).toEqual([]);
+    expect(harness.clientTokens).toEqual([]);
+    expect(harness.adminClientCalls()).toBe(0);
+    expect(harness.patches()).toEqual([]);
   });
 });
 

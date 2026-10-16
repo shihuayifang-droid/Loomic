@@ -104,6 +104,7 @@ import {
 } from "./db/job-attempt-repository.js";
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
 import { createJobOwnerReadRepository } from "./db/job-owner-read-repository.js";
+import { createJobOwnerWriteRepository } from "./db/job-owner-write-repository.js";
 import { createJobConcurrencyRepository } from "./db/job-concurrency-repository.js";
 import { createJobTransitionRepository } from "./db/job-transition-repository.js";
 import { createCreditReadRepository } from "./db/credit-read-repository.js";
@@ -521,9 +522,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           // same consequence: no repository means both reads fail closed as the
           // service's existing `job_query_failed` 500, because the user client
           // they used to read through is no longer reachable from those methods.
-          // `createUserClient` stays wired: `createJob` and `cancelJob` still use
-          // it.
           jobOwnerReadRepository: createJobOwnerReadRepository({
+            getTransactionPool: () => getTransactionPool(databaseEnv),
+          }),
+          // ADR-0001 / workorder 21U: the caller cancelling their OWN job behind
+          // `cancelJob` — `POST /api/jobs/:jobId/cancel`, and the reaction
+          // `withBilling` runs when a charge fails. Built lazily against the same
+          // pool as the repositories above, and with the same consequence: no
+          // repository means the cancel fails closed as the service's existing
+          // `job_cancel_failed` 500, because the user client it used to write
+          // through is no longer reachable from that method. `createUserClient`
+          // stays wired for `createJob`, which still reads and writes through it.
+          jobOwnerWriteRepository: createJobOwnerWriteRepository({
             getTransactionPool: () => getTransactionPool(databaseEnv),
           }),
           // ADR-0001 / workorder 21M: the four guarded status transitions

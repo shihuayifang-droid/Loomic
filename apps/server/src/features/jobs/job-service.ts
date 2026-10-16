@@ -9,6 +9,7 @@ import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
 import type { JobAdminReadRepository } from "../../db/job-admin-read-repository.js";
 import type { JobOwnerReadRepository } from "../../db/job-owner-read-repository.js";
+import type { JobOwnerWriteRepository } from "../../db/job-owner-write-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import type { JobTransitionRepository } from "../../db/job-transition-repository.js";
 import type {
@@ -168,10 +169,28 @@ export function createJobService(options: {
    * are exactly what workorder 21T removes, and a missing dependency must not be
    * able to bring them back.
    *
-   * `createUserClient` stays: `createJob` and `cancelJob` still read and write
-   * through it.
+   * `createUserClient` stays: `createJob` still reads and writes through it.
    */
   jobOwnerReadRepository?: JobOwnerReadRepository;
+  /**
+   * ADR-0001 / workorder 21U: the caller's OWN job cancel behind `cancelJob` —
+   * the `POST /api/jobs/:jobId/cancel` route, and the reaction `withBilling` runs
+   * when a charge fails. Its ACL is the explicit `created_by = actor` predicate
+   * in its own SQL, and its guard — `status in ('queued', 'running')`, with
+   * `retrying` deliberately NOT cancellable — plus the two columns it writes are
+   * statement text rather than caller arguments.
+   *
+   * Optional for the same reason the repositories above are, and with the same
+   * consequence: with no repository wired, or with a failing one, the cancel
+   * fails closed as the same `job_cancel_failed` 500 it already published. There
+   * is deliberately no user-client fallback — the PostgREST update this replaces
+   * is exactly what workorder 21U removes, and a missing dependency must not be
+   * able to bring it back.
+   *
+   * `createUserClient` stays: `createJob` still reads and writes through it, and
+   * `cancelJob` no longer touches it at all.
+   */
+  jobOwnerWriteRepository?: JobOwnerWriteRepository;
   /**
    * ADR-0001 / workorder 21M: the four guarded status transitions of the worker
    * (`markRunning`, `markRetrying`, `markSucceeded`, `markFailed`). It is the
@@ -425,26 +444,52 @@ export function createJobService(options: {
     },
 
     async cancelJob(user, jobId) {
-      const client = options.createUserClient(user.accessToken);
-      const { data: job, error } = await client
-        .from("background_jobs")
-        .update({ status: "canceled", canceled_at: new Date().toISOString() })
-        .eq("id", jobId)
-        .in("status", ["queued", "running"])
-        .select(SELECT_COLS)
-        .maybeSingle();
-
-      if (error) {
+      // ADR-0001 / workorder 21U: the caller's own cancel moved from the user
+      // client to the narrow `pg` repository. What did NOT move is the contract:
+      // `null` from the repository is this method's existing `job_not_found` 404
+      // (the guard matched no row — somebody else's job, an unknown id, or a
+      // state that may not be cancelled), and a repository that threw (a connect
+      // failure, a SQL error, or the 22P02 a malformed uuid raises) is its
+      // existing `job_cancel_failed` 500.
+      //
+      // The ACL moved WITH the write: the repository's statement carries
+      // `created_by = actor`, so a job belonging to somebody else matches no row
+      // here, exactly as the RLS policy used to make it. The status guard moved
+      // too, and it is still exactly queued/running — `retrying` stays
+      // uncancellable. The user client is no longer involved, which is why
+      // `user.accessToken` is not read any more.
+      //
+      // The timestamp is still THIS process's clock: it is built here and passed
+      // down, exactly as the removed update built its patch.
+      //
+      // There is deliberately no user-client fallback behind this: with no
+      // repository wired, the call fails closed with exactly the error a broken
+      // write produces, so a missing dependency can never revive the old update.
+      const repository = options.jobOwnerWriteRepository;
+      if (!repository) {
         throw new JobServiceError("job_cancel_failed", "Failed to cancel job.", 500);
       }
-      if (!job) {
+
+      let row: Record<string, unknown> | null;
+      try {
+        row = await repository.cancelOwnJob({
+          actorId: user.id,
+          jobId,
+          canceledAt: new Date().toISOString(),
+        });
+      } catch {
+        throw new JobServiceError("job_cancel_failed", "Failed to cancel job.", 500);
+      }
+
+      if (row === null) {
         throw new JobServiceError(
           "job_not_found",
           "Job not found or already completed.",
           404,
         );
       }
-      return mapJobRow(job as unknown as Record<string, unknown>);
+
+      return mapJobRow(row);
     },
 
     async getJobAdmin(jobId) {
