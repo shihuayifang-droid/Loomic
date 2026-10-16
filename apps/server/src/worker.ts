@@ -13,17 +13,9 @@ if (process.env.GLOBAL_AGENT_HTTP_PROXY) {
 import { randomUUID } from "node:crypto";
 import { loadServerEnv } from "./config/env.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
-import { createJobService } from "./features/jobs/job-service.js";
-import { createJobAttemptRepository } from "./db/job-attempt-repository.js";
-import { createJobTransitionRepository } from "./db/job-transition-repository.js";
-import { createJobBillingGateRepository } from "./db/job-billing-gate-repository.js";
-import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
-import { createJobRefundBasisRepository } from "./db/job-refund-basis-repository.js";
-import { createCreditReadRepository } from "./db/credit-read-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
-import { createRefundJob } from "./features/jobs/refund-job.js";
-import { createCreditService } from "./features/credits/credit-service.js";
+import { buildWorkerComposition } from "./worker-composition.js";
 import { getExecutor, type ExecutorContext } from "./features/jobs/job-executor.js";
 import {
   JOB_QUEUES,
@@ -67,115 +59,22 @@ async function main() {
     return adminClient;
   };
 
-  const jobService = createJobService({
+  // ADR-0001 / workorder 21X: the whole assembly below used to live here, in
+  // `main()`, where nothing could test it. It is unchanged and now lives in
+  // `worker-composition.ts`, behind the pure `buildWorkerComposition`. The one
+  // shape change is the pool getter: the six identical copies of the
+  // `DATABASE_URL` expression collapsed into the single `getTransactionPool`
+  // argument below, which is character for character what each copy used to be.
+  const { jobService, billingGate, refundJob, baseCtx } = buildWorkerComposition({
+    env,
+    pgmq,
     createUserClient,
     getAdminClient,
-    pgmq,
-    // ADR-0001 / workorder 21F: the atomic `attempt_count` move is the worker's
-    // own write, so the worker builds the repository itself — lazily, against
-    // `DATABASE_URL`, exactly as `app.ts` does. With no reachable pool the call
-    // fails closed, `processJobMessage` leaves the message for a later retry and
-    // nothing here can reach the old `increment_job_attempt` RPC.
-    jobAttemptRepository: createJobAttemptRepository({
-      getTransactionPool: () =>
-        getTransactionPool(
-          env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
-        ),
-    }),
-    // ADR-0001 / workorder 21M: the four guarded status transitions the worker
-    // performs on a job it is executing (`queued|retrying -> running`,
-    // `running -> retrying`, `running -> succeeded`, `* -> failed`). Built here,
-    // lazily and against the same `DATABASE_URL` as the attempt counter above.
-    // With no reachable pool each transition fails closed and
-    // `processJobMessage` treats it as a failure instead of assuming the row
-    // moved — nothing here can reach the update this replaces.
-    jobTransitionRepository: createJobTransitionRepository({
-      getTransactionPool: () =>
-        getTransactionPool(
-          env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
-        ),
-    }),
-    // ADR-0001 / workorder 21N: the admin single-row read both generation
-    // executors now share. Workorder 21I moved `getJobAdmin` onto this repository
-    // but wired it into `app.ts` only, so without this line the worker's
-    // executors call a service with nothing behind the read and every job row
-    // read fails closed as `job_query_failed`. Built lazily against the same
-    // `DATABASE_URL` as the repositories above.
-    jobAdminReadRepository: createJobAdminReadRepository({
-      getTransactionPool: () =>
-        getTransactionPool(
-          env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
-        ),
-    }),
-  });
-  const creditService = createCreditService({ getAdminClient });
-
-  // ADR-0001 / workorder 21W: the image executor's watermark decision reads the
-  // workspace subscription row to learn the plan. It used to be an admin client
-  // read inside the executor whose `error` field was discarded, so a missing row
-  // and a failed read both meant the free plan — and a free plan means the image
-  // IS watermarked. The read now goes through
-  // `CreditReadRepository.readSubscription`, built here as its OWN instance
-  // against the same `DATABASE_URL` as the repositories above. The
-  // `createCreditService` call above is deliberately untouched: that service
-  // still uses its admin client for everything else it does, and this line
-  // neither injects into it nor changes it. With no reachable pool the read
-  // fails and the executor falls back to the free plan, so the outcome is the
-  // one the discarded error used to produce.
-  const creditReadRepository = createCreditReadRepository({
     getTransactionPool: () =>
       getTransactionPool(
         env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
       ),
   });
-
-  // ADR-0001 / workorder 21H1: the billing gate the worker runs before it
-  // consumes an attempt or calls a model. Built here, lazily, exactly like the
-  // attempt repository above and against the same `DATABASE_URL`. With no
-  // reachable pool the READ fails, `processJobMessage` leaves the message for a
-  // later retry and the job is never executed unbilled — there is no fallback
-  // that could reach PostgREST or skip the gate.
-  const billingGate = createJobBillingGateRepository({
-    getTransactionPool: () =>
-      getTransactionPool(
-        env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
-      ),
-  });
-
-  // ADR-0001 / workorder 21O: the refund basis the worker reads before it gives
-  // credits back — `credits_cost`, `workspace_id`, `created_by` of one job row.
-  // It used to be an admin PostgREST read inside a local function in this file,
-  // which discarded its error field, so a failed read and a missing row both
-  // meant "refund nothing, silently". Built lazily against the same
-  // `DATABASE_URL` as the repositories above: with no reachable pool the read
-  // fails, the refund path logs that failure and NO money moves — there is no
-  // fallback that could reach PostgREST.
-  const refundBasisRepository = createJobRefundBasisRepository({
-    getTransactionPool: () =>
-      getTransactionPool(
-        env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
-      ),
-  });
-
-  // The refund decision itself lives in `features/jobs/refund-job.ts`: the
-  // condition, the amount, the description and the "never throws" contract are
-  // unchanged, and the tag stays a call-site argument so both log lines keep
-  // naming this worker.
-  const refundJob = createRefundJob({
-    readRefundBasis: (input) => refundBasisRepository.readRefundBasis(input),
-    creditService,
-  });
-
-  // Base context — per-message fields (queue, msgId, renewVt) are added per message below
-  const baseCtx = {
-    jobService,
-    pgmq,
-    getAdminClient,
-    env,
-    // Workorder 21W: the image executor's watermark decision reads the plan
-    // through this. Optional on `ExecutorContext`, wired here for real.
-    creditReadRepository,
-  };
 
   const inFlightByQueue = new Map<string, Set<Promise<void>>>(
     JOB_QUEUES.map((q) => [q, new Set()]),

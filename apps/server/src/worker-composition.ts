@@ -1,0 +1,207 @@
+/**
+ * Worker composition root (workorder 21X, ADR-0001 migration step 2).
+ *
+ * `worker.ts` used to build every collaborator of its polling loop inline in
+ * `main()`: the job service with its three `pg` repositories, the credits
+ * service, the read-only credits repository, the billing gate, the refund basis
+ * repository and the refund function, and then the per-message base context.
+ * That wiring had no test at all, and it could not have one where it lived: the
+ * module boots global-agent, registers every executor and provider and calls
+ * `main()` at import time. A single missing line there was also invisible to the
+ * type checker — workorder 21N lost the worker's `jobAdminReadRepository`, which
+ * is a perfectly legal options object, and every admin job read failed closed at
+ * runtime instead.
+ *
+ * This module is that same wiring, moved here and behind a PURE function, so a
+ * test can build the REAL composition and observe which collaborators each one
+ * actually received.
+ *
+ * Rules this module keeps:
+ *
+ * - The assembly order, the arguments of every repository and the five keys of
+ *   `baseCtx` are unchanged: this is a move, not a redesign.
+ * - The six identical copies of the pool getter are ONE input
+ *   (`getTransactionPool`). Every repository still receives a getter and still
+ *   reaches the pool LAZILY, so building this composition opens no connection
+ *   and touches no connection string; the worker passes the expression it always
+ *   passed.
+ * - Pure: no `process.env` read, no connection, no log line and no module-level
+ *   side effect. Importing this module registers NO executor and NO provider —
+ *   those registrations stay in `worker.ts`, where they already were.
+ */
+
+import { createJobService, type JobService } from "./features/jobs/job-service.js";
+import { createJobAttemptRepository } from "./db/job-attempt-repository.js";
+import { createJobTransitionRepository } from "./db/job-transition-repository.js";
+import {
+  createJobBillingGateRepository,
+  type JobBillingGateRepository,
+} from "./db/job-billing-gate-repository.js";
+import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
+import { createJobRefundBasisRepository } from "./db/job-refund-basis-repository.js";
+import {
+  createCreditReadRepository,
+  type CreditReadRepository,
+} from "./db/credit-read-repository.js";
+import { createRefundJob, type RefundJob } from "./features/jobs/refund-job.js";
+import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
+import type { ServerEnv } from "./config/env.js";
+import type { PgmqClient } from "./queue/pgmq-client.js";
+import type { AdminSupabaseClient } from "./supabase/admin.js";
+import type { UserSupabaseClient } from "./supabase/user.js";
+import type { TransactionPool } from "./db/transaction.js";
+
+/**
+ * Everything the composition needs from its caller. `env`, `pgmq`,
+ * `createUserClient` and `getAdminClient` are the values `main()` already held;
+ * `getTransactionPool` is the one thing this extraction changed shape, so the
+ * six copies of the same expression live at ONE call site instead of six.
+ */
+export type WorkerCompositionInput = {
+  env: ServerEnv;
+  pgmq: PgmqClient;
+  createUserClient: (accessToken: string) => UserSupabaseClient;
+  getAdminClient: () => AdminSupabaseClient;
+  /**
+   * The lazily-resolved `pg` pool every repository below reads and writes
+   * through. It is an input rather than something built here so the connection
+   * string expression stays at the worker's own call site — and so a test can
+   * hand in a recording pool with no database behind it.
+   */
+  getTransactionPool: () => TransactionPool;
+};
+
+/**
+ * The per-message base context, exactly the five keys `worker.ts` spread into
+ * every `ExecutorContext`. `jobService` and `creditReadRepository` are the SAME
+ * instances the composition returns: nothing here re-wraps or re-builds them.
+ */
+export type WorkerBaseContext = {
+  jobService: JobService;
+  pgmq: PgmqClient;
+  getAdminClient: () => AdminSupabaseClient;
+  env: ServerEnv;
+  creditReadRepository: CreditReadRepository;
+};
+
+export type WorkerComposition = {
+  jobService: JobService;
+  creditService: CreditService;
+  creditReadRepository: CreditReadRepository;
+  billingGate: JobBillingGateRepository;
+  refundJob: RefundJob;
+  baseCtx: WorkerBaseContext;
+};
+
+/**
+ * Build the worker's collaborators. Pure and synchronous: it constructs plain
+ * objects and touches no pool, no queue and no environment variable, so the
+ * first actual connection happens on the first call that genuinely reads or
+ * writes.
+ */
+export function buildWorkerComposition(
+  input: WorkerCompositionInput,
+): WorkerComposition {
+  const { env, pgmq, createUserClient, getAdminClient, getTransactionPool } = input;
+
+  const jobService = createJobService({
+    createUserClient,
+    getAdminClient,
+    pgmq,
+    // ADR-0001 / workorder 21F: the atomic `attempt_count` move is the worker's
+    // own write, so the worker builds the repository itself — lazily, against
+    // `DATABASE_URL`, exactly as `app.ts` does. With no reachable pool the call
+    // fails closed, `processJobMessage` leaves the message for a later retry and
+    // nothing here can reach the old `increment_job_attempt` RPC.
+    jobAttemptRepository: createJobAttemptRepository({
+      getTransactionPool,
+    }),
+    // ADR-0001 / workorder 21M: the four guarded status transitions the worker
+    // performs on a job it is executing (`queued|retrying -> running`,
+    // `running -> retrying`, `running -> succeeded`, `* -> failed`). Built here,
+    // lazily and against the same `DATABASE_URL` as the attempt counter above.
+    // With no reachable pool each transition fails closed and
+    // `processJobMessage` treats it as a failure instead of assuming the row
+    // moved — nothing here can reach the update this replaces.
+    jobTransitionRepository: createJobTransitionRepository({
+      getTransactionPool,
+    }),
+    // ADR-0001 / workorder 21N: the admin single-row read both generation
+    // executors now share. Workorder 21I moved `getJobAdmin` onto this repository
+    // but wired it into `app.ts` only, so without this line the worker's
+    // executors call a service with nothing behind the read and every job row
+    // read fails closed as `job_query_failed`. Built lazily against the same
+    // `DATABASE_URL` as the repositories above.
+    jobAdminReadRepository: createJobAdminReadRepository({
+      getTransactionPool,
+    }),
+  });
+  const creditService = createCreditService({ getAdminClient });
+
+  // ADR-0001 / workorder 21W: the image executor's watermark decision reads the
+  // workspace subscription row to learn the plan. It used to be an admin client
+  // read inside the executor whose `error` field was discarded, so a missing row
+  // and a failed read both meant the free plan — and a free plan means the image
+  // IS watermarked. The read now goes through
+  // `CreditReadRepository.readSubscription`, built here as its OWN instance
+  // against the same `DATABASE_URL` as the repositories above. The
+  // `createCreditService` call above is deliberately untouched: that service
+  // still uses its admin client for everything else it does, and this line
+  // neither injects into it nor changes it. With no reachable pool the read
+  // fails and the executor falls back to the free plan, so the outcome is the
+  // one the discarded error used to produce.
+  const creditReadRepository = createCreditReadRepository({
+    getTransactionPool,
+  });
+
+  // ADR-0001 / workorder 21H1: the billing gate the worker runs before it
+  // consumes an attempt or calls a model. Built here, lazily, exactly like the
+  // attempt repository above and against the same `DATABASE_URL`. With no
+  // reachable pool the READ fails, `processJobMessage` leaves the message for a
+  // later retry and the job is never executed unbilled — there is no fallback
+  // that could reach PostgREST or skip the gate.
+  const billingGate = createJobBillingGateRepository({
+    getTransactionPool,
+  });
+
+  // ADR-0001 / workorder 21O: the refund basis the worker reads before it gives
+  // credits back — `credits_cost`, `workspace_id`, `created_by` of one job row.
+  // It used to be an admin PostgREST read inside a local function in this file,
+  // which discarded its error field, so a failed read and a missing row both
+  // meant "refund nothing, silently". Built lazily against the same
+  // `DATABASE_URL` as the repositories above: with no reachable pool the read
+  // fails, the refund path logs that failure and NO money moves — there is no
+  // fallback that could reach PostgREST.
+  const refundBasisRepository = createJobRefundBasisRepository({
+    getTransactionPool,
+  });
+
+  // The refund decision itself lives in `features/jobs/refund-job.ts`: the
+  // condition, the amount, the description and the "never throws" contract are
+  // unchanged, and the tag stays a call-site argument so both log lines keep
+  // naming this worker.
+  const refundJob = createRefundJob({
+    readRefundBasis: (refundInput) => refundBasisRepository.readRefundBasis(refundInput),
+    creditService,
+  });
+
+  // Base context — per-message fields (queue, msgId, renewVt) are added per message below
+  const baseCtx: WorkerBaseContext = {
+    jobService,
+    pgmq,
+    getAdminClient,
+    env,
+    // Workorder 21W: the image executor's watermark decision reads the plan
+    // through this. Optional on `ExecutorContext`, wired here for real.
+    creditReadRepository,
+  };
+
+  return {
+    jobService,
+    creditService,
+    creditReadRepository,
+    billingGate,
+    refundJob,
+    baseCtx,
+  };
+}
