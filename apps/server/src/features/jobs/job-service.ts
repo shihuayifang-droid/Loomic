@@ -8,6 +8,7 @@ import type {
 
 import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
+import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -69,11 +70,32 @@ export type JobService = {
   // charged still has to say so. The free-model and billing-disabled paths write
   // `(jobId, 0, null)` — a deliberate "confirmed, costs nothing" record that the
   // worker's billing gate can tell apart from "nothing recorded yet".
+  //
+  // Workorder 21H2: this write now CHECKS its answer and THROWS
+  // `job_query_failed` when it did not land (a broken write, or a row the
+  // predicate no longer owns). It used to be an admin update whose `error` and
+  // row count nobody read, so a charge that was never attributed looked exactly
+  // like one that was (21H0 H12). Zero rows is not success here.
   setCreditsInfo(
     jobId: string,
     creditsCost: number,
     transactionId: string | null,
   ): Promise<void>;
+  /**
+   * Workorder 21H2: take ownership of a job whose charge was never linked, so
+   * its refund is issued exactly once.
+   *
+   * `true` = this call claimed the row; `false` = the claim was refused (already
+   * billed, already claimed, or a state no compensation may touch). A missing or
+   * failing repository throws `job_query_failed` — the refund must never be
+   * attempted without knowing whether the claim succeeded.
+   */
+  claimUnlinkedCharge(jobId: string): Promise<boolean>;
+  /**
+   * Workorder 21H2: record that a claimed job's charge was refunded, so a later
+   * compensation pass stops seeing it as owing anything.
+   */
+  markChargeRefunded(jobId: string): Promise<boolean>;
   markRunning(jobId: string): Promise<boolean>;
   markRetrying(jobId: string, errorCode: string, errorMessage: string): Promise<boolean>;
   markSucceeded(jobId: string, result: Record<string, unknown>): Promise<boolean>;
@@ -94,6 +116,19 @@ export function createJobService(options: {
    * like a failing one — the same `job_query_failed` 500 and no count.
    */
   jobAttemptRepository?: JobAttemptRepository;
+  /**
+   * ADR-0001 / workorder 21H2: the job's credits link and the two steps of the
+   * compensation that owns an unlinked charge (`claimUnlinkedCharge`,
+   * `markChargeRefunded`). It is the only writer of `background_jobs.credits_cost`
+   * and `credits_transaction_id`.
+   *
+   * Optional for the same reason the attempt repository is, and with the same
+   * consequence: with no repository wired, or with a failing one, every method
+   * fails closed as the same `job_query_failed` 500. There is deliberately no
+   * PostgREST fallback — the unchecked admin update this replaces is exactly the
+   * defect (21H0 H12) workorder 21H2 removes.
+   */
+  jobCreditsLinkRepository?: JobCreditsLinkRepository;
 }): JobService {
   function mapJobRow(row: Record<string, unknown>): BackgroundJob {
     return {
@@ -361,14 +396,70 @@ export function createJobService(options: {
     // --- Admin-only methods (admin client, bypasses RLS) ---
 
     async setCreditsInfo(jobId, creditsCost, transactionId) {
-      const admin = options.getAdminClient();
-      await admin
-        .from("background_jobs")
-        .update({
-          credits_cost: creditsCost,
-          credits_transaction_id: transactionId,
-        })
-        .eq("id", jobId);
+      // ADR-0001 / workorder 21H2: the write that records WHICH transaction paid
+      // for the job moved from an unchecked admin PostgREST update to the narrow
+      // `pg` repository, and it now CHECKS its answer.
+      //
+      // What the old update did: one admin PostgREST update on
+      // `background_jobs`, matching the job id — with no projection, no `error`
+      // read and no row count. A database error and a zero-row update were both
+      // indistinguishable from success, so the job could keep a NULL
+      // `credits_transaction_id` while its charge had already been taken
+      // (21H0 H12).
+      //
+      // There is deliberately no PostgREST fallback behind this: with no
+      // repository wired, the call fails closed with exactly the error a broken
+      // write produces, so a missing dependency can never revive the update.
+      const repository = options.jobCreditsLinkRepository;
+      if (!repository) throw jobCreditsNotRecorded(jobId);
+
+      let linked: boolean;
+      try {
+        linked = await repository.linkCredits({
+          jobId,
+          creditsCost,
+          transactionId,
+        });
+      } catch {
+        throw jobCreditsNotRecorded(jobId);
+      }
+
+      // Zero rows is a legal answer at the repository level — it means the
+      // predicate matched nothing (the job was already billed, or it is no
+      // longer in a pre-execution state) — but it is a FAILURE here: the caller
+      // asked for this job's charge to be recorded and it was not. Reporting
+      // success would leave a taken charge unattributable, which is the state
+      // this workorder exists to remove. The two messages are fixed and
+      // distinct, so a log can tell "the write broke" from "the row was not
+      // billable" without either one carrying driver text.
+      if (!linked) throw jobCreditsNotBillable(jobId);
+    },
+
+    async claimUnlinkedCharge(jobId) {
+      // Workorder 21H2: the refund's authority. The caller may refund only after
+      // this answered `true`, so a missing or failing repository must never look
+      // like a refusal — that would either refund without ownership (a second
+      // refund, since `refund_credits` does not de-duplicate by job id) or lose
+      // the compensation silently. It throws, and the caller decides.
+      const repository = options.jobCreditsLinkRepository;
+      if (!repository) throw unlinkedChargeNotClaimed(jobId);
+
+      try {
+        return await repository.claimUnlinkedCharge({ jobId });
+      } catch {
+        throw unlinkedChargeNotClaimed(jobId);
+      }
+    },
+
+    async markChargeRefunded(jobId) {
+      const repository = options.jobCreditsLinkRepository;
+      if (!repository) throw chargeRefundNotMarked(jobId);
+
+      try {
+        return await repository.markChargeRefunded({ jobId });
+      } catch {
+        throw chargeRefundNotMarked(jobId);
+      }
     },
 
     async markRunning(jobId) {
@@ -453,6 +544,53 @@ function incrementAttemptFailed(jobId: string): JobServiceError {
   return new JobServiceError(
     "job_query_failed",
     `increment_job_attempt failed for ${jobId}`,
+    500,
+  );
+}
+
+/**
+ * The four failures the credits-link path can report (workorder 21H2).
+ *
+ * Like `incrementAttemptFailed`, these are functions rather than constants so
+ * every caller gets its own error, and each message is FIXED text: the driver's
+ * own text is deliberately not concatenated, because it can name the statement,
+ * the host or a credential. The repository already carries the raw failure as
+ * `cause` for whoever needs to classify it.
+ *
+ * `jobCreditsNotRecorded` and `jobCreditsNotBillable` are two different messages
+ * on purpose: "the write broke" and "the row was not billable any more" are
+ * different incidents — the first is an outage, the second is a race the
+ * compensation path handles — and folding them into one string would erase that
+ * from every log line.
+ */
+function jobCreditsNotRecorded(jobId: string): JobServiceError {
+  return new JobServiceError(
+    "job_query_failed",
+    `Failed to record the job credits for ${jobId}.`,
+    500,
+  );
+}
+
+function jobCreditsNotBillable(jobId: string): JobServiceError {
+  return new JobServiceError(
+    "job_query_failed",
+    `The job credits for ${jobId} were not recorded: the job is no longer billable.`,
+    500,
+  );
+}
+
+function unlinkedChargeNotClaimed(jobId: string): JobServiceError {
+  return new JobServiceError(
+    "job_query_failed",
+    `Failed to claim the unlinked charge of ${jobId}.`,
+    500,
+  );
+}
+
+function chargeRefundNotMarked(jobId: string): JobServiceError {
+  return new JobServiceError(
+    "job_query_failed",
+    `Failed to mark the charge of ${jobId} as refunded.`,
     500,
   );
 }

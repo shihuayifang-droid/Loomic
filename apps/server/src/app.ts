@@ -100,6 +100,10 @@ import {
   type JobAttemptRepository,
 } from "./db/job-attempt-repository.js";
 import {
+  createJobCreditsLinkRepository,
+  type JobCreditsLinkRepository,
+} from "./db/job-credits-link-repository.js";
+import {
   createAgentRunWriteRepository,
   type AgentRunWriteRepository,
 } from "./db/agent-run-write-repository.js";
@@ -219,6 +223,13 @@ export type BuildAppOptions = {
    * reaches PostgREST).
    */
   jobAttemptRepository?: JobAttemptRepository;
+  /**
+   * ADR-0001 / workorder 21H2: the job's credits link and the two compensation
+   * steps that own an unlinked charge. Injectable for the same reason the other
+   * repositories are — a test can hand the app its own double and observe that
+   * the charge is recorded through it (and that nothing reaches PostgREST).
+   */
+  jobCreditsLinkRepository?: JobCreditsLinkRepository;
 };
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -355,6 +366,20 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     createJobAttemptRepository({
       getTransactionPool: () => getTransactionPool(databaseEnv),
     });
+  // ADR-0001 / workorder 21H2: the write that records WHICH transaction paid for
+  // a job — and the two statements that compensate a charge which was taken but
+  // never linked. Built lazily against the same pool, exactly like the
+  // repositories above, and handed to the job service below. Like them it has no
+  // PostgREST fallback to fall back TO: with no pool, or with no repository, the
+  // call fails closed as a `JobCreditsLinkError` and the service reports its
+  // existing `job_query_failed` 500 — which is what turns an unattributed charge
+  // into a request that fails loudly instead of one that silently keeps the
+  // money.
+  const jobCreditsLinkRepository =
+    options.jobCreditsLinkRepository ??
+    createJobCreditsLinkRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   // ADR-0001 / workorder 21G: the two server-only `agent_runs` writes — the
   // accepted insert and the run metadata update — go through their own narrow
   // repository, built lazily against the same pool and handed to the agent run
@@ -462,6 +487,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           getAdminClient,
           pgmq,
           jobAttemptRepository,
+          jobCreditsLinkRepository,
         })
       : undefined);
   const creditService =

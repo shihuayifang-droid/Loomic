@@ -5,6 +5,7 @@ import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
 import type { JobBillingGateRepository } from "../../db/job-billing-gate-repository.js";
+import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import {
   CreditServiceError,
   type CreditService,
@@ -69,6 +70,24 @@ type HarnessConfig = {
   attemptError?: Error;
   /** Build the service with NO attempt repository at all (fail-closed path). */
   withoutAttemptRepository?: boolean;
+  /**
+   * ADR-0001 / workorder 21H2: what the credits-link repository answers.
+   *
+   * `linked` / `claimed` / `marked` are the resolved booleans (the predicate
+   * matched nothing ⇒ `false`); the `*Error` fields are the rejected-promise
+   * channel. Both are failures the service must handle, and they are different
+   * answers on purpose: the old PostgREST update had no way to express either.
+   */
+  creditsLink?: {
+    linked?: boolean;
+    claimed?: boolean;
+    marked?: boolean;
+    linkError?: Error;
+    claimError?: Error;
+    markError?: Error;
+  };
+  /** Build the service with NO credits-link repository at all (fail-closed). */
+  withoutCreditsLinkRepository?: boolean;
 };
 
 function makeHarness(config: HarnessConfig = {}) {
@@ -211,6 +230,47 @@ function makeHarness(config: HarnessConfig = {}) {
     },
   };
 
+  // ADR-0001 / workorder 21H2: the credits link and the two compensation steps.
+  // The harness records every call (operation + the exact argument object the
+  // service passed down), so "the charge is recorded through the repository" and
+  // "the compensation runs in this order" are observable rather than asserted in
+  // prose — and `patches()` staying empty is what proves nothing reaches
+  // PostgREST any more.
+  const creditsLinkCalls: Array<{
+    operation: string;
+    input: Record<string, unknown>;
+  }> = [];
+
+  const jobCreditsLinkRepository: JobCreditsLinkRepository = {
+    async linkCredits(input) {
+      creditsLinkCalls.push({ operation: "linkCredits", input: { ...input } });
+      // The link write is the same row write the PostgREST update used to be, so
+      // it keeps the same trace marker: the H14 ordering pin stays byte-identical
+      // across the migration instead of being quietly rewritten.
+      trace.push("update:background_jobs");
+      if (config.creditsLink?.linkError) throw config.creditsLink.linkError;
+      return config.creditsLink?.linked ?? true;
+    },
+    async claimUnlinkedCharge(input) {
+      creditsLinkCalls.push({
+        operation: "claimUnlinkedCharge",
+        input: { ...input },
+      });
+      trace.push("credits-link:claim");
+      if (config.creditsLink?.claimError) throw config.creditsLink.claimError;
+      return config.creditsLink?.claimed ?? true;
+    },
+    async markChargeRefunded(input) {
+      creditsLinkCalls.push({
+        operation: "markChargeRefunded",
+        input: { ...input },
+      });
+      trace.push("credits-link:mark");
+      if (config.creditsLink?.markError) throw config.creditsLink.markError;
+      return config.creditsLink?.marked ?? true;
+    },
+  };
+
   const service: JobService = createJobService({
     createUserClient: (accessToken: string) => {
       clientTokens.push(accessToken);
@@ -235,6 +295,9 @@ function makeHarness(config: HarnessConfig = {}) {
       },
     } as unknown as PgmqClient,
     ...(config.withoutAttemptRepository ? {} : { jobAttemptRepository }),
+    ...(config.withoutCreditsLinkRepository
+      ? {}
+      : { jobCreditsLinkRepository }),
   });
 
   const inOp = () => ops.find((op): op is Extract<Op, { kind: "in" }> => op.kind === "in");
@@ -259,6 +322,10 @@ function makeHarness(config: HarnessConfig = {}) {
     clientTokens,
     trace,
     jobRows,
+    creditsLinkCalls,
+    /** The credits-link operations in the order the service issued them. */
+    creditsLinkOperations: () =>
+      creditsLinkCalls.map((call) => call.operation),
     inOp,
     updateOp,
     insertOp,
@@ -385,6 +452,131 @@ describe("job service state guards", () => {
     // the admin client: a missing dependency cannot resurrect the old call.
     expect(harness.attemptCalls).toEqual([]);
     expect(harness.rpcCalls).toEqual([]);
+  });
+
+  it("case 7d: the credits link goes through the repository, and a refusing write is a fixed 500", async () => {
+    // Workorder 21H2. Two things the old admin update could not do: report that
+    // the row was not written, and report that the write itself broke.
+    const refused = makeHarness({ creditsLink: { linked: false } });
+
+    const refusedError = await refused.service
+      .setCreditsInfo("job-1", 10, "tx-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(refusedError).toBeInstanceOf(JobServiceError);
+    expect(refusedError?.code).toBe("job_query_failed");
+    expect(refusedError?.statusCode).toBe(500);
+    expect(refusedError?.message).toBe(
+      "The job credits for job-1 were not recorded: the job is no longer billable.",
+    );
+    // Exactly one argument object, and it carries nothing else: no token, no
+    // workspace, no generic patch a caller could widen the write with.
+    expect(refused.creditsLinkCalls).toEqual([
+      {
+        operation: "linkCredits",
+        input: { jobId: "job-1", creditsCost: 10, transactionId: "tx-1" },
+      },
+    ]);
+    // No PostgREST fallback: the migration is not a second chance for the old
+    // unchecked update.
+    expect(refused.patches()).toEqual([]);
+    expect(refused.rpcCalls).toEqual([]);
+  });
+
+  it("case 7e: a breaking credits link is a fixed 500 whose message carries no driver text", async () => {
+    const harness = makeHarness({
+      creditsLink: {
+        linkError: new Error(
+          "permission denied for table background_jobs: postgres://loomic:secret@10.210.134.37:5432/loomic",
+        ),
+      },
+    });
+
+    const error = await harness.service
+      .setCreditsInfo("job-1", 10, "tx-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_query_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to record the job credits for job-1.");
+    // The two failure modes are DIFFERENT fixed messages, and neither one is a
+    // channel for the driver's text.
+    expect(error?.message).not.toBe(
+      "The job credits for job-1 were not recorded: the job is no longer billable.",
+    );
+    expect(error?.message).not.toMatch(
+      /permission denied|background_jobs|postgres:\/\/|secret|10\.210\.134\.37/,
+    );
+    expect(harness.patches()).toEqual([]);
+  });
+
+  it("case 7f: claimUnlinkedCharge and markChargeRefunded pass the answer through, and fail closed", async () => {
+    // `true` / `false` are the repository's own answers and must reach the
+    // caller unchanged: the compensation decides whether to refund on exactly
+    // this value, so inventing one would refund without ownership.
+    const changed = makeHarness({});
+    expect(await changed.service.claimUnlinkedCharge("job-1")).toBe(true);
+    expect(await changed.service.markChargeRefunded("job-1")).toBe(true);
+    expect(changed.creditsLinkCalls).toEqual([
+      { operation: "claimUnlinkedCharge", input: { jobId: "job-1" } },
+      { operation: "markChargeRefunded", input: { jobId: "job-1" } },
+    ]);
+    expect(changed.patches()).toEqual([]);
+
+    const refused = makeHarness({
+      creditsLink: { claimed: false, marked: false },
+    });
+    expect(await refused.service.claimUnlinkedCharge("job-1")).toBe(false);
+    expect(await refused.service.markChargeRefunded("job-1")).toBe(false);
+
+    for (const [call, scenario, message] of [
+      [
+        (harness: ReturnType<typeof makeHarness>) =>
+          harness.service.claimUnlinkedCharge("job-1"),
+        { claimError: new Error("connection reset") },
+        "Failed to claim the unlinked charge of job-1.",
+      ],
+      [
+        (harness: ReturnType<typeof makeHarness>) =>
+          harness.service.markChargeRefunded("job-1"),
+        { markError: new Error("connection reset") },
+        "Failed to mark the charge of job-1 as refunded.",
+      ],
+    ] as const) {
+      const broken = makeHarness({ creditsLink: scenario });
+      const error = await call(broken)
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as JobServiceError);
+
+      expect(error).toBeInstanceOf(JobServiceError);
+      expect(error?.code).toBe("job_query_failed");
+      expect(error?.statusCode).toBe(500);
+      expect(error?.message).toBe(message);
+      expect(error?.message).not.toMatch(/connection reset/);
+    }
+
+    // And with no repository at all, both fail closed the same way: a missing
+    // dependency may never look like a refusal.
+    const absent = makeHarness({ withoutCreditsLinkRepository: true });
+    for (const call of [
+      absent.service.setCreditsInfo("job-1", 10, "tx-1"),
+      absent.service.claimUnlinkedCharge("job-1"),
+      absent.service.markChargeRefunded("job-1"),
+    ]) {
+      const error = await call
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as JobServiceError);
+
+      expect(error).toBeInstanceOf(JobServiceError);
+      expect(error?.code).toBe("job_query_failed");
+      expect(error?.statusCode).toBe(500);
+    }
+    expect(absent.creditsLinkCalls).toEqual([]);
+    expect(absent.patches()).toEqual([]);
+    expect(absent.rpcCalls).toEqual([]);
   });
 
   it("case 8: a legacy dead_letter row is read as failed", async () => {
@@ -1144,10 +1336,12 @@ type BillingScenario = {
   cost?: number;
   deductError?: Error;
   deductTxId?: string;
-  /** Resolved error reported by the awaited UPDATE chain (setCreditsInfo). */
-  updateError?: { message: string } | null;
-  /** Per-call outcomes for the awaited UPDATE chains. */
-  updateOutcomes?: Array<{ rows?: number; reject?: Error }>;
+  /**
+   * Workorder 21H2: what the credits-link repository answers to
+   * `setCreditsInfo`. `linked: false` is the migrated form of the old resolved
+   * "the write did not land" answer; `linkError` is the rejected-promise form.
+   */
+  creditsLink?: HarnessConfig["creditsLink"];
   /** `false` models a cancel whose guard matched no row (404, swallowed). */
   cancelSeesRow?: boolean;
 };
@@ -1157,10 +1351,9 @@ function makeBillingHarness(scenario: BillingScenario = {}) {
     insertedJob: WRITE_JOB_ROW,
     canvasRow: { project_id: "project-1" },
     jobRow: scenario.cancelSeesRow === false ? null : WRITE_JOB_ROW,
-    ...(scenario.updateError === undefined ? {} : { updateError: scenario.updateError }),
-    ...(scenario.updateOutcomes === undefined
+    ...(scenario.creditsLink === undefined
       ? {}
-      : { updateOutcomes: [...scenario.updateOutcomes] }),
+      : { creditsLink: scenario.creditsLink }),
   });
 
   // Billing markers go into the SAME trace as the service's own statements, so
@@ -1350,53 +1543,118 @@ describe("withBilling through the real JobService: where the money sits in the w
     expect(harness.trace).not.toContain("billing:refundCredits:10");
   });
 
-  it("case H12: a credits-info write that reports a DATABASE ERROR is dropped on the floor", async () => {
+  it("case H12 (FLIPPED 21H2): a credits-info write that did not land is no longer dropped — it fails the request", async () => {
+    // OLD ASSERTION (21H0): the write's resolved answer was ignored, the charge
+    // went through, the body ran, and the job kept a NULL
+    // `credits_transaction_id` with nobody refunding it.
+    //
+    // NEW ASSERTION (21H2): the link write's result is checked. `linked: false`
+    // is the predicate answering "this row is not billable any more" — the same
+    // class of answer the old resolved `{ error: "permission denied ..." }` was,
+    // in the shape the `pg` repository reports it. It now becomes the service's
+    // fixed `job_query_failed` 500, the body does NOT run, and the charge is
+    // compensated (claim -> refund -> mark) because the money was already taken.
     const { harness, bill } = makeBillingHarness({
-      updateError: { message: "permission denied for table background_jobs" },
+      creditsLink: { linked: false },
     });
 
-    const result = await bill();
+    const error = await bill()
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
 
-    // The charge went through and the body ran...
-    expect(result).toEqual({ jobId: "job-21h0", creditsCost: 10 });
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_query_failed");
+    expect(error?.statusCode).toBe(500);
+    // Fixed text: it names the job, never the driver's message or any SQL.
+    expect(error?.message).toBe(
+      "The job credits for job-21h0 were not recorded: the job is no longer billable.",
+    );
+    expect(error?.message).not.toMatch(
+      /permission denied|background_jobs|public\.|postgres:\/\//i,
+    );
+
+    // The charge DID happen, and the link was attempted exactly once through the
+    // repository — the PostgREST update is gone, so no admin patch carries the
+    // credit columns any more.
     expect(harness.trace).toContain("billing:deductCredits:10:job-21h0");
-    expect(harness.trace).toContain("run:body");
-
-    // ...while the write that records WHICH transaction paid for the job
-    // reported an error nobody reads: `setCreditsInfo` awaits the statement and
-    // never inspects its `error`, so the job keeps a null
-    // credits_transaction_id and no cancel or refund is triggered.
-    expect(harness.patches()).toEqual([
-      { credits_cost: 10, credits_transaction_id: "tx-21h0" },
+    expect(harness.creditsLinkOperations()).toEqual([
+      "linkCredits",
+      "claimUnlinkedCharge",
+      "markChargeRefunded",
     ]);
-    expect(harness.trace).not.toContain("billing:refundCredits:10");
+    expect(harness.creditsLinkCalls[0]?.input).toEqual({
+      jobId: "job-21h0",
+      creditsCost: 10,
+      transactionId: "tx-21h0",
+    });
+    expect(harness.patches()).toEqual([]);
+
+    // Nobody executes a job nobody can bill, and the money goes back exactly
+    // once, in the order the ownership rule requires.
+    expect(harness.trace).not.toContain("run:body");
+    expect(harness.trace).toContain("billing:refundCredits:10");
+    expect(
+      harness.trace.indexOf("credits-link:claim"),
+    ).toBeLessThan(harness.trace.indexOf("billing:refundCredits:10"));
+    expect(
+      harness.trace.indexOf("billing:refundCredits:10"),
+    ).toBeLessThan(harness.trace.indexOf("credits-link:mark"));
+    // No cancel: the claim already moved the job. A cancel would have added a
+    // second guarded `update:background_jobs` (and a patch), so counting the row
+    // writes is what states the flip rather than describing it.
+    expect(
+      harness.trace.filter((entry) => entry === "update:background_jobs"),
+    ).toHaveLength(1);
     expect(harness.jobRows.has("job-21h0")).toBe(true);
   });
 
-  it("case H13: a credits-info write that THROWS cancels a job that was already paid for", async () => {
+  it("case H13 (FLIPPED 21H2): a credits-info write that THROWS claims, refunds and marks instead of cancelling", async () => {
+    // OLD ASSERTION (21H0): the money was taken, the write threw, and the only
+    // reaction was to cancel the job — nobody refunded.
+    //
+    // NEW ASSERTION (21H2): the same rejection is answered by the compensation.
+    // Cancel is gone from this path on purpose: the claim moves a
+    // queued/retrying job to `failed`, so cancelling would either be a no-op or
+    // race that write.
     const transport = new Error("fetch failed: connection reset by peer");
     const { harness, bill } = makeBillingHarness({
-      updateOutcomes: [{ reject: transport }],
+      creditsLink: { linkError: transport },
     });
 
     const error = await bill()
       .then(() => null)
       .catch((thrown: unknown) => thrown as Error);
 
-    expect(error).toBe(transport);
+    // The caller still sees the write failure the request actually hit: the
+    // compensation neither replaces it nor hides it.
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect((error as JobServiceError).code).toBe("job_query_failed");
+    expect((error as JobServiceError).message).toBe(
+      "Failed to record the job credits for job-21h0.",
+    );
 
-    // CURRENT BEHAVIOUR, PINNED AS A RISK: the money was already taken, and the
-    // only reaction is to cancel the job. The catch around the charge covers
-    // this write too, so the job is cancelled and NOBODY refunds: this workorder
-    // does not change that, it records it.
     expect(harness.trace).toContain("billing:deductCredits:10:job-21h0");
-    expect(harness.patches()).toEqual([
-      { credits_cost: 10, credits_transaction_id: "tx-21h0" },
-      { status: "canceled", canceled_at: expect.any(String) },
+    expect(harness.creditsLinkOperations()).toEqual([
+      "linkCredits",
+      "claimUnlinkedCharge",
+      "markChargeRefunded",
     ]);
-    expect(harness.trace).not.toContain("billing:refundCredits:10");
-    expect(harness.jobRows.has("job-21h0")).toBe(true);
+    expect(harness.trace).toContain("billing:refundCredits:10");
+
+    // THE FLIP, stated as the assertion the old pin made: there is no cancel any
+    // more, and the credit columns are not written by a PostgREST update. The
+    // link is the only row write — a cancel would have added a second
+    // `update:background_jobs` through the guarded status update.
+    expect(harness.patches()).toEqual([]);
+    expect(harness.patches()).not.toContainEqual({
+      status: "canceled",
+      canceled_at: expect.any(String),
+    });
+    expect(
+      harness.trace.filter((entry) => entry === "update:background_jobs"),
+    ).toHaveLength(1);
     expect(harness.trace).not.toContain("run:body");
+    expect(harness.jobRows.has("job-21h0")).toBe(true);
   });
 
   it("case H14: the full order - guards, balance, job, enqueue, charge, credits info, body", async () => {
