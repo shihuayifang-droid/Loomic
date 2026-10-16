@@ -5,11 +5,13 @@
 // all. Once the bucket is private, the project that generated an image can no
 // longer read it, and nothing in the row says which project it was.
 //
-// Two properties matter and both are asserted here:
+// Three properties matter and all three are asserted here:
 //   * ownership comes from the job's canvas/project, not from the billing
 //     workspace, so the two are passed to the RPC separately;
 //   * a metadata failure FAILS the job. An uploaded object with no asset row is
-//     the silent success this ticket exists to remove.
+//     the silent success this ticket exists to remove;
+//   * the job row is read through `JobService.getJobAdmin` (workorder 21N): the
+//     admin client is not a source for it, and asking it for one fails loudly.
 //
 // The provider call and the CDN download are mocked so the file never leaves the
 // machine (and never spends money).
@@ -36,6 +38,8 @@ vi.mock("../credits/watermark.js", () => ({
   applyWatermark: (...args: unknown[]) => applyWatermark(...args),
 }));
 
+import type { BackgroundJob } from "@loomic/shared";
+
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { getExecutor, type ExecutorContext } from "./job-executor.js";
 
@@ -50,23 +54,27 @@ const CREATED_BY = "user-1";
 
 type RpcCall = { name: string; params: Record<string, unknown> };
 
-function makeAdmin(options: {
-  job: Record<string, unknown>;
-  rpcError?: { message: string } | null;
-}) {
+function makeAdmin(options: { rpcError?: { message: string } | null } = {}) {
   const rpcs: RpcCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
   const signCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
+  const jobRowReads: string[] = [];
 
   const client = {
     from(table: string) {
+      // Workorder 21N: the executors read their job row through
+      // `JobService.getJobAdmin`, so the admin client must not be able to serve
+      // one. A case that regresses to the old read fails loudly here instead of
+      // quietly passing off a client that is no longer the source.
+      if (table === "background_jobs") {
+        jobRowReads.push(table);
+        throw new Error("executor must not read job rows through the admin client");
+      }
+
       const chain = {
         select: () => chain,
         eq: () => chain,
-        single: async () => ({
-          data: table === "background_jobs" ? options.job : null,
-          error: null,
-        }),
+        single: async () => ({ data: null, error: null }),
         maybeSingle: async () => ({
           // A paid plan keeps the watermark path out of the way; it is not what
           // this file is about.
@@ -104,23 +112,73 @@ function makeAdmin(options: {
     },
   };
 
-  return { client: client as unknown as AdminSupabaseClient, rpcs, uploads, signCalls };
+  return {
+    client: client as unknown as AdminSupabaseClient,
+    rpcs,
+    uploads,
+    signCalls,
+    jobRowReads,
+  };
 }
 
-function makeContext(client: AdminSupabaseClient): ExecutorContext {
+/** The context plus the job ids its service substitute was asked for. */
+type TestExecutorContext = ExecutorContext & { jobReads: string[] };
+
+/**
+ * The executor's ONLY source of a job row. Workorder 21N moved that read onto
+ * `JobService.getJobAdmin`, so the substitute carries exactly that one method and
+ * the case hands it the row it wants the executor to see. Everything else on
+ * `BackgroundJob` gets a legal placeholder: no case asserts on those columns.
+ */
+function makeContext(
+  client: AdminSupabaseClient,
+  job: ExecutorJobFixture,
+): TestExecutorContext {
+  const jobReads: string[] = [];
+
   return {
-    jobService: {} as ExecutorContext["jobService"],
+    jobService: {
+      getJobAdmin: async (jobId: string): Promise<BackgroundJob> => {
+        jobReads.push(jobId);
+        return {
+          id: jobId,
+          thread_id: null,
+          queue_name: "image_generation",
+          job_type: "image_generation",
+          status: "running",
+          result: null,
+          error_code: null,
+          error_message: null,
+          attempt_count: 0,
+          max_attempts: 3,
+          created_at: "2026-01-01T00:00:00.000Z",
+          updated_at: "2026-01-01T00:00:00.000Z",
+          started_at: null,
+          completed_at: null,
+          failed_at: null,
+          canceled_at: null,
+          ...job,
+        };
+      },
+    } as unknown as ExecutorContext["jobService"],
     pgmq: {} as ExecutorContext["pgmq"],
     getAdminClient: () => client,
     env: {} as ExecutorContext["env"],
     queue: "image_generation",
     msgId: 1,
     renewVt: async () => {},
+    jobReads,
   };
 }
 
+/** The six job columns both executors consume, as the service returns them. */
+type ExecutorJobFixture = Pick<
+  BackgroundJob,
+  "created_by" | "workspace_id" | "canvas_id" | "project_id" | "session_id" | "payload"
+>;
+
 /** A job whose billing workspace is personal while its project lives in the team. */
-function jobRow(overrides: Record<string, unknown> = {}) {
+function jobRow(overrides: Partial<ExecutorJobFixture> = {}): ExecutorJobFixture {
   return {
     created_by: CREATED_BY,
     workspace_id: PERSONAL_WORKSPACE,
@@ -166,11 +224,11 @@ beforeEach(() => {
 
 describe("generation executors record project asset ownership", () => {
   it("case 1: the image executor passes canvas, project and object path to the RPC", async () => {
-    const admin = makeAdmin({ job: jobRow() });
+    const admin = makeAdmin();
     const executor = getExecutor("image_generation");
     expect(executor).toBeDefined();
 
-    const result = await executor!("job-1", {}, makeContext(admin.client));
+    const result = await executor!("job-1", {}, makeContext(admin.client, jobRow()));
 
     expect(admin.rpcs).toHaveLength(1);
     expect(admin.rpcs[0]?.name).toBe("record_project_asset");
@@ -190,9 +248,13 @@ describe("generation executors record project asset ownership", () => {
   });
 
   it("case 1b: the job result carries a SIGNED url, never a public one", async () => {
-    const admin = makeAdmin({ job: jobRow() });
+    const admin = makeAdmin();
 
-    const result = await getExecutor("image_generation")!("job-1b", {}, makeContext(admin.client));
+    const result = await getExecutor("image_generation")!(
+      "job-1b",
+      {},
+      makeContext(admin.client, jobRow()),
+    );
 
     // X-52: the worker signs what it just recorded. A permanent public URL here
     // would survive the bucket going private as a dead link.
@@ -204,13 +266,12 @@ describe("generation executors record project asset ownership", () => {
   });
 
   it("case 2: the video executor does the same for video objects", async () => {
-    const admin = makeAdmin({
-      job: jobRow({ payload: { prompt: "a clip", model: "test/video" } }),
-    });
+    const admin = makeAdmin();
+    const job = jobRow({ payload: { prompt: "a clip", model: "test/video" } });
     const executor = getExecutor("video_generation");
     expect(executor).toBeDefined();
 
-    const result = await executor!("job-2", {}, makeContext(admin.client));
+    const result = await executor!("job-2", {}, makeContext(admin.client, job));
 
     expect(admin.rpcs).toHaveLength(1);
     expect(admin.rpcs[0]?.params).toMatchObject({
@@ -231,9 +292,9 @@ describe("generation executors record project asset ownership", () => {
   });
 
   it("case 3: billing stays personal while ownership follows the team project", async () => {
-    const admin = makeAdmin({ job: jobRow() });
+    const admin = makeAdmin();
 
-    await getExecutor("image_generation")!("job-3", {}, makeContext(admin.client));
+    await getExecutor("image_generation")!("job-3", {}, makeContext(admin.client, jobRow()));
 
     const params = admin.rpcs[0]?.params ?? {};
     // The fallback is the ONLY workspace the worker may name, and it is the
@@ -244,11 +305,13 @@ describe("generation executors record project asset ownership", () => {
   });
 
   it("case 4: a job with no project records against the billing workspace only", async () => {
-    const admin = makeAdmin({
-      job: jobRow({ canvas_id: null, project_id: null }),
-    });
+    const admin = makeAdmin();
 
-    await getExecutor("image_generation")!("job-4", {}, makeContext(admin.client));
+    await getExecutor("image_generation")!(
+      "job-4",
+      {},
+      makeContext(admin.client, jobRow({ canvas_id: null, project_id: null })),
+    );
 
     expect(admin.rpcs[0]?.params).toMatchObject({
       p_project_id: null,
@@ -259,12 +322,11 @@ describe("generation executors record project asset ownership", () => {
 
   it("case 5: a metadata failure fails the job instead of succeeding silently", async () => {
     const admin = makeAdmin({
-      job: jobRow(),
       rpcError: { message: "record_project_asset exploded" },
     });
 
     await expect(
-      getExecutor("image_generation")!("job-5", {}, makeContext(admin.client)),
+      getExecutor("image_generation")!("job-5", {}, makeContext(admin.client, jobRow())),
     ).rejects.toThrow(/record asset ownership/i);
 
     // The object was uploaded; the point is that the job did NOT report success.
@@ -273,12 +335,27 @@ describe("generation executors record project asset ownership", () => {
 
   it("case 6: a video metadata failure fails the job too", async () => {
     const admin = makeAdmin({
-      job: jobRow({ payload: { prompt: "a clip", model: "test/video" } }),
       rpcError: { message: "record_project_asset exploded" },
     });
+    const job = jobRow({ payload: { prompt: "a clip", model: "test/video" } });
 
     await expect(
-      getExecutor("video_generation")!("job-6", {}, makeContext(admin.client)),
+      getExecutor("video_generation")!("job-6", {}, makeContext(admin.client, job)),
     ).rejects.toThrow(/record asset ownership/i);
+  });
+
+  it("case 7: the job row comes from getJobAdmin, never from the admin client", async () => {
+    const admin = makeAdmin();
+    const ctx = makeContext(admin.client, jobRow());
+
+    await getExecutor("image_generation")!("job-7", {}, ctx);
+
+    // The service read is the ONLY source of a job row, and it is asked for
+    // exactly this job.
+    expect(ctx.jobReads).toHaveLength(1);
+    expect(ctx.jobReads[0]).toBe("job-7");
+    // Nothing reached the admin client for a job row. The old read is a loud
+    // failure now, so a regression cannot pass this case by staying quiet.
+    expect(admin.jobRowReads).toEqual([]);
   });
 });
