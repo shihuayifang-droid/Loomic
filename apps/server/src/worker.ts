@@ -19,6 +19,7 @@ import { createJobTransitionRepository } from "./db/job-transition-repository.js
 import { createJobBillingGateRepository } from "./db/job-billing-gate-repository.js";
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
 import { createJobRefundBasisRepository } from "./db/job-refund-basis-repository.js";
+import { createCreditReadRepository } from "./db/credit-read-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
 import { createRefundJob } from "./features/jobs/refund-job.js";
@@ -109,6 +110,25 @@ async function main() {
   });
   const creditService = createCreditService({ getAdminClient });
 
+  // ADR-0001 / workorder 21W: the image executor's watermark decision reads the
+  // workspace subscription row to learn the plan. It used to be an admin client
+  // read inside the executor whose `error` field was discarded, so a missing row
+  // and a failed read both meant the free plan — and a free plan means the image
+  // IS watermarked. The read now goes through
+  // `CreditReadRepository.readSubscription`, built here as its OWN instance
+  // against the same `DATABASE_URL` as the repositories above. The
+  // `createCreditService` call above is deliberately untouched: that service
+  // still uses its admin client for everything else it does, and this line
+  // neither injects into it nor changes it. With no reachable pool the read
+  // fails and the executor falls back to the free plan, so the outcome is the
+  // one the discarded error used to produce.
+  const creditReadRepository = createCreditReadRepository({
+    getTransactionPool: () =>
+      getTransactionPool(
+        env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
+      ),
+  });
+
   // ADR-0001 / workorder 21H1: the billing gate the worker runs before it
   // consumes an attempt or calls a model. Built here, lazily, exactly like the
   // attempt repository above and against the same `DATABASE_URL`. With no
@@ -152,6 +172,9 @@ async function main() {
     pgmq,
     getAdminClient,
     env,
+    // Workorder 21W: the image executor's watermark decision reads the plan
+    // through this. Optional on `ExecutorContext`, wired here for real.
+    creditReadRepository,
   };
 
   const inFlightByQueue = new Map<string, Set<Promise<void>>>(

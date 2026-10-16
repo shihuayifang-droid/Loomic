@@ -106,21 +106,35 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
     // Apply watermark for free-plan users
     if (workspaceId) {
+      // The plan decides whether this image is watermarked, and the only
+      // acceptable failure direction is "watermark it": a paid workspace that
+      // cannot be read loses nothing but a watermark, while a free one that
+      // cannot be read must NOT hand out an unwatermarked image. So an absent
+      // repository, a missing subscription row and a failed read all mean the
+      // free plan. That is what this read did before it moved onto the credit
+      // repository: it used a client whose `error` field was discarded, which
+      // left the plan at `free` for exactly those three cases.
+      let plan: SubscriptionPlan = "free";
       try {
-        const { data: sub } = await admin
-          .from("subscriptions")
-          .select("plan")
-          .eq("workspace_id", workspaceId)
-          .maybeSingle();
+        const sub = ctx.creditReadRepository
+          ? await ctx.creditReadRepository.readSubscription({ workspaceId })
+          : null;
+        plan = (sub?.plan as SubscriptionPlan) ?? "free";
+      } catch {
+        // Read failure is the free plan — see above. Deliberately a separate
+        // try from the watermark below: merging them would turn a failed READ
+        // into a skipped watermark.
+        plan = "free";
+      }
 
-        const plan: SubscriptionPlan = (sub?.plan as SubscriptionPlan) ?? "free";
-        if (plan === "free") {
+      if (plan === "free") {
+        try {
           buffer = await applyWatermark(buffer, generated.mimeType ?? "image/png");
           lap("watermark_applied");
+        } catch (wmErr) {
+          // Non-fatal: log and continue without watermark rather than failing the job
+          console.warn(`${tag} Watermark failed, continuing without:`, wmErr);
         }
-      } catch (wmErr) {
-        // Non-fatal: log and continue without watermark rather than failing the job
-        console.warn(`${tag} Watermark failed, continuing without:`, wmErr);
       }
     }
 

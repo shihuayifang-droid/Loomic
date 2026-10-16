@@ -13,6 +13,14 @@
 //   * the job row is read through `JobService.getJobAdmin` (workorder 21N): the
 //     admin client is not a source for it, and asking it for one fails loudly.
 //
+// Workorder 21W added a fourth property: the decision to watermark reads the
+// workspace plan through `ExecutorContext.creditReadRepository`, and EVERY way
+// that read can fail — no repository, no row, a thrown error — still produces a
+// watermark, because an unreadable plan must never hand a free workspace an
+// unwatermarked image. The fake admin answers no subscription row at all now, so
+// a case that regresses to the old client-side read fails loudly instead of
+// quietly passing.
+//
 // The provider call and the CDN download are mocked so the file never leaves the
 // machine (and never spends money).
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -38,9 +46,10 @@ vi.mock("../credits/watermark.js", () => ({
   applyWatermark: (...args: unknown[]) => applyWatermark(...args),
 }));
 
-import type { BackgroundJob } from "@loomic/shared";
+import type { BackgroundJob, SubscriptionPlan } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type { SubscriptionReadRow } from "../../db/credit-read-repository.js";
 import { getExecutor, type ExecutorContext } from "./job-executor.js";
 
 // Importing the executors is what registers them.
@@ -71,16 +80,20 @@ function makeAdmin(options: { rpcError?: { message: string } | null } = {}) {
         throw new Error("executor must not read job rows through the admin client");
       }
 
+      // Workorder 21W: the watermark decision no longer asks the admin client
+      // for the workspace subscription row — it goes through the credit read
+      // repository on the executor context. This branch used to ANSWER with a
+      // paid plan, which silently kept the watermark path out of the way; now a
+      // case that regresses to the old read fails loudly in this file instead.
+      if (table === "subscriptions") {
+        throw new Error("executor must not read subscriptions through the admin client");
+      }
+
       const chain = {
         select: () => chain,
         eq: () => chain,
         single: async () => ({ data: null, error: null }),
-        maybeSingle: async () => ({
-          // A paid plan keeps the watermark path out of the way; it is not what
-          // this file is about.
-          data: table === "subscriptions" ? { plan: "pro" } : null,
-          error: null,
-        }),
+        maybeSingle: async () => ({ data: null, error: null }),
       };
       return chain;
     },
@@ -121,6 +134,41 @@ function makeAdmin(options: { rpcError?: { message: string } | null } = {}) {
   };
 }
 
+/** The subscription row's nullable columns; no case asserts on these. */
+const NULLABLE_SUBSCRIPTION_COLUMNS = {
+  billing_period: null,
+  stripe_customer_id: null,
+  stripe_subscription_id: null,
+  current_period_start: null,
+  current_period_end: null,
+  canceled_at: null,
+} satisfies Omit<SubscriptionReadRow, "plan">;
+
+/**
+ * Workorder 21W: the substitute for the plan read the image executor's
+ * watermark decision goes through, plus every argument it was handed.
+ *
+ * The default answer is a paid plan, which keeps the watermark path out of the
+ * way for the cases that are not about it — that is the job the fake admin's
+ * subscription branch used to do, and it is why the cases above still see no
+ * watermark.
+ */
+function makeCreditRead(
+  options: { plan?: SubscriptionPlan | null; failWith?: Error } = {},
+) {
+  const calls: Array<{ workspaceId: string }> = [];
+  const repository: NonNullable<ExecutorContext["creditReadRepository"]> = {
+    async readSubscription(input) {
+      calls.push(input);
+      if (options.failWith) throw options.failWith;
+      const plan = options.plan === undefined ? "pro" : options.plan;
+      if (plan === null) return null;
+      return { ...NULLABLE_SUBSCRIPTION_COLUMNS, plan };
+    },
+  };
+  return { repository, calls };
+}
+
 /** The context plus the job ids its service substitute was asked for. */
 type TestExecutorContext = ExecutorContext & { jobReads: string[] };
 
@@ -129,10 +177,16 @@ type TestExecutorContext = ExecutorContext & { jobReads: string[] };
  * `JobService.getJobAdmin`, so the substitute carries exactly that one method and
  * the case hands it the row it wants the executor to see. Everything else on
  * `BackgroundJob` gets a legal placeholder: no case asserts on those columns.
+ *
+ * Workorder 21W added the plan substitute on the same pattern: it is injected by
+ * default (a paid plan) and a case that wants to drive the watermark path hands
+ * in its own. Passing `null` leaves the field off the context entirely, which is
+ * the "worker forgot to wire it" shape one of the cases below pins.
  */
 function makeContext(
   client: AdminSupabaseClient,
   job: ExecutorJobFixture,
+  creditRead: ReturnType<typeof makeCreditRead> | null = makeCreditRead(),
 ): TestExecutorContext {
   const jobReads: string[] = [];
 
@@ -167,6 +221,10 @@ function makeContext(
     queue: "image_generation",
     msgId: 1,
     renewVt: async () => {},
+    // Omitted entirely when the case passed `null`: an optional field that is
+    // present-and-undefined is a different shape under
+    // `exactOptionalPropertyTypes`, and the executor's check does not care.
+    ...(creditRead ? { creditReadRepository: creditRead.repository } : {}),
     jobReads,
   };
 }
@@ -357,5 +415,176 @@ describe("generation executors record project asset ownership", () => {
     // Nothing reached the admin client for a job row. The old read is a loud
     // failure now, so a regression cannot pass this case by staying quiet.
     expect(admin.jobRowReads).toEqual([]);
+  });
+});
+
+// Workorder 21W: the watermark decision and the plan read behind it. The two
+// failure directions are NOT symmetric and both are pinned here — an unreadable
+// plan watermarks (fail-closed for a free workspace), while a watermark that
+// itself fails only warns and lets the job finish.
+describe("the watermark decision reads the plan through the credit repository", () => {
+  it("case 8: a paid plan is never watermarked", async () => {
+    const admin = makeAdmin();
+    const credit = makeCreditRead({ plan: "pro" });
+
+    const result = await getExecutor("image_generation")!(
+      "job-8",
+      {},
+      makeContext(admin.client, jobRow(), credit),
+    );
+
+    expect(credit.calls).toEqual([{ workspaceId: PERSONAL_WORKSPACE }]);
+    expect(applyWatermark).not.toHaveBeenCalled();
+    expect(result.asset_id).toBe("asset-1");
+  });
+
+  it("case 9: a free plan is watermarked once and the MARKED buffer is uploaded", async () => {
+    const admin = makeAdmin();
+    const credit = makeCreditRead({ plan: "free" });
+    // The mark GROWS the buffer (32 -> 64), so the uploaded byte count says
+    // WHICH buffer reached the bucket. Case 13 is its mirror image.
+    applyWatermark.mockImplementationOnce(async () => Buffer.alloc(64));
+
+    await getExecutor("image_generation")!(
+      "job-9",
+      {},
+      makeContext(admin.client, jobRow(), credit),
+    );
+
+    expect(applyWatermark).toHaveBeenCalledTimes(1);
+    expect(credit.calls).toEqual([{ workspaceId: PERSONAL_WORKSPACE }]);
+    expect(admin.uploads).toHaveLength(1);
+    expect(admin.uploads[0]?.bytes).toBe(64);
+  });
+
+  it("case 10: a workspace with no subscription row is treated as free", async () => {
+    const admin = makeAdmin();
+    const credit = makeCreditRead({ plan: null });
+
+    const result = await getExecutor("image_generation")!(
+      "job-10",
+      {},
+      makeContext(admin.client, jobRow(), credit),
+    );
+
+    expect(credit.calls).toEqual([{ workspaceId: PERSONAL_WORKSPACE }]);
+    expect(applyWatermark).toHaveBeenCalledTimes(1);
+    expect(result.asset_id).toBe("asset-1");
+  });
+
+  it("case 11: no repository on the context is treated as free", async () => {
+    const admin = makeAdmin();
+    const ctx = makeContext(admin.client, jobRow(), null);
+
+    // The shape this pins: the worker did not wire the repository, so the field
+    // is genuinely absent rather than present and undefined.
+    expect("creditReadRepository" in ctx).toBe(false);
+
+    const result = await getExecutor("image_generation")!("job-11", {}, ctx);
+
+    expect(applyWatermark).toHaveBeenCalledTimes(1);
+    expect(result.asset_id).toBe("asset-1");
+  });
+
+  it("case 12: a FAILED plan read still watermarks and the job still succeeds", async () => {
+    const admin = makeAdmin();
+    const credit = makeCreditRead({
+      failWith: new Error("credit read failed (readSubscription)"),
+    });
+
+    const result = await getExecutor("image_generation")!(
+      "job-12",
+      {},
+      makeContext(admin.client, jobRow(), credit),
+    );
+
+    // The read was attempted and threw — and a free workspace's image is still
+    // watermarked. This is the fail-closed direction: the old code discarded the
+    // same error and fell through to the free plan.
+    expect(credit.calls).toEqual([{ workspaceId: PERSONAL_WORKSPACE }]);
+    expect(applyWatermark).toHaveBeenCalledTimes(1);
+    expect(admin.uploads).toHaveLength(1);
+    expect(result.asset_id).toBe("asset-1");
+  });
+
+  it("case 13: a watermark failure warns once, keeps the job alive and uploads the RAW image", async () => {
+    const admin = makeAdmin();
+    const credit = makeCreditRead({ plan: "free" });
+    // 40 bytes in and nothing added: the bucket must receive the download's own
+    // buffer. Case 9 showed a SUCCESSFUL mark reaching it with the size the mark
+    // produced, so the pair distinguishes "raw" from "marked".
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        arrayBuffer: async () => new ArrayBuffer(40),
+      })),
+    );
+    applyWatermark.mockRejectedValueOnce(new Error("sharp exploded"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const result = await getExecutor("image_generation")!(
+        "job-13",
+        {},
+        makeContext(admin.client, jobRow(), credit),
+      );
+
+      expect(applyWatermark).toHaveBeenCalledTimes(1);
+      expect(result.asset_id).toBe("asset-1");
+
+      const watermarkWarnings = warn.mock.calls.filter((call) =>
+        String(call[0]).includes("Watermark failed, continuing without:"),
+      );
+      expect(watermarkWarnings).toHaveLength(1);
+      // The frozen sentence, ending exactly where it always did: only the tag in
+      // front of it is allowed to vary.
+      expect(String(watermarkWarnings[0]?.[0])).toMatch(
+        /^\[image-job:job-13 [^\]]*\] Watermark failed, continuing without:$/,
+      );
+      expect(String(watermarkWarnings[0]?.[1])).toContain("sharp exploded");
+
+      // The job finished and the object was stored — unwatermarked, at the size
+      // it was downloaded with.
+      expect(admin.uploads).toHaveLength(1);
+      expect(admin.uploads[0]?.bytes).toBe(40);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("case 14: the plan read is asked for the billing workspace and nothing else", async () => {
+    const admin = makeAdmin();
+    const credit = makeCreditRead();
+
+    await getExecutor("image_generation")!(
+      "job-14",
+      {},
+      makeContext(admin.client, jobRow(), credit),
+    );
+
+    expect(credit.calls).toHaveLength(1);
+    expect(credit.calls[0]).toEqual({ workspaceId: PERSONAL_WORKSPACE });
+    // "Exactly" means no second key hiding beside it.
+    expect(Object.keys(credit.calls[0] ?? {})).toEqual(["workspaceId"]);
+  });
+
+  it("case 15: with no billing workspace neither the plan read nor the mark runs", async () => {
+    const admin = makeAdmin();
+    const credit = makeCreditRead();
+
+    const result = await getExecutor("image_generation")!(
+      "job-15",
+      {},
+      makeContext(admin.client, jobRow({ workspace_id: "" }), credit),
+    );
+
+    expect(credit.calls).toEqual([]);
+    expect(applyWatermark).not.toHaveBeenCalled();
+    // The JOB still ran: this is a skipped watermark, not a skipped job.
+    expect(admin.uploads).toHaveLength(1);
+    expect(result.asset_id).toBe("asset-1");
   });
 });

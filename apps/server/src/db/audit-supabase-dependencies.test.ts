@@ -738,11 +738,26 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // no client method either, so `fromCallsIncludingTests` follows `fromCalls`
     // down again. The RPC counters are untouched: this migration removed no RPC
     // call site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(101);
+    //
+    // Workorder 21W then removed the LAST PostgREST read of
+    // `features/jobs/executors/image-generation.ts` — the workspace subscription
+    // row the image executor read to decide whether to watermark a generated
+    // image — so both counters below move down together again (101->100). That is
+    // a real coupling removal rather than a counting change: the executor asks
+    // `ExecutorContext.creditReadRepository` for the plan (workorder 21K's
+    // `CreditReadRepository.readSubscription`, built in `worker.ts` beside the
+    // other `pg` repositories) instead of naming a client method of its own. The
+    // behaviour is unchanged in the direction that matters: no repository, no
+    // subscription row and a failed read all still mean the free plan, and a free
+    // plan is still watermarked, exactly as the discarded error field produced.
+    // Its cases name no client method either, so `fromCallsIncludingTests`
+    // follows `fromCalls` down again. The RPC counters are untouched: this
+    // migration removed no RPC call site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(100);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(101);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(100);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
