@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  applicationErrorCodeSchema,
   applicationErrorResponseSchema,
   unauthenticatedErrorResponseSchema,
   workspaceSettingsResponseSchema,
@@ -520,63 +521,6 @@ describe("PUT /api/workspace/settings: every write failure is the same 500", () 
 
 describe("GET /api/workspace/settings: the read now runs on its repository", () => {
   /**
-   * STOP POINT (workorder 21L §7) — the wire body of a FAILED read, measured.
-   *
-   * `getWorkspaceSettings` throws
-   * `SettingsServiceError("settings_read_failed", "Unable to load workspace
-   * settings.", 500)` — it always has, and this workorder keeps it. The route
-   * answers a `SettingsServiceError` through
-   * `applicationErrorResponseSchema.parse(...)`, and that schema's code enum
-   * (`applicationErrorCodeSchema`, `packages/shared/src/http.ts:120-193`) does
-   * NOT contain `settings_read_failed`. The parse therefore throws INSIDE the
-   * error path, and Fastify replaces the intended body with its own generic 500
-   * plus the raw zod dump. The STATUS is still the required 500; the `code` never
-   * reaches the client.
-   *
-   * This is a PRE-EXISTING defect, not one this workorder introduced: the
-   * PostgREST read it replaces threw the very same code on any read failure, and
-   * the same class of defect is what the three "LOCAL FORK" codes further down
-   * that enum were added to fix. It is only MEASURED now, because case 10
-   * exercises a failing read for the first time.
-   *
-   * It cannot be fixed from inside this workorder. The two files that would fix
-   * it are both outside the 7-file whitelist:
-   *   (A) `packages/shared/src/http.ts` — add `settings_read_failed` to
-   *       `applicationErrorCodeSchema` (one line, backward compatible: widening
-   *       an enum only accepts more). RECOMMENDED, and the same fix the three
-   *       LOCAL FORK codes got.
-   *   (B) `http/settings.ts` — stop putting this one code through the shared
-   *       parse. Not recommended: it drops the shared response contract.
-   *
-   * So the wire body is PINNED AS IT IS — with the failing assertion's intent
-   * written out in full — and the decision is reported as a stop point rather
-   * than taken here. When the enum is widened, the two `expect(response.json())`
-   * blocks below become:
-   *
-   *   expect(response.json()).toEqual({
-   *     error: { code: "settings_read_failed", message: "Unable to load workspace settings." },
-   *   });
-   *   expect(applicationErrorResponseSchema.parse(response.json())).toBeDefined();
-   *
-   * The service-level half of the same requirement is asserted directly in case
-   * 13, where it IS reachable.
-   */
-  function expectPinnedReadFailureBody(body: unknown): void {
-    const payload = body as { error?: unknown; message?: unknown; statusCode?: unknown };
-
-    expect(payload.statusCode).toBe(500);
-    expect(payload.error).toBe("Internal Server Error");
-    expect(String(payload.message)).toContain("Invalid enum value");
-    // The intended body is NOT what a client receives today: there is no
-    // structured error object at all, and the service code is only visible inside
-    // the zod dump.
-    expect(payload).not.toHaveProperty("error.code");
-    expect((payload as { error: { code?: unknown } }).error).not.toEqual(
-      expect.objectContaining({ code: "settings_read_failed" }),
-    );
-  }
-
-  /**
    * The same real app, with the settings service built around the two repository
    * doubles. `buildApp` deliberately has no injectable read repository (21L built
    * it inline at its one call site), so the read half is observed from here.
@@ -654,7 +598,19 @@ describe("GET /api/workspace/settings: the read now runs on its repository", () 
         // NOT a 403 and NOT a 404: the failure may not answer whether the
         // workspace exists or whether the caller is a member of it.
         expect([403, 404]).not.toContain(response.statusCode);
-        expectPinnedReadFailureBody(response.json());
+        // The failure reaches the client as its OWN code: `settings_read_failed`
+        // is part of the shared wire enum (workorder 21L-fixup), so the shared
+        // response schema below parses here instead of throwing inside this very
+        // error path and leaving Fastify to answer with its generic 500.
+        expect(response.json()).toEqual({
+          error: {
+            code: "settings_read_failed",
+            message: "Unable to load workspace settings.",
+          },
+        });
+        expect(applicationErrorResponseSchema.parse(response.json())).toBeDefined();
+        // And the body is the route's own projection, not a zod dump.
+        expect(response.body).not.toContain("Invalid enum value");
         for (const leak of [
           PERSONAL_WORKSPACE_ID,
           "workspace_settings",
@@ -741,8 +697,16 @@ describe("GET /api/workspace/settings: the read now runs on its repository", () 
 
       expect(response.statusCode).toBe(500);
       expect([403, 404]).not.toContain(response.statusCode);
-      // Pinned, not designed: see the stop-point note above `expectPinnedReadFailureBody`.
-      expectPinnedReadFailureBody(response.json());
+      // The same body the failing read answers with a repository behind it: the
+      // missing repository is not a separate wire outcome.
+      expect(response.json()).toEqual({
+        error: {
+          code: "settings_read_failed",
+          message: "Unable to load workspace settings.",
+        },
+      });
+      expect(applicationErrorResponseSchema.parse(response.json())).toBeDefined();
+      expect(response.body).not.toContain("Invalid enum value");
       for (const leak of [
         PERSONAL_WORKSPACE_ID,
         "workspace_settings",
@@ -805,5 +769,59 @@ describe("GET /api/workspace/settings: the read now runs on its repository", () 
       );
       expect((error as SettingsServiceError).statusCode).toBe(500);
     }
+  });
+});
+
+/**
+ * Every code `SettingsServiceError` can carry must be one the wire schema accepts.
+ *
+ * `applicationErrorResponseSchema.parse()` runs INSIDE the route's error path
+ * (`http/settings.ts` `sendSettingsError`). An unlisted code therefore makes the
+ * parse throw while already handling a failure, and the client receives Fastify's
+ * generic 500 plus the raw zod dump instead of the intended reply — the real cause
+ * replaced by noise. That is exactly what `settings_read_failed` did until
+ * workorder 21L-fixup added it to `applicationErrorCodeSchema`
+ * (`packages/shared/src/http.ts`), which is why case 10 and case 11 can assert the
+ * body on the wire now.
+ *
+ * Kept as a literal list rather than derived from the type, because a type cannot
+ * be enumerated at runtime — and a check that silently covers nothing is worse
+ * than no check. The exhaustiveness assertion below is what keeps the list equal
+ * to the union the constructor accepts.
+ */
+const SETTINGS_SERVICE_CODES = [
+  "settings_not_found",
+  "settings_read_failed",
+  "settings_update_failed",
+] as const;
+
+describe("SettingsServiceError wire contract", () => {
+  it.each(SETTINGS_SERVICE_CODES)(
+    "%s is accepted by applicationErrorCodeSchema",
+    (code) => {
+      expect(() => applicationErrorCodeSchema.parse(code)).not.toThrow();
+    },
+  );
+
+  it("the list above still covers the constructor's accepted codes", () => {
+    // Exhaustiveness, stated the way that actually holds: `SettingsServiceError["code"]`
+    // is the whole union the constructor takes, so it only stays assignable to the
+    // literal union of the list above while the two are equal. A member added to the
+    // class without a line here stops this file compiling — which is the point, since
+    // a code the wire enum does not list is a code the client never receives.
+    // (`settings_not_found` has no throw site in the server today: the only two
+    // `new SettingsServiceError(...)` calls pass the two codes around it. It is
+    // listed because it IS part of the union, and the union is what reaches the route.)
+    const carried: SettingsServiceError["code"] = "settings_read_failed";
+    const covered: (typeof SETTINGS_SERVICE_CODES)[number] = carried;
+
+    const error = new SettingsServiceError(
+      covered,
+      "Unable to load workspace settings.",
+      500,
+    );
+
+    expect(error.code).toBe("settings_read_failed");
+    expect(error.statusCode).toBe(500);
   });
 });

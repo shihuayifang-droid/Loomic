@@ -139,6 +139,7 @@ export const applicationErrorCodeSchema = z.enum([
   "project_update_failed",
   "session_not_found",
   "settings_not_found",
+  "settings_read_failed",
   "settings_update_failed",
   "upload_failed",
   "asset_not_found",
