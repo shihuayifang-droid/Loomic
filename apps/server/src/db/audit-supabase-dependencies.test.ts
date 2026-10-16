@@ -560,11 +560,25 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // files name no client method, so `fromCallsIncludingTests` follows
     // `fromCalls` down again. The RPC counters are untouched: this migration
     // removed no RPC call site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(126);
+    //
+    // Workorder 21K then moved the last two PostgREST reads of
+    // `features/credits/credit-service.ts` — the workspace transaction list and
+    // the workspace subscription row — into `CreditReadRepository` (126->124),
+    // so both counters below move down together one last time. That is a real
+    // coupling removal rather than a counting change: those two methods no
+    // longer receive an admin client at all, and the repository that replaces
+    // them can only reach PostgreSQL, where the workspace predicate is
+    // `$1::uuid` and the transaction limit is bound as `$2::int` instead of
+    // being written into the statement. Its three new test files name no client
+    // method, so `fromCallsIncludingTests` follows `fromCalls` down again. The
+    // RPC counters are untouched: this migration removed no RPC call site — the
+    // remaining RPC of that service is the plan grant, whose counter is
+    // unchanged.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(124);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(126);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(124);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

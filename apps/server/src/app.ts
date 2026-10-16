@@ -101,6 +101,7 @@ import {
 } from "./db/job-attempt-repository.js";
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
 import { createJobConcurrencyRepository } from "./db/job-concurrency-repository.js";
+import { createCreditReadRepository } from "./db/credit-read-repository.js";
 import {
   createJobCreditsLinkRepository,
   type JobCreditsLinkRepository,
@@ -502,8 +503,19 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           }),
         })
       : undefined);
+  // ADR-0001 / workorder 21K: the transaction list and the subscription row go
+  // through the pure `pg` repository, built lazily against the same pool as the
+  // repositories above. The admin client stays: every other method of this
+  // service still uses it. With no repository wired those two reads fail closed
+  // as their existing `credit_query_failed` 500 rather than falling back.
   const creditService =
-    options.creditService ?? createCreditService({ getAdminClient });
+    options.creditService ??
+    createCreditService({
+      getAdminClient,
+      creditReadRepository: createCreditReadRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
+    });
   // ADR-0001 / workorder 21J: the plan's concurrency count goes through the
   // pure `pg` repository, built lazily against the same pool as the repositories
   // above. `createTierGuard` no longer receives a Supabase client at all: with no

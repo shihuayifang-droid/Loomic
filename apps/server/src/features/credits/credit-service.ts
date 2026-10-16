@@ -6,6 +6,7 @@ import type {
 } from "@loomic/shared";
 import { PLAN_CONFIGS } from "@loomic/shared";
 
+import type { CreditReadRepository } from "../../db/credit-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 
 // ── Error ────────────────────────────────────────────────────
@@ -84,8 +85,16 @@ export type CreditService = {
 
 // ── Factory ──────────────────────────────────────────────────
 
+/**
+ * `creditReadRepository` is OPTIONAL on purpose (workorder 21K): the two reads
+ * it serves are the only ones that moved, and the remaining methods still work
+ * through the admin client. When it is absent those two reads fail closed as
+ * their existing `credit_query_failed` 500 — there is no PostgREST fallback and
+ * the admin client is no longer reachable from them at all.
+ */
 export function createCreditService(options: {
   getAdminClient: () => AdminSupabaseClient;
+  creditReadRepository?: CreditReadRepository;
 }): CreditService {
   return {
     async getBalance(workspaceId) {
@@ -238,57 +247,55 @@ export function createCreditService(options: {
     },
 
     async getTransactions(workspaceId, limit = 20) {
-      const admin = options.getAdminClient();
       const safeLimit = Math.min(Math.max(limit, 1), 100);
 
-      const { data, error } = await admin
-        .from("credit_transactions")
-        .select(
-          "id, transaction_type, amount, balance_after, job_id, description, created_at",
-        )
-        .eq("workspace_id", workspaceId)
-        .order("created_at", { ascending: false })
-        .limit(safeLimit);
+      try {
+        const repository = options.creditReadRepository;
+        if (!repository) {
+          throw new Error("credit transaction read needs a repository");
+        }
 
-      if (error) {
+        // The clamp is passed on as-is: `NaN` stays `NaN`, the repository
+        // refuses it before it can reach the database, and the refusal below is
+        // therefore still this method's existing 500.
+        return await repository.listTransactions({
+          workspaceId,
+          limit: safeLimit,
+        });
+      } catch {
         throw new CreditServiceError(
           "credit_query_failed",
           "Failed to query transactions.",
           500,
         );
       }
-
-      return (data ?? []) as CreditTransaction[];
     },
 
     async getSubscription(workspaceId) {
-      const admin = options.getAdminClient();
+      try {
+        const repository = options.creditReadRepository;
+        if (!repository) {
+          throw new Error("credit subscription read needs a repository");
+        }
 
-      const { data, error } = await admin
-        .from("subscriptions")
-        .select(
-          "plan, billing_period, stripe_customer_id, stripe_subscription_id, current_period_start, current_period_end, canceled_at",
-        )
-        .eq("workspace_id", workspaceId)
-        .maybeSingle();
+        const data = await repository.readSubscription({ workspaceId });
 
-      if (error) {
+        return {
+          plan: (data?.plan as SubscriptionPlan) ?? "free",
+          billingPeriod: (data?.billing_period as BillingPeriod) ?? null,
+          stripeCustomerId: data?.stripe_customer_id ?? null,
+          stripeSubscriptionId: data?.stripe_subscription_id ?? null,
+          currentPeriodStart: data?.current_period_start ?? null,
+          currentPeriodEnd: data?.current_period_end ?? null,
+          canceledAt: data?.canceled_at ?? null,
+        };
+      } catch {
         throw new CreditServiceError(
           "credit_query_failed",
           "Failed to query subscription.",
           500,
         );
       }
-
-      return {
-        plan: (data?.plan as SubscriptionPlan) ?? "free",
-        billingPeriod: (data?.billing_period as BillingPeriod) ?? null,
-        stripeCustomerId: data?.stripe_customer_id ?? null,
-        stripeSubscriptionId: data?.stripe_subscription_id ?? null,
-        currentPeriodStart: data?.current_period_start ?? null,
-        currentPeriodEnd: data?.current_period_end ?? null,
-        canceledAt: data?.canceled_at ?? null,
-      };
     },
 
     async updatePlan(workspaceId, plan) {
