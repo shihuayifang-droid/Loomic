@@ -3,14 +3,17 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   FIND_READABLE_CANVAS_CONTENT,
+  FIND_READABLE_CANVAS_PROJECT_LINK,
   LIST_READABLE_CANVAS_ASSETS,
   LIST_READABLE_SUCCEEDED_IMAGE_JOBS,
   CanvasReadError,
   createCanvasReadRepository,
   type CanvasReadRepository,
+  type CanvasProjectLinkRow,
 } from "../../db/canvas-read-repository.js";
 import type { TransactionPool } from "../../db/transaction.js";
 import {
+  asUser,
   createMigratedDb,
   createPGliteTransactionPool,
   createUser,
@@ -48,13 +51,18 @@ const ADMIN_PROJECT = "cccc0000-0000-4000-8000-000000000002";
 const MEMBER_PROJECT = "cccc0000-0000-4000-8000-000000000003";
 const ARCHIVED_PROJECT = "cccc0000-0000-4000-8000-000000000004";
 const OUTSIDER_PROJECT = "cccc0000-0000-4000-8000-000000000005";
+const BRANDED_PROJECT = "cccc0000-0000-4000-8000-000000000006";
 
 const ACTIVE_CANVAS = "dddd0000-0000-4000-8000-000000000001";
 const ADMIN_CANVAS = "dddd0000-0000-4000-8000-000000000002";
 const MEMBER_CANVAS = "dddd0000-0000-4000-8000-000000000003";
 const ARCHIVED_CANVAS = "dddd0000-0000-4000-8000-000000000004";
 const OUTSIDER_CANVAS = "dddd0000-0000-4000-8000-000000000005";
+const BRANDED_CANVAS = "dddd0000-0000-4000-8000-000000000006";
 const MISSING_CANVAS = "dddd0000-0000-4000-8000-00000000000f";
+
+/** The one brand kit in the fixture (workorder 21R). */
+const BRAND_KIT_ID = "bbbb0000-0000-4000-8000-000000000001";
 
 const JOB_OLD = "eeee0000-0000-4000-8000-000000000001";
 const JOB_MID = "eeee0000-0000-4000-8000-000000000002";
@@ -129,13 +137,14 @@ async function insertProject(options: {
   name: string;
   createdBy: string;
   archivedAt?: string;
+  brandKitId?: string;
 }): Promise<void> {
   await db.query(
     `insert into public.projects (
        id, workspace_id, name, slug, description, created_by,
-       archived_at, created_at, updated_at
+       archived_at, brand_kit_id, created_at, updated_at
      )
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $8)`,
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)`,
     [
       options.id,
       teamWorkspaceId,
@@ -144,6 +153,7 @@ async function insertProject(options: {
       `description of ${options.name}`,
       options.createdBy,
       options.archivedAt ?? null,
+      options.brandKitId ?? null,
       "2026-01-01T00:00:00.000Z",
     ],
   );
@@ -290,6 +300,20 @@ beforeAll(async () => {
     createdBy: OUTSIDER_ID,
   });
 
+  // One project carries a brand kit, so "the project HAS a kit" is a case of its
+  // own rather than a shape the fixture can never produce.
+  await db.query(
+    `insert into public.brand_kits (id, user_id, name, is_default)
+     values ($1, $2, 'Canvas Team Kit', true)`,
+    [BRAND_KIT_ID, AUTHOR_ID],
+  );
+  await insertProject({
+    id: BRANDED_PROJECT,
+    name: "Branded",
+    createdBy: AUTHOR_ID,
+    brandKitId: BRAND_KIT_ID,
+  });
+
   await insertCanvas({
     id: ACTIVE_CANVAS,
     projectId: ACTIVE_PROJECT,
@@ -324,6 +348,13 @@ beforeAll(async () => {
     name: "Outsider canvas",
     createdBy: OUTSIDER_ID,
     content: { elements: [{ id: "el-outsider" }], appState: {} },
+  });
+  await insertCanvas({
+    id: BRANDED_CANVAS,
+    projectId: BRANDED_PROJECT,
+    name: "Branded canvas",
+    createdBy: AUTHOR_ID,
+    content: { elements: [{ id: "el-branded" }], appState: {} },
   });
 
   await insertJob({
@@ -751,5 +782,366 @@ describe("canvas-read-repository: PGlite real SQL ACL", () => {
       canvasId: ACTIVE_CANVAS,
     });
     expect(after).toEqual({ content: ACTIVE_CONTENT });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workorder 21R: the canvas → project link.
+//
+// This is the read the Agent runtime used for the brand kit, for the workspace
+// whose skills it loads, and for the project a generation job is authorised
+// against. It replaces a read the caller's PostgREST client performed under
+// `canvases_select_project_reader` / `private.can_read_project`, so the only
+// acceptable answer is the one that policy would have given — including for an
+// ARCHIVED project, which is why this read has no archived filter at all.
+//
+// Every case below reads the same question TWICE for the same identity:
+//
+//   (1) through the repository, which is privileged (the database owner bypasses
+//       RLS), so the statement's own predicate is the only gate;
+//   (2) through `asUser()`, i.e. `set local role authenticated` plus a
+//       transaction-local `request.jwt.claim.sub`, running the exact SELECT the
+//       removed PostgREST read performed.
+//
+// The two must be EQUAL for every identity, and equal to the project the canvas
+// belongs to or to `null`.
+// ---------------------------------------------------------------------------
+
+/**
+ * The removed PostgREST read, verbatim as SQL: one column, one key. Under
+ * `asUser()` the `canvases_select_project_reader` policy decides which row
+ * exists, exactly as PostgREST's own client did; `maybeSingle()` is the
+ * `rows[0] ?? null` below.
+ */
+const SELECT_CANVAS_PROJECT = `select project_id
+  from public.canvases
+ where id = $1`;
+
+async function viaRepository(
+  actorId: string,
+  canvasId: string,
+): Promise<CanvasProjectLinkRow | null> {
+  return repository.findReadableCanvasProjectLink({ actorId, canvasId });
+}
+
+async function viaRls(
+  actorId: string,
+  canvasId: string,
+): Promise<string | null> {
+  const result = await asUser(db, actorId, (tx) =>
+    tx.query<{ project_id: string }>(SELECT_CANVAS_PROJECT, [canvasId]),
+  );
+
+  return result.rows[0]?.project_id ?? null;
+}
+
+/**
+ * The comparison this file exists for. Both reads are performed for ONE identity
+ * on ONE canvas and each is asserted against the expected answer AND against the
+ * other, so a disagreement is reported as a disagreement rather than as two
+ * independent mismatches.
+ */
+async function expectBothReads(
+  actorId: string,
+  canvasId: string,
+  expectedProjectId: string | null,
+): Promise<void> {
+  const byRepository = await viaRepository(actorId, canvasId);
+  const byRls = await viaRls(actorId, canvasId);
+
+  expect(byRls).toBe(expectedProjectId);
+  expect(byRepository?.project_id ?? null).toBe(expectedProjectId);
+  expect(byRepository?.project_id ?? null).toBe(byRls);
+
+  if (byRepository) {
+    // The link carries the workspace the skill read is keyed by, and it is the
+    // project's own workspace — never the caller's personal one (Q1).
+    expect(byRepository.workspace_id).toBe(teamWorkspaceId);
+  }
+}
+
+/** A canvas and the project it belongs to, as the fixture really holds them. */
+async function storedProjectOf(canvasId: string): Promise<string> {
+  return firstRow(
+    (
+      await db.query<{ project_id: string }>(
+        "select project_id from public.canvases where id = $1",
+        [canvasId],
+      )
+    ).rows,
+  ).project_id;
+}
+
+describe("canvas-read-repository: canvas → project link (workorder 21R)", () => {
+  it("case 10: the author reads their own project's link, with a null brand kit", async () => {
+    const link = await viaRepository(AUTHOR_ID, ACTIVE_CANVAS);
+
+    expect(link).toEqual({
+      project_id: ACTIVE_PROJECT,
+      workspace_id: teamWorkspaceId,
+      brand_kit_id: null,
+    });
+    // The row really is in the table under that project.
+    expect(await storedProjectOf(ACTIVE_CANVAS)).toBe(ACTIVE_PROJECT);
+  });
+
+  it("case 11: a project that HAS a brand kit answers with that kit id", async () => {
+    const link = await viaRepository(AUTHOR_ID, BRANDED_CANVAS);
+
+    expect(link).toEqual({
+      project_id: BRANDED_PROJECT,
+      workspace_id: teamWorkspaceId,
+      brand_kit_id: BRAND_KIT_ID,
+    });
+
+    // The kit id is the PROJECT's column, not reconstructed by the mapper.
+    const stored = firstRow(
+      (
+        await db.query<{ brand_kit_id: string | null }>(
+          "select brand_kit_id from public.projects where id = $1",
+          [BRANDED_PROJECT],
+        )
+      ).rows,
+    );
+    expect(stored.brand_kit_id).toBe(BRAND_KIT_ID);
+  });
+
+  it("case 12: a same-workspace admin reads the link of another author's canvas", async () => {
+    expect(await viaRepository(ADMIN_ID, ACTIVE_CANVAS)).toEqual({
+      project_id: ACTIVE_PROJECT,
+      workspace_id: teamWorkspaceId,
+      brand_kit_id: null,
+    });
+    // And the admin reads the branded one with its kit, so the widening carries
+    // the whole row rather than a redacted project id.
+    expect((await viaRepository(ADMIN_ID, BRANDED_CANVAS))?.brand_kit_id).toBe(
+      BRAND_KIT_ID,
+    );
+  });
+
+  it("case 13: the workspace owner reads the link of another author's canvas", async () => {
+    expect(await viaRepository(OWNER_ID, ACTIVE_CANVAS)).toEqual({
+      project_id: ACTIVE_PROJECT,
+      workspace_id: teamWorkspaceId,
+      brand_kit_id: null,
+    });
+  });
+
+  it("case 14: an ordinary member is refused another author's canvas and allowed their own", async () => {
+    // Not the author, role `member`: the admin/owner branch does not apply.
+    await expect(viaRepository(MEMBER_ID, ACTIVE_CANVAS)).resolves.toBeNull();
+
+    // Their own canvas still answers — the refusal above is the author clause,
+    // not a blanket denial of ordinary members.
+    expect(await viaRepository(MEMBER_ID, MEMBER_CANVAS)).toEqual({
+      project_id: MEMBER_PROJECT,
+      workspace_id: teamWorkspaceId,
+      brand_kit_id: null,
+    });
+  });
+
+  it("case 15: an author who is NOT a workspace member is refused their own project", async () => {
+    // The fixture's sharpest boundary: OUTSIDER_ID owns OUTSIDER_PROJECT and its
+    // canvas inside this very workspace, but has no `workspace_members` row. The
+    // read ACL is `created_by = me AND I am a member`, so authorship alone is not
+    // enough — reading it as "author OR admin" would leak here.
+    expect(await storedProjectOf(OUTSIDER_CANVAS)).toBe(OUTSIDER_PROJECT);
+    expect(
+      firstRow(
+        (
+          await db.query<{ n: number }>(
+            `select count(*)::int as n from public.workspace_members
+              where workspace_id = $1 and user_id = $2`,
+            [teamWorkspaceId, OUTSIDER_ID],
+          )
+        ).rows,
+      ).n,
+    ).toBe(0);
+
+    await expect(viaRepository(OUTSIDER_ID, OUTSIDER_CANVAS)).resolves.toBeNull();
+    await expect(viaRls(OUTSIDER_ID, OUTSIDER_CANVAS)).resolves.toBeNull();
+  });
+
+  it("case 16: ★ an ARCHIVED project's canvas still resolves — the point of this read", async () => {
+    // The project really is archived, and the CONTENT read really does refuse it
+    // (that filter is deliberate too, and belongs to that read alone).
+    const archived = firstRow(
+      (
+        await db.query<{ archived_at: Date | null }>(
+          "select archived_at from public.projects where id = $1",
+          [ARCHIVED_PROJECT],
+        )
+      ).rows,
+    );
+    expect(archived.archived_at).not.toBeNull();
+    await expect(
+      repository.findReadableCanvasContent({
+        actorId: AUTHOR_ID,
+        canvasId: ARCHIVED_CANVAS,
+      }),
+    ).resolves.toBeNull();
+
+    // The link read must NOT follow it: the brand kit and the workspace skills
+    // of an archived project's canvas have to keep resolving, and a generation
+    // submitted from it must not be refused before credits are charged.
+    expect(await viaRepository(AUTHOR_ID, ARCHIVED_CANVAS)).toEqual({
+      project_id: ARCHIVED_PROJECT,
+      workspace_id: teamWorkspaceId,
+      brand_kit_id: null,
+    });
+    // An admin reads it too, and the policy agrees with both.
+    expect((await viaRepository(ADMIN_ID, ARCHIVED_CANVAS))?.project_id).toBe(
+      ARCHIVED_PROJECT,
+    );
+    await expectBothReads(AUTHOR_ID, ARCHIVED_CANVAS, ARCHIVED_PROJECT);
+    await expectBothReads(ADMIN_ID, ARCHIVED_CANVAS, ARCHIVED_PROJECT);
+    await expectBothReads(OWNER_ID, ARCHIVED_CANVAS, ARCHIVED_PROJECT);
+    await expectBothReads(MEMBER_ID, ARCHIVED_CANVAS, null);
+    await expectBothReads(OUTSIDER_ID, ARCHIVED_CANVAS, null);
+  });
+
+  it("case 17: a well-formed uuid with no canvas is null, not an error", async () => {
+    for (const actorId of [AUTHOR_ID, ADMIN_ID, OWNER_ID, MEMBER_ID, OUTSIDER_ID]) {
+      await expect(viaRepository(actorId, MISSING_CANVAS)).resolves.toBeNull();
+    }
+    await expect(viaRls(AUTHOR_ID, MISSING_CANVAS)).resolves.toBeNull();
+  });
+
+  it("case 18: an illegal uuid is a real SQL error, wrapped, and the same pool reads on", async () => {
+    await expect(
+      db.query("select project_id from public.canvases where id = $1", [INVALID_ID]),
+    ).rejects.toThrow(/invalid input syntax for type uuid/);
+
+    const detail = await viaRepository(AUTHOR_ID, INVALID_ID).catch(
+      (reason: unknown) => reason,
+    );
+
+    expect(detail).toBeInstanceOf(CanvasReadError);
+    expect((detail as CanvasReadError).operation).toBe(
+      FIND_READABLE_CANVAS_PROJECT_LINK,
+    );
+    expect((detail as CanvasReadError).message).toBe(
+      `canvas read failed (${FIND_READABLE_CANVAS_PROJECT_LINK})`,
+    );
+    expect((detail as CanvasReadError).message).not.toMatch(
+      /select|public\.|join|archived|postgres:\/\/|10\.210\.134\.37|secret/i,
+    );
+    expect(((detail as CanvasReadError).cause as Error).message).toMatch(
+      /invalid input syntax for type uuid/,
+    );
+
+    // ROLLBACK plus release left the connection usable for the next read, and
+    // the fixture was not modified by the failed one.
+    await expect(viaRepository(AUTHOR_ID, ACTIVE_CANVAS)).resolves.toEqual({
+      project_id: ACTIVE_PROJECT,
+      workspace_id: teamWorkspaceId,
+      brand_kit_id: null,
+    });
+  });
+
+  it("case 19: one call issues exactly one domain statement, privileged for the actor, and leaves no context behind", async () => {
+    const seen: string[] = [];
+    let connects = 0;
+    const observingPool: TransactionPool = {
+      async connect() {
+        connects += 1;
+        const inner = await pool.connect();
+        return {
+          async query(sql: string, params?: readonly unknown[]) {
+            if (sql.includes("public.canvases")) seen.push(sql);
+            return inner.query(sql, params);
+          },
+          release(error?: Error | boolean) {
+            inner.release(error);
+          },
+        };
+      },
+    };
+
+    const observing = createCanvasReadRepository({
+      getTransactionPool: () => observingPool,
+    });
+
+    const link = await observing.findReadableCanvasProjectLink({
+      actorId: AUTHOR_ID,
+      canvasId: ACTIVE_CANVAS,
+    });
+
+    expect(link?.project_id).toBe(ACTIVE_PROJECT);
+    expect(connects).toBe(1);
+    // One statement, and it is the link read — not a membership probe followed
+    // by a second statement.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("public.workspace_members");
+
+    // The transaction-local actor does not survive the call.
+    const gone = firstRow(
+      (
+        await db.query<{ user_id: boolean }>(
+          `select nullif(current_setting('app.user_id', true), '') is null as user_id`,
+        )
+      ).rows,
+    );
+    expect(gone.user_id).toBe(true);
+
+    // And the next read is still its own caller's.
+    await expect(viaRepository(OUTSIDER_ID, ACTIVE_CANVAS)).resolves.toBeNull();
+  });
+
+  // ── the identity matrix: repository vs `can_read_project` ──
+  //
+  // Five identities x five canvases, each cell read twice. The expectations are
+  // stated here once and then walked, so a cell cannot be quietly dropped.
+
+  it("case 20: the author agrees with the policy on all five canvases", async () => {
+    await expectBothReads(AUTHOR_ID, ACTIVE_CANVAS, ACTIVE_PROJECT);
+    await expectBothReads(AUTHOR_ID, ADMIN_CANVAS, null);
+    await expectBothReads(AUTHOR_ID, MEMBER_CANVAS, null);
+    await expectBothReads(AUTHOR_ID, ARCHIVED_CANVAS, ARCHIVED_PROJECT);
+    await expectBothReads(AUTHOR_ID, OUTSIDER_CANVAS, null);
+    await expectBothReads(AUTHOR_ID, BRANDED_CANVAS, BRANDED_PROJECT);
+  });
+
+  it("case 21: the admin agrees with the policy on all five canvases — every project of the workspace", async () => {
+    await expectBothReads(ADMIN_ID, ACTIVE_CANVAS, ACTIVE_PROJECT);
+    await expectBothReads(ADMIN_ID, ADMIN_CANVAS, ADMIN_PROJECT);
+    await expectBothReads(ADMIN_ID, MEMBER_CANVAS, MEMBER_PROJECT);
+    await expectBothReads(ADMIN_ID, ARCHIVED_CANVAS, ARCHIVED_PROJECT);
+    // Including a project whose author is not a member at all: the admin/owner
+    // branch does not consult the author.
+    await expectBothReads(ADMIN_ID, OUTSIDER_CANVAS, OUTSIDER_PROJECT);
+    await expectBothReads(ADMIN_ID, BRANDED_CANVAS, BRANDED_PROJECT);
+  });
+
+  it("case 22: the owner agrees with the policy on all five canvases", async () => {
+    await expectBothReads(OWNER_ID, ACTIVE_CANVAS, ACTIVE_PROJECT);
+    await expectBothReads(OWNER_ID, ADMIN_CANVAS, ADMIN_PROJECT);
+    await expectBothReads(OWNER_ID, MEMBER_CANVAS, MEMBER_PROJECT);
+    await expectBothReads(OWNER_ID, ARCHIVED_CANVAS, ARCHIVED_PROJECT);
+    await expectBothReads(OWNER_ID, OUTSIDER_CANVAS, OUTSIDER_PROJECT);
+    await expectBothReads(OWNER_ID, BRANDED_CANVAS, BRANDED_PROJECT);
+  });
+
+  it("case 23: the ordinary member agrees with the policy — only their own project", async () => {
+    await expectBothReads(MEMBER_ID, ACTIVE_CANVAS, null);
+    await expectBothReads(MEMBER_ID, ADMIN_CANVAS, null);
+    await expectBothReads(MEMBER_ID, MEMBER_CANVAS, MEMBER_PROJECT);
+    await expectBothReads(MEMBER_ID, ARCHIVED_CANVAS, null);
+    await expectBothReads(MEMBER_ID, OUTSIDER_CANVAS, null);
+    // An archived project is equally invisible to a plain member who is not its
+    // author — dropping the archived filter must not become a widening.
+    await expectBothReads(MEMBER_ID, BRANDED_CANVAS, null);
+  });
+
+  it("case 24: the non-member agrees with the policy — nothing, not even their own project", async () => {
+    await expectBothReads(OUTSIDER_ID, ACTIVE_CANVAS, null);
+    await expectBothReads(OUTSIDER_ID, ADMIN_CANVAS, null);
+    await expectBothReads(OUTSIDER_ID, MEMBER_CANVAS, null);
+    await expectBothReads(OUTSIDER_ID, ARCHIVED_CANVAS, null);
+    // The sharpest cell of the matrix: the project IS theirs and is still
+    // refused, because the membership join is not optional.
+    expect(await storedProjectOf(OUTSIDER_CANVAS)).toBe(OUTSIDER_PROJECT);
+    await expectBothReads(OUTSIDER_ID, OUTSIDER_CANVAS, null);
+    await expectBothReads(OUTSIDER_ID, BRANDED_CANVAS, null);
   });
 });

@@ -151,6 +151,9 @@ function makeRepository(
     async findReadableCanvasContent() {
       throw new Error("the recovery path must not read canvas content");
     },
+    async findReadableCanvasProjectLink() {
+      throw new Error("the recovery path must not read the canvas project link");
+    },
     async listReadableSucceededImageJobs(input) {
       calls.push({ actorId: input.actorId, canvasId: input.canvasId });
       if (options.error) throw options.error;

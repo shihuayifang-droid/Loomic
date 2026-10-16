@@ -28,21 +28,21 @@ export interface WorkspaceSkillEntry {
 }
 
 /**
- * Load enabled skills (both system and user-created) for a given canvas.
+ * Load enabled skills (both system and user-created) for a given workspace.
  *
- * Resolves the canvas → project → workspace chain, then fetches all
- * skills installed and enabled in that workspace. Only skills with
- * non-empty `skill_content` are returned.
+ * The workspace id is resolved by the caller from the canvas → project link
+ * (workorder 21R): that read is an ACL decision and belongs in the canvas
+ * repository, not here. This function only fetches the skills installed and
+ * enabled in the workspace it is handed, and only returns those with non-empty
+ * `skill_content`.
  */
 export async function loadWorkspaceSkills(
   userClient: UserSupabaseClient,
-  canvasId: string,
+  workspaceId: string,
 ): Promise<WorkspaceSkillEntry[]> {
-  // Step 1: Resolve canvas → project → workspace
-  const workspaceId = await resolveWorkspaceId(userClient, canvasId);
   if (!workspaceId) return [];
 
-  // Step 2: Query enabled workspace skills with full skill data
+  // Query enabled workspace skills with full skill data.
   // NOTE: workspace_skills / skills tables may not yet be in the generated
   // Supabase types — use `as any` to bypass PostgREST type checking.
   const { data: rows, error } = await (userClient as any)
@@ -98,47 +98,4 @@ export async function loadWorkspaceSkills(
       };
     })
     .filter((entry): entry is WorkspaceSkillEntry => entry !== null);
-}
-
-/**
- * Resolve canvas ID → workspace ID via the canvas → project join.
- */
-async function resolveWorkspaceId(
-  client: UserSupabaseClient,
-  canvasId: string,
-): Promise<string | null> {
-  // Try joined query first (single round-trip)
-  try {
-    const { data } = await client
-      .from("canvases")
-      .select("project:projects(workspace_id)")
-      .eq("id", canvasId)
-      .maybeSingle();
-
-    const project = data?.project as { workspace_id?: string } | null;
-    if (project?.workspace_id) return project.workspace_id;
-  } catch {
-    // FK may not be exposed via PostgREST — fall back to two-step
-  }
-
-  // Two-step fallback
-  try {
-    const { data: canvas } = await client
-      .from("canvases")
-      .select("project_id")
-      .eq("id", canvasId)
-      .maybeSingle();
-
-    if (!canvas?.project_id) return null;
-
-    const { data: project } = await client
-      .from("projects")
-      .select("workspace_id")
-      .eq("id", canvas.project_id)
-      .maybeSingle();
-
-    return (project?.workspace_id as string) ?? null;
-  } catch {
-    return null;
-  }
 }

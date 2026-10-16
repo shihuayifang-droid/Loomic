@@ -19,9 +19,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ImageAttachment } from "@loomic/shared";
 
-import type { CanvasReadRepository } from "../db/canvas-read-repository.js";
+import type {
+  CanvasProjectLinkRow,
+  CanvasReadRepository,
+} from "../db/canvas-read-repository.js";
 import type { UserSupabaseClient } from "../supabase/user.js";
-import { readCanvasSummaryForRun, resolveAttachmentContent } from "./runtime.js";
+import {
+  readCanvasProjectLinkForRun,
+  readCanvasSummaryForRun,
+  resolveAttachmentContent,
+  resolveCanvasProjectId,
+} from "./runtime.js";
 
 const BUCKET = "project-assets";
 const OBJECT_PATH = "ws-team/p/a.png";
@@ -153,6 +161,20 @@ const VISIBLE: AssetRow = {
 
 const RUN_ACTOR = "user-1";
 const RUN_CANVAS = "canvas-1";
+const RUN_PROJECT = "project-1";
+const RUN_WORKSPACE = "workspace-1";
+const RUN_BRAND_KIT = "brand-kit-1";
+
+/** A driver error as PostgreSQL would raise it: it names the statement. */
+const DRIVER_ERROR = new Error(
+  'select c.project_id, p.workspace_id from public.canvases c where c.id = $2::uuid — invalid input syntax for type uuid: "canvas-1"',
+);
+
+const RUN_LINK: CanvasProjectLinkRow = {
+  project_id: RUN_PROJECT,
+  workspace_id: RUN_WORKSPACE,
+  brand_kit_id: RUN_BRAND_KIT,
+};
 
 const CANVAS_ELEMENT = {
   id: "el-1",
@@ -169,14 +191,22 @@ function canvasRepository(options: {
   content?: unknown;
   error?: Error;
   found?: boolean;
+  link?: CanvasProjectLinkRow | null;
+  linkError?: Error;
 }) {
   const calls: Array<{ actorId: string; canvasId: string }> = [];
+  const linkCalls: Array<{ actorId: string; canvasId: string }> = [];
 
   const repository: CanvasReadRepository = {
     async findReadableCanvasContent(input) {
       calls.push({ actorId: input.actorId, canvasId: input.canvasId });
       if (options.error) throw options.error;
       return options.found === false ? null : { content: options.content as never };
+    },
+    async findReadableCanvasProjectLink(input) {
+      linkCalls.push({ actorId: input.actorId, canvasId: input.canvasId });
+      if (options.linkError) throw options.linkError;
+      return options.link ?? null;
     },
     async listReadableSucceededImageJobs() {
       return [];
@@ -186,7 +216,7 @@ function canvasRepository(options: {
     },
   };
 
-  return { repository, calls };
+  return { repository, calls, linkCalls };
 }
 
 afterEach(() => {
@@ -398,5 +428,183 @@ describe("readCanvasSummaryForRun (20C)", () => {
 
     // An actor-less read is not a read: it must never reach the database.
     expect(h.calls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workorder 21R: the canvas → project link. Two consumers with OPPOSITE
+// failure disciplines read the same repository method, and that difference is
+// what these cases pin down:
+//
+//   - `readCanvasProjectLinkForRun` feeds the brand kit and the workspace
+//     skills: it must NEVER reject, because neither is worth failing a run for.
+//   - `resolveCanvasProjectId` is the gate before credits are charged: it must
+//     FAIL CLOSED, because a job created without its project can never have its
+//     output authorised.
+// ---------------------------------------------------------------------------
+
+describe("readCanvasProjectLinkForRun (21R)", () => {
+  it("case 1: returns the link, asking with the run's own actor and canvas", async () => {
+    const h = canvasRepository({ link: RUN_LINK });
+
+    const link = await readCanvasProjectLinkForRun({
+      repository: h.repository,
+      actorId: RUN_ACTOR,
+      canvasId: RUN_CANVAS,
+    });
+
+    expect(link).toEqual(RUN_LINK);
+    // The repository is the authority for who is asking; a link resolved for
+    // somebody else's canvas would leak a project with no error attached.
+    expect(h.linkCalls).toEqual([
+      { actorId: RUN_ACTOR, canvasId: RUN_CANVAS },
+    ]);
+  });
+
+  it("case 2: a link without a brand kit is returned as-is, not rejected", async () => {
+    const h = canvasRepository({ link: { ...RUN_LINK, brand_kit_id: null } });
+
+    await expect(
+      readCanvasProjectLinkForRun({
+        repository: h.repository,
+        actorId: RUN_ACTOR,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toEqual({ ...RUN_LINK, brand_kit_id: null });
+  });
+
+  it("case 3: a repository error never rejects, and logs fixed text with no driver detail", async () => {
+    const h = canvasRepository({ linkError: DRIVER_ERROR });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const link = await readCanvasProjectLinkForRun({
+      repository: h.repository,
+      actorId: RUN_ACTOR,
+      canvasId: RUN_CANVAS,
+    });
+
+    expect(link).toBeNull();
+    // The lookup WAS attempted — the null above is the degradation, not a
+    // skipped read.
+    expect(h.linkCalls).toHaveLength(1);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const logged = warn.mock.calls.flat().map(String).join(" ");
+    expect(logged).toContain("canvas project link lookup failed");
+    expect(logged).not.toContain("public.canvases");
+    expect(logged).not.toContain("$2::uuid");
+    expect(logged).not.toContain("invalid input syntax");
+  });
+
+  it("case 4: an unreadable canvas is a null link, not a failure", async () => {
+    const h = canvasRepository({ link: null });
+
+    await expect(
+      readCanvasProjectLinkForRun({
+        repository: h.repository,
+        actorId: RUN_ACTOR,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toBeNull();
+    expect(h.linkCalls).toHaveLength(1);
+  });
+
+  it("case 5: without a repository, an actor or a canvas nothing is asked and nothing rejects", async () => {
+    const h = canvasRepository({ link: RUN_LINK });
+
+    await expect(
+      readCanvasProjectLinkForRun({
+        repository: undefined,
+        actorId: RUN_ACTOR,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      readCanvasProjectLinkForRun({
+        repository: h.repository,
+        actorId: undefined,
+        canvasId: RUN_CANVAS,
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      readCanvasProjectLinkForRun({
+        repository: h.repository,
+        actorId: RUN_ACTOR,
+        canvasId: undefined,
+      }),
+    ).resolves.toBeNull();
+
+    // A link read with no actor would be a privileged read for nobody.
+    expect(h.linkCalls).toHaveLength(0);
+  });
+});
+
+describe("resolveCanvasProjectId (21R)", () => {
+  it("case 1: answers the project id and asks with the actor it was given", async () => {
+    const h = canvasRepository({ link: RUN_LINK });
+
+    await expect(
+      resolveCanvasProjectId(
+        h.repository,
+        RUN_ACTOR,
+        RUN_CANVAS,
+        "submitImageJob",
+      ),
+    ).resolves.toBe(RUN_PROJECT);
+    expect(h.linkCalls).toEqual([
+      { actorId: RUN_ACTOR, canvasId: RUN_CANVAS },
+    ]);
+  });
+
+  it("case 2: a missing repository refuses the job with the fixed code, and logs no driver text", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const error = await refusal(
+      resolveCanvasProjectId(undefined, RUN_ACTOR, RUN_CANVAS, "submitImageJob"),
+    );
+
+    expect(error.message).toBe("Canvas project lookup failed (canvas_read_failed)");
+    expect(error.message).not.toMatch(/postgres|public\.|select|repository is not/i);
+    const logged = log.mock.calls.flat().map(String).join(" ");
+    expect(logged).toContain("[submitImageJob] canvas project lookup failed");
+    expect(logged).not.toContain("Canvas project lookup failed");
+  });
+
+  it("case 3: a throwing repository is refused the same way — fail closed, never undefined", async () => {
+    const h = canvasRepository({ linkError: DRIVER_ERROR });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const error = await refusal(
+      resolveCanvasProjectId(h.repository, RUN_ACTOR, RUN_CANVAS, "submitVideoJob"),
+    );
+
+    // The whole point: a read that failed must not become a job with no project.
+    expect(error.message).toBe("Canvas project lookup failed (canvas_read_failed)");
+    // The driver's message used to be interpolated into this one.
+    expect(error.message).not.toContain("public.canvases");
+    expect(error.message).not.toContain("invalid input syntax");
+    expect(error.message).not.toContain("$2::uuid");
+    expect(h.linkCalls).toHaveLength(1);
+
+    const logged = log.mock.calls.flat().map(String).join(" ");
+    expect(logged).toContain("[submitVideoJob] canvas project lookup failed");
+    expect(logged).not.toContain("public.canvases");
+    expect(logged).not.toContain("invalid input syntax");
+  });
+
+  it("case 4: an unreadable canvas refuses the job with the message that was already there, verbatim", async () => {
+    const h = canvasRepository({ link: null });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const error = await refusal(
+      resolveCanvasProjectId(h.repository, RUN_ACTOR, RUN_CANVAS, "submitImageJob"),
+    );
+
+    expect(error.message).toBe(
+      "Canvas not found or not accessible — refusing to create a job without its project",
+    );
+    // "not found" and "not accessible" stay indistinguishable on purpose: the
+    // message must not become an existence oracle over other people's canvases.
+    expect(h.linkCalls).toHaveLength(1);
   });
 });

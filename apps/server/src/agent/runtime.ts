@@ -19,7 +19,10 @@ import type {
 import type { ServerEnv } from "../config/env.js";
 import { createPipelineLogger } from "../ws/logger.js";
 import type { AgentRunMetadataService } from "../features/agent-runs/agent-run-service.js";
-import type { CanvasReadRepository } from "../db/canvas-read-repository.js";
+import type {
+  CanvasProjectLinkRow,
+  CanvasReadRepository,
+} from "../db/canvas-read-repository.js";
 import type { JobService } from "../features/jobs/job-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { AdminSupabaseClient } from "../supabase/admin.js";
@@ -428,45 +431,40 @@ function fingerprintWorkspaceSkills(skills: WorkspaceSkillEntry[]): string {
 }
 
 /**
- * Resolve the brand kit id for a canvas, never rejecting.
+ * The canvas's project link for one run, never rejecting (workorder 21R).
  *
- * Extracted from the run pipeline so it can be started concurrently with the
- * other pre-flight lookups. Supabase sits ~180ms away, so running these three
- * independent queries back to back cost more in waiting than in work.
+ * Three separate pre-flight answers come from this one read: the project's brand
+ * kit, the workspace whose skills the run loads, and the project a generation job
+ * must be authorised against. The Agent run asks the canvas repository with the
+ * REAL actor id, so a canvas the caller cannot read answers `null` rather than
+ * leaking a project the caller has no membership in.
+ *
+ * Every reason not to answer — no repository, no actor, no canvas, an unreadable
+ * canvas, a repository error — ends as `null`. The brand kit then simply is not
+ * injected and the run loads no workspace skills, which is exactly the
+ * degradation the three separate lookups already produced. Extracted so the two
+ * properties that matter are testable on their own: what the repository is asked,
+ * and that no failure here can fail the run.
  */
-async function resolveBrandKitId(
-  createUserClient: (accessToken: string) => unknown,
-  accessToken: string,
-  canvasId: string,
-): Promise<string | null> {
+export async function readCanvasProjectLinkForRun(input: {
+  repository: CanvasReadRepository | undefined;
+  actorId: string | undefined;
+  canvasId: string | undefined;
+}): Promise<CanvasProjectLinkRow | null> {
+  const { repository, actorId, canvasId } = input;
+  if (!repository || !actorId || !canvasId) return null;
+
   try {
-    const client = createUserClient(accessToken) as any;
-    const { data: canvas } = await client
-      .from("canvases")
-      .select("project_id, projects!inner(brand_kit_id)")
-      .eq("id", canvasId)
-      .maybeSingle();
-    return canvas?.projects?.brand_kit_id ?? null;
+    return await repository.findReadableCanvasProjectLink({
+      actorId,
+      canvasId,
+    });
   } catch {
-    // Fallback: the joined query fails if the FK isn't exposed via PostgREST.
-    try {
-      const client = createUserClient(accessToken) as any;
-      const { data: c } = await client
-        .from("canvases")
-        .select("project_id")
-        .eq("id", canvasId)
-        .maybeSingle();
-      if (!c?.project_id) return null;
-      const { data: p } = await client
-        .from("projects")
-        .select("brand_kit_id")
-        .eq("id", c.project_id)
-        .maybeSingle();
-      return p?.brand_kit_id ?? null;
-    } catch (err) {
-      console.warn("Failed to resolve brand kit ID:", err);
-      return null;
-    }
+    // Non-critical, and the message is fixed text: a driver error that embeds
+    // the statement, a host or a credential must not reach a log line through
+    // this path.
+    console.warn("[runtime] canvas project link lookup failed");
+    return null;
   }
 }
 
@@ -554,7 +552,7 @@ async function resolvePersonalWorkspaceId(
 }
 
 /**
- * The project a canvas belongs to, read through the caller's own client.
+ * The project a canvas belongs to, for a job that names that canvas.
  *
  * The worker records asset ownership from the job's project, so a job that names
  * a canvas has to carry the project that canvas belongs to. Two reasons this is
@@ -563,31 +561,40 @@ async function resolvePersonalWorkspaceId(
  *  - Ownership must follow the canvas/project source of truth. The job's own
  *    workspace is the PERSONAL billing workspace (Q1), which is the wrong
  *    workspace to authorise a team project's media against.
- *  - Using the caller's client makes RLS part of the answer: a canvas they
- *    cannot read returns no row, and the job is refused rather than created
- *    against a guessed project.
+ *  - The repository applies the canvas's project ACL inside the statement, so a
+ *    canvas the caller cannot read returns no row and the job is refused rather
+ *    than created against a guessed project.
+ *
+ * This is the gate BEFORE credits are charged, so it is fail-CLOSED and does not
+ * share the never-rejecting discipline of `readCanvasProjectLinkForRun`: a
+ * missing repository, a thrown read and an unreadable canvas all have to stop the
+ * run. Returning an undefined project would create a job that no later step can
+ * authorise its output against.
+ *
+ * The failure messages are fixed text. The read now goes through PostgreSQL
+ * rather than PostgREST, whose `{code, message}` pair used to be interpolated
+ * here; a driver error can carry the statement, a host or a credential, so none
+ * of it is echoed any more.
  */
-async function resolveCanvasProjectId(
-  client: UserSupabaseClient,
+export async function resolveCanvasProjectId(
+  repository: CanvasReadRepository | undefined,
+  actorId: string,
   canvasId: string,
   context: string,
 ): Promise<string> {
-  const { data: canvas, error } = await client
-    .from("canvases")
-    .select("project_id")
-    .eq("id", canvasId)
-    .maybeSingle();
+  let link: CanvasProjectLinkRow | null;
 
-  if (error) {
-    console.log(
-      `[${context}] canvas project lookup failed`,
-      JSON.stringify({ code: error.code, message: error.message }),
-    );
-    throw new Error(
-      `Canvas project lookup failed (${error.code ?? "no-code"}): ${error.message}`,
-    );
+  try {
+    if (!repository) {
+      throw new Error("canvas read repository is not configured");
+    }
+    link = await repository.findReadableCanvasProjectLink({ actorId, canvasId });
+  } catch {
+    console.log(`[${context}] canvas project lookup failed`);
+    throw new Error("Canvas project lookup failed (canvas_read_failed)");
   }
-  if (!canvas?.project_id) {
+
+  if (!link) {
     // No project means no way to authorise the generated asset later, so the
     // run fails here — before credits are charged — instead of on the canvas.
     console.log(`[${context}] canvas ${canvasId} has no readable project`);
@@ -595,7 +602,8 @@ async function resolveCanvasProjectId(
       "Canvas not found or not accessible — refusing to create a job without its project",
     );
   }
-  return canvas.project_id;
+
+  return link.project_id;
 }
 
 export type AgentRunService = ReturnType<typeof createAgentRunService>;
@@ -830,26 +838,46 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               )
           : Promise.resolve({ ok: true as const, value: null });
 
+      // The canvas → project link is asked ONCE per run and answered from that
+      // one read by both the brand kit and the workspace-skill loader: they used
+      // to be two separate round trips for the same fact.
+      //
+      // Both conditions now follow `run.userId` rather than the user client: the
+      // link has to be read as a real actor, and a run without one has nobody to
+      // read it AS. In practice an access token implies a user id, so this is the
+      // same set of runs as before; the difference is that a user-less run now
+      // degrades to "no brand kit, no workspace skills" instead of reading
+      // through a client with no actor attached.
+      const linkTask = readCanvasProjectLinkForRun({
+        repository: options.canvasReadRepository,
+        actorId: run.userId,
+        canvasId: run.canvasId,
+      });
+
+      const createUserClient = options.createUserClient;
+      const accessToken = run.accessToken;
+
       const skillsTask: Promise<WorkspaceSkillEntry[]> =
-        run.canvasId && run.accessToken && options.createUserClient
-          ? loadWorkspaceSkills(
-              options.createUserClient(run.accessToken) as UserSupabaseClient,
-              run.canvasId,
-            ).catch((err) => {
-              // Non-fatal: the agent runs without workspace skills.
-              console.warn("[runtime] Failed to load workspace skills:", err);
-              return [];
-            })
+        accessToken && createUserClient
+          ? linkTask
+              .then((link) =>
+                link
+                  ? loadWorkspaceSkills(
+                      createUserClient(accessToken) as UserSupabaseClient,
+                      link.workspace_id,
+                    )
+                  : [],
+              )
+              .catch((err) => {
+                // Non-fatal: the agent runs without workspace skills.
+                console.warn("[runtime] Failed to load workspace skills:", err);
+                return [];
+              })
           : Promise.resolve([]);
 
-      const brandKitTask: Promise<string | null> =
-        run.canvasId && run.accessToken && options.createUserClient
-          ? resolveBrandKitId(
-              options.createUserClient,
-              run.accessToken,
-              run.canvasId,
-            )
-          : Promise.resolve(null);
+      const brandKitTask: Promise<string | null> = linkTask.then(
+        (link) => link?.brand_kit_id ?? null,
+      );
 
       try {
         await updatePersistedRunStatus(
@@ -931,7 +959,12 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           // the canvas, so the generated asset can be authorised against the team
           // project that asked for it.
           const projectId = canvasId
-            ? await resolveCanvasProjectId(client, canvasId, "submitImageJob")
+            ? await resolveCanvasProjectId(
+                options.canvasReadRepository,
+                userId,
+                canvasId,
+                "submitImageJob",
+              )
             : undefined;
 
           const user: AuthenticatedUser = {
@@ -1175,7 +1208,12 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           jobLap("workspace_resolved", { workspaceId });
 
           const projectId = canvasId
-            ? await resolveCanvasProjectId(client, canvasId, "submitVideoJob")
+            ? await resolveCanvasProjectId(
+                options.canvasReadRepository,
+                userId,
+                canvasId,
+                "submitVideoJob",
+              )
             : undefined;
 
           const user: AuthenticatedUser = {

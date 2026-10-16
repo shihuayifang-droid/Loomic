@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   FIND_READABLE_CANVAS_CONTENT,
+  FIND_READABLE_CANVAS_PROJECT_LINK,
   LIST_READABLE_CANVAS_ASSETS,
   LIST_READABLE_SUCCEEDED_IMAGE_JOBS,
   CanvasReadError,
@@ -98,9 +99,14 @@ function domainCalls(queries: readonly QueryRecord[]): QueryRecord[] {
 }
 
 function contextParams(queries: readonly QueryRecord[]): unknown[][] {
-  return queries
+  const flat = queries
     .filter((entry) => entry.sql === TRANSACTION_STATEMENTS.setLocalSetting)
-    .map((entry) => [...(entry.params ?? [])]);
+    .flatMap((entry) => [...(entry.params ?? [])]);
+  const pairs: unknown[][] = [];
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    pairs.push([flat[i], flat[i + 1]]);
+  }
+  return pairs;
 }
 
 function repositoryFor(harness: Harness): CanvasReadRepository {
@@ -478,5 +484,224 @@ describe("canvas-read-repository: failure classification", () => {
       }),
     ).resolves.toEqual([]);
     expect(getterCalls).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workorder 21R: the Agent runtime's three canvas → project questions (brand
+// kit, workspace for skills, project a job is authorised against) collapse into
+// this one read. The single fact these cases defend is that the archived filter
+// of the OTHER canvas reads must NOT follow it here.
+// ---------------------------------------------------------------------------
+
+const PROJECT_ID = "88888888-8888-4888-8888-888888888888";
+const WORKSPACE_ID = "99999999-9999-4999-8999-999999999999";
+const BRAND_KIT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+const LINK_ROW = {
+  project_id: PROJECT_ID,
+  workspace_id: WORKSPACE_ID,
+  brand_kit_id: null,
+};
+
+async function linkFor(
+  harness: Harness,
+  actorId: string = ACTOR_ID,
+  canvasId: string = CANVAS_ID,
+) {
+  return repositoryFor(harness).findReadableCanvasProjectLink({
+    actorId,
+    canvasId,
+  });
+}
+
+describe("canvas-read-repository: findReadableCanvasProjectLink", () => {
+  it("case 15: binds both ids, executes one statement, carries the actor and maps the link", async () => {
+    const harness = createHarness(() => [LINK_ROW]);
+
+    const link = await linkFor(harness);
+
+    expect(link).toEqual({
+      project_id: PROJECT_ID,
+      workspace_id: WORKSPACE_ID,
+      brand_kit_id: null,
+    });
+
+    const statements = domainCalls(harness.queries);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]?.params).toEqual([ACTOR_ID, CANVAS_ID]);
+    expect(harness.connectAttempts()).toBe(1);
+
+    // The actor of the read is the one it authorises for, and the read runs
+    // privileged — the predicate, not RLS, is the gate.
+    expect(
+      contextParams(harness.queries).find(
+        (params) => params[0] === TRANSACTION_SETTING_NAMES.userId,
+      ),
+    ).toEqual([TRANSACTION_SETTING_NAMES.userId, ACTOR_ID]);
+    expect(
+      contextParams(harness.queries).find(
+        (params) => params[0] === TRANSACTION_SETTING_NAMES.executionMode,
+      ),
+    ).toEqual([TRANSACTION_SETTING_NAMES.executionMode, "privileged"]);
+
+    // No id is ever concatenated into the statement.
+    const sql = statements[0]?.sql ?? "";
+    expect(sql).not.toContain(ACTOR_ID);
+    expect(sql).not.toContain(CANVAS_ID);
+  });
+
+  it("case 16: the predicate is can_read_project — membership AND author-or-admin/owner", async () => {
+    const harness = createHarness(() => [LINK_ROW]);
+
+    await linkFor(harness);
+
+    const sql = domainCalls(harness.queries)[0]?.sql ?? "";
+    expect(sql).toContain("from public.canvases c");
+    expect(sql).toContain("join public.projects p on p.id = c.project_id");
+    expect(sql).toContain("join public.workspace_members m");
+    expect(sql).toContain("m.workspace_id = p.workspace_id");
+    expect(sql).toContain("m.user_id = $1::uuid");
+    expect(sql).toContain("where c.id = $2::uuid");
+    // The author clause is OR-ed INSIDE the join's result, so the membership
+    // requirement is never bypassed: an author who is not a member is refused.
+    expect(sql).toContain(
+      "and (p.created_by = $1::uuid or m.role in ('admin', 'owner'))",
+    );
+    // The write ACL is NOT the source: `created_by` alone would deny admins.
+    expect(sql).not.toContain("can_write_project");
+  });
+
+  it("case 17: there is NO archived filter — the policy this copies has none", async () => {
+    const harness = createHarness(() => [LINK_ROW]);
+
+    await linkFor(harness);
+
+    const sql = domainCalls(harness.queries)[0]?.sql ?? "";
+    // ★ The core of workorder 21R. Adding `archived_at is null` here would strip
+    // the brand kit and the workspace skills from every archived project's canvas
+    // and refuse every generation submitted from one.
+    expect(sql).not.toContain("archived");
+    // Guard against the copy-paste that would reintroduce it: this is not the
+    // content read, and it reads no canvas column beyond the join key.
+    expect(sql).not.toContain("c.content");
+    expect(sql).not.toContain("asset_objects");
+    expect(sql).not.toContain("background_jobs");
+  });
+
+  it("case 18: no readable row is null, and a null brand kit stays a null brand kit", async () => {
+    const missing = createHarness(() => []);
+    await expect(linkFor(missing)).resolves.toBeNull();
+
+    // A project without a brand kit is an ANSWER, not a shape problem: the whole
+    // point of the nullable column is that most projects have no kit.
+    const noKit = createHarness(() => [{ ...LINK_ROW, brand_kit_id: null }]);
+    await expect(linkFor(noKit)).resolves.toEqual({
+      project_id: PROJECT_ID,
+      workspace_id: WORKSPACE_ID,
+      brand_kit_id: null,
+    });
+  });
+
+  it("case 19: a project WITH a brand kit answers with that kit id", async () => {
+    const harness = createHarness(() => [
+      { ...LINK_ROW, brand_kit_id: BRAND_KIT_ID },
+    ]);
+
+    await expect(linkFor(harness)).resolves.toEqual({
+      project_id: PROJECT_ID,
+      workspace_id: WORKSPACE_ID,
+      brand_kit_id: BRAND_KIT_ID,
+    });
+  });
+
+  it("case 20: two rows fail loud instead of letting one project silently win", async () => {
+    const harness = createHarness(() => [
+      LINK_ROW,
+      { ...LINK_ROW, project_id: CANVAS_ID },
+    ]);
+
+    const error = await linkFor(harness).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(CanvasReadError);
+    expect((error as CanvasReadError).operation).toBe(
+      FIND_READABLE_CANVAS_PROJECT_LINK,
+    );
+    expect((error as CanvasReadError).message).toBe(
+      `canvas read failed (${FIND_READABLE_CANVAS_PROJECT_LINK})`,
+    );
+  });
+
+  it("case 21: a row whose project or workspace is unusable fails loud", async () => {
+    for (const row of [
+      { ...LINK_ROW, project_id: "" },
+      { ...LINK_ROW, project_id: null },
+      { ...LINK_ROW, workspace_id: "" },
+      { ...LINK_ROW, workspace_id: null },
+      { ...LINK_ROW, project_id: 7 },
+    ]) {
+      const harness = createHarness(() => [row]);
+      await expect(linkFor(harness)).rejects.toBeInstanceOf(CanvasReadError);
+    }
+  });
+
+  it("case 22: a non-string brand kit fails loud rather than being coerced", async () => {
+    // A number, an object or an empty string is not the nullable uuid column's
+    // contract; passing it on would hand the Agent a brand kit id that is not one.
+    for (const brandKitId of [42, {}, [], ""]) {
+      const harness = createHarness(() => [
+        { ...LINK_ROW, brand_kit_id: brandKitId },
+      ]);
+      await expect(linkFor(harness)).rejects.toBeInstanceOf(CanvasReadError);
+    }
+  });
+
+  it("case 23: an empty actor id or canvas id fails loud BEFORE the pool is touched", async () => {
+    const emptyActor = createHarness(() => [LINK_ROW]);
+    const actorError = await linkFor(emptyActor, "", CANVAS_ID).catch(
+      (reason: unknown) => reason,
+    );
+    expect(actorError).toBeInstanceOf(CanvasReadError);
+    expect((actorError as CanvasReadError).operation).toBe(
+      FIND_READABLE_CANVAS_PROJECT_LINK,
+    );
+    // A read with no actor must never become a privileged read for nobody.
+    expect(emptyActor.connectAttempts()).toBe(0);
+    expect(emptyActor.queries).toHaveLength(0);
+
+    const emptyCanvas = createHarness(() => [LINK_ROW]);
+    await expect(linkFor(emptyCanvas, ACTOR_ID, "")).rejects.toBeInstanceOf(
+      CanvasReadError,
+    );
+    expect(emptyCanvas.connectAttempts()).toBe(0);
+  });
+
+  it("case 24: a connect or SQL failure is a CanvasReadError whose message leaks nothing", async () => {
+    const connect = createHarness(() => [], {
+      connectError: new Error(
+        "ECONNREFUSED postgres://user:secret@10.210.134.37:5432/db",
+      ),
+    });
+    const connectError = await linkFor(connect).catch((reason: unknown) => reason);
+
+    expect(connectError).toBeInstanceOf(CanvasReadError);
+    expect((connectError as CanvasReadError).operation).toBe(
+      FIND_READABLE_CANVAS_PROJECT_LINK,
+    );
+    expect((connectError as CanvasReadError).message).toBe(
+      `canvas read failed (${FIND_READABLE_CANVAS_PROJECT_LINK})`,
+    );
+    expect((connectError as CanvasReadError).message).not.toMatch(
+      /select|public\.|join|postgres:\/\/|10\.210\.134\.37|secret|archived/i,
+    );
+
+    const sqlFailure = createHarness(() => {
+      throw new Error('invalid input syntax for type uuid: "not-a-uuid"');
+    });
+    const sqlError = await linkFor(sqlFailure, INVALID_ID, INVALID_ID).catch(
+      (reason: unknown) => reason,
+    );
+    expect(sqlError).toBeInstanceOf(CanvasReadError);
+    expect((sqlError as CanvasReadError).message).not.toContain("uuid");
   });
 });

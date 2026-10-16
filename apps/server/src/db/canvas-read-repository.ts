@@ -14,8 +14,17 @@
  * every read walks `canvas → project → workspace_members` and requires
  *
  * - a membership row for the caller in the project's workspace,
- * - the project not archived, and
- * - the caller is the project author or holds `admin`/`owner`.
+ * - the caller is the project author or holds `admin`/`owner`,
+ * - and, for the reads that publish canvas CONTENT or its assets, the project
+ *   not archived.
+ *
+ * That last condition belongs to those reads only. The project-link read
+ * (workorder 21R) deliberately drops it, because the question it answers —
+ * "which project does this canvas belong to?" — is the question
+ * `private.can_read_project` answers, and that predicate has no `archived_at`
+ * term. Carrying one there would strip the brand kit and the workspace skills
+ * from every archived project's canvas and refuse every generation submitted
+ * from one.
  *
  * A plain member who is not the author, a non-member, an archived project and a
  * missing canvas are all the same answer: `null` for the content read, `[]` for
@@ -72,11 +81,27 @@ export type CanvasAssetIdentityRow = {
   object_path: string;
 };
 
+/**
+ * The project a canvas belongs to, plus the workspace that authorises it.
+ *
+ * `brand_kit_id` is the project's nullable brand kit; `workspace_id` is what the
+ * caller passes on to the reads that are keyed by workspace (workspace skills).
+ */
+export type CanvasProjectLinkRow = {
+  project_id: string;
+  workspace_id: string;
+  brand_kit_id: string | null;
+};
+
 export type CanvasReadRepository = {
   findReadableCanvasContent(input: {
     actorId: string;
     canvasId: string;
   }): Promise<{ content: CanvasContent | null } | null>;
+  findReadableCanvasProjectLink(input: {
+    actorId: string;
+    canvasId: string;
+  }): Promise<CanvasProjectLinkRow | null>;
   listReadableSucceededImageJobs(input: {
     actorId: string;
     canvasId: string;
@@ -89,12 +114,15 @@ export type CanvasReadRepository = {
 };
 
 export const FIND_READABLE_CANVAS_CONTENT = "findReadableCanvasContent";
+export const FIND_READABLE_CANVAS_PROJECT_LINK =
+  "findReadableCanvasProjectLink";
 export const LIST_READABLE_SUCCEEDED_IMAGE_JOBS =
   "listReadableSucceededImageJobs";
 export const LIST_READABLE_CANVAS_ASSETS = "listReadableCanvasAssets";
 
 export type CanvasReadOperation =
   | typeof FIND_READABLE_CANVAS_CONTENT
+  | typeof FIND_READABLE_CANVAS_PROJECT_LINK
   | typeof LIST_READABLE_SUCCEEDED_IMAGE_JOBS
   | typeof LIST_READABLE_CANVAS_ASSETS;
 
@@ -135,6 +163,35 @@ join public.workspace_members as m
 where c.id = $2
   and p.archived_at is null
   and (p.created_by = $1 or m.role in ('admin', 'owner'))
+`;
+
+/**
+ * The project a canvas belongs to, for the caller's own identity (workorder
+ * 21R). This is the read the Agent runtime used to perform through the caller's
+ * PostgREST client for three separate questions: the canvas's brand kit, the
+ * workspace whose skills the run loads, and the project a generation job must be
+ * authorised against.
+ *
+ * The predicate is `private.can_read_project` verbatim, including its ORDER of
+ * requirements: the membership join is not optional, so an author who is not a
+ * member of the workspace is refused, and `admin`/`owner` widen the read to every
+ * project of the workspace. The write ACL is deliberately NOT the source here —
+ * it is stricter (`created_by` only) and would deny the admins the read policy
+ * admits.
+ *
+ * There is deliberately NO `archived_at` filter: the policy has none. An
+ * archived project's canvas must still resolve, or its brand kit and workspace
+ * skills would silently disappear and every generation submitted from it would
+ * be refused before credits are charged. This is the same "no archived filter on
+ * purpose" precedent as `findReadableProjectWorkspaceForMutation`.
+ */
+const READABLE_CANVAS_PROJECT_LINK_SQL = `
+select c.project_id, p.workspace_id, p.brand_kit_id
+  from public.canvases c
+  join public.projects p on p.id = c.project_id
+  join public.workspace_members m on m.workspace_id = p.workspace_id and m.user_id = $1::uuid
+ where c.id = $2::uuid
+   and (p.created_by = $1::uuid or m.role in ('admin', 'owner'))
 `;
 
 /**
@@ -250,6 +307,46 @@ export function createCanvasReadRepository(options: {
         throw new CanvasReadError(
           FIND_READABLE_CANVAS_CONTENT,
           new Error("canvas read returned more than one row"),
+        );
+      }
+
+      return rows[0] ?? null;
+    },
+
+    async findReadableCanvasProjectLink({ actorId, canvasId }) {
+      // Both ids ARE the question, so an empty one is a caller bug rather than a
+      // query that must answer nothing. Fail loud before the pool is touched, so
+      // a missing actor can never be turned into a privileged read for nobody.
+      if (typeof actorId !== "string" || actorId.length === 0) {
+        throw new CanvasReadError(
+          FIND_READABLE_CANVAS_PROJECT_LINK,
+          new Error("canvas project link read needs a non-empty actorId"),
+        );
+      }
+      if (typeof canvasId !== "string" || canvasId.length === 0) {
+        throw new CanvasReadError(
+          FIND_READABLE_CANVAS_PROJECT_LINK,
+          new Error("canvas project link read needs a non-empty canvasId"),
+        );
+      }
+
+      const rows = await readRows(
+        FIND_READABLE_CANVAS_PROJECT_LINK,
+        actorId,
+        READABLE_CANVAS_PROJECT_LINK_SQL,
+        [actorId, canvasId],
+        mapCanvasProjectLink,
+      );
+
+      // One canvas id is one row (`canvases.project_id` is NOT NULL and a
+      // foreign key), and the membership join cannot fan out because
+      // `(workspace_id, user_id)` is unique. A second row therefore means the SQL
+      // and this module disagree, and the caller must not have to guess which
+      // project the canvas belongs to.
+      if (rows.length > 1) {
+        throw new CanvasReadError(
+          FIND_READABLE_CANVAS_PROJECT_LINK,
+          new Error("canvas project link read returned more than one row"),
         );
       }
 
@@ -387,6 +484,22 @@ function mapAssetIdentity(
   };
 }
 
+/**
+ * The project link. Two of the three columns are the read's reason to exist, so
+ * they must be real strings; `brand_kit_id` is a nullable uuid column, where SQL
+ * NULL is the legitimate "this project has no brand kit" rather than a shape
+ * problem.
+ */
+function mapCanvasProjectLink(
+  row: Readonly<Record<string, unknown>>,
+): CanvasProjectLinkRow {
+  return {
+    project_id: requireString(row, "project_id"),
+    workspace_id: requireString(row, "workspace_id"),
+    brand_kit_id: optionalString(row, "brand_kit_id"),
+  };
+}
+
 function asRow(value: unknown): Readonly<Record<string, unknown>> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("canvas read returned a row that is not an object");
@@ -402,6 +515,26 @@ function requireString(
   const value = row[field];
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`canvas read returned no usable "${field}"`);
+  }
+
+  return value;
+}
+
+/**
+ * A nullable string column. SQL NULL is an answer here — it is how "this project
+ * has no brand kit" arrives — but anything that is neither null nor a non-empty
+ * string is a shape the callers are not written for, so it fails loud instead of
+ * being coerced.
+ */
+function optionalString(
+  row: Readonly<Record<string, unknown>>,
+  field: string,
+): string | null {
+  const value = row[field];
+  if (value === null || value === undefined) return null;
+
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`canvas read returned an unusable "${field}"`);
   }
 
   return value;

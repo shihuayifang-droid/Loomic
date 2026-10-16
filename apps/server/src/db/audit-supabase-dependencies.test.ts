@@ -653,11 +653,29 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // this method. Its new cases name no client method either, so
     // `fromCallsIncludingTests` follows `fromCalls` down again. The RPC counters
     // are untouched: this migration removed no RPC call site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(114);
+    //
+    // Workorder 21R then removed the LAST seven PostgREST reads of the Agent
+    // runtime's canvas → project path — `resolveBrandKitId` in
+    // `agent/runtime.ts` (three: the joined read and both steps of its fallback),
+    // `resolveCanvasProjectId` in the same file (one) and `resolveWorkspaceId` in
+    // `agent/workspace-skills.ts` (three: the joined read and both steps of its
+    // fallback) — so both counters below move down together again (114->107).
+    // All three asked the same question, so they collapse into ONE statement on
+    // `CanvasReadRepository.findReadableCanvasProjectLink`, which the run now
+    // issues once and answers the brand kit and the workspace skills from. That
+    // is a real coupling removal rather than a counting change: none of the three
+    // call sites names a client method any more, and the predicate is
+    // `private.can_read_project` verbatim — including the fact that it has NO
+    // `archived_at` term, so an archived project's canvas keeps resolving.
+    // `workspace_skills` / `skill_files` stay on the user client and are counted
+    // exactly as before. Its new cases name no client method either, so
+    // `fromCallsIncludingTests` follows `fromCalls` down again. The RPC counters
+    // are untouched: this migration removed no RPC call site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(107);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(114);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(107);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
