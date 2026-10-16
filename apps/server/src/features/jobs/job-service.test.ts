@@ -2058,7 +2058,7 @@ describe("createJob: authorize, then insert, then enqueue (工单21H0)", () => {
     // how a client fallback could come back unnoticed.
     // WHY: the repository's statement carries `created_by = actor` itself, so the
     // user client has nothing left to decide — and with no repository wired the
-    // method fails closed instead of reaching for it (case H15c below).
+    // method fails closed instead of reaching for it (case H15b below).
     const cancelHarness = makeHarness({ jobOwnerWriteRow: WRITE_JOB_ROW });
     await cancelHarness.service.cancelJob(WRITE_USER, "job-21h0");
     expect(cancelHarness.jobOwnerWriteCalls).toEqual([
