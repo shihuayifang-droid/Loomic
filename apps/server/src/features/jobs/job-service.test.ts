@@ -8,6 +8,10 @@ import type {
   JobAdminReadRepository,
   JobAdminReadRow,
 } from "../../db/job-admin-read-repository.js";
+import type {
+  JobOwnerReadRepository,
+  JobOwnerReadRow,
+} from "../../db/job-owner-read-repository.js";
 import type { JobBillingGateRepository } from "../../db/job-billing-gate-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import type { JobTransitionRepository } from "../../db/job-transition-repository.js";
@@ -108,6 +112,18 @@ type HarnessConfig = {
   /** Build the service with NO admin read repository at all (fail-closed). */
   withoutJobAdminReadRepository?: boolean;
   /**
+   * ADR-0001 / workorder 21T: what the caller's OWN reads answer. `ownJobRow`
+   * is `readOwnJob`'s row (`null` — or omitting it — is the "no such job for
+   * this actor" answer) and `ownJobRows` is `listOwnJobs`'s list (default: an
+   * empty one). The two `*Error` fields are the rejected-promise channel.
+   */
+  ownJobRow?: Record<string, unknown> | null;
+  ownJobRows?: Array<Record<string, unknown>>;
+  ownJobError?: Error;
+  ownJobListError?: Error;
+  /** Build the service with NO owner read repository at all (fail-closed). */
+  withoutJobOwnerReadRepository?: boolean;
+  /**
    * ADR-0001 / workorder 21M: build the service with NO transition repository at
    * all (the fail-closed path of the four `mark*` methods).
    */
@@ -148,6 +164,26 @@ function adminJobFixture(
     canceled_at: null,
     ...overrides,
   };
+}
+
+/**
+ * ADR-0001 / workorder 21T: the same 22-column record, for the caller's OWN
+ * reads. Both `background_jobs` repositories answer with the shape workorder 21I
+ * defined, so one fixture serves both — and a case that changes it changes what
+ * `getJob`, `listJobs` and `getJobAdmin` all see.
+ */
+function ownerJobFixture(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return adminJobFixture(overrides);
+}
+
+/**
+ * The caller a case acts as. The `id` is what the owner ACL is keyed by, so
+ * every case that cares who is asking names it explicitly.
+ */
+function caller(id = "user-1") {
+  return { accessToken: "t", email: "a@t", id, userMetadata: {} };
 }
 
 function makeHarness(config: HarnessConfig = {}) {
@@ -376,6 +412,31 @@ function makeHarness(config: HarnessConfig = {}) {
     },
   };
 
+  // ADR-0001 / workorder 21T: the caller's OWN job reads behind `getJob` and
+  // `listJobs`. The harness records the exact argument object the service passed
+  // down — operation, actor and both filters — so "the actor is the caller",
+  // "`undefined` reaches the repository as `null`" and "the filters are not
+  // interpreted here" are observable rather than asserted in prose. An `ops` list
+  // free of any client read, and an empty `clientTokens`, are what prove those
+  // two methods no longer touch PostgREST at all.
+  const jobOwnerReadCalls: Array<{
+    operation: string;
+    input: Record<string, unknown>;
+  }> = [];
+
+  const jobOwnerReadRepository: JobOwnerReadRepository = {
+    async readOwnJob(input) {
+      jobOwnerReadCalls.push({ operation: "readOwnJob", input: { ...input } });
+      if (config.ownJobError) throw config.ownJobError;
+      return (config.ownJobRow ?? null) as JobOwnerReadRow | null;
+    },
+    async listOwnJobs(input) {
+      jobOwnerReadCalls.push({ operation: "listOwnJobs", input: { ...input } });
+      if (config.ownJobListError) throw config.ownJobListError;
+      return (config.ownJobRows ?? []) as JobOwnerReadRow[];
+    },
+  };
+
   // ADR-0001 / workorder 21M: the four guarded status transitions. The double
   // keeps the SAME outward shape the old client update had — it records the
   // patch the transition would have written and answers the same row-count
@@ -464,6 +525,9 @@ function makeHarness(config: HarnessConfig = {}) {
     ...(config.withoutJobAdminReadRepository
       ? {}
       : { jobAdminReadRepository }),
+    ...(config.withoutJobOwnerReadRepository
+      ? {}
+      : { jobOwnerReadRepository }),
     ...(config.withoutJobTransitionRepository
       ? {}
       : { jobTransitionRepository }),
@@ -493,6 +557,7 @@ function makeHarness(config: HarnessConfig = {}) {
     jobRows,
     creditsLinkCalls,
     jobAdminReadCalls,
+    jobOwnerReadCalls,
     transitionCalls,
     adminClientCalls: () => adminClientCalls,
     /** The credits-link operations in the order the service issued them. */
@@ -911,27 +976,378 @@ describe("job service state guards", () => {
   it("case 9: listJobs by failed also matches legacy dead_letter rows", async () => {
     const harness = makeHarness();
 
-    await harness.service.listJobs(
-      { accessToken: "t", email: "a@t", id: "user-1", userMetadata: {} },
-      { status: "failed" },
-    );
+    await harness.service.listJobs(caller(), { status: "failed" });
 
-    expect(harness.inOp()?.column).toBe("status");
-    expect(harness.inOp()?.values).toEqual(["failed", "dead_letter"]);
+    // OLD ASSERTION (pre-21T): the service built `in("status", ["failed",
+    // "dead_letter"])` on the user client's PostgREST chain.
+    // NEW ASSERTION: the filter reaches `JobOwnerReadRepository` verbatim — the
+    // service no longer decides HOW `failed` is expressed — and the legacy value
+    // is admitted by that repository's statement instead.
+    // WHY: the statement is fixed text with `or (... = 'failed' and status =
+    // 'dead_letter')`, so the four filter combinations cannot be built per call
+    // site. The behaviour is measured in `job-owner-read-repository.test.ts`
+    // case 7 (statement text) and in the PGlite case 8 (failed + dead_letter rows
+    // come back, and the old value-list form selects the same ids).
+    expect(harness.jobOwnerReadCalls).toEqual([
+      {
+        operation: "listOwnJobs",
+        input: { actorId: "user-1", status: "failed", jobType: null },
+      },
+    ]);
+    // Nothing is left on the client chain: no `in`, no `eq`, no read at all.
+    expect(harness.inOp()).toBeUndefined();
+    expect(harness.ops).toEqual([]);
   });
 
-  it("case 9b: listJobs by any other status still uses eq", async () => {
+  it("case 9b: listJobs passes any other status through unchanged", async () => {
     const harness = makeHarness();
 
-    await harness.service.listJobs(
-      { accessToken: "t", email: "a@t", id: "user-1", userMetadata: {} },
-      { status: "retrying" },
-    );
+    await harness.service.listJobs(caller(), { status: "retrying" });
 
-    expect(harness.inOp()).toBeUndefined();
+    // OLD ASSERTION (pre-21T): `eq("status", "retrying")` on the user client.
+    // NEW ASSERTION: the value is handed to the repository as given; whether it
+    // is a legal enum member is PostgreSQL's answer, not this method's.
+    // WHY: the enum cast in the repository's statement is what keeps an unknown
+    // status a 500 instead of an empty list, so the service must NOT pre-judge
+    // the value here.
+    expect(harness.jobOwnerReadCalls).toEqual([
+      {
+        operation: "listOwnJobs",
+        input: { actorId: "user-1", status: "retrying", jobType: null },
+      },
+    ]);
+    expect(harness.ops).toEqual([]);
+  });
+});
+
+// ADR-0001 / workorder 21T: the caller's OWN job reads (`getJob`, `listJobs`)
+// moved from the user client to `JobOwnerReadRepository`, whose statement carries
+// the explicit `created_by = actor` ACL. What these cases pin is that the MOVE
+// changed no answer: the same rows come back through `mapJobRow`, the same
+// `job_not_found` 404 and the same `job_query_failed` 500 come out of the other
+// outcomes, the filters arrive unconverted, and with no repository wired both
+// methods fail closed instead of reaching for the client they used to read
+// through.
+describe("getJob and listJobs: the caller's own reads go through the repository (工单21T)", () => {
+  it("case 1: getJob returns the repository's row, mapped", async () => {
+    const harness = makeHarness({
+      ownJobRow: ownerJobFixture({
+        project_id: null,
+        canvas_id: "canvas-1",
+        session_id: null,
+        thread_id: null,
+        status: "running",
+        payload: { prompt: "a cat", steps: [1, 2, { depth: "deep" }] },
+        result: { url: "oss://bucket/key.png" },
+        attempt_count: 2,
+        started_at: "2026-09-30T00:01:00.000Z",
+      }),
+    });
+
+    const job = await harness.service.getJob(caller(), "job-1");
+
+    expect(job).toEqual({
+      id: "job-1",
+      workspace_id: "ws-1",
+      project_id: null,
+      canvas_id: "canvas-1",
+      session_id: null,
+      thread_id: null,
+      queue_name: "image_generation_jobs",
+      job_type: "image_generation",
+      status: "running",
+      payload: { prompt: "a cat", steps: [1, 2, { depth: "deep" }] },
+      result: { url: "oss://bucket/key.png" },
+      error_code: null,
+      error_message: null,
+      attempt_count: 2,
+      max_attempts: 3,
+      created_by: "user-1",
+      created_at: "2026-09-30T00:00:00.000Z",
+      updated_at: "2026-09-30T00:00:00.000Z",
+      started_at: "2026-09-30T00:01:00.000Z",
+      completed_at: null,
+      failed_at: null,
+      canceled_at: null,
+    });
+
+    // One call, two fields: the actor comes from the authenticated user and the
+    // job id from the route. There is no token, no workspace and no filter a
+    // caller could widen the read with.
+    expect(harness.jobOwnerReadCalls).toEqual([
+      { operation: "readOwnJob", input: { actorId: "user-1", jobId: "job-1" } },
+    ]);
     expect(
-      harness.ops.some((op) => op.kind === "eq" && op.column === "status" && op.value === "retrying"),
-    ).toBe(true);
+      Object.keys(harness.jobOwnerReadCalls[0]?.input ?? {}),
+    ).toEqual(["actorId", "jobId"]);
+    // The user client is no longer part of this path at all.
+    expect(harness.clientTokens).toEqual([]);
+    expect(harness.ops).toEqual([]);
+  });
+
+  it("case 2: getJob's null is the existing 404 — not a 403", async () => {
+    const harness = makeHarness({ ownJobRow: null });
+
+    const error = await harness.service
+      .getJob(caller(), "job-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_not_found");
+    expect(error?.statusCode).toBe(404);
+    expect(error?.message).toBe("Job not found.");
+    // A job that belongs to somebody else and a job that does not exist are the
+    // same answer, exactly as the RLS read made them — so a probe cannot learn
+    // whether an id exists.
+    expect(harness.jobOwnerReadCalls).toEqual([
+      { operation: "readOwnJob", input: { actorId: "user-1", jobId: "job-1" } },
+    ]);
+    expect(harness.clientTokens).toEqual([]);
+  });
+
+  it("case 3: getJob's failure is the existing 500, never a 404", async () => {
+    const harness = makeHarness({
+      ownJobError: new Error(
+        "connect ECONNREFUSED 10.210.134.37:5432 " +
+          "select ... from public.background_jobs",
+      ),
+    });
+
+    const error = await harness.service
+      .getJob(caller(), "job-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_query_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to query job.");
+    // The driver's own text is not concatenated: it can name the statement, the
+    // host or a credential. The repository carries it as `cause`.
+    expect(error?.message).not.toMatch(
+      /ECONNREFUSED|10\.210\.134\.37|public\.|background_jobs/,
+    );
+  });
+
+  it("case 4: a malformed job id stays a 500, not a 404", async () => {
+    // The repository is what raises 22P02 for a non-uuid; the service must not
+    // fold that into "no such job".
+    const harness = makeHarness({
+      ownJobError: Object.assign(new Error("invalid input syntax for type uuid"), {
+        code: "22P02",
+      }),
+    });
+
+    const error = await harness.service
+      .getJob(caller(), "not-a-uuid")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error?.code).toBe("job_query_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to query job.");
+    expect(error?.message).not.toMatch(/invalid input|uuid/i);
+  });
+
+  it("case 5: getJob maps a legacy dead_letter row to failed", async () => {
+    const harness = makeHarness({
+      ownJobRow: ownerJobFixture({ status: "dead_letter" }),
+    });
+
+    const job = await harness.service.getJob(caller(), "job-1");
+
+    // `mapJobRow` is still the server's single translation point; the repository
+    // reports the raw column.
+    expect(job.status).toBe("failed");
+    expect(harness.jobOwnerReadCalls).toEqual([
+      { operation: "readOwnJob", input: { actorId: "user-1", jobId: "job-1" } },
+    ]);
+  });
+
+  it("case 6: listJobs passes the actor and BOTH filters verbatim", async () => {
+    const harness = makeHarness({ ownJobRows: [ownerJobFixture()] });
+
+    await harness.service.listJobs(caller(), {
+      status: "failed",
+      jobType: "video_generation",
+    });
+
+    // The service no longer interprets the filter: it hands both values down and
+    // the repository's statement owns the `failed`-includes-`dead_letter` rule
+    // and the enum cast.
+    expect(harness.jobOwnerReadCalls).toEqual([
+      {
+        operation: "listOwnJobs",
+        input: {
+          actorId: "user-1",
+          status: "failed",
+          jobType: "video_generation",
+        },
+      },
+    ]);
+    expect(Object.keys(harness.jobOwnerReadCalls[0]?.input ?? {})).toEqual([
+      "actorId",
+      "status",
+      "jobType",
+    ]);
+    expect(harness.clientTokens).toEqual([]);
+    expect(harness.ops).toEqual([]);
+  });
+
+  it("case 7: an omitted filter reaches the repository as an explicit null", async () => {
+    const harness = makeHarness();
+
+    await harness.service.listJobs(caller());
+
+    // Both keys are ALWAYS present: "no filter" is a value the fixed statement
+    // understands, and an absent key cannot be told from an unfiltered read.
+    expect(harness.jobOwnerReadCalls).toEqual([
+      {
+        operation: "listOwnJobs",
+        input: { actorId: "user-1", status: null, jobType: null },
+      },
+    ]);
+
+    const half = makeHarness();
+    await half.service.listJobs(caller(), { jobType: "image_generation" });
+    expect(half.jobOwnerReadCalls).toEqual([
+      {
+        operation: "listOwnJobs",
+        input: { actorId: "user-1", status: null, jobType: "image_generation" },
+      },
+    ]);
+  });
+
+  it("case 8: listJobs maps every row, in the repository's order", async () => {
+    const harness = makeHarness({
+      ownJobRows: [
+        ownerJobFixture({ id: "job-3", status: "dead_letter" }),
+        ownerJobFixture({ id: "job-2", status: "queued" }),
+        ownerJobFixture({ id: "job-1", status: "running" }),
+      ],
+    });
+
+    const jobs = await harness.service.listJobs(caller());
+
+    expect(jobs.map((job) => job.id)).toEqual(["job-3", "job-2", "job-1"]);
+    // Order is the statement's (`order by created_at desc`), not this method's:
+    // the service passes the rows through untouched.
+    expect(jobs.map((job) => job.status)).toEqual(["failed", "queued", "running"]);
+  });
+
+  it("case 9: listJobs answers an empty array for an empty list", async () => {
+    const harness = makeHarness({ ownJobRows: [] });
+
+    await expect(harness.service.listJobs(caller())).resolves.toEqual([]);
+
+    expect(harness.jobOwnerReadCalls).toEqual([
+      {
+        operation: "listOwnJobs",
+        input: { actorId: "user-1", status: null, jobType: null },
+      },
+    ]);
+    expect(harness.clientTokens).toEqual([]);
+  });
+
+  it("case 10: listJobs' failure is the existing 500, with no driver text", async () => {
+    const harness = makeHarness({
+      ownJobListError: Object.assign(
+        new Error('invalid input value for enum background_job_status: "bogus"'),
+        { code: "22P02" },
+      ),
+    });
+
+    const error = await harness.service
+      .listJobs(caller(), { status: "bogus" as never })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_query_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to list jobs.");
+    // The unknown value must NOT come back as an empty list with a 200 — that is
+    // the whole reason the statement casts the filter to its enum type.
+    expect(error?.message).not.toMatch(/invalid input|enum|bogus/i);
+  });
+
+  it("case 11: with no repository wired BOTH reads fail closed", async () => {
+    // The doubles would answer with a row and a list if they were consulted, so
+    // the 500s below can only come from the missing dependency — not from a
+    // missing job or an empty table.
+    const harness = makeHarness({
+      withoutJobOwnerReadRepository: true,
+      ownJobRow: ownerJobFixture(),
+      ownJobRows: [ownerJobFixture()],
+      jobRow: ownerJobFixture(),
+    });
+
+    const single = await harness.service
+      .getJob(caller(), "job-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+    expect(single?.code).toBe("job_query_failed");
+    expect(single?.statusCode).toBe(500);
+    expect(single?.message).toBe("Failed to query job.");
+
+    const list = await harness.service
+      .listJobs(caller())
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+    expect(list?.code).toBe("job_query_failed");
+    expect(list?.statusCode).toBe(500);
+    expect(list?.message).toBe("Failed to list jobs.");
+
+    // Fail-closed means nothing happened: no repository call, and — the point of
+    // the migration — no user PostgREST read either.
+    expect(harness.jobOwnerReadCalls).toEqual([]);
+    expect(harness.ops).toEqual([]);
+    expect(harness.clientTokens).toEqual([]);
+  });
+
+  it("case 12: neither read builds a user client, on the success or the failure path", async () => {
+    // The stub throws on contact, so these assertions can only pass while both
+    // methods stay off PostgREST entirely.
+    const success = makeHarness({
+      ownJobRow: ownerJobFixture(),
+      ownJobRows: [ownerJobFixture()],
+    });
+    await expect(success.service.getJob(caller(), "job-1")).resolves.toMatchObject({
+      id: "job-1",
+    });
+    await expect(success.service.listJobs(caller())).resolves.toHaveLength(1);
+    expect(success.clientTokens).toEqual([]);
+
+    const failing = makeHarness({
+      ownJobError: new Error("boom"),
+      ownJobListError: new Error("boom"),
+    });
+    await expect(
+      failing.service.getJob(caller(), "job-1").catch((error: unknown) => error),
+    ).resolves.toBeInstanceOf(JobServiceError);
+    await expect(
+      failing.service.listJobs(caller()).catch((error: unknown) => error),
+    ).resolves.toBeInstanceOf(JobServiceError);
+    expect(failing.clientTokens).toEqual([]);
+  });
+
+  it("case 13: the actor is the authenticated user's id, never the access token", async () => {
+    const harness = makeHarness({ ownJobRow: ownerJobFixture() });
+
+    await harness.service.getJob(caller("user-42"), "job-7");
+    await harness.service.listJobs(caller("user-42"), { status: "queued" });
+
+    // The ACL value is the user id in both calls — the same value the RLS policy
+    // read from the JWT — and the token is not part of it.
+    expect(harness.jobOwnerReadCalls).toEqual([
+      { operation: "readOwnJob", input: { actorId: "user-42", jobId: "job-7" } },
+      {
+        operation: "listOwnJobs",
+        input: { actorId: "user-42", status: "queued", jobType: null },
+      },
+    ]);
+    expect(harness.clientTokens).toEqual([]);
   });
 });
 

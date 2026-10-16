@@ -269,7 +269,7 @@ function requireReadArgument(value: unknown, field: string): string {
   return value;
 }
 
-function mapJobReadRow(row: unknown): JobAdminReadRow {
+export function mapJobReadRow(row: unknown): JobAdminReadRow {
   const record = asReadRow(row);
 
   return {

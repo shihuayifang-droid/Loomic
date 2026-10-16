@@ -103,6 +103,7 @@ import {
   type JobAttemptRepository,
 } from "./db/job-attempt-repository.js";
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
+import { createJobOwnerReadRepository } from "./db/job-owner-read-repository.js";
 import { createJobConcurrencyRepository } from "./db/job-concurrency-repository.js";
 import { createJobTransitionRepository } from "./db/job-transition-repository.js";
 import { createCreditReadRepository } from "./db/credit-read-repository.js";
@@ -512,6 +513,17 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           // because the admin client it used to read through is no longer
           // reachable from that method.
           jobAdminReadRepository: createJobAdminReadRepository({
+            getTransactionPool: () => getTransactionPool(databaseEnv),
+          }),
+          // ADR-0001 / workorder 21T: the caller's OWN job reads behind `getJob`
+          // and `listJobs` — `GET /api/jobs/:jobId` and `GET /api/jobs`. Built
+          // lazily against the same pool as the repositories above, and with the
+          // same consequence: no repository means both reads fail closed as the
+          // service's existing `job_query_failed` 500, because the user client
+          // they used to read through is no longer reachable from those methods.
+          // `createUserClient` stays wired: `createJob` and `cancelJob` still use
+          // it.
+          jobOwnerReadRepository: createJobOwnerReadRepository({
             getTransactionPool: () => getTransactionPool(databaseEnv),
           }),
           // ADR-0001 / workorder 21M: the four guarded status transitions

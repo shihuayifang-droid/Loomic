@@ -8,6 +8,7 @@ import type {
 import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
 import type { JobAdminReadRepository } from "../../db/job-admin-read-repository.js";
+import type { JobOwnerReadRepository } from "../../db/job-owner-read-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import type { JobTransitionRepository } from "../../db/job-transition-repository.js";
 import type {
@@ -153,6 +154,24 @@ export function createJobService(options: {
    * be able to bring it back.
    */
   jobAdminReadRepository?: JobAdminReadRepository;
+  /**
+   * ADR-0001 / workorder 21T: the caller's OWN job reads behind `getJob` and
+   * `listJobs`. It is the only reader of a job row for the user who asks for it,
+   * and its ACL is the explicit `created_by = actor` predicate in its own SQL —
+   * the same rule the table's RLS policy applied, with no workspace membership
+   * check added.
+   *
+   * Optional for the same reason the repositories above are, and with the same
+   * consequence: with no repository wired, or with a failing one, both reads fail
+   * closed as the same `job_query_failed` 500 they already published. There is
+   * deliberately no user-client fallback — the two PostgREST reads this replaces
+   * are exactly what workorder 21T removes, and a missing dependency must not be
+   * able to bring them back.
+   *
+   * `createUserClient` stays: `createJob` and `cancelJob` still read and write
+   * through it.
+   */
+  jobOwnerReadRepository?: JobOwnerReadRepository;
   /**
    * ADR-0001 / workorder 21M: the four guarded status transitions of the worker
    * (`markRunning`, `markRetrying`, `markSucceeded`, `markFailed`). It is the
@@ -341,48 +360,68 @@ export function createJobService(options: {
     },
 
     async getJob(user, jobId) {
-      const client = options.createUserClient(user.accessToken);
-      const { data: job, error } = await client
-        .from("background_jobs")
-        .select(SELECT_COLS)
-        .eq("id", jobId)
-        .maybeSingle();
-
-      if (error) {
+      // ADR-0001 / workorder 21T: the caller's own job row moved from the user
+      // client to the narrow `pg` repository. What did NOT move is the contract:
+      // `null` from the repository is this method's existing `job_not_found` 404,
+      // and a repository that threw (a connect failure, a SQL error, or the 22P02
+      // a malformed uuid raises) is its existing `job_query_failed` 500 — a bad
+      // argument is not a missing job, so it is NOT turned into a 404 here.
+      //
+      // The ACL moved WITH the read: the repository's statement carries
+      // `created_by = actor`, so a job belonging to somebody else is `null` here,
+      // exactly as the RLS policy used to make it. The user client is no longer
+      // involved, which is why `user.accessToken` is not read any more.
+      //
+      // There is deliberately no user-client fallback behind this: with no
+      // repository wired, the call fails closed with exactly the error a broken
+      // read produces, so a missing dependency can never revive the old read.
+      const repository = options.jobOwnerReadRepository;
+      if (!repository) {
         throw new JobServiceError("job_query_failed", "Failed to query job.", 500);
       }
-      if (!job) {
+
+      let row: Record<string, unknown> | null;
+      try {
+        row = await repository.readOwnJob({ actorId: user.id, jobId });
+      } catch {
+        throw new JobServiceError("job_query_failed", "Failed to query job.", 500);
+      }
+
+      if (row === null) {
         throw new JobServiceError("job_not_found", "Job not found.", 404);
       }
-      return mapJobRow(job as unknown as Record<string, unknown>);
+
+      return mapJobRow(row);
     },
 
     async listJobs(user, filters) {
-      const client = options.createUserClient(user.accessToken);
-      let query = client
-        .from("background_jobs")
-        .select(SELECT_COLS)
-        .eq("created_by", user.id)
-        .order("created_at", { ascending: false })
-        .limit(50);
-
-      if (filters?.status) {
-        // Filtering by "failed" must also surface legacy `dead_letter` rows,
-        // which are read as failed (see mapJobRow).
-        query =
-          filters.status === "failed"
-            ? query.in("status", ["failed", "dead_letter"])
-            : query.eq("status", filters.status);
-      }
-      if (filters?.jobType) query = query.eq("job_type", filters.jobType);
-
-      const { data: jobs, error } = await query;
-      if (error) {
+      // ADR-0001 / workorder 21T: the caller's own job list moved with the same
+      // two rules as `getJob` above — the repository's fixed statement owns the
+      // `created_by` ACL, the newest-first order and the 50-row cap, and a
+      // repository that threw or was never wired is the existing
+      // `job_query_failed` 500 rather than a fallback.
+      //
+      // The filters are passed DOWN as they arrive, `undefined` normalised to an
+      // explicit `null`: "no filter on this column" is a value the statement
+      // understands, and an unknown one is bound as its enum type so PostgreSQL
+      // rejects it — which is the 500 the old read produced, not an empty list.
+      const repository = options.jobOwnerReadRepository;
+      if (!repository) {
         throw new JobServiceError("job_query_failed", "Failed to list jobs.", 500);
       }
-      return (jobs ?? []).map((row) =>
-        mapJobRow(row as unknown as Record<string, unknown>),
-      );
+
+      let rows: Record<string, unknown>[];
+      try {
+        rows = await repository.listOwnJobs({
+          actorId: user.id,
+          status: filters?.status ?? null,
+          jobType: filters?.jobType ?? null,
+        });
+      } catch {
+        throw new JobServiceError("job_query_failed", "Failed to list jobs.", 500);
+      }
+
+      return rows.map((row) => mapJobRow(row));
     },
 
     async cancelJob(user, jobId) {
