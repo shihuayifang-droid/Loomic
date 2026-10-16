@@ -12,6 +12,10 @@ import type {
   AuthenticatedUser,
   UserSupabaseClient,
 } from "../../supabase/user.js";
+import type {
+  BrandKitListResult,
+  BrandKitReadRepository,
+} from "../../db/brand-kit-read-repository.js";
 
 const BRAND_KIT_BUCKET = "brand-kit-assets";
 const SIGNED_URL_EXPIRY_SECONDS = 3600;
@@ -93,6 +97,15 @@ export type BrandKitService = {
 
 export function createBrandKitService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
+  /**
+   * ADR-0001 / workorder 21Y: the PostgreSQL home of the two reads behind
+   * `listKits`. REQUIRED on purpose — this service has exactly one assembly
+   * point (`app.ts`), and workorder 21X measured that an OPTIONAL dependency
+   * fails silently when its one wiring line is dropped: the type check still
+   * exits 0, and the read would only fail at runtime. Required means a missing
+   * wire is a compile error instead.
+   */
+  brandKitReadRepository: BrandKitReadRepository;
 }): BrandKitService {
   async function fetchKitDetail(
     client: UserSupabaseClient,
@@ -174,40 +187,36 @@ export function createBrandKitService(options: {
 
   return {
     async listKits(user) {
-      const client = options.createUserClient(user.accessToken);
+      // ADR-0001 / workorder 21Y: the two PostgREST reads that used to run here —
+      // the caller's own kit rows, then the `kit_id`/`asset_type` rows of exactly
+      // those kits — now run in `BrandKitReadRepository.listOwnKits`. That
+      // repository replaces the two RLS policies with their verbatim SQL rather
+      // than deriving a new ACL: `brand_kits` and `brand_kit_assets` are
+      // owner-only, so it keys on the actor alone. The caller's own client is no
+      // longer created here at all.
+      let rows: BrandKitListResult;
 
-      const { data: kits, error: kitsError } = await client
-        .from("brand_kits")
-        .select("id, name, is_default, cover_url, created_at, updated_at")
-        .eq("user_id", user.id)
-        .order("created_at", { ascending: true });
-
-      if (kitsError) {
+      try {
+        rows = await options.brandKitReadRepository.listOwnKits({
+          actorId: user.id,
+        });
+      } catch {
+        // `http/brand-kits.ts` answers anything that is not a
+        // `BrandKitServiceError` with its own 500 and the message
+        // "An unexpected error occurred.", so the repository's fixed
+        // `BrandKitReadError` has to be translated here to keep the published
+        // code AND message unchanged.
         throw new BrandKitServiceError(
           "brand_kit_query_failed",
           KIT_QUERY_FAILED_MESSAGE,
           500,
         );
       }
+
+      const { kits, assets } = rows;
 
       if (!kits.length) {
         return [];
-      }
-
-      const { data: assets, error: assetsError } = await client
-        .from("brand_kit_assets")
-        .select("kit_id, asset_type")
-        .in(
-          "kit_id",
-          kits.map((k) => k.id),
-        );
-
-      if (assetsError) {
-        throw new BrandKitServiceError(
-          "brand_kit_query_failed",
-          KIT_QUERY_FAILED_MESSAGE,
-          500,
-        );
       }
 
       const countsByKit = new Map<
@@ -215,7 +224,7 @@ export function createBrandKitService(options: {
         { color: number; font: number; logo: number; image: number }
       >();
 
-      for (const asset of assets ?? []) {
+      for (const asset of assets) {
         let counts = countsByKit.get(asset.kit_id);
         if (!counts) {
           counts = { color: 0, font: 0, logo: 0, image: 0 };

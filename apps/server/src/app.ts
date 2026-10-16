@@ -60,6 +60,9 @@ import {
   type IdentityReadRepository,
 } from "./db/identity-read-repository.js";
 import {
+  createBrandKitReadRepository,
+} from "./db/brand-kit-read-repository.js";
+import {
   createCanvasReadRepository,
   type CanvasReadRepository,
 } from "./db/canvas-read-repository.js";
@@ -446,8 +449,20 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       getAdminClient,
       projectReadRepository,
     });
+  // ADR-0001 / workorder 21Y: `listKits` reads the caller's own brand kits and
+  // the asset rows of those kits through the PostgreSQL repository, built lazily
+  // against the same pool as the other repositories and handed to the service
+  // here. `brand_kits` and `brand_kit_assets` are owner-only, so the repository
+  // keys on the actor alone; `createUserClient` stays wired for the write
+  // routes, which did not move.
   const brandKitService =
-    options.brandKitService ?? createBrandKitService({ createUserClient });
+    options.brandKitService ??
+    createBrandKitService({
+      createUserClient,
+      brandKitReadRepository: createBrandKitReadRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
+    });
   const canvasService =
     options.canvasService ??
     createCanvasService({
