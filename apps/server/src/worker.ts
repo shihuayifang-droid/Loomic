@@ -18,9 +18,11 @@ import { createJobAttemptRepository } from "./db/job-attempt-repository.js";
 import { createJobTransitionRepository } from "./db/job-transition-repository.js";
 import { createJobBillingGateRepository } from "./db/job-billing-gate-repository.js";
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
+import { createJobRefundBasisRepository } from "./db/job-refund-basis-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
-import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
+import { createRefundJob } from "./features/jobs/refund-job.js";
+import { createCreditService } from "./features/credits/credit-service.js";
 import { getExecutor, type ExecutorContext } from "./features/jobs/job-executor.js";
 import {
   JOB_QUEUES,
@@ -120,6 +122,30 @@ async function main() {
       ),
   });
 
+  // ADR-0001 / workorder 21O: the refund basis the worker reads before it gives
+  // credits back — `credits_cost`, `workspace_id`, `created_by` of one job row.
+  // It used to be an admin PostgREST read inside a local function in this file,
+  // which discarded its error field, so a failed read and a missing row both
+  // meant "refund nothing, silently". Built lazily against the same
+  // `DATABASE_URL` as the repositories above: with no reachable pool the read
+  // fails, the refund path logs that failure and NO money moves — there is no
+  // fallback that could reach PostgREST.
+  const refundBasisRepository = createJobRefundBasisRepository({
+    getTransactionPool: () =>
+      getTransactionPool(
+        env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
+      ),
+  });
+
+  // The refund decision itself lives in `features/jobs/refund-job.ts`: the
+  // condition, the amount, the description and the "never throws" contract are
+  // unchanged, and the tag stays a call-site argument so both log lines keep
+  // naming this worker.
+  const refundJob = createRefundJob({
+    readRefundBasis: (input) => refundBasisRepository.readRefundBasis(input),
+    creditService,
+  });
+
   // Base context — per-message fields (queue, msgId, renewVt) are added per message below
   const baseCtx = {
     jobService,
@@ -199,7 +225,7 @@ async function main() {
                 billingGate,
                 pgmq,
                 getExecutor,
-                refundJob: (jobId) => refundJob(jobId, ctx, creditService, tag),
+                refundJob: (jobId) => refundJob(jobId, tag),
                 log: (message) => console.log(`${tag} ${message}`),
               },
               { queue, queueJobType: jobType, msg, ctx },
@@ -220,47 +246,11 @@ async function main() {
 /**
  * Per-message handling lives in `process-job-message.ts` (testable without a
  * worker). This file only wires the real collaborators into it.
+ *
+ * The refund of a terminally failed job lives in `features/jobs/refund-job.ts`
+ * (workorder 21O) and reads its basis through `JobRefundBasisRepository`. It is
+ * constructed above, beside the other repositories.
  */
-
-/**
- * Refund credits for a terminally failed job if credits were deducted.
- * Only terminally failed jobs get refunds — not cancelled jobs.
- */
-async function refundJob(
-  jobId: string,
-  ctx: ExecutorContext,
-  creditService: CreditService,
-  tag: string,
-) {
-  try {
-    const admin = ctx.getAdminClient();
-    const { data: jobRow } = await admin
-      .from("background_jobs")
-      .select("credits_cost, workspace_id, created_by")
-      .eq("id", jobId)
-      .single();
-
-    if (!jobRow) return;
-
-    const creditsCost = jobRow.credits_cost ?? 0;
-    const workspaceId = jobRow.workspace_id;
-    const createdBy = jobRow.created_by;
-
-    if (creditsCost <= 0 || !workspaceId || !createdBy) return;
-
-    const txId = await creditService.refundCredits(
-      workspaceId,
-      createdBy,
-      creditsCost,
-      jobId,
-      "Auto-refund: job failed",
-    );
-    console.log(`${tag} Refunded ${creditsCost} credits for job ${jobId} (tx: ${txId})`);
-  } catch (refundErr) {
-    // Log but don't crash the worker — the job is already dead-lettered
-    console.error(`${tag} Failed to refund credits for job ${jobId}:`, refundErr);
-  }
-}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
