@@ -530,11 +530,17 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // persistence failure rather than a fallback. Both counters move together
     // because both files are production source, and no READ of `agent_runs` ever
     // existed here to be left behind.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(129);
+    //
+    // Workorder 21H2 then moved the admin PostgREST write of
+    // `JobService.setCreditsInfo` — the credits link that closes a job — into
+    // `JobCreditsLinkRepository` (129→128), so both counters below move down
+    // together. The credits RULE invocation further down is a Supabase RPC with
+    // its own counter and is untouched.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(128);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(129);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(128);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
