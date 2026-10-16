@@ -574,6 +574,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     agentPersistenceService,
     ...(options.agentFactory ? { agentFactory: options.agentFactory } : {}),
     agentRunMetadataService,
+    // Workorder 21S: the Agent runtime reads the row behind an attachment's
+    // `assetId` through the same repository the upload/project flows use.
+    assetReadRepository,
     canvasReadRepository,
     connectionManager,
     createUserClient,

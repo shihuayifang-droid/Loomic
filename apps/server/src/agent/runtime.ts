@@ -20,6 +20,10 @@ import type { ServerEnv } from "../config/env.js";
 import { createPipelineLogger } from "../ws/logger.js";
 import type { AgentRunMetadataService } from "../features/agent-runs/agent-run-service.js";
 import type {
+  AssetReadRepository,
+  AssetReadRow,
+} from "../db/asset-read-repository.js";
+import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
 } from "../db/canvas-read-repository.js";
@@ -268,22 +272,35 @@ export type ResolvedAttachments = {
  * "the client's URL differs from the one I just minted" proves nothing about
  * whether the assetId is forged — an expired token, a sessionStorage-restored
  * preview or a different signing clock all produce that difference for an asset
- * the caller is fully entitled to. The authority is whether the CURRENT JWT can
- * read the row at all, which is what the lookup below asks RLS.
+ * the caller is fully entitled to. The authority is whether the asset ROW is
+ * readable by the run's own actor at all, which is what the repository's
+ * actor-carrying statement re-applies below.
  *
  * 工单14 fixup T1: the previous byte-equality check (`signedUrl !==
  * attachment.url`) is removed. It rejected exactly the legitimate rotation it
  * was meant to tolerate, and `use-image-attachments.test.ts` case 5 already
  * declares a stale preview legal — the two could not both be true.
  *
+ * 工单21S: that row read no longer travels through the caller's PostgREST
+ * client. `AssetReadRepository.findReadableAsset` answers it in SQL that carries
+ * the run's actor id and re-applies the asset's read ACL inside the statement —
+ * the same two branches the replaced policy had, and, like it, with no archive
+ * filter. Only the SIGNING step still needs the caller's client, because a
+ * signature has to be minted for the token the caller actually holds.
+ *
  * The bytes the model sees therefore come from the row behind the `assetId`,
- * read with the CALLER's JWT and signed by the ONE signing service — never from
- * anything in the request body.
+ * read for the CALLER's actor id and signed with the CALLER's JWT by the ONE
+ * signing service — never from anything in the request body.
  *
  * Three refusals, all before the model is called:
  *   * the asset does not exist or the caller cannot see it,
  *   * the row cannot be signed for this caller,
  *   * the bytes cannot be fetched from the signed URL.
+ *
+ * Every way the FIRST refusal can happen — no repository, no actor id, a read
+ * that threw, a read that answered no row — produces that one sentence letter
+ * for letter. The reason is not disclosed and no driver text is carried into
+ * it, so a failed read cannot be told apart from an asset that is not there.
  *
  * A refusal here is deliberate rather than lenient: falling back to the
  * client-supplied URL would mean the model's input is chosen by the request body
@@ -292,22 +309,44 @@ export type ResolvedAttachments = {
  * bearer token.
  */
 export async function resolveAttachmentContent(
-  client: UserSupabaseClient,
+  input: {
+    /** Answers the asset row for the run's actor; no row means "not readable". */
+    repository: AssetReadRepository | undefined;
+    /** The run's own user id — the actor the row has to be readable by. */
+    actorId: string | undefined;
+    /** Mints the storage signature for the caller. Reads no table of its own. */
+    signingClient: UserSupabaseClient;
+  },
   attachments: ImageAttachment[],
 ): Promise<ResolvedAttachments> {
+  const { repository, actorId, signingClient } = input;
   const imageBlocks: ResolvedAttachments["imageBlocks"] = [];
   const downloaded: ResolvedAttachments["downloaded"] = [];
 
   for (const [index, attachment] of attachments.entries()) {
-    const { data: assetRow, error: assetError } = await client
-      .from("asset_objects")
-      .select("bucket, object_path, mime_type")
-      .eq("id", attachment.assetId)
-      .maybeSingle();
+    let assetRow: AssetReadRow | null = null;
 
-    if (assetError || !assetRow) {
-      // Which half failed is deliberately not disclosed: a row the caller cannot
-      // see and a row that does not exist must be indistinguishable, or the
+    try {
+      // A read is only attempted with BOTH an actor and a repository: an
+      // actor-less read would be a privileged read for nobody.
+      assetRow =
+        repository && actorId
+          ? await repository.findReadableAsset({
+              actorId,
+              assetId: attachment.assetId,
+            })
+          : null;
+    } catch {
+      // The driver's own text is dropped on purpose: it can carry the
+      // statement, a host or a credential, and echoing it would also make a
+      // failed read distinguishable from a row that is simply not there.
+      assetRow = null;
+    }
+
+    if (!assetRow) {
+      // Which way the read failed is deliberately not disclosed: a row the
+      // caller cannot see, a row that does not exist, a read that could not be
+      // attempted and a read that threw must all be indistinguishable, or the
       // error becomes an existence oracle for other people's assets.
       throw new Error(
         `attachment ${index + 1} references an asset that is not available to this user`,
@@ -316,9 +355,11 @@ export async function resolveAttachmentContent(
 
     let signedUrl: string;
     try {
-      signedUrl = await signProjectAssetUrl(client, assetRow.object_path, {
-        bucket: assetRow.bucket,
-      });
+      signedUrl = await signProjectAssetUrl(
+        signingClient,
+        assetRow.object_path,
+        { bucket: assetRow.bucket },
+      );
     } catch {
       throw new Error(
         `attachment ${index + 1} could not be authorised for reading`,
@@ -371,6 +412,15 @@ type CreateAgentRuntimeOptions = {
   agentPersistenceService?: AgentPersistenceService;
   agentFactory?: LoomicAgentFactory;
   agentRunMetadataService?: AgentRunMetadataService;
+  /**
+   * Asset read repository (workorder 21S). The row behind an attachment's
+   * `assetId` is a pure read of one asset, so it goes through actor-carrying SQL
+   * that re-applies the asset's read ACL instead of the caller's PostgREST
+   * client. Optional here and fatal per attachment: without it no attachment can
+   * be resolved, which is the same refusal a row the caller cannot read already
+   * produced, and never a fallback to the URL in the request body.
+   */
+  assetReadRepository?: AssetReadRepository;
   /**
    * Canvas read repository (workorder 20C). The automatic canvas summary is a
    * pure read, so it goes through actor-carrying SQL that re-applies the
@@ -1613,7 +1663,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
 
         if (hasAttachments) {
           // X-52: the bytes the model sees come from the `asset_objects` row
-          // behind each `assetId`, read with the caller's JWT and re-signed —
+          // behind each `assetId`, read for the run's own actor and re-signed —
           // NOT from the URL in the request, which is not read at all.
           // `resolveAttachmentContent` refuses (before the model is called) when
           // the asset is absent, not visible to this user, or cannot be signed
@@ -1638,7 +1688,11 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           ) as UserSupabaseClient;
 
           const { imageBlocks, downloaded } = await resolveAttachmentContent(
-            attachmentClient,
+            {
+              repository: options.assetReadRepository,
+              actorId: run.userId,
+              signingClient: attachmentClient,
+            },
             run.attachments!,
           );
 

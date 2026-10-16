@@ -671,11 +671,24 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // exactly as before. Its new cases name no client method either, so
     // `fromCallsIncludingTests` follows `fromCalls` down again. The RPC counters
     // are untouched: this migration removed no RPC call site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(107);
+    //
+    // Workorder 21S then removed the LAST PostgREST read of the Agent runtime's
+    // attachment path — `resolveAttachmentContent` in `agent/runtime.ts`, which
+    // read the single `asset_objects` row behind each attachment's `assetId`
+    // before signing it — so both counters below move down together again
+    // (107->106). That is a real coupling removal rather than a counting change:
+    // the row now comes from `AssetReadRepository.findReadableAsset`, whose
+    // statement carries the run's own actor id and re-applies the asset's
+    // two-branch read ACL verbatim, with no archive filter in either, so this
+    // path no longer names a client method for the read and the caller's client
+    // is kept for the SIGNATURE alone. Its new cases name no client method
+    // either, so `fromCallsIncludingTests` follows `fromCalls` down again. The
+    // RPC counters are untouched: this migration removed no RPC call site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(106);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(107);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(106);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

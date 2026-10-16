@@ -15,10 +15,22 @@
 // its own accesses. A field that is consulted "only for comparison" is still a
 // field an attacker gets to choose; counting reads is the only way to tell the
 // two apart from the outside.
+//
+// 工单21S: the row those bytes come from is no longer read through the caller's
+// PostgREST client — it comes from `AssetReadRepository.findReadableAsset`, asked
+// with the run's own actor id. The signing client in these tests therefore keeps
+// ONLY its storage surface: a table read through it throws, and the number of
+// times one was attempted is asserted to be zero. The read itself is a fake
+// repository that records every ask, so "which actor asked for which asset" and
+// "was the read attempted at all" are measured rather than assumed.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ImageAttachment } from "@loomic/shared";
 
+import type {
+  AssetReadRepository,
+  AssetReadRow,
+} from "../db/asset-read-repository.js";
 import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
@@ -33,40 +45,34 @@ import {
 
 const BUCKET = "project-assets";
 const OBJECT_PATH = "ws-team/p/a.png";
+const ACTOR = "user-1";
 const EXPIRED = "https://proj.test/storage/v1/object/sign/p.svg?token=expired-old";
 const FORGED = "https://evil.test/exfiltrate.png";
 const PNG = Buffer.from("the-real-bytes", "utf-8");
 
-type AssetRow = { bucket: string; object_path: string; mime_type: string | null };
+/** A driver error as PostgreSQL would raise it: it names the statement. */
+const ASSET_DRIVER_ERROR = new Error(
+  'select a.bucket, a.object_path from public.asset_objects a where a.id = $2::uuid — invalid input syntax for type uuid: "asset-1"',
+);
 
 /**
- * A user client whose `asset_objects` read answers like RLS does: a row the
- * caller may not see is simply ABSENT, never an error.
+ * A SIGNING client, and only that: it mints a storage signature and nothing else.
+ *
+ * The row read now belongs to the asset repository (工单21S), so a table read
+ * through this object THROWS and is counted. That is what turns "the row no
+ * longer comes from here" into a measurement: a runtime that reached for a table
+ * again would fail the case on the throw instead of passing on a stub that still
+ * answered.
  */
-function makeClient(options: {
-  assets?: Record<string, AssetRow>;
-  signError?: { message: string } | null;
-}) {
-  const assets = options.assets ?? {};
+function makeClient(options: { signError?: { message: string } | null } = {}) {
   const signCalls: string[] = [];
   let signSeq = 0;
-
-  const chain = {
-    select: () => chain,
-    eq: (_column: string, id: string) => ({
-      maybeSingle: async () => {
-        const row = assets[id];
-        return row ? { data: row, error: null } : { data: null, error: null };
-      },
-    }),
-  };
+  let tableReads = 0;
 
   const client = {
     from: (table: string) => {
-      if (table !== "asset_objects") {
-        throw new Error(`unexpected table in runtime test: ${table}`);
-      }
-      return chain;
+      tableReads += 1;
+      throw new Error(`unexpected table read in runtime test: ${table}`);
     },
     storage: {
       from: (bucket: string) => ({
@@ -92,11 +98,62 @@ function makeClient(options: {
     signCalls,
     /** How many signatures were minted — rotation made visible. */
     signCount: () => signSeq,
+    /** How many table reads this client was asked for — must stay zero. */
+    tableReads: () => tableReads,
   };
 }
 
-/** A fetch stub that serves the given bytes per object path and records every URL. */
-function makeFetch(bytesByPath: Record<string, Buffer>) {
+/** One asset row as the repository returns it: eight columns, three of them read. */
+function assetRow(overrides: Partial<AssetReadRow> = {}): AssetReadRow {
+  return {
+    id: "asset-1",
+    bucket: BUCKET,
+    object_path: OBJECT_PATH,
+    mime_type: "image/png",
+    byte_size: null,
+    workspace_id: "workspace-1",
+    project_id: null,
+    created_at: "2026-10-16T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+/**
+ * A fake `AssetReadRepository` that records the RAW ask, so both "which actor
+ * asked for which asset" and the exact shape of the input object are observable.
+ *
+ * `readable` maps an assetId to the row THIS caller may read. An id that is not
+ * in the map answers `null` — which is how the real statement reports both
+ * "there is no such asset" and "there is one but it is not yours": one answer,
+ * never an error, and never a distinguishable one.
+ */
+function assetRepository(
+  options: { readable?: Record<string, AssetReadRow>; error?: Error } = {},
+) {
+  const readable = options.readable ?? {};
+  const calls: Array<Record<string, unknown>> = [];
+
+  const repository: AssetReadRepository = {
+    async findReadableAsset(input) {
+      calls.push({ ...input });
+      if (options.error) throw options.error;
+      return readable[input.assetId] ?? null;
+    },
+  };
+
+  return { repository, calls };
+}
+
+/**
+ * A fetch stub that serves the given bytes per object path and records every URL.
+ * The content type is a parameter because the mime fallback chain has to be told
+ * apart from the row's own `mime_type`, and a stub that always answered
+ * `image/png` could not do that.
+ */
+function makeFetch(
+  bytesByPath: Record<string, Buffer>,
+  contentType = "image/png",
+) {
   const calls: string[] = [];
 
   const impl = async (input: unknown) => {
@@ -117,7 +174,9 @@ function makeFetch(bytesByPath: Record<string, Buffer>) {
     return {
       ok: true,
       status: 200,
-      headers: { get: () => "image/png" },
+      headers: {
+        get: (name: string) => (name === "content-type" ? contentType : null),
+      },
       arrayBuffer: async () => Uint8Array.from(bytes).buffer,
     };
   };
@@ -130,13 +189,16 @@ function makeFetch(bytesByPath: Record<string, Buffer>) {
  * is measured rather than asserted. `url` is optional in the contract, which is
  * what makes leaving it off (and never touching it) a legal shape.
  */
-function attachmentWithUrlSpy(url: string): {
+function attachmentWithUrlSpy(
+  url: string,
+  assetId = "asset-1",
+): {
   attachment: ImageAttachment;
   reads: () => number;
 } {
   let reads = 0;
   const attachment = {
-    assetId: "asset-1",
+    assetId,
     mimeType: "image/png",
     get url() {
       reads += 1;
@@ -147,11 +209,16 @@ function attachmentWithUrlSpy(url: string): {
   return { attachment, reads: () => reads };
 }
 
-const VISIBLE: AssetRow = {
-  bucket: BUCKET,
-  object_path: OBJECT_PATH,
-  mime_type: "image/png",
-};
+/**
+ * An attachment that carries no usable request-side mime, so the fallback chain
+ * runs on the row and the response alone. The wire schema requires a `mimeType`,
+ * but the runtime's chain exists precisely because a value can be absent here —
+ * the cast states that this case contributes none instead of pretending the
+ * contract allows it.
+ */
+function attachmentWithoutMime(assetId = "asset-1"): ImageAttachment {
+  return { assetId } as ImageAttachment;
+}
 
 // ---------------------------------------------------------------------------
 // Workorder 20C: the automatic canvas summary is a pure read, so it goes through
@@ -240,12 +307,21 @@ async function refusal(promise: Promise<unknown>): Promise<Error> {
 
 describe("resolveAttachmentContent treats assetId as the authority (T1)", () => {
   it("case 1: an expired/rotated preview URL still succeeds, and the model gets the NEW signature's bytes", async () => {
-    const h = makeClient({ assets: { "asset-1": VISIBLE } });
+    const h = makeClient();
+    const a = assetRepository({ readable: { "asset-1": assetRow() } });
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
 
     const { attachment, reads } = attachmentWithUrlSpy(EXPIRED);
-    const resolved = await resolveAttachmentContent(h.client, [attachment]);
+    const resolved = await resolveAttachmentContent(
+      { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+      [attachment],
+    );
+
+    // The row came from the repository, asked for the RUN's actor — and not from
+    // the signing client, which was never asked for a table.
+    expect(a.calls).toEqual([{ actorId: ACTOR, assetId: "asset-1" }]);
+    expect(h.tableReads()).toBe(0);
 
     // The preview is a DIFFERENT string from what this read minted — that is the
     // rotation, and it must not be a refusal.
@@ -267,12 +343,16 @@ describe("resolveAttachmentContent treats assetId as the authority (T1)", () => 
   });
 
   it("case 2: a forged external URL still succeeds — and is NEVER fetched", async () => {
-    const h = makeClient({ assets: { "asset-1": VISIBLE } });
+    const h = makeClient();
+    const a = assetRepository({ readable: { "asset-1": assetRow() } });
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
 
     const { attachment, reads } = attachmentWithUrlSpy(FORGED);
-    const resolved = await resolveAttachmentContent(h.client, [attachment]);
+    const resolved = await resolveAttachmentContent(
+      { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+      [attachment],
+    );
 
     // Exactly one outbound request, to the address the SERVER signed. A forged
     // url in the request body is not an input to this function at all.
@@ -281,57 +361,333 @@ describe("resolveAttachmentContent treats assetId as the authority (T1)", () => 
     expect(f.calls.some((url) => url.includes("evil.test"))).toBe(false);
     expect(reads()).toBe(0);
     expect(resolved.imageBlocks).toHaveLength(1);
+    // The authority for what may be read is the repository, and it was asked
+    // with the run's actor — never through the signing client.
+    expect(a.calls).toEqual([{ actorId: ACTOR, assetId: "asset-1" }]);
+    expect(h.tableReads()).toBe(0);
   });
 
   it("case 3: an absent assetId and an invisible one fail IDENTICALLY, with no fetch", async () => {
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
 
-    const absent = makeClient({ assets: {} });
-    const invisible = makeClient({ assets: { "asset-1": VISIBLE } });
+    // The repository answers `null` for both: "there is none" and "there is one
+    // but it is not yours" are one answer in the statement, never an error.
+    const absent = assetRepository({ readable: {} });
+    const invisible = assetRepository({ readable: { "asset-1": assetRow() } });
+    const h = makeClient();
 
     const absentError = await refusal(
-      resolveAttachmentContent(absent.client, [
-        { assetId: "asset-missing", mimeType: "image/png" },
-      ]),
+      resolveAttachmentContent(
+        { repository: absent.repository, actorId: ACTOR, signingClient: h.client },
+        [{ assetId: "asset-missing", mimeType: "image/png" }],
+      ),
     );
 
-    // RLS answers "no row" for someone else's asset — the runtime must not be
+    // The read is the authority for who may see what — the runtime must not be
     // able to tell that apart from "no such asset", or the error message becomes
     // an existence oracle over other people's media.
     const invisibleError = await refusal(
-      resolveAttachmentContent(invisible.client, [
-        { assetId: "asset-not-mine", mimeType: "image/png" },
-      ]),
+      resolveAttachmentContent(
+        {
+          repository: invisible.repository,
+          actorId: ACTOR,
+          signingClient: h.client,
+        },
+        [{ assetId: "asset-not-mine", mimeType: "image/png" }],
+      ),
     );
 
     expect(absentError.message).toContain("not available to this user");
     expect(invisibleError.message).toBe(absentError.message);
 
-    // Nothing was signed, nothing was fetched, no model input was built.
-    expect(absent.signCalls).toHaveLength(0);
-    expect(invisible.signCalls).toHaveLength(0);
+    // The read WAS asked in both cases: the refusal is its answer, not a lookup
+    // that was skipped.
+    expect(absent.calls).toEqual([
+      { actorId: ACTOR, assetId: "asset-missing" },
+    ]);
+    expect(invisible.calls).toEqual([
+      { actorId: ACTOR, assetId: "asset-not-mine" },
+    ]);
+
+    // Nothing was signed, nothing was fetched, no model input was built — and no
+    // table was reached through the client.
+    expect(h.signCalls).toHaveLength(0);
+    expect(h.tableReads()).toBe(0);
     expect(f.calls).toHaveLength(0);
   });
 
   it("case 4: a signing refusal stops the run and returns no URL of any kind", async () => {
-    const h = makeClient({
-      assets: { "asset-1": VISIBLE },
-      signError: { message: "permission denied" },
-    });
+    const h = makeClient({ signError: { message: "permission denied" } });
+    const a = assetRepository({ readable: { "asset-1": assetRow() } });
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
 
     const error = await refusal(
-      resolveAttachmentContent(h.client, [
-        { assetId: "asset-1", mimeType: "image/png" },
-      ]),
+      resolveAttachmentContent(
+        { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+        [{ assetId: "asset-1", mimeType: "image/png" }],
+      ),
     );
 
     expect(error.message).toContain("could not be authorised for reading");
     // A signed URL is a bearer token: neither the message nor the log carries one.
     expect(error.message).not.toContain("http");
     expect(f.calls).toHaveLength(0);
+    // The row WAS readable, so this refusal comes from the signing step and not
+    // from the read — the two must not be confused when this is debugged.
+    expect(a.calls).toEqual([{ actorId: ACTOR, assetId: "asset-1" }]);
+    expect(h.tableReads()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workorder 21S: the row behind an `assetId` is read by the asset repository and
+// no longer by the caller's table client. Four different ways for that read to
+// come up empty have to produce ONE sentence, and the cases below compare those
+// messages to EACH OTHER rather than to a literal — an edit that made two of
+// them distinguishable has to fail, not merely look different.
+// ---------------------------------------------------------------------------
+
+/** Resolve one attachment against a given read answer and hand back the refusal. */
+async function refusalFor(
+  input: {
+    repository: AssetReadRepository | undefined;
+    actorId: string | undefined;
+    signingClient: UserSupabaseClient;
+  },
+  assetId = "asset-1",
+): Promise<Error> {
+  return refusal(
+    resolveAttachmentContent(input, [{ assetId, mimeType: "image/png" }]),
+  );
+}
+
+describe("resolveAttachmentContent reads the asset row through the repository (21S)", () => {
+  it("case 1: a missing repository refuses with the same sentence and reaches nothing else", async () => {
+    const h = makeClient();
+    const f = makeFetch({ [OBJECT_PATH]: PNG });
+    vi.stubGlobal("fetch", f.impl);
+
+    const error = await refusalFor({
+      repository: undefined,
+      actorId: ACTOR,
+      signingClient: h.client,
+    });
+
+    expect(error.message).toBe(
+      "attachment 1 references an asset that is not available to this user",
+    );
+    expect(h.signCalls).toHaveLength(0);
+    expect(h.tableReads()).toBe(0);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("case 2: a missing actor id refuses the same way and never asks the repository", async () => {
+    const h = makeClient();
+    const a = assetRepository({ readable: { "asset-1": assetRow() } });
+    const f = makeFetch({ [OBJECT_PATH]: PNG });
+    vi.stubGlobal("fetch", f.impl);
+
+    const error = await refusalFor({
+      repository: a.repository,
+      actorId: undefined,
+      signingClient: h.client,
+    });
+
+    expect(error.message).toBe(
+      "attachment 1 references an asset that is not available to this user",
+    );
+    // An actor-less read would be a privileged read for nobody, so it is not
+    // attempted at all — and the answer still does not say why.
+    expect(a.calls).toHaveLength(0);
+    expect(h.signCalls).toHaveLength(0);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("case 3: a throwing read refuses the same way and never echoes the driver text", async () => {
+    const h = makeClient();
+    const a = assetRepository({ error: ASSET_DRIVER_ERROR });
+    const f = makeFetch({ [OBJECT_PATH]: PNG });
+    vi.stubGlobal("fetch", f.impl);
+
+    const error = await refusalFor({
+      repository: a.repository,
+      actorId: ACTOR,
+      signingClient: h.client,
+    });
+
+    expect(error.message).toBe(
+      "attachment 1 references an asset that is not available to this user",
+    );
+    // The replaced read interpolated the driver's `{code, message}` pair, and a
+    // driver error can carry the statement, a host or a credential.
+    expect(error.message).not.toContain("asset_objects");
+    expect(error.message).not.toContain("public.");
+    expect(error.message).not.toContain("$2::uuid");
+    expect(error.message).not.toContain("invalid input syntax");
+
+    // The read WAS attempted, so the refusal is its answer rather than a skipped
+    // lookup — a distinction whoever debugs this next needs.
+    expect(a.calls).toHaveLength(1);
+    expect(h.signCalls).toHaveLength(0);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("case 4: no repository, no actor, a thrown read and an unreadable row are ONE answer", async () => {
+    const h = makeClient();
+    const f = makeFetch({ [OBJECT_PATH]: PNG });
+    vi.stubGlobal("fetch", f.impl);
+
+    const mine = assetRepository({ readable: { "asset-1": assetRow() } });
+    const missing = assetRepository({ readable: {} });
+    const throwing = assetRepository({ error: ASSET_DRIVER_ERROR });
+
+    const signedClient = h.client;
+    const messages = [
+      (
+        await refusalFor({
+          repository: undefined,
+          actorId: ACTOR,
+          signingClient: signedClient,
+        })
+      ).message,
+      (
+        await refusalFor({
+          repository: mine.repository,
+          actorId: undefined,
+          signingClient: signedClient,
+        })
+      ).message,
+      (
+        await refusalFor({
+          repository: throwing.repository,
+          actorId: ACTOR,
+          signingClient: signedClient,
+        })
+      ).message,
+      (
+        await refusalFor({
+          repository: missing.repository,
+          actorId: ACTOR,
+          signingClient: signedClient,
+        })
+      ).message,
+      // `mine` holds a row this caller MAY read and is asked for a DIFFERENT id:
+      // that is "there is one, but not yours" — the case the statement has to
+      // report exactly like "there is none".
+      (
+        await refusalFor(
+          {
+            repository: mine.repository,
+            actorId: ACTOR,
+            signingClient: signedClient,
+          },
+          "asset-not-mine",
+        )
+      ).message,
+    ];
+
+    // One distinct message across five reasons, and it is the existing sentence.
+    expect(new Set(messages).size).toBe(1);
+    expect(messages[0]).toBe(
+      "attachment 1 references an asset that is not available to this user",
+    );
+    expect(messages[0]).not.toContain("public.");
+    expect(h.signCalls).toHaveLength(0);
+    expect(h.tableReads()).toBe(0);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("case 5: the repository is asked with EXACTLY the actor and the asset id", async () => {
+    const h = makeClient();
+    const a = assetRepository({
+      readable: { "asset-9": assetRow({ id: "asset-9" }) },
+    });
+    const f = makeFetch({ [OBJECT_PATH]: PNG });
+    vi.stubGlobal("fetch", f.impl);
+
+    // The attachment carries a forged url: if the read were widened by anything
+    // the request carried, the recorded ask below would show it.
+    const { attachment } = attachmentWithUrlSpy(FORGED, "asset-9");
+    await resolveAttachmentContent(
+      { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+      [attachment],
+    );
+
+    expect(a.calls[0]).toEqual({ actorId: ACTOR, assetId: "asset-9" });
+    // Exactly two keys: no url, no token, no client is handed to the read.
+    expect(Object.keys(a.calls[0]!).sort()).toEqual(["actorId", "assetId"]);
+  });
+
+  it("case 6: a null mime_type falls through to the response content-type", async () => {
+    const h = makeClient();
+    // The response says webp, so an answer of `image/png` could only have come
+    // from somewhere else — that is what makes the fallback observable.
+    const f = makeFetch({ [OBJECT_PATH]: PNG }, "image/webp");
+    vi.stubGlobal("fetch", f.impl);
+
+    const noRowMime = assetRepository({
+      readable: { "asset-1": assetRow({ mime_type: null }) },
+    });
+    const fromHeader = await resolveAttachmentContent(
+      {
+        repository: noRowMime.repository,
+        actorId: ACTOR,
+        signingClient: h.client,
+      },
+      [attachmentWithoutMime()],
+    );
+    expect(fromHeader.downloaded[0]!.mimeType).toBe("image/webp");
+
+    // The row's own mime wins over the response when the request carries none…
+    const rowMime = assetRepository({
+      readable: { "asset-1": assetRow({ mime_type: "image/png" }) },
+    });
+    const fromRow = await resolveAttachmentContent(
+      { repository: rowMime.repository, actorId: ACTOR, signingClient: h.client },
+      [attachmentWithoutMime()],
+    );
+    expect(fromRow.downloaded[0]!.mimeType).toBe("image/png");
+
+    // …and the attachment's own mime wins over both.
+    const fromAttachment = await resolveAttachmentContent(
+      { repository: rowMime.repository, actorId: ACTOR, signingClient: h.client },
+      [{ assetId: "asset-1", mimeType: "image/gif" }],
+    );
+    expect(fromAttachment.downloaded[0]!.mimeType).toBe("image/gif");
+  });
+
+  it("case 7: every attachment is read on its own, and the refusal names its position", async () => {
+    const h = makeClient();
+    const a = assetRepository({
+      readable: { "asset-a": assetRow({ id: "asset-a" }) },
+    });
+    const f = makeFetch({ [OBJECT_PATH]: PNG });
+    vi.stubGlobal("fetch", f.impl);
+
+    const error = await refusal(
+      resolveAttachmentContent(
+        { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+        [
+          { assetId: "asset-a", mimeType: "image/png" },
+          { assetId: "asset-b", mimeType: "image/png" },
+        ],
+      ),
+    );
+
+    // The SECOND one is the unreadable one, and the message counts in the order
+    // the attachments arrived — that index is what an operator debugs with.
+    expect(error.message).toBe(
+      "attachment 2 references an asset that is not available to this user",
+    );
+    expect(a.calls).toEqual([
+      { actorId: ACTOR, assetId: "asset-a" },
+      { actorId: ACTOR, assetId: "asset-b" },
+    ]);
+    // The first attachment was fully processed before the second was refused.
+    expect(h.signCount()).toBe(1);
+    expect(f.calls).toHaveLength(1);
   });
 });
 
