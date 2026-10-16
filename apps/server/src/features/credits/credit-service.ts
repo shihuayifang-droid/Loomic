@@ -184,14 +184,20 @@ export function createCreditService(options: {
     async claimDailyCredits(workspaceId) {
       const admin = options.getAdminClient();
 
-      // Determine the workspace's plan
-      const { data: sub, error: subError } = await admin
-        .from("subscriptions")
-        .select("plan")
-        .eq("workspace_id", workspaceId)
-        .maybeSingle();
+      // Determine the workspace's plan. The subscription row now comes from the
+      // read repository: a workspace without one is still the `free` plan, and a
+      // missing repository or a failed read is still this method's existing
+      // refusal, word for word — there is no PostgREST fallback behind it.
+      let plan: SubscriptionPlan = "free";
+      try {
+        const repository = options.creditReadRepository;
+        if (!repository) {
+          throw new Error("credit claim needs a repository");
+        }
 
-      if (subError) {
+        const subscription = await repository.readSubscription({ workspaceId });
+        plan = (subscription?.plan as SubscriptionPlan) ?? "free";
+      } catch {
         throw new CreditServiceError(
           "credit_claim_failed",
           "Failed to query subscription.",
@@ -199,7 +205,6 @@ export function createCreditService(options: {
         );
       }
 
-      const plan = (sub?.plan as SubscriptionPlan) ?? "free";
       const config = PLAN_CONFIGS[plan];
 
       if (config.dailyCredits <= 0) {
@@ -226,16 +231,33 @@ export function createCreditService(options: {
         return { success: false };
       }
 
-      // Fetch updated balance
-      const { data: balanceRow } = await admin
-        .from("credit_balances")
-        .select("balance")
-        .eq("workspace_id", workspaceId)
-        .maybeSingle();
+      // Fetch updated balance. The credits are granted by this point, so a
+      // failure HERE must never become a 500: the client would be told the claim
+      // failed for credits it actually received, and its retry would then be
+      // answered "already claimed today". The read is best effort — its failure
+      // is logged with a FIXED text that carries no driver message — and the
+      // balance is published as 0.
+      let balance = 0;
+      try {
+        const repository = options.creditReadRepository;
+        if (!repository) {
+          throw new Error("credit claim needs a repository");
+        }
+
+        const snapshot = await repository.readBalanceSnapshot({
+          workspaceId,
+          claimDate: new Date().toISOString().slice(0, 10),
+        });
+        balance = snapshot.balance ?? 0;
+      } catch {
+        console.warn(
+          "[credits] claimDailyCredits: the daily claim succeeded but the balance read failed; reporting balance 0",
+        );
+      }
 
       return {
         success: true,
-        balance: balanceRow?.balance ?? 0,
+        balance,
       };
     },
 

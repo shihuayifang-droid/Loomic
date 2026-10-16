@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { PLAN_CONFIGS, type SubscriptionPlan } from "@loomic/shared";
+
 import {
   createCreditReadRepository,
   type BalanceSnapshotReadRow,
@@ -16,10 +18,11 @@ import {
 } from "./credit-service.js";
 
 /**
- * Workorders 21K and 21P: the three reads of `CreditService` that moved to the
- * pure `pg` repository — the transaction list, the subscription row and the
- * balance snapshot behind `getBalance`. This file tests THOSE THREE METHODS and
- * nothing else.
+ * Workorders 21K, 21P and 21Q: the reads of `CreditService` that moved to the
+ * pure `pg` repository — the transaction list, the subscription row, the
+ * balance snapshot behind `getBalance`, and the two reads `claimDailyCredits`
+ * makes around the daily claim (the plan BEFORE it, the updated balance AFTER
+ * it). This file tests THOSE METHODS and nothing else.
  *
  * The service is driven with a recording fake repository, so what is asserted is
  * the contract between the two modules: the clamped limit the service computes
@@ -28,7 +31,9 @@ import {
  * balance read computes from the system clock (JS UTC, never the local day), the
  * `0`/`free` defaults of a workspace with no rows at all, and the single failure
  * code all three methods answer with. The `getAdminClient` stub THROWS on
- * contact, so no case below can pass while a read still reaches PostgREST.
+ * contact, so no case below can pass while a read still reaches PostgREST — the
+ * claim cases use their own stub, which allows the ONE RPC of that method and
+ * records every other property read as a forbidden one.
  *
  * The database side of the same contract lives in
  * `test-support/db/credit-read-repository-db.test.ts` (real SQL over PGlite) and
@@ -712,5 +717,478 @@ describe("credit-service getBalance: the snapshot, its date and its defaults", (
     expect(fake.snapshotCalls).toHaveLength(1);
     expect(fake.listCalls).toEqual([]);
     expect(fake.subscriptionCalls).toEqual([]);
+  });
+});
+
+// ── claimDailyCredits (workorder 21Q) ────────────────────────────────────────
+
+/** One RPC the admin stand-in was asked to make, with its arguments. */
+type ClaimRpcCall = { fn: string; args: Record<string, unknown> };
+
+/** The daily amount `PLAN_CONFIGS.free` grants — the one plan that grants any. */
+const FREE_DAILY_CREDITS = 50;
+
+/**
+ * The admin stand-in of `claimDailyCredits`. The ONE method it answers is the
+ * RPC that grants the day's credits; every other property is recorded in
+ * `forbiddenReads` and, were it ever CALLED, throws. So a read left behind on
+ * the admin client cannot pass quietly, and `forbiddenReads` staying empty is
+ * the measurement behind "this method no longer reads through the client".
+ */
+function createClaimAdmin(
+  options: { claimed?: boolean; error?: { message: string } } = {},
+): {
+  admin: AdminSupabaseClient;
+  rpcCalls: ClaimRpcCall[];
+  forbiddenReads: string[];
+} {
+  const rpcCalls: ClaimRpcCall[] = [];
+  const forbiddenReads: string[] = [];
+
+  const admin = new Proxy(
+    {},
+    {
+      get(_target, property) {
+        // Symbols and `then` are the runtime's own probes (inspection, awaiting):
+        // they are not client methods and must not be recorded as reads.
+        if (typeof property === "symbol" || property === "then") {
+          return undefined;
+        }
+
+        if (property === "rpc") {
+          return async (fn: string, args: Record<string, unknown>) => {
+            rpcCalls.push({ fn, args });
+            if (options.error) return { data: null, error: options.error };
+
+            return { data: options.claimed ?? true, error: null };
+          };
+        }
+
+        forbiddenReads.push(String(property));
+
+        return () => {
+          throw new Error(
+            `claimDailyCredits reached the admin client's "${String(property)}"`,
+          );
+        };
+      },
+    },
+  ) as unknown as AdminSupabaseClient;
+
+  return { admin, rpcCalls, forbiddenReads };
+}
+
+/**
+ * The claim path's repository, with the two reads recorded SEPARATELY: a case
+ * can tell "the plan was read" from "the balance was read", and the failure of
+ * one can be injected without failing the other.
+ */
+function createClaimRepository(
+  options: {
+    subscription?: SubscriptionReadRow | null;
+    subscriptionFails?: Error;
+    snapshot?: BalanceSnapshotReadRow;
+    snapshotFails?: Error;
+  } = {},
+): {
+  repository: CreditReadRepository;
+  subscriptionCalls: string[];
+  snapshotCalls: SnapshotCall[];
+} {
+  const subscriptionCalls: string[] = [];
+  const snapshotCalls: SnapshotCall[] = [];
+
+  return {
+    subscriptionCalls,
+    snapshotCalls,
+    repository: {
+      async listTransactions() {
+        // This method has no business reading the ledger: the case fails loud
+        // instead of quietly answering an unrelated read.
+        throw new Error("claimDailyCredits must not read the transaction list");
+      },
+      async readSubscription(input) {
+        subscriptionCalls.push(input.workspaceId);
+        if (options.subscriptionFails) throw options.subscriptionFails;
+
+        return options.subscription ?? null;
+      },
+      async readBalanceSnapshot(input) {
+        snapshotCalls.push({
+          workspaceId: input.workspaceId,
+          claimDate: input.claimDate,
+        });
+        if (options.snapshotFails) throw options.snapshotFails;
+        if (!CLAIM_DATE_GUARD.test(input.claimDate)) {
+          throw new Error(
+            'credit balance snapshot read needs a "claimDate" of the form YYYY-MM-DD',
+          );
+        }
+
+        return (
+          options.snapshot ?? { balance: 0, plan: "free", daily_claimed: true }
+        );
+      },
+    },
+  };
+}
+
+/** The claim path's service: the repository is optional, the admin is not. */
+function buildClaimService(options: {
+  repository?: CreditReadRepository;
+  admin: AdminSupabaseClient;
+}): CreditService {
+  return createCreditService({
+    getAdminClient: () => options.admin,
+    ...(options.repository ? { creditReadRepository: options.repository } : {}),
+  });
+}
+
+/** The plans whose `PLAN_CONFIGS` entry grants no daily credits at all. */
+const ZERO_DAILY_PLANS: SubscriptionPlan[] = [
+  "starter",
+  "pro",
+  "ultra",
+  "business",
+];
+
+describe("credit-service claimDailyCredits: the plan read", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("case 27: no subscription row is the free plan, and the RPC gets its daily amount", async () => {
+    // The premise, pinned: `free` is the ONE plan that still grants a daily
+    // amount, and it is the amount the RPC must be asked for.
+    expect(PLAN_CONFIGS.free.dailyCredits).toBe(FREE_DAILY_CREDITS);
+
+    const admin = createClaimAdmin({ claimed: true });
+    const fake = createClaimRepository({
+      subscription: null,
+      snapshot: { balance: 12, plan: "free", daily_claimed: true },
+    });
+    const service = buildClaimService({
+      repository: fake.repository,
+      admin: admin.admin,
+    });
+
+    await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
+      success: true,
+      balance: 12,
+    });
+
+    expect(fake.subscriptionCalls).toEqual([WORKSPACE_ID]);
+    expect(admin.rpcCalls).toEqual([
+      {
+        fn: "claim_daily_credits",
+        args: { p_workspace_id: WORKSPACE_ID, p_amount: FREE_DAILY_CREDITS },
+      },
+    ]);
+    expect(admin.forbiddenReads).toEqual([]);
+  });
+
+  it("case 28: a failed plan read is the existing credit_claim_failed 500 and no RPC", async () => {
+    const admin = createClaimAdmin({ claimed: true });
+    const fake = createClaimRepository({
+      subscriptionFails: new Error(
+        "connect ECONNREFUSED 203.0.113.9:5432 postgres://loomic:secret@db.example/db",
+      ),
+    });
+    const service = buildClaimService({
+      repository: fake.repository,
+      admin: admin.admin,
+    });
+
+    const error = await refusal(() => service.claimDailyCredits(WORKSPACE_ID));
+
+    expect(error.code).toBe("credit_claim_failed");
+    expect(error.statusCode).toBe(500);
+    expect(error.message).toBe("Failed to query subscription.");
+    // The driver's message — host, port, credentials — stays out of the
+    // response; the repository already reduced it to a fixed text plus `cause`.
+    expect(error.message).not.toMatch(/ECONNREFUSED|203\.0\.113\.9|secret/i);
+    // The claim was never attempted, and neither was the balance read.
+    expect(admin.rpcCalls).toEqual([]);
+    expect(fake.snapshotCalls).toEqual([]);
+    expect(admin.forbiddenReads).toEqual([]);
+  });
+
+  it("case 29: with no repository the claim fails closed instead of falling back", async () => {
+    const admin = createClaimAdmin({ claimed: true });
+    const service = buildClaimService({ admin: admin.admin });
+
+    const error = await refusal(() => service.claimDailyCredits(WORKSPACE_ID));
+
+    expect(error.code).toBe("credit_claim_failed");
+    expect(error.statusCode).toBe(500);
+    expect(error.message).toBe("Failed to query subscription.");
+    expect(admin.rpcCalls).toEqual([]);
+    // Measured, not assumed: the client it used to read the plan through was
+    // never reached.
+    expect(admin.forbiddenReads).toEqual([]);
+  });
+
+  it("case 30: a stored plan of free is read as free and still claims", async () => {
+    const admin = createClaimAdmin({ claimed: true });
+    const fake = createClaimRepository({
+      subscription: { ...SUBSCRIPTION_ROW, plan: "free" },
+      snapshot: { balance: 3, plan: "free", daily_claimed: true },
+    });
+    const service = buildClaimService({
+      repository: fake.repository,
+      admin: admin.admin,
+    });
+
+    await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
+      success: true,
+      balance: 3,
+    });
+
+    expect(fake.subscriptionCalls).toEqual([WORKSPACE_ID]);
+    expect(fake.snapshotCalls).toHaveLength(1);
+    expect(admin.rpcCalls.map((call) => call.fn)).toEqual([
+      "claim_daily_credits",
+    ]);
+  });
+});
+
+describe("credit-service claimDailyCredits: the plans that grant no daily credits", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  for (const [offset, plan] of ZERO_DAILY_PLANS.entries()) {
+    it(`case ${31 + offset}: the ${plan} plan grants nothing, so the claim stops before the RPC`, async () => {
+      // The premise is pinned PER PLAN rather than assumed: this case is only
+      // meaningful while that plan really grants zero daily credits.
+      expect(PLAN_CONFIGS[plan].dailyCredits).toBe(0);
+
+      const admin = createClaimAdmin({ claimed: true });
+      const fake = createClaimRepository({
+        subscription: { ...SUBSCRIPTION_ROW, plan },
+        snapshot: { balance: 99, plan, daily_claimed: false },
+      });
+      const service = buildClaimService({
+        repository: fake.repository,
+        admin: admin.admin,
+      });
+
+      await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
+        success: false,
+      });
+      expect(admin.rpcCalls).toEqual([]);
+      // Nothing was claimed, so not even the balance was read.
+      expect(fake.snapshotCalls).toEqual([]);
+      expect(admin.forbiddenReads).toEqual([]);
+    });
+  }
+});
+
+describe("credit-service claimDailyCredits: the claim and the balance read", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("case 35: an already-claimed day answers success false and never reads a balance", async () => {
+    const admin = createClaimAdmin({ claimed: false });
+    const fake = createClaimRepository({
+      subscription: null,
+      snapshot: { balance: 42, plan: "free", daily_claimed: true },
+    });
+    const service = buildClaimService({
+      repository: fake.repository,
+      admin: admin.admin,
+    });
+
+    const result = await service.claimDailyCredits(WORKSPACE_ID);
+
+    expect(result).toEqual({ success: false });
+    // Exactly the published key set on this branch: no `balance` key at all.
+    expect(Object.keys(result)).toEqual(["success"]);
+    expect(fake.snapshotCalls).toEqual([]);
+    expect(admin.forbiddenReads).toEqual([]);
+  });
+
+  it("case 36: a granted claim publishes the snapshot's balance, asked for the JS UTC day", async () => {
+    vi.useFakeTimers();
+    // 23:30 on the 16th at UTC-8 is 07:30 on the 17th UTC: the LOCAL day and the
+    // UTC day disagree, so only one of them can be the day asked about.
+    vi.setSystemTime(new Date("2026-10-16T23:30:00-08:00"));
+
+    const admin = createClaimAdmin({ claimed: true });
+    const fake = createClaimRepository({
+      subscription: null,
+      snapshot: { balance: 37, plan: "free", daily_claimed: true },
+    });
+    const service = buildClaimService({
+      repository: fake.repository,
+      admin: admin.admin,
+    });
+
+    await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
+      success: true,
+      balance: 37,
+    });
+
+    expect(fake.snapshotCalls).toEqual([
+      { workspaceId: WORKSPACE_ID, claimDate: "2026-10-17" },
+    ]);
+    expect(admin.forbiddenReads).toEqual([]);
+  });
+
+  it("case 37: a balance read that FAILS after a granted claim is success true, balance 0, one warn", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const admin = createClaimAdmin({ claimed: true });
+    const fake = createClaimRepository({
+      subscription: null,
+      snapshotFails: new Error(
+        "connect ECONNREFUSED 203.0.113.9:5432 postgres://loomic:secret@db.example/db",
+      ),
+    });
+    const service = buildClaimService({
+      repository: fake.repository,
+      admin: admin.admin,
+    });
+
+    // The credits ARE granted by this point: a 500 here would tell the client the
+    // claim failed while the balance really moved, and its retry would then be
+    // answered "already claimed today".
+    await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
+      success: true,
+      balance: 0,
+    });
+
+    expect(admin.rpcCalls.map((call) => call.fn)).toEqual([
+      "claim_daily_credits",
+    ]);
+    expect(fake.snapshotCalls).toHaveLength(1);
+
+    // Exactly ONE log line, and it carries the fixed text only — the driver's
+    // host and credentials stay out of it.
+    expect(warn).toHaveBeenCalledTimes(1);
+    const logged = warn.mock.calls.flat().map(String).join(" ");
+    expect(logged).toMatch(/claimDailyCredits/);
+    expect(logged).not.toMatch(/ECONNREFUSED|203\.0\.113\.9|secret/i);
+  });
+
+  it("case 38: a workspace with no balance row publishes 0 and warns about nothing", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const admin = createClaimAdmin({ claimed: true });
+    const fake = createClaimRepository({
+      subscription: null,
+      snapshot: { balance: null, plan: null, daily_claimed: true },
+    });
+    const service = buildClaimService({
+      repository: fake.repository,
+      admin: admin.admin,
+    });
+
+    await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
+      success: true,
+      balance: 0,
+    });
+
+    // An absent balance row is a legal answer, NOT the failure case 37 covers:
+    // it must not be logged as one.
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("case 39: a failing RPC keeps its message verbatim and never reads a balance", async () => {
+    const admin = createClaimAdmin({ error: { message: "deadlock detected" } });
+    const fake = createClaimRepository({ subscription: null });
+    const service = buildClaimService({
+      repository: fake.repository,
+      admin: admin.admin,
+    });
+
+    const error = await refusal(() => service.claimDailyCredits(WORKSPACE_ID));
+
+    expect(error.code).toBe("credit_claim_failed");
+    expect(error.statusCode).toBe(500);
+    // Pinned word for word: this migration does NOT touch this message, which
+    // still carries the driver's own text.
+    expect(error.message).toBe(
+      "Failed to claim daily credits: deadlock detected",
+    );
+    expect(fake.snapshotCalls).toEqual([]);
+  });
+
+  it("case 40: every branch leaves the admin client's other methods unread", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const branches: Array<{
+      admin: ReturnType<typeof createClaimAdmin>;
+      call: () => Promise<unknown>;
+    }> = [];
+
+    const push = (
+      adminOptions: Parameters<typeof createClaimAdmin>[0],
+      repositoryOptions: Parameters<typeof createClaimRepository>[0] | null,
+    ) => {
+      const admin = createClaimAdmin(adminOptions);
+      const fake =
+        repositoryOptions === null
+          ? null
+          : createClaimRepository(repositoryOptions);
+      const service = buildClaimService({
+        ...(fake ? { repository: fake.repository } : {}),
+        admin: admin.admin,
+      });
+
+      branches.push({
+        admin,
+        call: () => service.claimDailyCredits(WORKSPACE_ID),
+      });
+    };
+
+    // Every branch of the method: a granted claim, a plan that grants nothing,
+    // an already-claimed day, a failing RPC, a failing balance read, and no
+    // repository at all.
+    push({ claimed: true }, { subscription: null });
+    push({ claimed: true }, { subscription: { ...SUBSCRIPTION_ROW, plan: "pro" } });
+    push({ claimed: false }, { subscription: null });
+    push({ error: { message: "boom" } }, { subscription: null });
+    push(
+      { claimed: true },
+      { subscription: null, snapshotFails: new Error("the read failed") },
+    );
+    push({ claimed: true }, null);
+
+    for (const branch of branches) {
+      await branch.call().catch(() => undefined);
+
+      // The admin client's OTHER methods are read ZERO times on every branch —
+      // measured on the client itself, not inferred from the repository's calls.
+      expect(branch.admin.forbiddenReads).toEqual([]);
+      expect(branch.admin.forbiddenReads).not.toContain("from");
+
+      for (const rpc of branch.admin.rpcCalls) {
+        expect(rpc.fn).toBe("claim_daily_credits");
+      }
+    }
+
+    // The spy is not vacuous: the RPC really was reached where it should be, and
+    // not at all where the plan or the repository stopped the call.
+    expect(branches[0]?.admin.rpcCalls).toHaveLength(1);
+    expect(branches[2]?.admin.rpcCalls).toHaveLength(1);
+    expect(branches[5]?.admin.rpcCalls).toEqual([]);
+    // ...and the one failing balance read really did produce its log line.
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("case 41: the claim stand-in is not vacuous — a forbidden read and its throw both show up", () => {
+    // A guard for this file's own premise. If the stand-in could not record a
+    // forbidden read, case 40 would pass for the wrong reason; this proves that
+    // reaching one is both observable and fatal.
+    const admin = createClaimAdmin({ claimed: true });
+
+    expect(admin.forbiddenReads).toEqual([]);
+
+    const forbidden = (
+      admin.admin as unknown as Record<string, () => unknown>
+    )["from"];
+    expect(admin.forbiddenReads).toEqual(["from"]);
+    expect(() => forbidden?.()).toThrow(/reached the admin client's "from"/);
   });
 });

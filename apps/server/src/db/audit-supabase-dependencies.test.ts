@@ -641,11 +641,23 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // `fromCallsIncludingTests` follows `fromCalls` down again. The RPC counters
     // are untouched: this migration removed no RPC call site — the remaining RPC
     // of that service is still the plan grant.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(116);
+    //
+    // Workorder 21Q then removed the LAST two admin PostgREST reads of
+    // `features/credits/credit-service.ts` — the plan read that `claimDailyCredits`
+    // makes BEFORE granting the day's credits and the balance read it makes AFTER
+    // — so both counters below move down together again (116->114). That is a
+    // real coupling removal rather than a counting change: the plan now comes
+    // from `CreditReadRepository.readSubscription` and the updated balance from
+    // its `readBalanceSnapshot`, so neither read names a client method any more
+    // and the grant's own RPC is the only thing left reaching that client from
+    // this method. Its new cases name no client method either, so
+    // `fromCallsIncludingTests` follows `fromCalls` down again. The RPC counters
+    // are untouched: this migration removed no RPC call site.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(114);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(116);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(114);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
