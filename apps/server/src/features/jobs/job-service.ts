@@ -64,7 +64,16 @@ export type JobService = {
   // transition happened, `false` = the guard rejected it (wrong current state,
   // or no such row). Callers use that to avoid double refunds and to skip work
   // for jobs that were cancelled meanwhile.
-  setCreditsInfo(jobId: string, creditsCost: number, transactionId: string): Promise<void>;
+  //
+  // Workorder 21H1: `transactionId` is nullable because a job that was never
+  // charged still has to say so. The free-model and billing-disabled paths write
+  // `(jobId, 0, null)` — a deliberate "confirmed, costs nothing" record that the
+  // worker's billing gate can tell apart from "nothing recorded yet".
+  setCreditsInfo(
+    jobId: string,
+    creditsCost: number,
+    transactionId: string | null,
+  ): Promise<void>;
   markRunning(jobId: string): Promise<boolean>;
   markRetrying(jobId: string, errorCode: string, errorMessage: string): Promise<boolean>;
   markSucceeded(jobId: string, result: Record<string, unknown>): Promise<boolean>;

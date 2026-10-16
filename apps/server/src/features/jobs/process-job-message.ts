@@ -1,5 +1,5 @@
 /**
- * Handling of ONE job message (GN-30 / GN-34).
+ * Handling of ONE job message (GN-30 / GN-34, workorder 21H1).
  *
  * Lifted out of `worker.ts` so the branches below are testable without a worker,
  * a queue or a database. The worker keeps the polling loop, concurrency and
@@ -13,15 +13,54 @@
  *                              │
  *                              └─markFailed──▶ failed  (terminal, refunds once)
  *
- * Two rules matter more than the shape:
+ * Before any of that, one gate stands in front of the attempt counter:
+ *
+ *   ┌ billing gate ────────────────────────────────────────────────────────────┐
+ *   │ read the job's billing state (status, credits_cost, overdue)             │
+ *   │                                                                          │
+ *   │  read failed                       -> log, touch nothing (VT re-delivers)│
+ *   │  no such row                       -> fall through (archived below)      │
+ *   │  status not queued/retrying        -> fall through, untouched            │
+ *   │  credits_cost not null (0 or more) -> fall through: it is paid for       │
+ *   │  null, inside the window           -> renewVt(10s), touch nothing else   │
+ *   │  null, past the window             -> claim it as a terminal billing     │
+ *   │                                       failure (no refund), or defer if   │
+ *   │                                       the claim lost a race              │
+ *   └──────────────────────────────────────────────────────────────────────────┘
+ *
+ * WHY THE GATE EXISTS
+ * `createJob` enqueues the message BEFORE `withBilling` charges the workspace, so
+ * a worker can hold a message for a job that has not been paid for yet — and,
+ * until workorder 21H1, `credits_cost` NULL was indistinguishable from "free
+ * model". Without the gate the model is called and credits are spent on work
+ * nobody paid for (risk T-39 ①).
+ *
+ * WHY DEFERRING DOES NOT CONSUME AN ATTEMPT
+ * The gate sits BEFORE `incrementAttempt`, and the deferring arms touch nothing
+ * at all: no increment, no status write, no archive, no delete, no execution.
+ * Consuming an attempt for a job that is merely waiting for its charge would
+ * spend the retry budget on the queue's timing rather than on the job — three
+ * deferrals (30 seconds of visibility) would turn a healthy, paid job into
+ * `max_attempts_exceeded`. Instead the message is renewed for
+ * `BILLING_DEFER_VT_SECONDS` and comes back; when the charge lands, the next
+ * delivery passes the gate and the job runs with its full budget intact.
+ *
+ * Two more rules matter as much as the shape:
  *   - A retryable failure writes `retrying`, never `failed`. Writing `failed`
  *     told the user the generation was over while the worker was still going to
  *     retry it — and a manual re-submit at that point charged twice.
  *   - Credits are refunded only when `markFailed` actually changed a row, so two
- *     workers judging the same job cannot both refund.
+ *     workers judging the same job cannot both refund. The billing-gate failure
+ *     is deliberately NOT routed through `markFailed`: a job that was never
+ *     billed has nothing to refund, and its own statement carries the
+ *     `credits_cost is null` predicate that stops it racing a charge.
  */
 import type { BackgroundJobType } from "@loomic/shared";
 
+import type {
+  JobBillingGateRepository,
+  JobBillingGateRow,
+} from "../../db/job-billing-gate-repository.js";
 import type { PgmqClient, PgmqMessage } from "../../queue/pgmq-client.js";
 import type { ExecutorContext, JobExecutor } from "./job-executor.js";
 import type { JobService } from "./job-service.js";
@@ -34,8 +73,37 @@ const NON_RETRYABLE_CODES = new Set([
   "safety_filter",
 ]);
 
+/**
+ * How long a job may stay unbilled before the worker stops waiting for its
+ * charge and fails it as `billing_not_confirmed`.
+ *
+ * Ten minutes is far longer than the window between `createJob`'s enqueue and
+ * `withBilling`'s `setCreditsInfo` (one deduction round trip, normally well
+ * under a second), so a healthy request never sees it. It is also short enough
+ * that a job whose charge genuinely never happened is retired within the same
+ * session instead of sitting queued forever.
+ */
+export const BILLING_CONFIRM_TIMEOUT_SECONDS = 600;
+
+/**
+ * How long a message is made invisible while the job waits for its charge.
+ *
+ * Short on purpose: the wait is bounded by a database round trip, so the message
+ * only has to come back soon enough to be noticed — polling every ten seconds
+ * costs nothing, while a long renew would delay a job whose charge landed a
+ * moment after the read.
+ */
+export const BILLING_DEFER_VT_SECONDS = 10;
+
 export type ProcessJobMessageDeps = {
   jobService: JobService;
+  /**
+   * The billing gate: the read and the timeout claim that decide whether this
+   * job may consume an attempt. Required, not optional — a worker wired without
+   * it cannot tell a paid job from an unbilled one, which is exactly the state
+   * this gate exists to end.
+   */
+  billingGate: JobBillingGateRepository;
   /** Only the two message-lifecycle calls are needed here. */
   pgmq: Pick<PgmqClient, "archive" | "deleteMsg">;
   getExecutor: (jobType: BackgroundJobType) => JobExecutor | undefined;
@@ -105,7 +173,98 @@ export async function processJobMessage(
     return;
   }
 
-  // 3. Counting failed. Touch nothing: the message stays invisible until its
+  // 3. Billing gate. Runs BEFORE the attempt counter, so waiting for a charge
+  //    never costs an attempt (see the header). Four answers are legal:
+  //      - `null` (no such row) and any status other than queued/retrying fall
+  //        through to the original flow untouched;
+  //      - a non-null `creditsCost` (0 included) is a confirmation and falls
+  //        through too;
+  //      - queued/retrying with a null cost is the state this gate exists for:
+  //        defer while the window is open, claim the job once it is over.
+  let gate: JobBillingGateRow | null;
+
+  try {
+    gate = await deps.billingGate.readBillingGate({
+      jobId,
+      timeoutSeconds: BILLING_CONFIRM_TIMEOUT_SECONDS,
+    });
+  } catch (gateError) {
+    // G1. The answer is unknown, so nothing may be assumed from it. Touch
+    // nothing: the message stays invisible until its visibility timeout expires
+    // and is then delivered again. Archiving here would drop a job that may well
+    // be paid for, and failing it would punish a database hiccup.
+    deps.log(
+      `Billing gate read failed for job ${jobId}, leaving the message for a later retry: ${
+        gateError instanceof Error ? gateError.message : String(gateError)
+      }`,
+    );
+    return;
+  }
+
+  if (
+    gate !== null &&
+    (gate.status === "queued" || gate.status === "retrying") &&
+    gate.creditsCost === null
+  ) {
+    if (gate.overdue) {
+      // G5. The job is not paid for and its window is over. The claim is one
+      // atomic statement whose predicate re-checks all three conditions, so it
+      // cannot overwrite a charge that landed while this worker was deciding.
+      let claimed: boolean;
+
+      try {
+        claimed = await deps.billingGate.failUnbilledIfOverdue({
+          jobId,
+          timeoutSeconds: BILLING_CONFIRM_TIMEOUT_SECONDS,
+        });
+      } catch (claimError) {
+        // A failed claim is the same unknown as G1 — it must not be mistaken for
+        // a refusal, and it must not be retried from here.
+        deps.log(
+          `Billing gate claim failed for job ${jobId}, leaving the message for a later retry: ${
+            claimError instanceof Error ? claimError.message : String(claimError)
+          }`,
+        );
+        return;
+      }
+
+      if (claimed) {
+        // This delivery owns the outcome: the row really moved to `failed` with
+        // `billing_not_confirmed`, written by the claim's own statement.
+        //
+        // Deliberately NO `refundJob` and no `terminalFail`: a job that was never
+        // billed has nothing to refund (`credits_cost is null` is part of the
+        // claim's predicate), and `markFailed` would both race a charge landing
+        // now and treat the changed row as "refund this job".
+        await deps.pgmq.archive(queue, msg.msg_id);
+        deps.log(
+          `Job ${jobId} was not billed within ${BILLING_CONFIRM_TIMEOUT_SECONDS}s — failed as billing_not_confirmed, not refunded`,
+        );
+        return;
+      }
+
+      // The claim matched nothing: a charge landed, or the job was cancelled,
+      // between the read and the write. Neither is this worker's to overrule, so
+      // the message is deferred exactly as below and the next delivery re-reads
+      // the truth.
+    }
+
+    // G4 (and the lost-race half of G5). Wait for the charge without spending
+    // anything: no increment, no status write, no archive, no delete, no
+    // execution. `renewVt`'s contract is that it never throws, so it is not
+    // wrapped in a try.
+    ctx.renewVt(BILLING_DEFER_VT_SECONDS);
+    deps.log(
+      `Job ${jobId} is not billed yet — deferred for ${BILLING_DEFER_VT_SECONDS}s without consuming an attempt`,
+    );
+    return;
+  }
+
+  // G2 (the row is gone: the counter below answers null and the message is
+  // archived), G3 (paid for) and G6 (running/succeeded/failed/canceled and every
+  // other status) all continue here, unchanged.
+
+  // 4. Counting failed. Touch nothing: the message stays invisible until its
   //    visibility timeout expires and is then delivered again. Archiving here
   //    would silently drop a job that was already paid for.
   let counted: { attempt_count: number; max_attempts: number } | null;
@@ -121,7 +280,7 @@ export async function processJobMessage(
     return;
   }
 
-  // 4. The job row is gone.
+  // 5. The job row is gone.
   if (counted === null) {
     deps.log(`Job ${jobId} not found — archiving message`);
     await deps.pgmq.archive(queue, msg.msg_id);
@@ -130,7 +289,7 @@ export async function processJobMessage(
 
   const { attempt_count: attemptCount, max_attempts: maxAttempts } = counted;
 
-  // 5. The attempts were already spent by an earlier worker that died before
+  // 6. The attempts were already spent by an earlier worker that died before
   //    finishing. `>` (not `>=`): the count was just incremented, so on the
   //    third attempt the value is 3 and that attempt must still run.
   if (attemptCount > maxAttempts) {
@@ -141,7 +300,7 @@ export async function processJobMessage(
     return;
   }
 
-  // 6. Only queued/retrying jobs may start. `false` means cancelled or already
+  // 7. Only queued/retrying jobs may start. `false` means cancelled or already
   //    terminal — do not execute and do not refund (cancel has its own rules).
   const running = await deps.jobService.markRunning(jobId);
 

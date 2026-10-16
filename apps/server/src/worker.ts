@@ -15,6 +15,7 @@ import { loadServerEnv } from "./config/env.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import { createJobService } from "./features/jobs/job-service.js";
 import { createJobAttemptRepository } from "./db/job-attempt-repository.js";
+import { createJobBillingGateRepository } from "./db/job-billing-gate-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
 import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
@@ -78,6 +79,19 @@ async function main() {
     }),
   });
   const creditService = createCreditService({ getAdminClient });
+
+  // ADR-0001 / workorder 21H1: the billing gate the worker runs before it
+  // consumes an attempt or calls a model. Built here, lazily, exactly like the
+  // attempt repository above and against the same `DATABASE_URL`. With no
+  // reachable pool the READ fails, `processJobMessage` leaves the message for a
+  // later retry and the job is never executed unbilled — there is no fallback
+  // that could reach PostgREST or skip the gate.
+  const billingGate = createJobBillingGateRepository({
+    getTransactionPool: () =>
+      getTransactionPool(
+        env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
+      ),
+  });
 
   // Base context — per-message fields (queue, msgId, renewVt) are added per message below
   const baseCtx = {
@@ -155,6 +169,7 @@ async function main() {
             const task = processJobMessage(
               {
                 jobService,
+                billingGate,
                 pgmq,
                 getExecutor,
                 refundJob: (jobId) => refundJob(jobId, ctx, creditService, tag),

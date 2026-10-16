@@ -24,6 +24,20 @@
 //                   owns the refund. Refunding here too would double-refund.
 //   no job       -> nobody else can see the charge, so this function must
 //                   refund. That is the P0-2 fix, generalised.
+//
+// BILLING CONFIRMATION — the other obligation (workorder 21H1)
+// The worker refuses to start a job whose `credits_cost` is still NULL, because
+// that state cannot be told apart from "the charge has not happened yet". So
+// every path that creates a job has to leave a recorded answer behind:
+//
+//   charged      -> `setCreditsInfo(job, creditsCost, txId)` (unchanged),
+//   charged 0    -> `setCreditsInfo(job, 0, null)` — the free model, and the
+//                   deployment with the credit system switched off.
+//
+// `0` is a confirmation, not a placeholder: it is a non-null cost the gate reads
+// as "billed". A job created and left with NULL would be deferred for ten
+// minutes and then failed as `billing_not_confirmed` — a free generation lost to
+// a bookkeeping gap.
 import type {
   BackgroundJob,
   ImageQualityLevel,
@@ -218,6 +232,32 @@ export async function withBilling<T>(
     } catch (deductError) {
       if (job) await jobService!.cancelJob(user, job.id).catch(() => {});
       throw deductError;
+    }
+  } else if (job) {
+    // Workorder 21H1: the two paths that charge nothing still have to RECORD
+    // that they charged nothing. `createJob` enqueues the job before this
+    // function runs, so the worker may already be holding the message; with
+    // `credits_cost` left NULL (a free model, or a deployment with the credit
+    // system switched off) that message is indistinguishable from a job whose
+    // charge has not happened yet, and the worker's billing gate would defer it
+    // for ten minutes and then fail it as `billing_not_confirmed`.
+    //
+    // Writing `0` is the confirmation: a terminal, non-null cost the gate reads
+    // as "billed". `null` is the transaction id because no transaction exists —
+    // and because the gate keys on `credits_cost`, not on the link.
+    //
+    // This is deliberately NOT merged into the charge block above: the two look
+    // similar but they answer different questions, and the catch around this one
+    // must not be widened into the paid path's (workorder 21H2 owns that one).
+    try {
+      await jobService!.setCreditsInfo(job.id, 0, null);
+    } catch (confirmError) {
+      // Same reaction as a failed deduction, and for the same reason: the job
+      // must not be left startable when the record of what it costs could not be
+      // written. The cancel's own failure is swallowed so the caller sees the
+      // write error, exactly as the paid path does.
+      await jobService!.cancelJob(user, job.id).catch(() => {});
+      throw confirmError;
     }
   }
 

@@ -4,6 +4,7 @@ import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
+import type { JobBillingGateRepository } from "../../db/job-billing-gate-repository.js";
 import {
   CreditServiceError,
   type CreditService,
@@ -587,6 +588,8 @@ function makeProcessHarness(scenario: ProcessScenario = {}) {
 
   const calls: string[] = [];
   const logs: string[] = [];
+  /** Visibility renewals the billing gate asked for (workorder 21H1). */
+  const renewals: number[] = [];
   let refunds = 0;
 
   const executor: JobExecutor = async () => {
@@ -601,6 +604,20 @@ function makeProcessHarness(scenario: ProcessScenario = {}) {
 
   const deps = {
     jobService: jobHarness.service,
+    // Workorder 21H1: the billing gate is a required dependency of
+    // `processJobMessage` now. This harness drives the REAL JobService, and the
+    // cases below measure the attempt thresholds and the single-ownership
+    // boundaries — none of which the gate changes — so the stand-in answers the
+    // pass-through row (a confirmed, zero-cost job) every time. The gate's own
+    // matrix is pinned in `process-job-message.test.ts`.
+    billingGate: {
+      async readBillingGate() {
+        return { status: "queued", creditsCost: 0, overdue: false };
+      },
+      async failUnbilledIfOverdue() {
+        return false;
+      },
+    } as unknown as JobBillingGateRepository,
     pgmq: {
       async archive() {
         calls.push("archive");
@@ -626,7 +643,15 @@ function makeProcessHarness(scenario: ProcessScenario = {}) {
       msg_id: 7,
       message: { job_id: PROCESS_JOB_ID, job_type: "image_generation" },
     } as never,
-    ctx: {} as ExecutorContext,
+    // Workorder 21H1: the billing gate's deferring arm renews the message's
+    // visibility timeout. `renewVt`'s contract is that it never throws, and this
+    // harness's gate always passes, so the spy below is a guard against a future
+    // case failing with "undefined is not a function" instead of on its merits.
+    ctx: {
+      renewVt: (vtSeconds: number) => {
+        renewals.push(vtSeconds);
+      },
+    } as unknown as ExecutorContext,
   };
 
   /** Every guarded status write the real JobService performed, in order. */

@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest";
 
+import type { JobBillingGateRepository } from "../../db/job-billing-gate-repository.js";
 import type { ExecutorContext, JobExecutor } from "./job-executor.js";
 import type { JobService } from "./job-service.js";
-import { processJobMessage } from "./process-job-message.js";
+import {
+  BILLING_CONFIRM_TIMEOUT_SECONDS,
+  BILLING_DEFER_VT_SECONDS,
+  processJobMessage,
+} from "./process-job-message.js";
+
+/** A gate row, spelled out per case so the matrix below reads like the ticket. */
+type GateRow = { status: string; creditsCost: number | null; overdue: boolean };
 
 type Scenario = {
   increment?: () => Promise<{ attempt_count: number; max_attempts: number } | null>;
@@ -14,6 +22,18 @@ type Scenario = {
   executorReturns?: Record<string, unknown>;
   hasExecutor?: boolean;
   refundThrows?: boolean;
+  /**
+   * What the billing gate's read answers. Omitted = a confirmed job (cost 0),
+   * i.e. the pass-through answer every case written before this ticket gets.
+   * `null` is a real answer too: the job row does not exist.
+   */
+  gate?: GateRow | null;
+  /** The gate read throws instead of answering. */
+  gateReadThrows?: boolean;
+  /** What the timeout claim answers. Default: it claimed the row. */
+  gateClaim?: boolean;
+  /** The timeout claim throws instead of answering. */
+  gateClaimThrows?: boolean;
 };
 
 function makeHarness(scenario: Scenario = {}) {
@@ -67,8 +87,42 @@ function makeHarness(scenario: Scenario = {}) {
 
   const logs: string[] = [];
 
+  /** Every gate call, with the arguments it was given. */
+  const gateReads: Array<{ jobId: string; timeoutSeconds: number }> = [];
+  const gateClaims: Array<{ jobId: string; timeoutSeconds: number }> = [];
+
+  const billingGate = {
+    async readBillingGate(input: { jobId: string; timeoutSeconds: number }) {
+      calls.push("readBillingGate");
+      gateReads.push(input);
+      if (scenario.gateReadThrows) throw new Error("gate read exploded");
+      // The default is a CONFIRMED job, so every case written before this
+      // ticket keeps measuring what it was written to measure.
+      return scenario.gate === undefined
+        ? { status: "queued", creditsCost: 0, overdue: false }
+        : scenario.gate;
+    },
+    async failUnbilledIfOverdue(input: { jobId: string; timeoutSeconds: number }) {
+      calls.push("failUnbilledIfOverdue");
+      gateClaims.push(input);
+      if (scenario.gateClaimThrows) throw new Error("gate claim exploded");
+      return scenario.gateClaim ?? true;
+    },
+  } as unknown as JobBillingGateRepository;
+
+  /** The visibility renewals the gate asked for. */
+  const renewals: number[] = [];
+
+  const ctx = {
+    renewVt: (vtSeconds: number) => {
+      calls.push("renewVt");
+      renewals.push(vtSeconds);
+    },
+  } as unknown as ExecutorContext;
+
   const deps = {
     jobService,
+    billingGate,
     pgmq: pgmq as never,
     getExecutor: () =>
       scenario.hasExecutor === false ? undefined : executor,
@@ -86,7 +140,7 @@ function makeHarness(scenario: Scenario = {}) {
     queue: "image_generation",
     queueJobType: "image_generation" as const,
     msg: { msg_id: 7, message: { job_id: "job-1", job_type: "image_generation" } } as never,
-    ctx: {} as ExecutorContext,
+    ctx,
   };
 
   return {
@@ -96,10 +150,23 @@ function makeHarness(scenario: Scenario = {}) {
     failures,
     retries,
     logs,
+    renewals,
+    gateReads,
+    gateClaims,
     refunds: () => refunds,
     run: () => processJobMessage(deps, args),
   };
 }
+
+/** The whole happy path, as the list of calls it is allowed to make. */
+const PASS_THROUGH_AND_SUCCEED = [
+  "readBillingGate",
+  "incrementAttempt",
+  "markRunning",
+  "executor",
+  "markSucceeded",
+  "deleteMsg",
+];
 
 describe("processJobMessage", () => {
   it("case 1: a success runs the executor and deletes the message", async () => {
@@ -107,13 +174,7 @@ describe("processJobMessage", () => {
 
     await h.run();
 
-    expect(h.calls).toEqual([
-      "incrementAttempt",
-      "markRunning",
-      "executor",
-      "markSucceeded",
-      "deleteMsg",
-    ]);
+    expect(h.calls).toEqual(PASS_THROUGH_AND_SUCCEED);
     expect(h.refunds()).toBe(0);
     expect(h.calls).not.toContain("archive");
   });
@@ -261,5 +322,258 @@ describe("processJobMessage", () => {
     expect(h.calls).toContain("refundJob");
     expect(h.calls).toContain("archive");
     expect(h.logs.join(" ")).toContain("Refund failed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workorder 21H1 — the billing gate, one case per row of the ticket's matrix.
+//
+// `case G<n>` numbering matches the table in the workorder, so a reviewer can
+// read the two side by side. Every case asserts BOTH the calls that must happen
+// and the calls that must not, because "did nothing" is the whole behaviour of
+// the deferring arms: a deferral that quietly incremented, archived or refunded
+// would look identical from the outside and be wrong.
+// ---------------------------------------------------------------------------
+
+/** The gate row for a job that is queued, unbilled and past its window. */
+const OVERDUE_UNBILLED: GateRow = {
+  status: "queued",
+  creditsCost: null,
+  overdue: true,
+};
+
+/** The gate row for a job that is queued, unbilled and still inside the window. */
+const WAITING_UNBILLED: GateRow = {
+  status: "queued",
+  creditsCost: null,
+  overdue: false,
+};
+
+describe("processJobMessage: the billing gate (工单21H1)", () => {
+  it("case G1: a gate READ failure logs and touches nothing at all", async () => {
+    const h = makeHarness({ gateReadThrows: true });
+
+    await h.run();
+
+    // The read is the only call. No increment (so no attempt is spent), no
+    // status write, no execute, no archive, no delete, no refund — the message
+    // stays invisible and comes back when its visibility timeout expires.
+    expect(h.calls).toEqual(["readBillingGate"]);
+    expect(h.refunds()).toBe(0);
+    expect(h.failures).toEqual([]);
+    expect(h.logs.join(" ")).toContain("Billing gate read failed");
+    expect(h.logs.join(" ")).toContain("gate read exploded");
+  });
+
+  it("case G2: no gate row falls through to the original flow, with no new branch", async () => {
+    // `null` means the job row is gone. The gate adds nothing here: the original
+    // flow already answers a missing row by archiving the message, and that is
+    // what must happen — nothing else.
+    const h = makeHarness({ gate: null, increment: async () => null });
+
+    await h.run();
+
+    expect(h.calls).toEqual(["readBillingGate", "incrementAttempt", "archive"]);
+    expect(h.calls).not.toContain("executor");
+    expect(h.calls).not.toContain("markRunning");
+    expect(h.refunds()).toBe(0);
+  });
+
+  it("case G3: a recorded cost — 0 included — passes straight through", async () => {
+    // 0 is a confirmation (free model, or billing switched off), and any positive
+    // number is a charge. Neither the amount nor the age changes the answer: the
+    // gate keys on `creditsCost === null`, and nothing else.
+    const rows: GateRow[] = [
+      { status: "queued", creditsCost: 0, overdue: false },
+      { status: "queued", creditsCost: 0, overdue: true },
+      { status: "queued", creditsCost: 10, overdue: true },
+      { status: "retrying", creditsCost: 3, overdue: false },
+    ];
+
+    for (const gate of rows) {
+      const h = makeHarness({ gate });
+
+      await h.run();
+
+      expect(h.calls).toEqual(PASS_THROUGH_AND_SUCCEED);
+      expect(h.calls).not.toContain("renewVt");
+      expect(h.calls).not.toContain("failUnbilledIfOverdue");
+      expect(h.refunds()).toBe(0);
+    }
+  });
+
+  it("case G4: an unbilled job inside the window is deferred, and nothing else happens", async () => {
+    const h = makeHarness({ gate: WAITING_UNBILLED });
+
+    await h.run();
+
+    // Exactly one visibility renewal, and no other call of any kind: no attempt
+    // is consumed while the charge is in flight (see the module header).
+    expect(h.calls).toEqual(["readBillingGate", "renewVt"]);
+    expect(h.renewals).toEqual([BILLING_DEFER_VT_SECONDS]);
+    expect(h.gateClaims).toEqual([]);
+    expect(h.logs.join(" ")).toContain("not billed yet");
+
+    // `retrying` is deferred the same way: the gate is about the money, not
+    // about which of the two startable statuses the row is in.
+    const retrying = makeHarness({
+      gate: { status: "retrying", creditsCost: null, overdue: false },
+    });
+    await retrying.run();
+    expect(retrying.calls).toEqual(["readBillingGate", "renewVt"]);
+  });
+
+  it("case G5 (claim won): an overdue unbilled job is archived, and NEVER refunded", async () => {
+    const h = makeHarness({ gate: OVERDUE_UNBILLED, gateClaim: true });
+
+    await h.run();
+
+    // The claim is attempted, it changed the row, and the message is retired.
+    // Neither `terminalFail` nor `refundJob` may run: nothing was ever charged,
+    // so a refund here would pay out for a payment that never happened — and
+    // `markFailed` would race a charge landing right now.
+    expect(h.calls).toEqual(["readBillingGate", "failUnbilledIfOverdue", "archive"]);
+    expect(h.calls).not.toContain("refundJob");
+    expect(h.calls).not.toContain("markFailed");
+    expect(h.calls).not.toContain("incrementAttempt");
+    expect(h.calls).not.toContain("executor");
+    expect(h.calls).not.toContain("renewVt");
+    expect(h.refunds()).toBe(0);
+    expect(h.failures).toEqual([]);
+    expect(h.gateClaims).toEqual([
+      { jobId: "job-1", timeoutSeconds: BILLING_CONFIRM_TIMEOUT_SECONDS },
+    ]);
+  });
+
+  it("case G5 (claim lost): a refused claim defers exactly like G4", async () => {
+    // `false` means the predicate matched nothing: a charge landed, or the job
+    // was cancelled, between the read and the write. Neither is this worker's to
+    // overrule, so the answer is the deferring arm rather than a failure.
+    const h = makeHarness({ gate: OVERDUE_UNBILLED, gateClaim: false });
+
+    await h.run();
+
+    expect(h.calls).toEqual([
+      "readBillingGate",
+      "failUnbilledIfOverdue",
+      "renewVt",
+    ]);
+    expect(h.renewals).toEqual([BILLING_DEFER_VT_SECONDS]);
+    expect(h.calls).not.toContain("archive");
+    expect(h.calls).not.toContain("executor");
+    expect(h.refunds()).toBe(0);
+  });
+
+  it("case G5 (claim threw): a failed claim is treated as G1, not as a refusal", async () => {
+    const h = makeHarness({ gate: OVERDUE_UNBILLED, gateClaimThrows: true });
+
+    await h.run();
+
+    // An unknown claim must not be mistaken for "somebody else handled it": the
+    // message is left alone and comes back, exactly as on a failed read.
+    expect(h.calls).toEqual(["readBillingGate", "failUnbilledIfOverdue"]);
+    expect(h.calls).not.toContain("archive");
+    expect(h.calls).not.toContain("renewVt");
+    expect(h.refunds()).toBe(0);
+    expect(h.logs.join(" ")).toContain("Billing gate claim failed");
+  });
+
+  it("case G6: any status other than queued/retrying passes through, even unbilled and overdue", async () => {
+    // This is the row that must add NO behaviour. A job that is running is being
+    // executed by this or another worker; a terminal one is somebody else's
+    // answer. Neither may be failed for billing, deferred, archived early or
+    // refunded here.
+    for (const status of [
+      "running",
+      "succeeded",
+      "failed",
+      "canceled",
+      "dead_letter",
+    ]) {
+      const h = makeHarness({
+        gate: { status, creditsCost: null, overdue: true },
+      });
+
+      await h.run();
+
+      expect(h.calls).toEqual(PASS_THROUGH_AND_SUCCEED);
+      expect(h.calls).not.toContain("failUnbilledIfOverdue");
+      expect(h.calls).not.toContain("renewVt");
+      expect(h.calls).not.toContain("markFailed");
+      expect(h.refunds()).toBe(0);
+    }
+  });
+
+  it("case G7: past the gate, every threshold and the single-refund rule are unchanged", async () => {
+    // The gate passes here (a confirmed cost), so what follows is the original
+    // flow verbatim: `>` before executing, `>=` after a failure, and a refund
+    // only when `markFailed` really changed a row.
+    const lastAttempt = makeHarness({
+      gate: { status: "queued", creditsCost: 10, overdue: false },
+      increment: async () => ({ attempt_count: 3, max_attempts: 3 }),
+    });
+    await lastAttempt.run();
+    // 3/3 after the increment is the FINAL attempt and it must still run.
+    expect(lastAttempt.calls).toEqual(PASS_THROUGH_AND_SUCCEED);
+
+    const overBudget = makeHarness({
+      increment: async () => ({ attempt_count: 4, max_attempts: 3 }),
+    });
+    await overBudget.run();
+    expect(overBudget.failures).toEqual([
+      { code: "max_attempts_exceeded", message: expect.stringContaining("4/3") },
+    ]);
+    expect(overBudget.refunds()).toBe(1);
+
+    const failedWhileConfirmed = makeHarness({
+      increment: async () => ({ attempt_count: 3, max_attempts: 3 }),
+      executorThrows: { message: "still broken" },
+    });
+    await failedWhileConfirmed.run();
+    expect(failedWhileConfirmed.refunds()).toBe(1);
+    expect(failedWhileConfirmed.calls).toContain("archive");
+  });
+
+  it("case G8: the gate is READ before the attempt counter, and on every delivery", async () => {
+    // The ordering IS the fix: a gate placed after `incrementAttempt` would spend
+    // an attempt on every deferral, and three deferrals would turn a healthy paid
+    // job into `max_attempts_exceeded`.
+    const deferred = makeHarness({ gate: WAITING_UNBILLED });
+    await deferred.run();
+
+    expect(deferred.calls.indexOf("readBillingGate")).toBe(0);
+    expect(deferred.calls).not.toContain("incrementAttempt");
+
+    const confirmed = makeHarness();
+    await confirmed.run();
+
+    expect(confirmed.calls.indexOf("readBillingGate")).toBeLessThan(
+      confirmed.calls.indexOf("incrementAttempt"),
+    );
+
+    // And every delivery re-reads: a second delivery of the same message after
+    // the charge landed sees `creditsCost` and runs.
+    const secondDelivery = makeHarness({
+      gate: { status: "queued", creditsCost: 5, overdue: true },
+    });
+    await secondDelivery.run();
+    expect(secondDelivery.calls).toEqual(PASS_THROUGH_AND_SUCCEED);
+  });
+
+  it("case G9: the gate is asked for the same job, with the ticket's window", async () => {
+    const h = makeHarness();
+
+    await h.run();
+
+    expect(BILLING_CONFIRM_TIMEOUT_SECONDS).toBe(600);
+    expect(BILLING_DEFER_VT_SECONDS).toBe(10);
+    expect(h.gateReads).toEqual([
+      { jobId: "job-1", timeoutSeconds: BILLING_CONFIRM_TIMEOUT_SECONDS },
+    ]);
+    // The read and the claim are asked about the same job with the same window,
+    // so the claim cannot be made under a different rule than the read.
+    const overdue = makeHarness({ gate: OVERDUE_UNBILLED, gateClaim: true });
+    await overdue.run();
+    expect(overdue.gateReads).toEqual(overdue.gateClaims);
   });
 });

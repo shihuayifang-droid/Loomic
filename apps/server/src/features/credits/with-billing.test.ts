@@ -394,6 +394,137 @@ describe("withBilling", () => {
     });
   });
 
+  // -------------------------------------------------------------------------
+  // Workorder 21H1: the paths that charge NOTHING still have to record that they
+  // charged nothing. `createJob` enqueues the job before this function runs, so
+  // the worker may already hold the message; a job left with a NULL
+  // `credits_cost` is indistinguishable from one whose charge is still in
+  // flight, and the worker's billing gate would defer it and then fail it as
+  // `billing_not_confirmed`.
+  //
+  // The paid branch is deliberately NOT merged with these: the cases at the
+  // bottom of this block pin that it still writes exactly once, with the real
+  // amount and the real transaction.
+  // -------------------------------------------------------------------------
+  describe("billing confirmation when nothing is charged (工单21H1)", () => {
+    it("records (0, null) for a free model, before the work runs", async () => {
+      tierGuard = makeTierGuard({ calculateCreditCost: vi.fn(() => 0) });
+      const runSpy = vi.fn(async ({ job }: { job?: { id: string } }) => job?.id ?? "none");
+
+      const result = await withBilling(
+        { creditService, tierGuard, jobService },
+        { ...IMAGE_REQUEST, job: { payload: { prompt: "free" } } },
+        runSpy,
+      );
+
+      expect(result).toBe("job-1");
+      // A free model is not charged...
+      expect(creditService.deductCredits).not.toHaveBeenCalled();
+      // ...but it IS confirmed: `0` is a non-null cost the gate reads as billed.
+      expect(jobService.setCreditsInfo).toHaveBeenCalledTimes(1);
+      expect(jobService.setCreditsInfo).toHaveBeenCalledWith("job-1", 0, null);
+      // `null` is the honest transaction id: no transaction exists, and the gate
+      // keys on `credits_cost`, never on the link.
+      // The worker may already be holding the queued message, so the record is
+      // written before the caller's work starts.
+      expect(jobService.setCreditsInfo.mock.invocationCallOrder[0]).toBeLessThan(
+        runSpy.mock.invocationCallOrder[0]!,
+      );
+    });
+
+    it("records (0, null) when the credit system is off and a job exists", async () => {
+      const result = await withBilling(
+        { jobService },
+        { ...IMAGE_REQUEST, job: { payload: {} } },
+        async ({ job, creditsCost }) => `${job?.id}:${creditsCost}`,
+      );
+
+      expect(result).toBe("job-1:0");
+      expect(jobService.createJob).toHaveBeenCalledTimes(1);
+      expect(jobService.setCreditsInfo).toHaveBeenCalledTimes(1);
+      expect(jobService.setCreditsInfo).toHaveBeenCalledWith("job-1", 0, null);
+    });
+
+    it("records nothing when no job was created", async () => {
+      // No job means nobody can be waiting on a queue message, so there is
+      // nothing to confirm — on both the billing-enabled and the billing-off
+      // path.
+      await withBilling(
+        { creditService, tierGuard, jobService },
+        IMAGE_REQUEST,
+        async () => "ok",
+      );
+      expect(jobService.createJob).not.toHaveBeenCalled();
+      expect(jobService.setCreditsInfo).not.toHaveBeenCalled();
+
+      await withBilling({ jobService }, IMAGE_REQUEST, async () => "ok");
+      expect(jobService.setCreditsInfo).not.toHaveBeenCalled();
+    });
+
+    it("cancels the job and rethrows when the confirmation write fails", async () => {
+      tierGuard = makeTierGuard({ calculateCreditCost: vi.fn(() => 0) });
+      const failure = new Error("job update exploded");
+      jobService.setCreditsInfo = vi.fn(async () => {
+        throw failure;
+      });
+      const runSpy = vi.fn(async () => "ok");
+
+      const error = await withBilling(
+        { creditService, tierGuard, jobService },
+        { ...IMAGE_REQUEST, job: { payload: {} } },
+        runSpy,
+      )
+        .then(() => null)
+        .catch((thrown: unknown) => thrown);
+
+      // The caller sees the write error, not the cancel.
+      expect(error).toBe(failure);
+      // Same reaction as a failed deduction: the job must not stay startable
+      // when the record of what it costs could not be written.
+      expect(jobService.cancelJob).toHaveBeenCalledWith(USER, "job-1");
+      expect(runSpy).not.toHaveBeenCalled();
+      // Nothing was charged, so there is nothing to give back.
+      expect(creditService.deductCredits).not.toHaveBeenCalled();
+      expect(creditService.refundCredits).not.toHaveBeenCalled();
+    });
+
+    it("surfaces the confirmation error even when the cancel itself fails", async () => {
+      tierGuard = makeTierGuard({ calculateCreditCost: vi.fn(() => 0) });
+      const failure = new Error("job update exploded");
+      jobService.setCreditsInfo = vi.fn(async () => {
+        throw failure;
+      });
+      jobService.cancelJob = vi.fn(async () => {
+        throw new Error("cancel endpoint down");
+      });
+
+      const error = await withBilling(
+        { creditService, tierGuard, jobService },
+        { ...IMAGE_REQUEST, job: { payload: {} } },
+        async () => "ok",
+      )
+        .then(() => null)
+        .catch((thrown: unknown) => thrown);
+
+      expect(error).toBe(failure);
+      expect(jobService.cancelJob).toHaveBeenCalledTimes(1);
+    });
+
+    it("the charged path still writes the real amount exactly once, and never a 0", async () => {
+      await withBilling(
+        { creditService, tierGuard, jobService },
+        { ...IMAGE_REQUEST, job: { payload: {} } },
+        async () => "ok",
+      );
+
+      // One write, carrying the amount and the transaction — and no second
+      // "confirmed, costs nothing" record beside it.
+      expect(jobService.setCreditsInfo).toHaveBeenCalledTimes(1);
+      expect(jobService.setCreditsInfo).toHaveBeenCalledWith("job-1", 10, "tx-1");
+      expect(jobService.setCreditsInfo).not.toHaveBeenCalledWith("job-1", 0, null);
+    });
+  });
+
   it("fails loudly when a job is requested without a job service", async () => {
     await expect(
       withBilling(
