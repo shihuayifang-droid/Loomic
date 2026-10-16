@@ -788,25 +788,10 @@ function jobTransitionFailed(jobId: string): JobServiceError {
 }
 
 /**
- * The four failures the credits-link path can report (workorder 21H2).
- *
- * Like `incrementAttemptFailed`, these are functions rather than constants so
- * every caller gets its own error, and each message is FIXED text: the driver's
- * own text is deliberately not concatenated, because it can name the statement,
- * the host or a credential. The repository already carries the raw failure as
- * `cause` for whoever needs to classify it.
- *
- * `jobCreditsNotRecorded` and `jobCreditsNotBillable` are two different messages
- * on purpose: "the write broke" and "the row was not billable any more" are
- * different incidents — the first is an outage, the second is a race the
- * compensation path handles — and folding them into one string would erase that
- * from every log line.
- */
-/**
  * The two failures the authorization reads of `createJob` can report (workorder
  * 21V).
  *
- * Like the helpers above they are functions rather than constants, so every
+ * Like the helpers around them they are functions rather than constants, so every
  * caller gets its own error, and each message is FIXED text: the driver's own
  * text is deliberately not concatenated, because it can name the statement, the
  * host or a credential — and the repository already carries the raw failure as
@@ -833,6 +818,21 @@ function jobProjectNotVerified(): JobServiceError {
   );
 }
 
+/**
+ * The four failures the credits-link path can report (workorder 21H2).
+ *
+ * Like `incrementAttemptFailed`, these are functions rather than constants so
+ * every caller gets its own error, and each message is FIXED text: the driver's
+ * own text is deliberately not concatenated, because it can name the statement,
+ * the host or a credential. The repository already carries the raw failure as
+ * `cause` for whoever needs to classify it.
+ *
+ * `jobCreditsNotRecorded` and `jobCreditsNotBillable` are two different messages
+ * on purpose: "the write broke" and "the row was not billable any more" are
+ * different incidents — the first is an outage, the second is a race the
+ * compensation path handles — and folding them into one string would erase that
+ * from every log line.
+ */
 function jobCreditsNotRecorded(jobId: string): JobServiceError {
   return new JobServiceError(
     "job_query_failed",
