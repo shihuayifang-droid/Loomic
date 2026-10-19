@@ -229,6 +229,7 @@ import { AppDropdown } from "@/components/ui/app-dropdown";
 | 前缀 | 区域 |
 |---|---|
 | `account-` | 账号与计费（登录、注册、个人资料、套餐升级、取消订阅） |
+| `adjust-` | 调整面板（重置、关闭、自动调整、取消与完成，以及 17 个参数滑块） |
 | `agent-` | Agent 相关的选择与偏好（模型选择、默认模型、模型偏好弹层） |
 | `app-` | 应用外壳（侧边栏、错误兜底页） |
 | `attachment-` | 附件条（附件的移除） |
