@@ -220,6 +220,7 @@ import { AppDropdown } from "@/components/ui/app-dropdown";
 | `home-` | 首页（提示词框、发现画廊、示例浏览器、项目卡片） |
 | `image-` | 逐图工具条（工具条、分隔线、tooltip、「更多」菜单与菜单项） |
 | `landing-` | 落地页（浮动导航、价格预览） |
+| `price-` | 价格展示（PriceTag 五态文案与获取失败重试） |
 | `pricing-` | 价格页（套餐卡片、对比表、常见问题、月付与年付切换） |
 | `project-` | 单个项目的详情控件（项目名编辑） |
 | `projects-` | 项目列表与项目弹窗（新建、删除、重试） |
