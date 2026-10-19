@@ -112,9 +112,11 @@ function domainCall(queries: readonly QueryRecord[]): QueryRecord {
 
 function contextParams(queries: readonly QueryRecord[]): Map<string, unknown> {
   const values = new Map<string, unknown>();
-  for (const entry of queries) {
-    if (entry.sql !== TRANSACTION_STATEMENTS.setLocalSetting) continue;
-    values.set(String(entry.params?.[0]), entry.params?.[1]);
+  const flat = queries
+    .filter((entry) => entry.sql === TRANSACTION_STATEMENTS.setLocalSetting)
+    .flatMap((entry) => [...(entry.params ?? [])]);
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    values.set(String(flat[i]), flat[i + 1]);
   }
   return values;
 }
@@ -181,14 +183,17 @@ describe("chat write repository: the insert statement", () => {
     expect(sql).not.toContain("archived_at");
 
     // The caller's id is used as given; the column list carries no created_by.
+    // The two jsonb arguments are bound as JSON TEXT on purpose: node-postgres
+    // turns a JavaScript array into a PostgreSQL array literal, which `::jsonb`
+    // rejects with 22P02 (see requireJsonArgument).
     expect(params).toEqual([
       ACTOR_ID,
       MESSAGE_ID,
       SESSION_ID,
       "assistant",
       "hello",
-      [{ name: "generate_image", status: "completed" }],
-      [{ type: "text", text: "hi" }],
+      JSON.stringify([{ name: "generate_image", status: "completed" }]),
+      JSON.stringify([{ type: "text", text: "hi" }]),
     ]);
     expect(sql).toContain("$2::uuid");
     expect(sql).toContain("returning");

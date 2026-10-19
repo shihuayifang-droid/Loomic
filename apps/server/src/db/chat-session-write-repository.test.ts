@@ -114,9 +114,11 @@ function statements(queries: readonly QueryRecord[]): string[] {
 
 function contextParams(queries: readonly QueryRecord[]): Map<string, unknown> {
   const values = new Map<string, unknown>();
-  for (const entry of queries) {
-    if (entry.sql !== TRANSACTION_STATEMENTS.setLocalSetting) continue;
-    values.set(String(entry.params?.[0]), entry.params?.[1]);
+  const flat = queries
+    .filter((entry) => entry.sql === TRANSACTION_STATEMENTS.setLocalSetting)
+    .flatMap((entry) => [...(entry.params ?? [])]);
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    values.set(String(flat[i]), flat[i + 1]);
   }
   return values;
 }

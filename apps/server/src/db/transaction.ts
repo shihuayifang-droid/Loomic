@@ -57,7 +57,24 @@ export const TRANSACTION_STATEMENTS = {
   begin: "BEGIN",
   commit: "COMMIT",
   rollback: "ROLLBACK",
-  setLocalSetting: "select set_config($1, $2, true)",
+  /**
+   * All four settings in ONE statement. The settings themselves are unchanged —
+   * each is still `set_config(name, value, true)`, i.e. transaction-local, and
+   * every name and value stays a bind parameter.
+   *
+   * Why: each statement is a full network round trip, so the previous
+   * one-setting-per-statement form cost four of them. Against a database that is
+   * a few hundred milliseconds away (the Supabase pooler here is ~252 ms per
+   * statement) those three extra round trips made every repository read ~765 ms
+   * slower than it needed to be, and a page load issues several.
+   */
+  setLocalSetting: [
+    "select",
+    "  set_config($1, $2, true),",
+    "  set_config($3, $4, true),",
+    "  set_config($5, $6, true),",
+    "  set_config($7, $8, true)",
+  ].join("\n"),
 } as const;
 
 /**
@@ -124,12 +141,14 @@ export async function withTransaction<T>(
     await client.query(TRANSACTION_STATEMENTS.begin);
     beginIssued = true;
 
-    for (const [index, name] of TRANSACTION_SETTING_ORDER.entries()) {
-      await client.query(TRANSACTION_STATEMENTS.setLocalSetting, [
-        name,
-        context[index] ?? "",
-      ]);
-    }
+    // One statement, not four: see TRANSACTION_STATEMENTS.setLocalSetting.
+    // The parameter list is [name, value] repeated in TRANSACTION_SETTING_ORDER,
+    // so the tuple below is the single source of both the names and the order.
+    const settingParams = TRANSACTION_SETTING_ORDER.flatMap((name, index) => [
+      name,
+      context[index] ?? "",
+    ]);
+    await client.query(TRANSACTION_STATEMENTS.setLocalSetting, settingParams);
 
     const result = await run(client);
     await client.query(TRANSACTION_STATEMENTS.commit);

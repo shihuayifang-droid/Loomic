@@ -84,7 +84,14 @@ function contextCalls(queries: readonly QueryRecord[]): QueryRecord[] {
 }
 
 function contextParams(queries: readonly QueryRecord[]): unknown[][] {
-  return contextCalls(queries).map((entry) => [...(entry.params ?? [])]);
+  const flat = queries
+    .filter((entry) => entry.sql === TRANSACTION_STATEMENTS.setLocalSetting)
+    .flatMap((entry) => [...(entry.params ?? [])]);
+  const pairs: unknown[][] = [];
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    pairs.push([flat[i], flat[i + 1]]);
+  }
+  return pairs;
 }
 
 const FOUNDATION_ROW = {

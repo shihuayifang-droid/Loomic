@@ -92,9 +92,14 @@ function domainCalls(queries: readonly QueryRecord[]): QueryRecord[] {
 }
 
 function contextParams(queries: readonly QueryRecord[]): unknown[][] {
-  return queries
+  const flat = queries
     .filter((entry) => entry.sql === TRANSACTION_STATEMENTS.setLocalSetting)
-    .map((entry) => [...(entry.params ?? [])]);
+    .flatMap((entry) => [...(entry.params ?? [])]);
+  const pairs: unknown[][] = [];
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    pairs.push([flat[i], flat[i + 1]]);
+  }
+  return pairs;
 }
 
 function repositoryFor(harness: Harness): TeamAdminReadRepository {

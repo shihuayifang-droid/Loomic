@@ -437,12 +437,24 @@ function requireWriteContent(
  * means "store SQL NULL", while an `undefined` argument means the caller never
  * decided. The second is a bug in the caller, so it fails loud instead of being
  * silently stored as "no blocks".
+ *
+ * The value is returned as JSON TEXT, not as the JavaScript value, and that is
+ * load-bearing: `node-postgres` serialises a JavaScript ARRAY as a PostgreSQL
+ * array literal (`{"{\"type\":\"text\",…}"}`), not as JSON, so binding the array
+ * to `$n::jsonb` is rejected with SQLSTATE 22P02. Both arguments here are
+ * arrays in practice, so without this every message that carries content blocks
+ * or tool activity fails to save — which is exactly what happened: plain
+ * text-only messages stored fine, and every real conversation message (which
+ * always carries blocks) returned "Failed to save message."
+ *
+ * PGlite does not go through `prepareValue`, so the integration tests could not
+ * see this; only a real PostgreSQL connection can.
  */
 function requireJsonArgument(
   operation: ChatWriteOperation,
   value: unknown,
   field: string,
-): Json | null {
+): string | null {
   if (value === null) return null;
 
   if (value === undefined) {
@@ -460,7 +472,7 @@ function requireJsonArgument(
     );
   }
 
-  return value as Json;
+  return JSON.stringify(value);
 }
 
 /** `updatedAt` is published as ISO-8601; anything else is not a timestamp. */

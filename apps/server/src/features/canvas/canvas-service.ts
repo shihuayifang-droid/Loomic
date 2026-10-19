@@ -583,6 +583,29 @@ function canTransformOnTheFly(mimeType: string): boolean {
   );
 }
 
+/**
+ * Whether the display projection may be routed through storage's on-the-fly image
+ * renderer (`/storage/v1/render/image/sign/...`).
+ *
+ * That route is a Supabase feature an individual project may not have enabled. On
+ * a project without it EVERY such URL answers
+ * `403 {"error":"FeatureNotEnabled","message":"feature not enabled for this tenant"}`
+ * — verified against this deployment for the same object that `/object/sign/`
+ * serves with a 200. The client treats the failure as recoverable (it retries the
+ * undownscaled original), but the retry is not guaranteed to run on every path: an
+ * image pushed in by `canvas.sync` was observed staying a grey placeholder box while
+ * the same object loaded fine on the next full page load.
+ *
+ * So the renderer is opt-OUT rather than assumed: default on (unchanged behaviour
+ * where the feature exists), and a deployment whose project lacks it sets
+ * `LOOMIC_CANVAS_DISPLAY_TRANSFORM=0` to make the plain object URL the primary one.
+ * Downscaling is an optimisation; it must never be the only way to see a picture.
+ */
+function canvasDisplayTransformEnabled(): boolean {
+  const raw = process.env.LOOMIC_CANVAS_DISPLAY_TRANSFORM?.trim().toLowerCase();
+  return raw !== "0" && raw !== "false" && raw !== "off";
+}
+
 async function resolveFilesFromStorage(
   client: UserSupabaseClient,
   canvasId: string,
@@ -660,7 +683,8 @@ async function resolveFilesFromStorage(
         typeof entry.fileData.mimeType === "string"
           ? entry.fileData.mimeType
           : "";
-      const transformable = canTransformOnTheFly(mimeType);
+      const transformable =
+        canTransformOnTheFly(mimeType) && canvasDisplayTransformEnabled();
 
       // SIGNED, not public (X-52): the caller's JWT decides whether this object
       // may be read at all. The 1024px display projection is signed as a

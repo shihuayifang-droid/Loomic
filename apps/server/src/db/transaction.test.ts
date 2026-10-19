@@ -74,6 +74,20 @@ function configCalls(client: FakeClient): QueryRecord[] {
   );
 }
 
+/**
+ * The four settings are written by ONE statement whose parameter list is
+ * `[name, value, name, value, …]`. Tests assert on the pairs, so this decodes
+ * them instead of pinning the flattened array at every call site.
+ */
+function configPairs(client: FakeClient): Array<[string, string]> {
+  const params = (configCalls(client)[0]?.params ?? []) as readonly string[];
+  const pairs: Array<[string, string]> = [];
+  for (let i = 0; i + 1 < params.length; i += 2) {
+    pairs.push([params[i]!, params[i + 1]!]);
+  }
+  return pairs;
+}
+
 const ACTOR = { userId: "user-1", workspaceId: "ws-1", role: "owner" };
 
 afterEach(async () => {
@@ -87,15 +101,15 @@ describe("withTransaction: session context", () => {
 
     await withTransaction(pool, ACTOR, async () => undefined);
 
+    // One statement, not four: every statement is a network round trip, and the
+    // pooler this runs against is ~252 ms away (see TRANSACTION_STATEMENTS).
     expect(client.queries.map((entry) => entry.sql)).toEqual([
       TRANSACTION_STATEMENTS.begin,
       TRANSACTION_STATEMENTS.setLocalSetting,
-      TRANSACTION_STATEMENTS.setLocalSetting,
-      TRANSACTION_STATEMENTS.setLocalSetting,
-      TRANSACTION_STATEMENTS.setLocalSetting,
       TRANSACTION_STATEMENTS.commit,
     ]);
-    expect(configCalls(client).map((entry) => entry.params)).toEqual([
+    expect(configCalls(client)).toHaveLength(1);
+    expect(configPairs(client)).toEqual([
       ["app.user_id", "user-1"],
       ["app.workspace_id", "ws-1"],
       ["app.role", "owner"],
@@ -127,7 +141,7 @@ describe("withTransaction: session context", () => {
       async () => undefined,
     );
 
-    expect(configCalls(client).map((entry) => entry.params)).toEqual([
+    expect(configPairs(client)).toEqual([
       ["app.user_id", ""],
       ["app.workspace_id", ""],
       ["app.role", ""],
@@ -140,7 +154,7 @@ describe("withTransaction: session context", () => {
 
     await withTransaction(createFakePool(client), {}, async () => undefined);
 
-    expect(configCalls(client).map((entry) => entry.params)).toEqual([
+    expect(configPairs(client)).toEqual([
       ["app.user_id", ""],
       ["app.workspace_id", ""],
       ["app.role", ""],
@@ -157,7 +171,7 @@ describe("withTransaction: session context", () => {
       async () => undefined,
     );
 
-    expect(configCalls(client).map((entry) => entry.params)).toEqual([
+    expect(configPairs(client)).toEqual([
       ["app.user_id", "user-7"],
       ["app.workspace_id", ""],
       ["app.role", ""],
@@ -220,7 +234,7 @@ describe("withTransaction: explicit privileged mode", () => {
       { mode: "privileged" },
     );
 
-    expect(configCalls(client).map((entry) => entry.params)).toEqual([
+    expect(configPairs(client)).toEqual([
       ["app.user_id", "user-1"],
       ["app.workspace_id", "ws-1"],
       ["app.role", "owner"],
@@ -247,7 +261,7 @@ describe("withTransaction: explicit privileged mode", () => {
       { mode: "privileged" },
     );
 
-    expect(configCalls(client).map((entry) => entry.params)).toEqual([
+    expect(configPairs(client)).toEqual([
       ["app.user_id", ""],
       ["app.workspace_id", ""],
       ["app.role", ""],
@@ -264,7 +278,7 @@ describe("withTransaction: explicit privileged mode", () => {
       async () => "done",
     );
 
-    expect(configCalls(client).at(-1)?.params).toEqual([
+    expect(configPairs(client).at(-1)).toEqual([
       "app.execution_mode",
       "privileged",
     ]);
@@ -279,7 +293,7 @@ describe("withTransaction: explicit privileged mode", () => {
       async () => "done",
     );
 
-    expect(configCalls(client).map((entry) => entry.params)).toEqual([
+    expect(configPairs(client)).toEqual([
       ["app.user_id", "user-1"],
       ["app.workspace_id", "ws-1"],
       ["app.role", "owner"],
@@ -296,7 +310,7 @@ describe("withTransaction: explicit privileged mode", () => {
       async () => undefined,
     );
 
-    expect(configCalls(client).at(-1)?.params).toEqual([
+    expect(configPairs(client).at(-1)).toEqual([
       "app.execution_mode",
       "user",
     ]);
@@ -423,7 +437,7 @@ describe("withTransaction: failure handling", () => {
       expect(statements.has(entry.sql)).toBe(true);
       expect(entry.sql).not.toContain("user-1");
     }
-    expect(configCalls(client)[0]?.params).toEqual([
+    expect(configPairs(client)[0]).toEqual([
       "app.user_id",
       "user-1' OR 1=1 --",
     ]);
