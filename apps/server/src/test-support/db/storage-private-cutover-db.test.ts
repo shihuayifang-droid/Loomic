@@ -526,14 +526,15 @@ beforeAll(async () => {
 }, 120_000);
 
 describe("X-52 final private storage cutover (工单18)", () => {
-  it("case 1: the migration set grows from 39 to 40 and matches the directory", () => {
+  it("case 1: includes the cutover migration in order", () => {
     const files = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith(".sql"));
     // 31A: +1 migration (pricing_rules)
     expect(applied.length).toBe(41);
     expect(applied.length).toBe(files.length);
-    expect(applied).toContain(CUTOVER_MIGRATION);
-    // Applied last: a migration that lands out of order is not the cutover.
-    expect(applied[applied.length - 1]).toBe(CUTOVER_MIGRATION);
+    // 31A: cutover is no longer the last migration; assert it is applied and ordered, not that it is last
+    const cutoverIndex = applied.indexOf(CUTOVER_MIGRATION);
+    expect(cutoverIndex).toBeGreaterThanOrEqual(0);
+    expect(applied.slice(0, cutoverIndex).every((name) => name < CUTOVER_MIGRATION)).toBe(true);
   });
 
   it("case 2: the three buckets carry the final public values", async () => {
