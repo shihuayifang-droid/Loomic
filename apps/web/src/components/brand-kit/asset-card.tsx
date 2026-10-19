@@ -29,7 +29,7 @@ export function AssetCard({ asset, onDelete, onUpdateLabel }: AssetCardProps) {
             <ImageIcon className="h-8 w-8 text-muted-foreground/40" />
           )}
         </div>
-        <button
+        <button data-testid="brand-kit-asset-card-delete"
           type="button"
           onClick={() => onDelete(asset.id)}
           className={cn(
@@ -67,7 +67,7 @@ export function AddAssetCard({
 }: AddAssetCardProps) {
   return (
     <div className="flex flex-col items-center gap-1.5">
-      <button
+      <button data-testid="brand-kit-asset-card-add"
         type="button"
         onClick={onClick}
         disabled={disabled}

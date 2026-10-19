@@ -42,7 +42,7 @@ export function PricingCard({
   function renderCta() {
     if (isCurrentPlan) {
       return (
-        <Button
+        <Button data-testid={`pricing-card-${tier.id}-cta`}
           className="w-full cursor-default"
           size="lg"
           variant="outline"
@@ -62,7 +62,7 @@ export function PricingCard({
 
     if (tier.ctaVariant === "accent") {
       return (
-        <Button
+        <Button data-testid={`pricing-card-${tier.id}-cta`}
           className="w-full cursor-pointer"
           size="lg"
           disabled={loading}
@@ -79,7 +79,7 @@ export function PricingCard({
     }
 
     return (
-      <Button
+      <Button data-testid={`pricing-card-${tier.id}-cta`}
         className="w-full cursor-pointer"
         size="lg"
         variant={tier.ctaVariant === "outline" ? "outline" : "default"}

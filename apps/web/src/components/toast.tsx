@@ -6,9 +6,10 @@ import {
   useCallback,
   useContext,
   useMemo,
+  useRef,
   useState,
 } from "react";
-import type { ReactNode } from "react";
+import type { MouseEvent, ReactNode } from "react";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -16,16 +17,37 @@ import type { ReactNode } from "react";
 
 type ToastVariant = "success" | "error" | "info";
 
+/**
+ * X-40 二期：toast 上可选的入口按钮（「修改参数」/「稍后重试」）。
+ * 文案由调用方给（`lib/error-catalog.ts` 的常量），这里只负责渲染与关闭。
+ */
+interface ToastAction {
+  label: string;
+  onAction: () => void;
+}
+
 interface Toast {
   id: string;
   message: string;
   variant: ToastVariant;
+  /**
+   * `null` = 没有入口按钮。用必填的 `null` 而不是可选字段，是因为
+   * tsconfig 开了 `exactOptionalPropertyTypes`，可选字段不能显式赋 undefined。
+   */
+  action: ToastAction | null;
+}
+
+/** 带入口按钮的 toast 的额外参数。不传就是旧行为（3 秒、无按钮）。 */
+export interface ToastActionOptions {
+  actionLabel: string;
+  onAction: () => void;
 }
 
 interface ToastContextValue {
   toast: (message: string, variant?: ToastVariant) => void;
   success: (message: string) => void;
-  error: (message: string) => void;
+  /** 旧签名 `error(msg)` 保持不变；第二个参数只有入口按钮才传。 */
+  error: (message: string, opts?: ToastActionOptions) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -39,6 +61,11 @@ const ToastContext = createContext<ToastContextValue | null>(null);
 // ---------------------------------------------------------------------------
 
 const TOAST_DURATION = 3000;
+/**
+ * 带入口按钮的 toast 给 6 秒：用户要先看清错在哪，再决定点「修改参数」
+ * 还是「稍后重试」，3 秒不够点完。
+ */
+const TOAST_DURATION_WITH_ACTION = 6000;
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -48,11 +75,21 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const add = useCallback(
-    (message: string, variant: ToastVariant = "info") => {
+    (
+      message: string,
+      variant: ToastVariant = "info",
+      opts?: ToastActionOptions,
+    ) => {
       // Use crypto.randomUUID() for collision-safe IDs across concurrent renders
       const id = crypto.randomUUID();
-      setToasts((prev) => [...prev, { id, message, variant }]);
-      setTimeout(() => remove(id), TOAST_DURATION);
+      const action: ToastAction | null = opts
+        ? { label: opts.actionLabel, onAction: opts.onAction }
+        : null;
+      setToasts((prev) => [...prev, { id, message, variant, action }]);
+      setTimeout(
+        () => remove(id),
+        action ? TOAST_DURATION_WITH_ACTION : TOAST_DURATION,
+      );
     },
     [remove],
   );
@@ -61,7 +98,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     () => ({
       toast: add,
       success: (msg) => add(msg, "success"),
-      error: (msg) => add(msg, "error"),
+      error: (msg, opts) => add(msg, "error", opts),
     }),
     [add],
   );
@@ -127,6 +164,20 @@ const variantStyles: Record<ToastVariant, { bg: string; icon: ReactNode }> = {
 
 function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }) {
   const { bg, icon } = variantStyles[toast.variant];
+  /**
+   * 入口按钮只执行一次。点完之后 toast 会被移除，但退出动画期间按钮仍在
+   * DOM 里 —— 连点两下就会把 onAction 跑两遍（重试会提交两次生成）。
+   */
+  const actionFiredRef = useRef(false);
+
+  const handleAction = (event: MouseEvent<HTMLButtonElement>) => {
+    // 不许冒泡到本体的 onClick，否则这一下会把 toast 关两次
+    event.stopPropagation();
+    if (actionFiredRef.current) return;
+    actionFiredRef.current = true;
+    toast.action?.onAction();
+    onDismiss();
+  };
 
   return (
     <motion.div
@@ -135,11 +186,23 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, y: -8, scale: 0.95 }}
       transition={{ duration: 0.25, ease: [0.25, 0.46, 0.45, 0.94] }}
+      data-testid="toast-item"
+      data-variant={toast.variant}
       onClick={onDismiss}
       className={`flex cursor-pointer items-center gap-2.5 rounded-xl px-4 py-3 text-sm font-medium shadow-lg backdrop-blur-sm ${bg}`}
     >
       {icon}
       {toast.message}
+      {toast.action === null ? null : (
+        <button
+          type="button"
+          data-testid="toast-action"
+          onClick={handleAction}
+          className="ml-1 shrink-0 cursor-pointer rounded-lg border border-background/40 px-2 py-0.5 text-xs font-semibold underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-background/60"
+        >
+          {toast.action.label}
+        </button>
+      )}
     </motion.div>
   );
 }

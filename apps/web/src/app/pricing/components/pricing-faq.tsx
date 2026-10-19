@@ -41,7 +41,7 @@ export function PricingFAQ() {
               className={isLast ? "" : "border-border border-b"}
             >
               {/* Question row */}
-              <button
+              <button data-testid="pricing-faq-question"
                 type="button"
                 onClick={() => toggle(index)}
                 className="hover:bg-muted/30 flex w-full cursor-pointer items-center justify-between px-6 py-5 text-left transition-colors"

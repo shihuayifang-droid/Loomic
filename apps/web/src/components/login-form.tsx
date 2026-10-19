@@ -205,12 +205,12 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
                   />
                 </div>
               )}
-              <Button type="submit" className="w-full" disabled={loading}>
+              <Button data-testid="account-login-submit" type="submit" className="w-full" disabled={loading}>
                 {loading
                   ? mode === "password" ? "Signing in..." : "Sending..."
                   : mode === "password" ? "Sign in" : "Send login link"}
               </Button>
-              <button
+              <button data-testid="account-login-mode-toggle"
                 type="button"
                 onClick={() => {
                   setMode(mode === "password" ? "magic" : "password");
@@ -229,7 +229,7 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
             </motion.div>
 
             <motion.div variants={fadeIn}>
-              <Button
+              <Button data-testid="account-login-google"
                 variant="outline"
                 className="w-full"
                 onClick={handleGoogle}

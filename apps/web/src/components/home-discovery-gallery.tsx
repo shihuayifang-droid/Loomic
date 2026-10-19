@@ -22,7 +22,7 @@ type DiscoveryTabProps = {
 
 function DiscoveryTab({ active, label, onClick }: DiscoveryTabProps) {
   return (
-    <button
+    <button data-testid="home-discovery-tab"
       type="button"
       onClick={onClick}
       className={cn(
@@ -126,7 +126,7 @@ export function HomeDiscoveryGallery({
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {visibleCases.map((item) => (
-          <button
+          <button data-testid={`home-discovery-case-${item.id}`}
             key={item.id}
             type="button"
             aria-label={item.title}

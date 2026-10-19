@@ -74,7 +74,7 @@ export function AgentSection({
           {modelsLoading ? (
             <p className="text-sm text-muted-foreground">Loading models...</p>
           ) : (
-            <select
+            <select data-testid="agent-default-model-select"
               id="defaultModel"
               value={selectedModel}
               onChange={(e) => setSelectedModel(e.target.value)}
@@ -100,7 +100,7 @@ export function AgentSection({
           </p>
         )}
 
-        <Button type="submit" disabled={saving || !hasChanges} size="sm">
+        <Button data-testid="agent-default-model-save" type="submit" disabled={saving || !hasChanges} size="sm">
           {saving ? "Saving..." : "Save"}
         </Button>
       </form>

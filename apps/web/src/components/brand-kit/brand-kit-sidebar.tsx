@@ -32,7 +32,7 @@ export function BrandKitSidebar({
 
       {/* Create button */}
       <div className="px-3 pb-3">
-        <button
+        <button data-testid="brand-kit-sidebar-create"
           type="button"
           onClick={onCreateKit}
           className="flex w-full items-center gap-2 rounded-xl border-2 border-dashed border-muted-foreground/30 px-3 py-2 text-sm text-muted-foreground transition-colors hover:border-muted-foreground/50 cursor-pointer min-h-[44px] sm:min-h-0"
@@ -84,7 +84,7 @@ export function BrandKitSidebar({
               </div>
 
               {/* Hover delete -- hidden on mobile to save space */}
-              <button
+              <button data-testid={`brand-kit-sidebar-item-${kit.id}-delete`}
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();

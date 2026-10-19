@@ -195,3 +195,44 @@ import { AppDropdown } from "@/components/ui/app-dropdown";
 
 本文不是建议清单。要改某条约定，先改本文件，再改代码 —— 顺序反了就会出现「代码里一套、文档里一套」。
 新组件的 testid 一律照第 1 节起名，第一批样本是 `ParamSlider` 与 `AppDropdown`（工单 30A）。
+
+---
+
+## 6. 已落地的区域前缀表（工单 30C）
+
+> 这张表是 `test/testid-lint.test.ts` 的数据源：测试会解析本节表格，任何 testid 的第一段
+> 都要能在这里找到对应的区域。新增一块界面时**先在这里加一行**，再写 testid。
+
+| 前缀 | 区域 |
+|---|---|
+| `account-` | 账号与计费（登录、注册、个人资料、套餐升级、取消订阅） |
+| `agent-` | Agent 相关的选择与偏好（模型选择、默认模型、模型偏好弹层） |
+| `app-` | 应用外壳（侧边栏、错误兜底页） |
+| `attachment-` | 附件条（附件的移除） |
+| `brand-kit-` | 品牌资料（侧边栏、编辑器、色板、字体、logo、素材卡） |
+| `canvas-` | 画布（工具菜单、底部栏、图层与文件面板、图像/视频生成面板、视频播放器、图片选择器） |
+| `chat-` | 对话（消息块、思考块、工具块、会话选择器、技能快捷、图片灯箱） |
+| `credits-` | 积分（余额、头部入口、用量历史、不足弹窗、限额提示） |
+| `home-` | 首页（提示词框、发现画廊、示例浏览器、项目卡片） |
+| `landing-` | 落地页（浮动导航、价格预览） |
+| `pricing-` | 价格页（套餐卡片、对比表、常见问题、月付与年付切换） |
+| `project-` | 单个项目的详情控件（项目名编辑） |
+| `projects-` | 项目列表与项目弹窗（新建、删除、重试） |
+| `settings-` | 设置页（分区导航、返回、各分区表单） |
+| `skills-` | 技能（列表页、技能卡、创建/导入/市场/详情弹窗） |
+| `toast-` | 全局 toast（toast 本体与入口按钮） |
+| `ui-` | 设计系统原语（`components/ui/` 里的对话框关闭按钮等） |
+
+**带值的 testid 怎么取值**（测试只校验形态，取值是评审要看的部分）：
+
+1. 优先用业务键，例如 `skills-card-{slug}`、`pricing-card-{tier.id}-cta`、`skills-tab-{tab}`。
+2. 业务键里出现 testid 不允许的字符（`:`、`/`、空格）时，在表达式里用 `-` 替换：
+   `` data-testid={`canvas-image-generator-ratio-item-${r.replace(/:/g, "-")}`} ``。
+3. 业务键是运行时随机 id（Excalidraw 元素 id、上传资产 id），或者只有中文显示名可用时，
+   **整列共用一个不带值的 testid**（例如 `canvas-layers-panel-item`），E2E 用
+   `getAllByTestId` 按文档顺序取 —— 这比把随机 id 拼进 testid 更稳定，也不违反「不用下标」。
+
+**调用方前缀（装饰值）**：接收 `testid` prop 的原语（`ui/app-dropdown.tsx`、`ui/param-slider.tsx`）
+自己写的是 `${testid}-menu` 这类「后缀装饰」，静态看第一段是 `${...}`。测试把 `${...}` 换成 `x`
+之后，以 `x-` 开头的值视为「前缀由调用方给」，只校验后缀形态，不查本节表格；
+真正的调用点传的是字面量（例如 `canvas-zoom-dropdown`），仍然受本节约束。

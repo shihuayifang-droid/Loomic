@@ -88,7 +88,26 @@ export function VideoGeneratorPanel({
   const lastFrameInputRef = useRef<HTMLInputElement>(null);
   const accessTokenRef = useRef(accessToken);
   accessTokenRef.current = accessToken;
-  const { handleGenerationError } = useGenerationErrorHandler();
+  /**
+   * X-40 二期：toast 上的两个入口。
+   * - `editParams`：把焦点送回本面板的 prompt 输入框 —— `user_fixable` 的码
+   *   要改的东西都在这一行文本里（时长/分辨率/比例是按钮，不从文本改）。
+   * - `retry`：走面板现有的提交函数（`handleGenerate`），不另写提交路径。
+   *   它定义在下面，所以通过 ref 取「最新的那个」，避免闭包里拿到旧 prompt。
+   */
+  const retryRef = useRef<(() => void) | null>(null);
+  const errorActions = useMemo(
+    () => ({
+      editParams: () => {
+        textareaRef.current?.focus();
+      },
+      retry: () => {
+        retryRef.current?.();
+      },
+    }),
+    [],
+  );
+  const { handleGenerationError } = useGenerationErrorHandler(errorActions);
   // AbortController for in-flight generation requests so we can cancel on unmount
   const abortRef = useRef<AbortController | null>(null);
 
@@ -404,6 +423,11 @@ export function VideoGeneratorPanel({
     handleGenerationError,
   ]);
 
+  // X-40 二期: 「稍后重试」重新提交一次，走的还是上面那一条提交路径。
+  retryRef.current = () => {
+    void handleGenerate();
+  };
+
   const resolutionLabel = currentPriceRate?.displayResolution ?? resolution;
   const paramsLabel = `${aspectRatio} \u00B7 ${duration}s \u00B7 ${resolutionLabel}`;
 
@@ -423,7 +447,7 @@ export function VideoGeneratorPanel({
           : "";
 
   return createPortal(
-    <div
+    <div data-testid="canvas-video-generator-panel"
       ref={panelRef}
       style={{ left: screenX, top: screenY }}
       className="fixed z-[100] w-[520px] rounded-[24px] border border-border bg-card/95 shadow-card backdrop-blur-lg"
@@ -433,14 +457,14 @@ export function VideoGeneratorPanel({
       {/* Frame upload area */}
       <div className="flex gap-2 p-2 pb-0">
         {/* First frame */}
-        <input
+        <input data-testid="canvas-video-generator-first-frame-input"
           ref={firstFrameInputRef}
           type="file"
           accept="image/png,image/jpeg,image/webp"
           className="hidden"
           onChange={handleFrameUpload("first", setFirstFrame)}
         />
-        <button
+        <button data-testid="canvas-video-generator-first-frame"
           type="button"
           onClick={() => firstFrameInputRef.current?.click()}
           className="flex h-[68px] w-[56px] flex-col items-center justify-center gap-1 rounded-2xl bg-muted/60 transition-colors hover:bg-muted"
@@ -460,14 +484,14 @@ export function VideoGeneratorPanel({
         </button>
 
         {/* Last frame */}
-        <input
+        <input data-testid="canvas-video-generator-last-frame-input"
           ref={lastFrameInputRef}
           type="file"
           accept="image/png,image/jpeg,image/webp"
           className="hidden"
           onChange={handleFrameUpload("last", setLastFrame)}
         />
-        <button
+        <button data-testid="canvas-video-generator-last-frame"
           type="button"
           onClick={() => lastFrameInputRef.current?.click()}
           className="flex h-[68px] w-[56px] flex-col items-center justify-center gap-1 rounded-2xl bg-muted/60 transition-colors hover:bg-muted"
@@ -489,7 +513,8 @@ export function VideoGeneratorPanel({
 
       {/* Prompt textarea */}
       <div className="px-4 py-3">
-        <textarea
+        <textarea data-testid="canvas-generator-prompt"
+        data-mode="video"
           ref={textareaRef}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
@@ -536,7 +561,7 @@ export function VideoGeneratorPanel({
       <div className="flex items-center justify-between px-2 pb-2">
         {/* Left: params button */}
         <div className="relative">
-          <button
+          <button data-testid="canvas-video-generator-params-trigger"
             type="button"
             onClick={() => setShowParamsPopover((v) => !v)}
             className="flex h-8 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
@@ -551,7 +576,7 @@ export function VideoGeneratorPanel({
             </svg>
           </button>
           {showParamsPopover && (
-            <div className="absolute bottom-full left-0 z-50 mb-1 w-[220px] rounded-xl border-[0.5px] border-border bg-card p-3 shadow-card">
+            <div data-testid="canvas-video-generator-params-menu" className="absolute bottom-full left-0 z-50 mb-1 w-[220px] rounded-xl border-[0.5px] border-border bg-card p-3 shadow-card">
               {/* Aspect ratio row */}
               <div className="mb-3">
                 <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -559,7 +584,7 @@ export function VideoGeneratorPanel({
                 </div>
                 <div className="flex gap-1">
                   {ASPECT_RATIOS.map((r) => (
-                    <button
+                    <button data-testid={`canvas-video-generator-params-ratio-${r.replace(/:/g, "-")}`}
                       key={r}
                       type="button"
                       onClick={() => handleAspectRatioChange(r)}
@@ -581,7 +606,7 @@ export function VideoGeneratorPanel({
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {durationOptions.map((d) => (
-                    <button
+                    <button data-testid={`canvas-video-generator-params-duration-${d}`}
                       key={d}
                       type="button"
                       onClick={() => handleDurationChange(d)}
@@ -607,7 +632,7 @@ export function VideoGeneratorPanel({
                       (rate) => rate.resolution === value,
                     )?.displayResolution;
                     return (
-                      <button
+                      <button data-testid={`canvas-video-generator-params-resolution-${value}`}
                         key={value}
                         type="button"
                         onClick={() => handleResolutionChange(value)}
@@ -631,7 +656,7 @@ export function VideoGeneratorPanel({
         <div className="flex items-center gap-1">
           {/* Model selector */}
           <div className="relative">
-            <button
+            <button data-testid="canvas-video-generator-model-trigger"
               type="button"
               onClick={() => setShowModelDropdown((v) => !v)}
               className="flex h-8 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
@@ -655,9 +680,9 @@ export function VideoGeneratorPanel({
               </svg>
             </button>
             {showModelDropdown && (
-              <div className="absolute bottom-full right-0 z-50 mb-1 max-h-[280px] w-[260px] overflow-y-auto rounded-xl border-[0.5px] border-border bg-card py-1 shadow-card">
+              <div data-testid="canvas-video-generator-model-menu" className="absolute bottom-full right-0 z-50 mb-1 max-h-[280px] w-[260px] overflow-y-auto rounded-xl border-[0.5px] border-border bg-card py-1 shadow-card">
                 {models.map((m) => (
-                  <button
+                  <button data-testid={`canvas-video-generator-model-item-${m.id.replace(/\//g, "-")}`}
                     key={m.id}
                     type="button"
                     onClick={() => handleModelChange(m.id)}
@@ -702,7 +727,7 @@ export function VideoGeneratorPanel({
           </div>
 
           {/* Generate button */}
-          <button
+          <button data-testid="canvas-video-generator-submit"
             type="button"
             onClick={() => void handleGenerate()}
             disabled={!prompt.trim() || loading}

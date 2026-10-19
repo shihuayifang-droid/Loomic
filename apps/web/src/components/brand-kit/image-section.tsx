@@ -49,7 +49,7 @@ export function ImageSection({
           />
         ))}
         <AddAssetCard label="Upload" onClick={handleClick} />
-        <input
+        <input data-testid="brand-kit-image-input"
           ref={inputRef}
           type="file"
           accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"

@@ -121,7 +121,7 @@ export function CreditUsageHistory() {
       {/* Filter tabs */}
       <div className="inline-flex gap-1 rounded-lg bg-muted p-1">
         {FILTER_OPTIONS.map((opt) => (
-          <button
+          <button data-testid={`credits-history-filter-${opt.value}`}
             key={opt.value}
             type="button"
             onClick={() => setFilter(opt.value)}
@@ -197,7 +197,7 @@ export function CreditUsageHistory() {
       {/* Load more */}
       {hasMore && filtered.length > 0 && (
         <div className="flex justify-center pt-2">
-          <button
+          <button data-testid="credits-history-load-more"
             type="button"
             onClick={handleLoadMore}
             disabled={loadingMore}

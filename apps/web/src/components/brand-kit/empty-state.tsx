@@ -18,7 +18,7 @@ export function EmptyState({ onCreateKit }: EmptyStateProps) {
           Create a brand kit to keep your colors, fonts, and logos organized.
         </p>
       </div>
-      <button
+      <button data-testid="brand-kit-empty-create"
         type="button"
         onClick={onCreateKit}
         className="inline-flex min-h-[44px] cursor-pointer items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 sm:min-h-0"

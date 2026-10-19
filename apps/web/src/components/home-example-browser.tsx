@@ -31,7 +31,7 @@ function ExampleChip({
   onClick,
 }: ExampleChipProps) {
   return (
-    <button
+    <button data-testid="home-example-chip"
       type="button"
       aria-pressed={active}
       disabled={disabled}
@@ -70,7 +70,7 @@ function ExamplePreviewCard({
   onClick: () => void;
 }) {
   return (
-    <button
+    <button data-testid="home-example-card"
       type="button"
       onClick={onClick}
       aria-label={title}

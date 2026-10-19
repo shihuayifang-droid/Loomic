@@ -64,7 +64,7 @@ export function GuidanceSection({ value, onSave }: GuidanceSectionProps) {
   return (
     <section>
       <SectionHeader title="Brand Guidance" />
-      <textarea
+      <textarea data-testid="brand-kit-guidance-input"
         ref={textareaRef}
         value={draft}
         onChange={handleChange}

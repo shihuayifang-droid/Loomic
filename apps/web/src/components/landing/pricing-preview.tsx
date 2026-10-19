@@ -145,7 +145,7 @@ function PricingCard({ plan }: { plan: PricingPlan }) {
       {/* CTA */}
       <div className="mt-8">
         {plan.highlighted ? (
-          <button
+          <button data-testid="landing-pricing-plan-cta"
             className={cn(
               "w-full rounded-lg py-2.5 text-sm font-medium transition-all duration-200",
               "hover:scale-[1.02] active:scale-[0.98]",
@@ -158,7 +158,7 @@ function PricingCard({ plan }: { plan: PricingPlan }) {
             {plan.cta}
           </button>
         ) : (
-          <Button variant="outline" className="w-full">
+          <Button data-testid="landing-pricing-plan-cta" variant="outline" className="w-full">
             {plan.cta}
           </Button>
         )}

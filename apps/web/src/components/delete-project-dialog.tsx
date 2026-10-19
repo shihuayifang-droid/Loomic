@@ -29,7 +29,7 @@ export function DeleteProjectDialog({
           确定删除此项目？此操作无法撤销。
         </p>
         <div className="mt-4 flex items-center justify-end gap-3">
-          <Button
+          <Button data-testid="projects-delete-dialog-cancel"
             variant="ghost"
             onClick={onCancel}
             disabled={deleting}
@@ -37,7 +37,7 @@ export function DeleteProjectDialog({
           >
             取消
           </Button>
-          <Button
+          <Button data-testid="projects-delete-dialog-confirm"
             onClick={onConfirm}
             disabled={deleting}
             className="rounded-xl bg-destructive text-destructive-foreground hover:bg-destructive/90"

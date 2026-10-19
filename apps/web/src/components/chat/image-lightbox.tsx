@@ -18,7 +18,7 @@ function LightboxBtn({
   children: React.ReactNode;
 }) {
   return (
-    <button
+    <button data-testid="chat-image-lightbox-open"
       type="button"
       title={title}
       onClick={onClick}
@@ -165,7 +165,7 @@ export function ImageLightbox({
   }, []);
 
   return createPortal(
-    <motion.div
+    <motion.div data-testid="chat-image-lightbox"
       ref={overlayRef}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
@@ -201,7 +201,7 @@ export function ImageLightbox({
       </div>
 
       {/* Close button */}
-      <button
+      <button data-testid="chat-image-lightbox-close"
         type="button"
         title="\u5173\u95ed (Esc)"
         onClick={onClose}

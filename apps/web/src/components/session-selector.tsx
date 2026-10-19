@@ -110,7 +110,7 @@ export function SessionSelector({
     <div className="flex items-center gap-1.5">
       {/* History toggle */}
       <div className="relative" ref={panelRef}>
-        <button
+        <button data-testid="chat-session-selector-trigger"
           type="button"
           onClick={() => {
             setOpen(!open);
@@ -140,7 +140,7 @@ export function SessionSelector({
               {/* Search */}
               <div className="relative">
                 <SearchIcon className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/70" />
-                <input
+                <input data-testid="chat-session-search-input"
                   type="text"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
@@ -182,7 +182,7 @@ export function SessionSelector({
                     <>
                       <span className="truncate flex-1">{s.title}</span>
                       <div className="flex items-center gap-1 shrink-0">
-                        <button
+                        <button data-testid="chat-session-delete-cancel"
                           type="button"
                           className="px-2 py-0.5 rounded text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
                           onClick={(e) => {
@@ -192,7 +192,7 @@ export function SessionSelector({
                         >
                           取消
                         </button>
-                        <button
+                        <button data-testid="chat-session-delete-confirm"
                           type="button"
                           className="px-2 py-0.5 rounded text-xs text-destructive-foreground bg-destructive hover:bg-destructive/90 transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
                           onClick={(e) => {
@@ -208,7 +208,7 @@ export function SessionSelector({
                     /* Normal state */
                     <>
                       <span className="truncate flex-1">{s.title}</span>
-                      <button
+                      <button data-testid="chat-session-item-delete"
                         type="button"
                         aria-label={`Delete ${s.title}`}
                         className="hidden group-hover:flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-destructive transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
@@ -229,7 +229,7 @@ export function SessionSelector({
       </div>
 
       {/* New chat button */}
-      <button
+      <button data-testid="chat-session-new"
         type="button"
         onClick={onNewChat}
         className="inline-flex items-center justify-center rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"

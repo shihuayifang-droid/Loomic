@@ -233,7 +233,7 @@ export function AppSidebar() {
         />
 
         {/* Sign out */}
-        <button
+        <button data-testid="app-sidebar-sign-out"
           type="button"
           onClick={handleSignOut}
           title="Sign out"

@@ -237,7 +237,7 @@ function MarketplaceDetailDialog({
         )}
 
         <DialogFooter>
-          <Button
+          <Button data-testid="skills-marketplace-install"
             size="sm"
             disabled={installing}
             onClick={handleInstall}
@@ -399,7 +399,7 @@ export function MarketplacePanel({
       {/* Search input */}
       <div className="relative mb-4 sm:mb-6 sm:max-w-md">
         <Search className="absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-        <input
+        <input data-testid="skills-marketplace-search-input"
           type="text"
           placeholder="搜索 skills.sh 市场..."
           value={query}

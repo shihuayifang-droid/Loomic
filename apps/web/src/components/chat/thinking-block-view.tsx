@@ -31,7 +31,7 @@ export const ThinkingBlockView = React.memo(function ThinkingBlockView({
       transition={{ duration: 0.3, ease: "easeOut" }}
       className="mb-2 overflow-hidden"
     >
-      <button
+      <button data-testid="chat-thinking-block-toggle"
         type="button"
         onClick={() => setExpanded((v) => !v)}
         className="flex items-center gap-2 text-xs text-muted-foreground/70 hover:text-muted-foreground transition-colors"

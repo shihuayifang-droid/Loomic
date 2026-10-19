@@ -349,7 +349,7 @@ export default function SkillsPage() {
       {/* Tab navigation -- scrollable on narrow screens */}
       <div className="mb-4 flex items-center gap-1 overflow-x-auto border-b border-border sm:mb-6">
         {TABS.map((tab) => (
-          <button
+          <button data-testid={`skills-tab-${tab}`}
             key={tab}
             type="button"
             onClick={() => setActiveTab(tab)}
@@ -374,7 +374,7 @@ export default function SkillsPage() {
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
-                  <Button
+                  <Button data-testid="skills-filter-toggle"
                     variant="outline"
                     size="sm"
                     className="min-h-[44px] sm:min-h-0"
@@ -405,7 +405,7 @@ export default function SkillsPage() {
             {/* Search -- full width on mobile, constrained on desktop */}
             <div className="relative order-last w-full sm:order-none sm:max-w-sm sm:flex-1">
               <Search className="absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-              <input
+              <input data-testid="skills-search-input"
                 type="text"
                 placeholder="搜索技能..."
                 value={searchQuery}
@@ -416,7 +416,7 @@ export default function SkillsPage() {
             </div>
 
             {/* Official filter toggle */}
-            <Button
+            <Button data-testid="skills-official-only-toggle"
               variant={officialOnly ? "default" : "outline"}
               size="sm"
               className="min-h-[44px] sm:min-h-0"
@@ -463,7 +463,7 @@ export default function SkillsPage() {
               </p>
             </div>
 
-            <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <Button data-testid="skills-create-button" size="sm" onClick={() => setCreateOpen(true)}>
               <Plus className="size-3.5" />
               添加
             </Button>

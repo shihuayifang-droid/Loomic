@@ -301,7 +301,7 @@ export const ToolBlockView = React.memo(function ToolBlockView({
           </div>
 
           {hasDetails && (
-            <button
+            <button data-testid="chat-tool-block-open-panel"
               type="button"
               onClick={handleOpenPanel}
               className="mt-2 flex items-center gap-0.5 text-[12px] text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
@@ -475,7 +475,7 @@ const ImageArtifactCard = React.memo(function ImageArtifactCard({
         />
         {/* Gradient overlay with download button */}
         <div className="absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/40 to-transparent opacity-0 group-hover:opacity-100 transition-opacity">
-          <button
+          <button data-testid="chat-tool-block-download"
             type="button"
             onClick={handleDownload}
             className="absolute bottom-2 right-2 flex h-7 w-7 items-center justify-center rounded-lg bg-white/20 backdrop-blur-sm text-white hover:bg-white/30 transition-colors"
@@ -572,7 +572,7 @@ function ToolDetailPanel({
               {config.label}
             </h3>
           </div>
-          <button
+          <button data-testid="chat-tool-block-panel-close"
             type="button"
             onClick={onClose}
             className="rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors cursor-pointer"
@@ -594,7 +594,7 @@ function ToolDetailPanel({
           {/* Input -- collapsible */}
           {hasInput && (
             <div>
-              <button
+              <button data-testid="chat-tool-block-input-toggle"
                 type="button"
                 onClick={() => setInputExpanded((v) => !v)}
                 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"

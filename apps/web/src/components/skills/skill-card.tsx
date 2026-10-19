@@ -67,7 +67,7 @@ function ToggleSwitch({
   onChange: (next: boolean) => void;
 }) {
   return (
-    <button
+    <button data-testid="skills-card-switch"
       type="button"
       role="switch"
       aria-checked={checked}
@@ -188,7 +188,7 @@ export function SkillCard({
           <DropdownMenu>
             <DropdownMenuTrigger
               render={
-                <button
+                <button data-testid="skills-card-menu-trigger"
                   type="button"
                   className="rounded-md p-0.5 text-muted-foreground opacity-0 transition-opacity hover:bg-muted group-hover:opacity-100"
                   onClick={(e) => e.stopPropagation()}

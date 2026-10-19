@@ -88,7 +88,7 @@ export function PricingComparison() {
       {/* Toggle button */}
       {featureCategories.length > INITIAL_CATEGORIES && (
         <div className="mt-6 text-center">
-          <Button
+          <Button data-testid="pricing-comparison-toggle"
             variant="outline"
             className="cursor-pointer"
             onClick={() => setExpanded((prev) => !prev)}

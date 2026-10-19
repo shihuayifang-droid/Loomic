@@ -97,7 +97,7 @@ export function FontPickerDialog({
       >
         {/* Search */}
         <div className="p-3 border-b">
-          <input
+          <input data-testid="brand-kit-font-search-input"
             type="text"
             placeholder="搜索字体..."
             value={search}
@@ -108,7 +108,7 @@ export function FontPickerDialog({
 
         {/* Category filter */}
         <div className="px-3 py-2 border-b">
-          <select
+          <select data-testid="brand-kit-font-category-select"
             value={category}
             onChange={(e) => setCategory(e.target.value)}
             className="text-sm bg-transparent outline-none cursor-pointer"
@@ -126,7 +126,7 @@ export function FontPickerDialog({
           className="flex-1 overflow-y-auto min-h-0"
         >
           {visibleFonts.map((font) => (
-              <button
+              <button data-testid={`brand-kit-font-item-${font.family.replace(/ /g, "-")}`}
                 key={font.family}
                 type="button"
                 onClick={() => setSelected(font)}
@@ -147,14 +147,14 @@ export function FontPickerDialog({
 
         {/* Footer */}
         <div className="flex justify-end gap-2 p-3 border-t">
-          <button
+          <button data-testid="brand-kit-font-cancel"
             type="button"
             onClick={onClose}
             className="px-4 py-1.5 text-sm border rounded-lg hover:bg-muted cursor-pointer"
           >
             取消
           </button>
-          <button
+          <button data-testid="brand-kit-font-add"
             type="button"
             onClick={handleAdd}
             disabled={!selected}

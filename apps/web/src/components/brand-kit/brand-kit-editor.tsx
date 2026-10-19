@@ -148,7 +148,7 @@ export function BrandKitEditor({
           <span className="text-sm text-muted-foreground whitespace-nowrap">
             应用到新项目
           </span>
-          <button
+          <button data-testid="brand-kit-default-toggle"
             type="button"
             role="switch"
             aria-checked={kit.is_default}
@@ -181,7 +181,7 @@ export function BrandKitEditor({
       <div className="flex-1 overflow-y-auto px-4 py-4 sm:px-6 sm:py-6 md:px-[80px] xl:px-[160px]">
         <div className="flex flex-col gap-8 max-w-[960px] mx-auto">
           {/* Extract from URL — disabled Phase 1 */}
-          <button
+          <button data-testid="brand-kit-extract-url"
             type="button"
             disabled
             className="inline-flex items-center gap-2 self-start rounded-xl border border-dashed px-4 py-2.5 text-sm text-muted-foreground opacity-50 cursor-not-allowed"
@@ -254,7 +254,7 @@ function MoreMenu({
 
   return (
     <div ref={menuRef} className="relative">
-      <button
+      <button data-testid="brand-kit-menu-trigger"
         type="button"
         onClick={() => setOpen((prev) => !prev)}
         className="rounded-lg p-2 text-muted-foreground hover:bg-muted transition-colors cursor-pointer"
@@ -265,7 +265,7 @@ function MoreMenu({
 
       {open && (
         <div className="absolute right-0 top-full mt-1 z-50 w-[140px] rounded-xl border bg-popover p-1.5 shadow-lg">
-          <button
+          <button data-testid="brand-kit-menu-duplicate"
             type="button"
             onClick={() => {
               onDuplicate();
@@ -276,7 +276,7 @@ function MoreMenu({
             <Copy className="h-4 w-4 text-muted-foreground" />
             复制
           </button>
-          <button
+          <button data-testid="brand-kit-menu-delete"
             type="button"
             onClick={() => {
               onDelete();

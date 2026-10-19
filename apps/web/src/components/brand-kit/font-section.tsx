@@ -94,7 +94,7 @@ export function FontSection({
                   Ag
                 </span>
               </div>
-              <button
+              <button data-testid="brand-kit-font-remove"
                 type="button"
                 onClick={() => onDeleteFont(font.id)}
                 className={cn(
@@ -119,7 +119,7 @@ export function FontSection({
         {/* Add button with dropdown menu */}
         <div className="flex flex-col items-center gap-1.5">
           <div ref={menuRef} className="relative">
-            <button
+            <button data-testid="brand-kit-font-add"
               type="button"
               onClick={() => setMenuOpen((prev) => !prev)}
               className="w-[150px] h-[113px] rounded-xl border-2 border-dashed border-muted-foreground/30 flex items-center justify-center hover:border-muted-foreground/50 transition-colors cursor-pointer"
@@ -130,7 +130,7 @@ export function FontSection({
 
             {menuOpen && (
               <div className="absolute left-0 top-full mt-1 z-50 w-[180px] rounded-xl border bg-popover p-1.5 shadow-lg">
-                <button
+                <button data-testid="brand-kit-font-pick"
                   type="button"
                   onClick={() => {
                     setMenuOpen(false);
@@ -140,7 +140,7 @@ export function FontSection({
                 >
                   从字体库选择
                 </button>
-                <button
+                <button data-testid="brand-kit-font-manual"
                   type="button"
                   onClick={handleManualInput}
                   className="flex w-full items-center rounded-lg px-3 py-2 text-sm text-foreground hover:bg-muted transition-colors cursor-pointer"

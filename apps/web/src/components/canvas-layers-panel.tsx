@@ -129,7 +129,7 @@ const LayerRow = memo(function LayerRow({
 
   return (
     <div style={{ contentVisibility: "auto", containIntrinsicSize: "auto 44px" }}>
-      <button
+      <button data-testid="canvas-layers-panel-item"
         type="button"
         className={`group/layer flex h-11 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 ${
           selected
@@ -143,7 +143,7 @@ const LayerRow = memo(function LayerRow({
           {elLabel(el)}
         </span>
         <div className="flex items-center gap-0.5">
-          <button
+          <button data-testid="canvas-layers-panel-item-lock"
             type="button"
             className="invisible flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:text-foreground group-hover/layer:visible cursor-pointer outline-none focus-visible:visible focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
             aria-label="Lock layer"
@@ -151,7 +151,7 @@ const LayerRow = memo(function LayerRow({
           >
             <LockIcon className="h-4 w-4" />
           </button>
-          <button
+          <button data-testid="canvas-layers-panel-item-visible"
             type="button"
             className="invisible flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:text-foreground group-hover/layer:visible cursor-pointer outline-none focus-visible:visible focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
             aria-label="Toggle layer visibility"
@@ -240,7 +240,7 @@ export function CanvasLayersPanel({
       {/* Title bar */}
       <div className="flex h-11 shrink-0 items-center justify-between px-3">
         <span className="text-sm font-medium text-foreground">图层</span>
-        <button
+        <button data-testid="canvas-layers-panel-close"
           type="button"
           className="flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
           onClick={onClose}

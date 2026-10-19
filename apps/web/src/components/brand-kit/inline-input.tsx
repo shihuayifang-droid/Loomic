@@ -51,7 +51,7 @@ export function InlineInput({
 
   return (
     <div className={cn("group", className)}>
-      <input
+      <input data-testid="brand-kit-inline-input"
         ref={inputRef}
         type="text"
         value={editing ? draft : value}

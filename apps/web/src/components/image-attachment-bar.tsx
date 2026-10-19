@@ -56,7 +56,7 @@ export function ImageAttachmentBar({ attachments, onRemove, onRetry }: ImageAtta
           )}
 
           {/* Remove button */}
-          <button
+          <button data-testid="attachment-remove"
             type="button"
             onClick={() => onRemove(att.id)}
             className="absolute -right-1 -top-1 hidden h-4 w-4 items-center justify-center rounded-full bg-primary text-primary-foreground group-hover:flex"

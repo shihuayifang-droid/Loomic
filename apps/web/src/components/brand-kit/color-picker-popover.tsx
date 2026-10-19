@@ -98,7 +98,7 @@ export function ColorPickerPopover({
       )}
     >
       {/* Name input */}
-      <input
+      <input data-testid="brand-kit-color-name-input"
         type="text"
         value={name}
         onChange={(e) => setName(e.target.value)}
@@ -119,7 +119,7 @@ export function ColorPickerPopover({
         />
         <div className="flex items-center gap-0.5 rounded-lg border px-2 py-1 text-sm flex-1">
           <span className="text-muted-foreground">#</span>
-          <input
+          <input data-testid="brand-kit-color-hex-input"
             type="text"
             value={hexInput}
             onChange={handleHexInputChange}
@@ -131,14 +131,14 @@ export function ColorPickerPopover({
 
       {/* Actions */}
       <div className="flex justify-end gap-2 pt-1">
-        <button
+        <button data-testid="brand-kit-color-cancel"
           type="button"
           onClick={onClose}
           className="rounded-lg px-3 py-1.5 text-sm text-muted-foreground hover:bg-muted transition-colors cursor-pointer"
         >
           Cancel
         </button>
-        <button
+        <button data-testid="brand-kit-color-save"
           type="button"
           onClick={handleSave}
           className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors cursor-pointer"

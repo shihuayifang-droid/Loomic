@@ -86,7 +86,7 @@ export function CreditInsufficientDialog({
             transition={{ duration: 0.2, ease: "easeOut" }}
           >
             {/* Close button */}
-            <button
+            <button data-testid="credits-insufficient-close"
               type="button"
               onClick={onClose}
               className="absolute right-3 top-3 flex h-7 w-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
@@ -140,7 +140,7 @@ export function CreditInsufficientDialog({
             {/* CTAs */}
             <div className="flex flex-col gap-2">
               {canClaim && (
-                <button
+                <button data-testid="credits-insufficient-claim"
                   type="button"
                   onClick={async () => {
                     await onClaimDaily();
@@ -152,7 +152,7 @@ export function CreditInsufficientDialog({
                   Claim Daily Credits
                 </button>
               )}
-              <button
+              <button data-testid="credits-insufficient-upgrade"
                 type="button"
                 onClick={handleUpgrade}
                 disabled={upgrading}
@@ -165,7 +165,7 @@ export function CreditInsufficientDialog({
                 )}
                 Upgrade Plan
               </button>
-              <button
+              <button data-testid="credits-insufficient-cancel"
                 type="button"
                 onClick={onClose}
                 className="w-full rounded-lg px-4 py-2 text-sm text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground"

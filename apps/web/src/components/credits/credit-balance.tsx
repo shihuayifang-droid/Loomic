@@ -122,7 +122,7 @@ export function CreditBalance() {
 
   return (
     <>
-      <button
+      <button data-testid="credits-balance-trigger"
         ref={btnRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -193,7 +193,7 @@ export function CreditBalance() {
 
               {/* Claim daily button (free plan, unclaimed) */}
               {canClaim && (
-                <button
+                <button data-testid="credits-balance-claim"
                   type="button"
                   onClick={handleClaim}
                   disabled={claiming}

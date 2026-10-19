@@ -204,7 +204,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
               </div>
 
               {onClearSelectedSeed ? (
-                <button
+                <button data-testid="home-prompt-seed-clear"
                   type="button"
                   onClick={onClearSelectedSeed}
                   className="shrink-0 rounded-full border border-border bg-background px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
@@ -232,7 +232,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
             </div>
           </div>
         ) : null}
-        <textarea
+        <textarea data-testid="home-prompt-input"
           ref={textareaRef}
           value={value}
           onChange={(e) => setValue(e.target.value)}
@@ -249,7 +249,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
           <div className="flex items-center gap-0.5">
             {onAddFiles ? (
               <>
-                <input
+                <input data-testid="home-prompt-file-input"
                   ref={fileInputRef}
                   type="file"
                   accept="image/png,image/jpeg,image/webp,image/gif"
@@ -263,7 +263,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
                     e.target.value = "";
                   }}
                 />
-                <button
+                <button data-testid="home-prompt-attach"
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   title="Attach"
@@ -281,7 +281,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
                 </button>
               </>
             ) : (
-              <button
+              <button data-testid="home-prompt-attach"
                 type="button"
                 disabled
                 title="Attach"
@@ -307,7 +307,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
                 if (btn.name === "Agent") {
                   return (
                     <div key={btn.name} className="relative">
-                      <button
+                      <button data-testid="home-prompt-agent-model-trigger"
                         ref={agentBtnRef}
                         type="button"
                         onClick={() => setModelPopoverOpen((prev) => !prev)}
@@ -337,7 +337,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
                   );
                 }
                 return (
-                  <button
+                  <button data-testid={`home-prompt-toolbar-${btn.name.toLowerCase()}`}
                     key={btn.name}
                     type="button"
                     disabled
@@ -357,7 +357,7 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
                 );
               })}
             </div>
-            <button
+            <button data-testid="home-prompt-submit"
               type="button"
               onClick={handleSubmit}
               disabled={disabled || isUploading || !hasContent}

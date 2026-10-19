@@ -63,7 +63,7 @@ export function EditableProjectName({
 
   if (editing) {
     return (
-      <input
+      <input data-testid="project-name-input"
         ref={inputRef}
         value={name}
         onChange={(e) => setName(e.target.value)}
@@ -76,7 +76,7 @@ export function EditableProjectName({
   }
 
   return (
-    <button
+    <button data-testid="project-name-edit"
       type="button"
       onClick={startEditing}
       className="h-8 rounded-lg bg-transparent hover:bg-card/60 backdrop-blur-sm px-2.5 text-sm font-medium text-foreground transition-colors truncate max-w-[200px] cursor-text"

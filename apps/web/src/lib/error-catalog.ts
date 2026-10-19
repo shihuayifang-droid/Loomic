@@ -24,9 +24,11 @@
  * 「请重试」, and the wording lives here only — never inline at a call site, or
  * the next tweak will land in one of five places.
  *
- * NOT IN THIS FILE YET: refund copy (「已退回 N 积分」) needs GN-35/BL-41; the
- * 「修改参数 / 稍后重试」action buttons need a toast that can render an action,
- * which `components/toast.tsx` cannot do today (see the handler's note).
+ * ACTION LABELS (工单 30C): the two entry-point captions live in
+ * `ERROR_ACTION_LABELS` below and nowhere else — a call site that writes
+ * 「修改参数」 inline is how the catalogue and the buttons drift apart.
+ *
+ * STILL NOT IN THIS FILE: refund copy (「已退回 N 积分」) needs GN-35/BL-41.
  */
 import type { ApplicationErrorCode } from "@loomic/shared";
 
@@ -40,6 +42,26 @@ export type ErrorEntry = {
   message: string;
   action: "edit_params" | "retry_later" | "quota" | null;
 };
+
+/**
+ * X-40 二期的入口按钮文案（工单 30C T2）。**只许从这里取**：调用处另写一份，
+ * 下次改文案就会漏改按钮。`quota` / `policy` 没有可点的入口 —— 额度入口归
+ * BL-45，账号级限制既不可重试也不可改参数，所以只有这两个键。
+ */
+export const ERROR_ACTION_LABELS = {
+  edit_params: "修改参数",
+  retry_later: "稍后重试",
+} as const;
+
+/**
+ * 条目的 `action` → 按钮文案；没有对应入口时返回 `null`（只显示文案）。
+ * 有文案也不代表一定有按钮：调用方没给回调时同样不显示（见 handler）。
+ */
+export function actionLabelOf(entry: ErrorEntry): string | null {
+  if (entry.action === "edit_params") return ERROR_ACTION_LABELS.edit_params;
+  if (entry.action === "retry_later") return ERROR_ACTION_LABELS.retry_later;
+  return null;
+}
 
 // --- Entry builders (keeps the table one line per code) ---------------------
 

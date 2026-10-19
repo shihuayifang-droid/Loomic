@@ -66,7 +66,7 @@ export class MessageErrorBoundary extends React.Component<
           />
         </svg>
         <span>消息渲染异常</span>
-        <button
+        <button data-testid="chat-message-error-retry"
           type="button"
           onClick={this.reset}
           className="ml-auto text-xs text-foreground/60 hover:text-foreground underline transition-colors"

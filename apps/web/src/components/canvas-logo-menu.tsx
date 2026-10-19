@@ -267,7 +267,7 @@ export function CanvasLogoMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      <input
+      <input data-testid="canvas-logo-file-input"
         ref={fileInputRef}
         type="file"
         accept="image/*"

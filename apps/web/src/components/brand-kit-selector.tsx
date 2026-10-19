@@ -86,7 +86,7 @@ export function BrandKitSelector({
 
   return (
     <div ref={containerRef} className="relative">
-      <button
+      <button data-testid="brand-kit-selector-trigger"
         type="button"
         disabled={updating}
         onClick={() => setOpen((v) => !v)}
@@ -99,7 +99,7 @@ export function BrandKitSelector({
       {open && (
         <div className="absolute left-0 top-full z-50 mt-1.5 min-w-[180px] rounded-xl border bg-popover shadow-lg p-1.5">
           {/* Unbind option */}
-          <button
+          <button data-testid="brand-kit-selector-item-none"
             type="button"
             onClick={() => handleSelect(null)}
             className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-muted transition-colors cursor-pointer"
@@ -114,7 +114,7 @@ export function BrandKitSelector({
 
           {/* Kit list */}
           {kits.map((kit) => (
-            <button
+            <button data-testid={`brand-kit-selector-item-${kit.id}`}
               key={kit.id}
               type="button"
               onClick={() => handleSelect(kit.id)}

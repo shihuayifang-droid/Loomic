@@ -77,7 +77,7 @@ const FileRow = memo(function FileRow({
       <div className="flex-1 overflow-hidden text-sm leading-[22px] text-foreground min-w-0">
         <div className="overflow-hidden text-ellipsis whitespace-nowrap">{file.name}</div>
       </div>
-      <button
+      <button data-testid="canvas-files-item-download"
         type="button"
         onClick={handleDownload}
         className="flex h-4 w-4 shrink-0 items-center justify-center text-foreground hover:text-muted-foreground transition-colors"
@@ -151,7 +151,7 @@ export function CanvasFilesPanel({ excalidrawApi, open, onClose }: CanvasFilesPa
       {/* Title bar */}
       <div className="flex h-[50px] shrink-0 items-center justify-between px-4">
         <span className="text-base font-medium text-foreground">已生成文件列表</span>
-        <button
+        <button data-testid="canvas-files-panel-close"
           type="button"
           className="flex h-7 w-7 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
           onClick={onClose}

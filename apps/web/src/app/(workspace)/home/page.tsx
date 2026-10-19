@@ -361,7 +361,7 @@ export default function HomePage() {
                 }
               >
                 {/* Trash icon -- hover reveal */}
-                <button
+                <button data-testid="home-project-card-delete"
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();

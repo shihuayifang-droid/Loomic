@@ -58,7 +58,7 @@ export function VideoPlayerPanel({
   }, [onClose]);
 
   return createPortal(
-    <div
+    <div data-testid="canvas-video-player-panel"
       ref={panelRef}
       style={{ left: screenX, top: screenY }}
       className="fixed z-[100] w-[480px] rounded-2xl border border-border bg-card/95 shadow-card backdrop-blur-lg overflow-hidden"
@@ -76,7 +76,7 @@ export function VideoPlayerPanel({
             <span className="text-xs text-muted-foreground">{durationSeconds}s</span>
           )}
         </div>
-        <button
+        <button data-testid="canvas-video-player-close"
           type="button"
           onClick={onClose}
           className="rounded-full p-1 hover:bg-muted/80 transition-colors"

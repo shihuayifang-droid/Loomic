@@ -78,7 +78,7 @@ export function ProjectList({
             }`}
           >
             {/* Trash icon -- hover reveal on desktop */}
-            <button
+            <button data-testid="projects-card-delete"
               type="button"
               onClick={(e) => {
                 e.preventDefault();

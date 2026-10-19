@@ -50,7 +50,7 @@ export function LogoSection({
           />
         ))}
         <AddAssetCard label="Upload" onClick={handleClick} />
-        <input
+        <input data-testid="brand-kit-logo-input"
           ref={inputRef}
           type="file"
           accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"

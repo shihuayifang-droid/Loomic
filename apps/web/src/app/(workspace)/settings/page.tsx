@@ -125,7 +125,7 @@ export default function SettingsPage() {
       <div className="mb-6 overflow-x-auto sm:mb-8">
         <div className="inline-flex gap-1 rounded-lg bg-muted p-1">
           {tabs.map((tab) => (
-            <button
+            <button data-testid={`settings-tab-${tab.id}`}
               key={tab.id}
               type="button"
               onClick={() => setActiveTab(tab.id)}

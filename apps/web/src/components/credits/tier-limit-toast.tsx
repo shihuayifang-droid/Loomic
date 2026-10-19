@@ -211,7 +211,7 @@ function TierToastItem({
           <div className="min-w-0 flex-1">
             <div className="flex items-center justify-between">
               <h4 className="text-sm font-semibold text-foreground">{config.title}</h4>
-              <button
+              <button data-testid="credits-tier-limit-close"
                 type="button"
                 onClick={onDismiss}
                 className="ml-2 flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
@@ -224,7 +224,7 @@ function TierToastItem({
             </p>
             {/* CTA row */}
             <div className="mt-3 flex items-center gap-2">
-              <button
+              <button data-testid="credits-tier-limit-cta"
                 type="button"
                 onClick={() => {
                   onDismiss();
@@ -234,7 +234,7 @@ function TierToastItem({
               >
                 {config.cta}
               </button>
-              <button
+              <button data-testid="credits-tier-limit-dismiss"
                 type="button"
                 onClick={onDismiss}
                 className="rounded-lg px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"

@@ -155,7 +155,7 @@ export function MessageMentionPicker({
                 {groupTitle(kind)}
               </div>
               {sectionItems.map((item) => (
-                <button
+                <button data-testid="canvas-image-picker-item"
                   key={`${item.kind}:${item.id}`}
                   type="button"
                   onClick={() => {

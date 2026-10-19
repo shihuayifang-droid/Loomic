@@ -26,7 +26,7 @@ export function SettingsLayout({ children }: SettingsLayoutProps) {
     <div className="flex min-h-screen">
       {/* Sidebar */}
       <aside className="w-52 shrink-0 border-r bg-secondary p-4">
-        <button
+        <button data-testid="settings-back"
           type="button"
           onClick={() => router.push("/projects")}
           className="text-sm text-muted-foreground hover:text-foreground mb-6 flex items-center gap-1"
@@ -40,7 +40,7 @@ export function SettingsLayout({ children }: SettingsLayoutProps) {
 
         <div className="space-y-0.5">
           {sections.map((section) => (
-            <button
+            <button data-testid={`settings-section-tab-${section.id}`}
               key={section.id}
               type="button"
               onClick={() => setActiveSection(section.id)}

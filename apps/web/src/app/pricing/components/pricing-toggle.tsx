@@ -17,7 +17,7 @@ export function PricingToggle({ value, onChange }: PricingToggleProps) {
   return (
     <div className="bg-muted inline-flex items-center gap-1 rounded-full p-1">
       {options.map(({ key, label }) => (
-        <button
+        <button data-testid={`pricing-toggle-${key}`}
           key={key}
           type="button"
           onClick={() => onChange(key)}

@@ -103,7 +103,7 @@ export function BillingSection() {
       {/* Actions */}
       <div className="flex flex-wrap gap-3">
         <Link href="/pricing">
-          <Button variant="default" size="lg">
+          <Button data-testid="account-billing-plan-change" variant="default" size="lg">
             <CreditCard className="mr-1.5 h-4 w-4" />
             {isFree ? "Upgrade Plan" : "Change Plan"}
           </Button>
@@ -115,7 +115,7 @@ export function BillingSection() {
             target="_blank"
             rel="noopener noreferrer"
           >
-            <Button variant="outline" size="lg">
+            <Button data-testid="account-billing-manage" variant="outline" size="lg">
               <ExternalLink className="mr-1.5 h-4 w-4" />
               Manage Billing
             </Button>
@@ -123,7 +123,7 @@ export function BillingSection() {
         )}
 
         {!isFree && !isCancelled && (
-          <Button
+          <Button data-testid="account-billing-cancel-open"
             variant="destructive"
             size="lg"
             onClick={() => setCancelConfirmOpen(true)}
@@ -164,14 +164,14 @@ export function BillingSection() {
               )}
 
               <div className="mt-5 flex justify-end gap-2">
-                <Button
+                <Button data-testid="account-billing-cancel-keep"
                   variant="outline"
                   onClick={() => setCancelConfirmOpen(false)}
                   disabled={cancelling}
                 >
                   Keep Subscription
                 </Button>
-                <Button
+                <Button data-testid="account-billing-cancel-confirm"
                   variant="destructive"
                   onClick={handleCancel}
                   disabled={cancelling}

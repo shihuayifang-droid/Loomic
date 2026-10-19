@@ -358,7 +358,7 @@ export function CanvasToolMenu({ accessToken, excalidrawApi, leftPanelOpen, ws }
           const isActive = activeTool === tool;
 
           return (
-            <button
+            <button data-testid={`canvas-tool-menu-tool-${tool}`}
               key={tool}
               type="button"
               title={TOOL_LABELS[tool]}
@@ -386,7 +386,7 @@ export function CanvasToolMenu({ accessToken, excalidrawApi, leftPanelOpen, ws }
           const { icon: Icon, label } = spec.toolbar!;
           const isActive = active?.kind === spec.kind;
           return (
-            <button
+            <button data-testid={`canvas-tool-menu-create-${spec.kind}`}
               key={spec.kind}
               type="button"
               title={label}

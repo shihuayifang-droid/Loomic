@@ -109,7 +109,7 @@ export function CreditHeaderButton() {
         )}
 
         {/* Credit balance button */}
-        <button
+        <button data-testid="credits-header-trigger"
           type="button"
           onClick={() => setOpen((v) => !v)}
           className="flex h-8 items-center gap-1.5 rounded-lg bg-muted px-3 text-xs font-medium tabular-nums text-foreground transition-colors hover:bg-accent"
@@ -174,7 +174,7 @@ export function CreditHeaderButton() {
 
                 {/* Claim daily (free plan, unclaimed) */}
                 {canClaim && (
-                  <button
+                  <button data-testid="credits-header-claim"
                     type="button"
                     onClick={handleClaim}
                     disabled={claiming}

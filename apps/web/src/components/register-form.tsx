@@ -164,7 +164,7 @@ export function RegisterForm() {
                   required
                 />
               </div>
-              <Button type="submit" className="w-full" disabled={loading}>
+              <Button data-testid="account-register-submit" type="submit" className="w-full" disabled={loading}>
                 {loading ? "Creating account..." : "Create account"}
               </Button>
             </motion.form>

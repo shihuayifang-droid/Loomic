@@ -62,14 +62,14 @@ export function ColorSection({
         {colors.map((color) => (
           <div key={color.id} className="flex flex-col items-center gap-1.5">
             <div className="relative group" ref={editingAsset?.id === color.id ? editAnchorRef : undefined}>
-              <button
+              <button data-testid="brand-kit-color-swatch-edit"
                 type="button"
                 onClick={() => handleSwatchClick(color)}
                 className="w-[69px] h-[69px] rounded-xl border cursor-pointer transition-shadow hover:shadow-md"
                 style={{ backgroundColor: color.text_content ?? "#888888" }}
                 aria-label={`Edit color ${color.display_name}`}
               />
-              <button
+              <button data-testid="brand-kit-color-swatch-delete"
                 type="button"
                 onClick={() => onDeleteColor(color.id)}
                 className={cn(
@@ -106,7 +106,7 @@ export function ColorSection({
         {/* Add button */}
         <div className="flex flex-col items-center gap-1.5">
           <div className="relative">
-            <button
+            <button data-testid="brand-kit-color-add"
               ref={addButtonRef}
               type="button"
               onClick={handleAddClick}

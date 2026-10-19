@@ -76,7 +76,7 @@ function ThemeToggle() {
   if (!mounted) return <div className="size-9" aria-hidden="true" />;
 
   return (
-    <Button
+    <Button data-testid="landing-nav-theme-toggle"
       variant="ghost"
       size="icon"
       onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
@@ -177,7 +177,7 @@ export function FloatingNav() {
             <ThemeToggle />
             <NavCTA />
             {/* Hamburger */}
-            <Button
+            <Button data-testid="landing-nav-menu-toggle"
               variant="ghost"
               size="icon"
               className="md:hidden"

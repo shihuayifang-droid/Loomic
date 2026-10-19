@@ -409,7 +409,7 @@ function CanvasPageContent() {
       <div className="flex min-h-screen flex-col items-center justify-center gap-3">
         <p className="text-sm text-destructive">{error}</p>
         {errorRetryable && (
-          <button
+          <button data-testid="canvas-load-retry"
             type="button"
             onClick={() => setReloadNonce((n) => n + 1)}
             className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent"

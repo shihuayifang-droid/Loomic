@@ -47,7 +47,7 @@ function FileTreeItem({ file }: { file: SkillFileEntry }) {
 
   return (
     <div>
-      <button
+      <button data-testid="skills-detail-info-toggle"
         type="button"
         onClick={() => setExpanded(!expanded)}
         className="w-full flex items-center gap-2 px-3 py-2 text-xs font-mono text-foreground hover:bg-muted/50 transition-colors"
@@ -211,7 +211,7 @@ export function SkillDetailDialog({
                   className="mr-auto flex items-center gap-2"
                 >
                   <span className="text-xs text-destructive">确认删除?</span>
-                  <Button
+                  <Button data-testid="skills-detail-delete-confirm"
                     variant="destructive"
                     size="xs"
                     disabled={actionLoading === "delete"}
@@ -224,7 +224,7 @@ export function SkillDetailDialog({
                   >
                     {actionLoading === "delete" ? "删除中..." : "确认"}
                   </Button>
-                  <Button
+                  <Button data-testid="skills-detail-delete-cancel"
                     variant="ghost"
                     size="xs"
                     onClick={() => setConfirmDelete(false)}
@@ -233,7 +233,7 @@ export function SkillDetailDialog({
                   </Button>
                 </motion.div>
               ) : (
-                <Button
+                <Button data-testid="skills-detail-delete"
                   variant="ghost"
                   size="sm"
                   className="mr-auto text-destructive hover:text-destructive"
@@ -248,7 +248,7 @@ export function SkillDetailDialog({
 
           {/* Edit (user skills only — placeholder) */}
           {isUserSkill && (
-            <Button variant="outline" size="sm" disabled>
+            <Button data-testid="skills-detail-close" variant="outline" size="sm" disabled>
               <Pen className="size-3.5" />
               编辑
             </Button>
@@ -256,7 +256,7 @@ export function SkillDetailDialog({
 
           {/* Install / Uninstall */}
           {isInstalled ? (
-            <Button
+            <Button data-testid="skills-detail-uninstall"
               variant="outline"
               size="sm"
               disabled={actionLoading === "uninstall"}
@@ -270,7 +270,7 @@ export function SkillDetailDialog({
               {actionLoading === "uninstall" ? "卸载中..." : "卸载"}
             </Button>
           ) : (
-            <Button
+            <Button data-testid="skills-detail-install"
               size="sm"
               disabled={actionLoading === "install"}
               onClick={() =>

@@ -188,7 +188,7 @@ export function CreateSkillDialog({
           {/* Category */}
           <div className="space-y-1.5">
             <Label htmlFor="skill-category">分类</Label>
-            <select
+            <select data-testid="skills-create-category-select"
               id="skill-category"
               value={category}
               onChange={(e) => setCategory(e.target.value as SkillCategory)}
@@ -205,7 +205,7 @@ export function CreateSkillDialog({
           {/* Description */}
           <div className="space-y-1.5">
             <Label htmlFor="skill-desc">描述</Label>
-            <textarea
+            <textarea data-testid="skills-create-desc-input"
               id="skill-desc"
               rows={2}
               placeholder="简述技能的功能和用途..."
@@ -220,7 +220,7 @@ export function CreateSkillDialog({
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
               <Label htmlFor="skill-content">SKILL.md 内容</Label>
-              <Button
+              <Button data-testid="skills-create-template"
                 type="button"
                 variant="ghost"
                 size="xs"
@@ -230,7 +230,7 @@ export function CreateSkillDialog({
                 使用模板
               </Button>
             </div>
-            <textarea
+            <textarea data-testid="skills-create-content-input"
               id="skill-content"
               rows={8}
               placeholder="# Skill Name&#10;&#10;## Instructions&#10;..."
@@ -244,7 +244,7 @@ export function CreateSkillDialog({
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
               <Label>附属文件（可选）</Label>
-              <Button
+              <Button data-testid="skills-create-add-file"
                 type="button"
                 variant="ghost"
                 size="xs"
@@ -268,7 +268,7 @@ export function CreateSkillDialog({
                       className="relative rounded-lg border border-border bg-secondary/40 p-3 space-y-2"
                     >
                       {/* Remove button */}
-                      <button
+                      <button data-testid="skills-create-file-remove"
                         type="button"
                         onClick={() => removeFile(index)}
                         className="absolute top-2 right-2 p-0.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
@@ -296,7 +296,7 @@ export function CreateSkillDialog({
                       </div>
 
                       {/* File content textarea */}
-                      <textarea
+                      <textarea data-testid="skills-create-file-content-input"
                         rows={4}
                         placeholder="文件内容..."
                         value={file.content}
@@ -317,14 +317,14 @@ export function CreateSkillDialog({
           </div>
 
           <DialogFooter>
-            <Button
+            <Button data-testid="skills-create-cancel"
               type="button"
               variant="outline"
               onClick={() => handleOpenChange(false)}
             >
               取消
             </Button>
-            <Button type="submit" disabled={!canSubmit || submitting}>
+            <Button data-testid="skills-create-submit" type="submit" disabled={!canSubmit || submitting}>
               {submitting ? "创建中..." : "创建"}
             </Button>
           </DialogFooter>

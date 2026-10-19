@@ -118,7 +118,7 @@ export function AgentModelSelector({ compact }: { compact?: boolean } = {}) {
 
   return (
     <>
-      <button
+      <button data-testid="agent-model-selector-trigger"
         ref={btnRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -154,7 +154,7 @@ export function AgentModelSelector({ compact }: { compact?: boolean } = {}) {
               Agent Model
             </div>
             {/* Auto option */}
-            <button
+            <button data-testid="agent-model-selector-item-auto"
               type="button"
               onClick={() => {
                 setModel(null);
@@ -192,7 +192,7 @@ export function AgentModelSelector({ compact }: { compact?: boolean } = {}) {
                     {PROVIDER_LABELS[provider] ?? provider}
                   </div>
                   {providerModels.map((m) => (
-                    <button
+                    <button data-testid={`agent-model-selector-item-${m.id.replace(/\//g, "-")}`}
                       key={m.id}
                       type="button"
                       onClick={() => {

@@ -86,7 +86,7 @@ export function ChatSkills({ onSend }: ChatSkillsProps) {
       </p>
       <div className="flex max-w-[320px] flex-wrap justify-center gap-2">
         {PRESET_SKILLS.map((skill) => (
-          <button
+          <button data-testid="chat-skills-item"
             key={skill.label}
             type="button"
             onClick={() => onSend(skill.prompt)}

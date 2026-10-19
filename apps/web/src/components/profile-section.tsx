@@ -81,7 +81,7 @@ export function ProfileSection({
           </p>
         )}
 
-        <Button type="submit" disabled={saving || !hasChanges} size="sm">
+        <Button data-testid="account-profile-save" type="submit" disabled={saving || !hasChanges} size="sm">
           {saving ? "Saving..." : "Save"}
         </Button>
       </form>

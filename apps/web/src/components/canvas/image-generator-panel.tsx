@@ -1,12 +1,13 @@
 "use client";
 
 import { ImageUp, Lock, Zap } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import type { ImageModelInfo } from "../../lib/server-api";
 import { fetchImageModels, generateImageDirect } from "../../lib/server-api";
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
+import { errorCodeOf, lookupError } from "../../lib/error-catalog";
 import {
   updateImageGeneratorElement,
   resizeImageGeneratorElement,
@@ -65,7 +66,26 @@ export function ImageGeneratorPanel({
   const refInputRef = useRef<HTMLInputElement>(null);
   const accessTokenRef = useRef(accessToken);
   accessTokenRef.current = accessToken;
-  const { handleGenerationError } = useGenerationErrorHandler();
+  /**
+   * X-40 二期：toast 上的两个入口。
+   * - `editParams`：把焦点送回本面板的 prompt 输入框 —— `user_fixable` 的码
+   *   （invalid_request / resolution_not_allowed…）要改的东西都在这一行文本里。
+   * - `retry`：走面板现有的提交函数（`handleGenerate`），不另写提交路径。
+   *   它定义在下面，所以通过 ref 取「最新的那个」，避免闭包里拿到旧 prompt。
+   */
+  const retryRef = useRef<(() => void) | null>(null);
+  const errorActions = useMemo(
+    () => ({
+      editParams: () => {
+        textareaRef.current?.focus();
+      },
+      retry: () => {
+        retryRef.current?.();
+      },
+    }),
+    [],
+  );
+  const { handleGenerationError } = useGenerationErrorHandler(errorActions);
   // AbortController for in-flight generation requests so we can cancel on unmount
   const abortRef = useRef<AbortController | null>(null);
 
@@ -219,7 +239,9 @@ export function ImageGeneratorPanel({
       console.error("[image-gen] Generation error:", err);
       const handled = handleGenerationError(err);
       if (!handled) {
-        setError("图片生成失败，请重试或更换模型。");
+        // X-40 二期: same as the video panel — the copy comes from the catalogue
+        // by code, not from a line written here (30B left this one hard-coded).
+        setError(lookupError(errorCodeOf(err)).message);
       }
       setLoading(false);
       updateImageGeneratorElement(excalidrawApi, elementId, {
@@ -240,8 +262,13 @@ export function ImageGeneratorPanel({
     handleGenerationError,
   ]);
 
+  // X-40 二期: 「稍后重试」重新提交一次，走的还是上面那一条提交路径。
+  retryRef.current = () => {
+    void handleGenerate();
+  };
+
   return createPortal(
-    <div
+    <div data-testid="canvas-image-generator-panel"
       ref={panelRef}
       style={{ left: screenX, top: screenY }}
       className="fixed z-[100] w-[450px] rounded-xl border-[0.5px] border-border bg-card/95 p-2 shadow-card backdrop-blur-lg"
@@ -249,7 +276,8 @@ export function ImageGeneratorPanel({
       onWheel={(e) => e.stopPropagation()}
     >
       {/* Prompt textarea */}
-      <textarea
+      <textarea data-testid="canvas-generator-prompt"
+        data-mode="image"
         ref={textareaRef}
         value={prompt}
         onChange={(e) => setPrompt(e.target.value)}
@@ -277,7 +305,7 @@ export function ImageGeneratorPanel({
         <div className="flex items-center">
           {/* Model selector */}
           <div className="relative">
-            <button
+            <button data-testid="canvas-image-generator-model-trigger"
               type="button"
               onClick={() => setShowModelDropdown((v) => !v)}
               className="flex h-8 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
@@ -301,9 +329,9 @@ export function ImageGeneratorPanel({
               </svg>
             </button>
             {showModelDropdown && (
-              <div className="absolute bottom-full left-0 z-50 mb-1 max-h-[280px] w-[260px] overflow-y-auto rounded-xl border-[0.5px] border-border bg-card py-1 shadow-card">
+              <div data-testid="canvas-image-generator-model-menu" className="absolute bottom-full left-0 z-50 mb-1 max-h-[280px] w-[260px] overflow-y-auto rounded-xl border-[0.5px] border-border bg-card py-1 shadow-card">
                 {models.map((m) => (
-                  <button
+                  <button data-testid={`canvas-image-generator-model-item-${m.id.replace(/\//g, "-")}`}
                     key={m.id}
                     type="button"
                     onClick={() => handleModelChange(m.id)}
@@ -348,7 +376,7 @@ export function ImageGeneratorPanel({
           </div>
 
           {/* Reference image upload */}
-          <input
+          <input data-testid="canvas-image-generator-ref-input"
             ref={refInputRef}
             type="file"
             accept="image/png,image/jpeg,image/webp,image/gif"
@@ -370,7 +398,7 @@ export function ImageGeneratorPanel({
               e.target.value = "";
             }}
           />
-          <button
+          <button data-testid="canvas-image-generator-ref-add"
             type="button"
             onClick={() => refInputRef.current?.click()}
             className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-muted ${
@@ -390,7 +418,7 @@ export function ImageGeneratorPanel({
                     alt="ref"
                     className="h-7 w-7 rounded object-cover border border-border"
                   />
-                  <button
+                  <button data-testid="canvas-image-generator-ref-remove"
                     type="button"
                     onClick={() => setRefImages((prev) => prev.filter((r) => r.id !== img.id))}
                     className="absolute -top-1 -right-1 hidden group-hover:flex h-3.5 w-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground text-[8px]"
@@ -407,7 +435,7 @@ export function ImageGeneratorPanel({
         <div className="flex items-center gap-1">
           {/* Quality (1K/2K/4K) */}
           <div className="relative">
-            <button
+            <button data-testid="canvas-image-generator-quality-trigger"
               type="button"
               onClick={() => setShowQualityDropdown((v) => !v)}
               className="flex h-8 items-center gap-0.5 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
@@ -424,9 +452,9 @@ export function ImageGeneratorPanel({
               </svg>
             </button>
             {showQualityDropdown && (
-              <div className="absolute bottom-full right-0 z-50 mb-1 rounded-lg border-[0.5px] border-border bg-card py-1 shadow-card">
+              <div data-testid="canvas-image-generator-quality-menu" className="absolute bottom-full right-0 z-50 mb-1 rounded-lg border-[0.5px] border-border bg-card py-1 shadow-card">
                 {QUALITIES.map((q) => (
-                  <button
+                  <button data-testid={`canvas-image-generator-quality-item-${q.value}`}
                     key={q.value}
                     type="button"
                     onClick={() => handleQualityChange(q.value)}
@@ -441,7 +469,7 @@ export function ImageGeneratorPanel({
 
           {/* Aspect ratio */}
           <div className="relative">
-            <button
+            <button data-testid="canvas-image-generator-ratio-trigger"
               type="button"
               onClick={() => setShowRatioDropdown((v) => !v)}
               className="flex h-8 items-center gap-0.5 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
@@ -456,9 +484,9 @@ export function ImageGeneratorPanel({
               </svg>
             </button>
             {showRatioDropdown && (
-              <div className="absolute bottom-full right-0 z-50 mb-1 rounded-lg border-[0.5px] border-border bg-card py-1 shadow-card">
+              <div data-testid="canvas-image-generator-ratio-menu" className="absolute bottom-full right-0 z-50 mb-1 rounded-lg border-[0.5px] border-border bg-card py-1 shadow-card">
                 {ASPECT_RATIOS.map((r) => (
-                  <button
+                  <button data-testid={`canvas-image-generator-ratio-item-${r.replace(/:/g, "-")}`}
                     key={r}
                     type="button"
                     onClick={() => handleAspectRatioChange(r)}
@@ -472,7 +500,7 @@ export function ImageGeneratorPanel({
           </div>
 
           {/* Generate button */}
-          <button
+          <button data-testid="canvas-image-generator-submit"
             type="button"
             onClick={() => void handleGenerate()}
             disabled={!prompt.trim() || loading}

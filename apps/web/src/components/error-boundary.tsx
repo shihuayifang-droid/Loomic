@@ -92,14 +92,14 @@ export class ErrorBoundary extends React.Component<
           </div>
 
           <div className="flex items-center gap-2">
-            <button
+            <button data-testid="app-error-retry"
               type="button"
               onClick={this.reset}
               className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
             >
               重试
             </button>
-            <button
+            <button data-testid="app-error-reload"
               type="button"
               onClick={() => window.location.reload()}
               className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"

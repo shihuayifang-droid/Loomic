@@ -139,7 +139,7 @@ export function ImportPanel({
         <div className="flex gap-2">
           <div className="relative flex-1">
             <ExternalLink className="absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-            <input
+            <input data-testid="skills-import-url-input"
               type="url"
               placeholder="https://github.com/user/repo/tree/main/skills/my-skill"
               value={url}
@@ -161,7 +161,7 @@ export function ImportPanel({
               )}
             />
           </div>
-          <Button
+          <Button data-testid="skills-import-submit"
             size="default"
             disabled={!url.trim() || isLoading}
             onClick={handleImport}
@@ -208,7 +208,7 @@ export function ImportPanel({
             </div>
             <div className="flex items-center gap-2">
               {onSwitchToInstalled && (
-                <Button
+                <Button data-testid="skills-import-switch-installed"
                   variant="outline"
                   size="xs"
                   onClick={onSwitchToInstalled}
@@ -216,7 +216,7 @@ export function ImportPanel({
                   查看已安装
                 </Button>
               )}
-              <Button variant="ghost" size="xs" onClick={handleReset}>
+              <Button data-testid="skills-import-reset" variant="ghost" size="xs" onClick={handleReset}>
                 继续导入
               </Button>
             </div>

@@ -113,7 +113,7 @@ function elLabel(el: ExcalidrawEl): string {
 
 function ElementRow({ el, onSelect }: { el: ExcalidrawEl; onSelect: (id: string) => void }) {
   return (
-    <button type="button"
+    <button data-testid="canvas-bottom-bar-element-item" type="button"
       className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded-md hover:bg-muted transition-colors text-foreground text-left"
       onClick={() => onSelect(el.id)}
     >
@@ -217,19 +217,19 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
     >
       <div className="flex items-center gap-0.5 rounded-full bg-card/90 backdrop-blur-lg border border-border px-1 py-1 shadow-card">
         {/* ── Background color button ── */}
-        <button ref={bgBtnRef} type="button" className={btnClass} onClick={toggleBgPicker} aria-label="Background color">
+        <button data-testid="canvas-background-trigger" ref={bgBtnRef} type="button" className={btnClass} onClick={toggleBgPicker} aria-label="Background color">
           {bgColor === "transparent"
             ? <CheckerIcon className="h-4 w-4 rounded-full" />
             : <span className="block h-4 w-4 rounded-full border border-border" style={{ backgroundColor: bgColor }} />}
         </button>
 
         {/* ── Layers button ── */}
-        <button type="button" className={`${btnClass} ${layersOpen ? "bg-muted text-foreground" : ""}`} onClick={handleToggleLayers} aria-label="Layers">
+        <button data-testid="canvas-layers-trigger" type="button" className={`${btnClass} ${layersOpen ? "bg-muted text-foreground" : ""}`} onClick={handleToggleLayers} aria-label="Layers">
           <LayersIcon className="h-4 w-4" />
         </button>
 
         {/* ── Files button ── */}
-        <button type="button" className={`${btnClass} ${filesOpen ? "bg-muted text-foreground" : ""}`} onClick={handleToggleFiles} aria-label="Generated files">
+        <button data-testid="canvas-files-trigger" type="button" className={`${btnClass} ${filesOpen ? "bg-muted text-foreground" : ""}`} onClick={handleToggleFiles} aria-label="Generated files">
           <FileIcon className="h-3.5 w-3.5" />
         </button>
 
@@ -237,7 +237,7 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
         <span className="mx-1 h-3 w-px bg-border" />
 
         {/* ── Zoom controls ── */}
-        <button type="button" className={btnClass} onClick={handleZoomOut} aria-label="Zoom out"><MinusIcon className="h-3.5 w-3.5" /></button>
+        <button data-testid="canvas-zoom-out" type="button" className={btnClass} onClick={handleZoomOut} aria-label="Zoom out"><MinusIcon className="h-3.5 w-3.5" /></button>
         <AppDropdown
           testid="canvas-zoom-dropdown"
           label={`${Math.round(zoom * 100)}%`}
@@ -245,7 +245,7 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
           triggerClassName="min-w-[40px] cursor-pointer text-center"
           items={zoomItems}
         />
-        <button type="button" className={btnClass} onClick={handleZoomIn} aria-label="Zoom in"><PlusIcon className="h-3.5 w-3.5" /></button>
+        <button data-testid="canvas-zoom-in" type="button" className={btnClass} onClick={handleZoomIn} aria-label="Zoom in"><PlusIcon className="h-3.5 w-3.5" /></button>
       </div>
 
       {/* ── Background color picker popover ── */}
@@ -254,7 +254,7 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
           {/* Title bar */}
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-foreground">画布背景色</span>
-            <button type="button" className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:text-foreground transition-colors"
+            <button data-testid="canvas-background-close" type="button" className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:text-foreground transition-colors"
               onClick={() => setBgPickerOpen(false)} aria-label="Close color picker">
               <CloseIcon className="h-3.5 w-3.5" />
             </button>
@@ -270,7 +270,7 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
           {/* Preset swatches */}
           <div className="flex flex-wrap items-center gap-2">
             {BG_PRESETS.map((hex) => (
-              <button key={hex} type="button"
+              <button data-testid={`canvas-background-swatch-${hex.replace(/#/g, "")}`} key={hex} type="button"
                 className={`h-6 w-6 shrink-0 rounded-full border hover:scale-110 transition-transform ${bgColor === hex ? "border-foreground ring-1 ring-foreground ring-offset-1 ring-offset-card" : "border-border"}`}
                 style={hex === "transparent" ? CHECKER_STYLE : { backgroundColor: hex }}
                 onClick={() => applyBgColor(hex)} aria-label={`Set background to ${hex}`} />
@@ -280,14 +280,14 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
           <div className="flex items-center gap-1.5">
             <div className="flex flex-1 items-center rounded-lg border border-border bg-muted overflow-hidden">
               <span className="flex h-7 w-7 shrink-0 items-center justify-center text-xs text-muted-foreground">#</span>
-              <input type="text" value={hexInput}
+              <input data-testid="canvas-background-hex-input" type="text" value={hexInput}
                 onChange={(e) => { const v = e.target.value.replace(/[^0-9a-fA-F]/g, "").slice(0, 6); setHexInput(v.toUpperCase()); }}
                 onKeyDown={(e) => { e.stopPropagation(); if (e.key === "Enter") handleHexInputSubmit(); }}
                 onBlur={handleHexInputSubmit} maxLength={6}
                 className="h-7 flex-1 border-none bg-transparent text-xs text-foreground outline-none" />
             </div>
             <div className="flex items-center rounded-lg border border-border bg-muted overflow-hidden">
-              <input type="text" value="100" readOnly className="h-7 w-8 border-none bg-transparent text-center text-xs text-foreground outline-none" />
+              <input data-testid="canvas-background-opacity-input" type="text" value="100" readOnly className="h-7 w-8 border-none bg-transparent text-center text-xs text-foreground outline-none" />
               <span className="flex h-7 w-6 shrink-0 items-center justify-center text-xs text-muted-foreground pr-1">%</span>
             </div>
           </div>

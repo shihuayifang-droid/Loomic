@@ -119,14 +119,14 @@ export function CreateProjectDialog({
             )}
           </AnimatePresence>
           <div className="flex justify-end gap-2">
-            <Button
+            <Button data-testid="projects-create-dialog-cancel"
               type="button"
               variant="outline"
               onClick={() => handleOpenChange(false)}
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={loading || !name.trim()}>
+            <Button data-testid="projects-create-dialog-submit" type="submit" disabled={loading || !name.trim()}>
               {loading ? "Creating..." : "Create"}
             </Button>
           </div>

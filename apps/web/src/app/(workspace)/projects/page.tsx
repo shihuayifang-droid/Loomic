@@ -82,7 +82,7 @@ export default function ProjectsPage() {
       <div className="flex h-full items-center justify-center">
         <div className="text-center space-y-4">
           <p className="text-sm text-destructive">{loadError}</p>
-          <Button variant="outline" onClick={loadData}>
+          <Button data-testid="projects-list-retry" variant="outline" onClick={loadData}>
             Retry
           </Button>
         </div>

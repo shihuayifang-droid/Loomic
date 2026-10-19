@@ -87,7 +87,7 @@ export function ImageModelPreferencePopover({
   if (!open || !pos) return null;
 
   return createPortal(
-    <div
+    <div data-testid="agent-model-preference"
       ref={popoverRef}
       style={{
         top: pos.above ? undefined : pos.top,
@@ -101,7 +101,7 @@ export function ImageModelPreferencePopover({
         <div className="px-3">
           <div className="flex rounded-lg bg-muted p-0.5">
             {(["image", "video"] as const).map((tab) => (
-              <button
+              <button data-testid={`agent-model-preference-tab-${tab}`}
                 key={tab}
                 type="button"
                 onClick={() => setActiveTab(tab)}
@@ -123,7 +123,7 @@ export function ImageModelPreferencePopover({
             <span className="text-sm font-semibold text-foreground">
               {activeTab === "image" ? "Image Model" : "Video Model"}
             </span>
-            <button
+            <button data-testid="agent-model-preference-auto-toggle"
               type="button"
               onClick={() =>
                 currentSetMode(currentPreference.mode === "auto" ? "manual" : "auto")
@@ -154,7 +154,7 @@ export function ImageModelPreferencePopover({
           {currentModels.map((m) => {
             const selected = currentPreference.models.includes(m.id);
             return (
-              <button
+              <button data-testid={`agent-model-preference-item-${m.id.replace(/\//g, "-")}`}
                 key={m.id}
                 type="button"
                 onClick={() => currentToggleModel(m.id)}
