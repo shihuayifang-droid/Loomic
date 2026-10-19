@@ -65,8 +65,25 @@ const PROBE_RELATIVE_PATH = "apps/server/scripts/probe.mjs";
  */
 const RUNTIME_PROBE_RELATIVE_PATH = "apps/server/src/audit-rpc-probe.ts";
 
+/**
+ * The same shape of probe for the `untypedFrom` wrapper rule (workorder 21AD /
+ * T-46): production scope, no test suffix, so it moves `server.fromCalls` and
+ * `server.fromCallsIncludingTests` together and never a `server.test*` key.
+ */
+const UNTYPED_FROM_PROBE_RELATIVE_PATH =
+  "apps/server/src/audit-untyped-from-probe.ts";
+
 const SUPABASE_SDK_PACKAGE = ["@supabase", "supabase-js"].join("/");
 const FROM_CALL = "." + "from(";
+
+/**
+ * The `untypedFrom` invocation token, split for exactly the same reason as
+ * `FROM_CALL`: this file is itself inside the server test scope, so a literal
+ * occurrence here would raise `server.fromCallsIncludingTests` by the number of
+ * fixture lines that carry it and would make the real-repository pins below
+ * depend on this file's own prose.
+ */
+const UNTYPED_FROM_CALL = "untypedFrom" + "(";
 
 const SUPABASE_ENV_NAMES = [
   "SUPABASE_URL",
@@ -198,6 +215,39 @@ function buildRpcProseProbeSource(): string {
     "const alsoAsserted = admin.rpc as any;",
     "",
     'await admin.rpc("deduct_credits", { p_workspace_id: "w" });',
+    "export {};",
+    "",
+  ].join("\n");
+}
+
+/**
+ * The `untypedFrom` wrapper of `http/skills.ts` and `http/skills-marketplace.ts`
+ * (workorder 21AD / T-46): the definition, two invocations and one comment
+ * mention. The definition contributes one from call - it is the wrapper's own
+ * body - so the counter must move by exactly 1 definition + 2 calls + 1 comment
+ * = 4, and that sum is what pins both halves of the rule at once.
+ */
+function buildUntypedFromProbeSource(): string {
+  return [
+    "declare const client: any;",
+    `const untypedFrom = (c, t) => (c as any)${FROM_CALL}t);`,
+    `await ${UNTYPED_FROM_CALL}client, "x")`,
+    `await ${UNTYPED_FROM_CALL}client, "x")`,
+    `// ${UNTYPED_FROM_CALL}client, "y")`,
+    "export {};",
+    "",
+  ].join("\n");
+}
+
+/**
+ * The same definition with no call site at all. The `=` between the wrapper name
+ * and its parenthesis keeps the definition from matching the wrapper rule, so
+ * this fixture must move the counter by exactly one - the body's own from call.
+ */
+function buildUntypedFromDefinitionProbeSource(): string {
+  return [
+    "declare const client: any;",
+    `const untypedFrom = (c, t) => (c as any)${FROM_CALL}t);`,
     "export {};",
     "",
   ].join("\n");
@@ -479,6 +529,78 @@ describe("audit-supabase-dependencies: typed RPC call forms", () => {
     expect(metricValue(restored.stdout, "server.rpcCallsAll")).toBe(
       metricValue(before.stdout, "server.rpcCallsAll"),
     );
+  }, AUDIT_TEST_TIMEOUT_MS);
+});
+
+describe("audit-supabase-dependencies: untypedFrom wrapper calls", () => {
+  it("counts the wrapper definition, its call sites and its comment mentions", () => {
+    const root = buildMirror("untyped-from-calls");
+    const probePath = join(root, UNTYPED_FROM_PROBE_RELATIVE_PATH);
+    const source = buildUntypedFromProbeSource();
+
+    // Guard against a vacuous pass: the fixture really does carry the token in
+    // every shape this case claims to cover.
+    expect(source).toContain("untypedFrom");
+
+    const before = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+    expect(before.status).toBe(0);
+    expect(problemCount(before.stdout)).toBe(0);
+
+    writeFileSync(probePath, source, "utf8");
+    const after = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+
+    // One definition (its own from call), two invocations and one comment
+    // mention: a delta of exactly four pins BOTH halves of the rule - that a
+    // call site is counted, and that a mention inside a comment is counted too,
+    // which is the same raw-text treatment the from-call rule already has
+    // (T-45 stays open on purpose, it is not fixed here).
+    //
+    // Unlike the RPC probes this rise does NOT fail the audit: the frozen
+    // baseline is 163 and the measurement stays far below it, because the rule
+    // counts a coupling the baseline already allowed for. Only a number above
+    // the baseline is a problem, so both runs must keep exiting 0.
+    expect(metricValue(after.stdout, "server.fromCalls")).toBe(
+      metricValue(before.stdout, "server.fromCalls") + 4,
+    );
+    expect(metricValue(after.stdout, "server.fromCallsIncludingTests")).toBe(
+      metricValue(before.stdout, "server.fromCallsIncludingTests") + 4,
+    );
+    expect(after.status).toBe(0);
+    expect(problemCount(after.stdout)).toBe(0);
+
+    rmSync(probePath);
+    const restored = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+
+    expect(metricValue(restored.stdout, "server.fromCalls")).toBe(
+      metricValue(before.stdout, "server.fromCalls"),
+    );
+    expect(
+      metricValue(restored.stdout, "server.fromCallsIncludingTests"),
+    ).toBe(metricValue(before.stdout, "server.fromCallsIncludingTests"));
+  }, AUDIT_TEST_TIMEOUT_MS);
+
+  it("counts a wrapper definition with no call site as exactly one", () => {
+    const root = buildMirror("untyped-from-definition");
+    const probePath = join(root, UNTYPED_FROM_PROBE_RELATIVE_PATH);
+
+    const before = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+    expect(before.status).toBe(0);
+    expect(problemCount(before.stdout)).toBe(0);
+
+    writeFileSync(probePath, buildUntypedFromDefinitionProbeSource(), "utf8");
+    const after = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
+
+    // Only the body's own from call moves the counter, by exactly one: the `=`
+    // between the wrapper name and its parenthesis keeps the definition from
+    // being mistaken for an invocation, which is the negative half of the rule
+    // (a rule that matched the definition too would count two here).
+    expect(metricValue(after.stdout, "server.fromCalls")).toBe(
+      metricValue(before.stdout, "server.fromCalls") + 1,
+    );
+    expect(metricValue(after.stdout, "server.fromCallsIncludingTests")).toBe(
+      metricValue(before.stdout, "server.fromCallsIncludingTests") + 1,
+    );
+    expect(problemCount(after.stdout)).toBe(0);
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 
@@ -830,11 +952,29 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // `record_project_asset` RPC still run on the clients they always used. The four
     // new test files name no client method either, so `fromCallsIncludingTests`
     // follows `fromCalls` down again.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(65);
+    // Workorder 21AD then COUNTED 19 table calls that had never been visible: the
+    // `untypedFrom` wrapper of `http/skills.ts` (15 call sites) and of
+    // `http/skills-marketplace.ts` (4) reaches PostgREST by calling `from(table)`
+    // on a `(client as any)` cast, and every caller names the wrapper instead of
+    // a client, so the from-call rule counted none of them - the two definition
+    // lines were the only part of those two files it saw. The counters below
+    // therefore move UP together (65->84). That is an OBSERVATION fix, not a new
+    // dependency, exactly like the RPC recognition of workorder 21-preflight B:
+    // no production call, SQL or schema changed, and the frozen baseline (163,
+    // which already allowed for those calls) is left untouched because the audit
+    // only fails on an increase OVER it. The rule is deliberately specific to this
+    // one wrapper - "any helper that returns a from-call receiver" would count
+    // innocent identifiers - so a future wrapper of this shape has to extend it by
+    // hand. It reads raw text like the from-call rule, which is why a mention
+    // inside a comment is counted too; T-45 stays open on purpose.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(84);
     // Guard for this file's own fixture discipline: fragment-assembled probe
-    // text must not raise the server test counters it is testing.
+    // text must not raise the server test counters it is testing. The wrapper
+    // fixtures above are assembled the same way (`UNTYPED_FROM_CALL`), so a
+    // literal token there cannot inflate this counter either - the two server
+    // counters below still agree exactly.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(65);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(84);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

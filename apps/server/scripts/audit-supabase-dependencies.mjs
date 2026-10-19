@@ -23,6 +23,19 @@
  *   `apps/web/src/**` and `apps/server/src/**` (server production excludes
  *   `*.test.ts`; test-only hits are reported as separate `server.test*` keys).
  * - `Array.from(` / `Object.from(` / `Buffer.from(` are not PostgREST calls.
+ * - `untypedFrom(client, table)` recognition (ticket 21AD / T-46). Two files,
+ *   `http/skills.ts` and `http/skills-marketplace.ts`, reach PostgREST tables
+ *   through that local wrapper, whose body is `(client as any).from(table)`:
+ *   the call site names the wrapper, not a client, so the `.from(` rule above
+ *   cannot see it. A call site of that wrapper counts as one
+ *   `server.fromCalls` from this ticket on (65 -> 84 for the 19 call sites) as
+ *   an OBSERVATION fix, not as a new dependency. The wrapper is deliberately
+ *   NOT generalised into "any helper that returns a `.from(` receiver": exactly
+ *   one such wrapper is known, and a rule that guesses would count innocent
+ *   identifiers. A future wrapper of this shape has to extend this rule by
+ *   hand, together with its call sites - see `UNTYPED_FROM_CALL_PATTERN`.
+ *   Like the `.from(` rule, it reads raw text, so a mention inside a comment is
+ *   counted too (T-45 stays open on purpose).
  * - `rpcCallsRuntime` excludes `apps/server/src/cli/**` (operator tooling, not
  *   the runtime surface) and is reported next to the all-files number.
  * - RPC recognition (ticket 21-preflight B / T-35). An RPC call site is
@@ -477,6 +490,24 @@ function countRpcCalls(text) {
   return countMatches(stripNonCode(text), RPC_CALL_PATTERN);
 }
 
+/**
+ * Call sites of the `untypedFrom(client, table)` wrapper of `http/skills.ts` and
+ * `http/skills-marketplace.ts` (ticket 21AD / T-46). That wrapper hides a real
+ * PostgREST table read behind `(client as any).from(table)`, and its callers
+ * name the wrapper instead of the client, so the `.from(` rule counts none of
+ * them - the call sites were invisible, not absent.
+ *
+ * The DEFINITION line (`const untypedFrom = (...)`) does not match: the `=` sits
+ * between the name and the parenthesis, so only invocations are counted.
+ *
+ * Deliberately specific rather than a general "isolate any function that returns
+ * a `.from(` receiver": exactly one wrapper of this shape exists, and a guessed
+ * pattern would count unrelated identifiers as PostgREST calls. Adding another
+ * wrapper of this shape means extending this rule by hand, together with the
+ * call sites it has to cover.
+ */
+const UNTYPED_FROM_CALL_PATTERN = /\buntypedFrom\s*\(/;
+
 function readAll(files) {
   return files.map((file) => readText(file)).join("\n");
 }
@@ -547,13 +578,13 @@ function collect(root, baselinePath) {
     serverProdText,
     /@supabase\/supabase-js/,
   );
-  metrics["server.fromCalls"] = countMatches(
-    serverProdText,
-    /(?<!Array)(?<!Object)(?<!Buffer)\.from\s*\(/,
-  );
+  metrics["server.fromCalls"] =
+    countMatches(serverProdText, /(?<!Array)(?<!Object)(?<!Buffer)\.from\s*\(/) +
+    countMatches(serverProdText, UNTYPED_FROM_CALL_PATTERN);
   metrics["server.fromCallsIncludingTests"] =
     metrics["server.fromCalls"] +
-    countMatches(serverTestText, /(?<!Array)(?<!Object)(?<!Buffer)\.from\s*\(/);
+    countMatches(serverTestText, /(?<!Array)(?<!Object)(?<!Buffer)\.from\s*\(/) +
+    countMatches(serverTestText, UNTYPED_FROM_CALL_PATTERN);
   metrics["server.rpcCallsRuntime"] = countRpcCalls(runtimeText);
   metrics["server.rpcCallsAll"] = countRpcCalls(serverProdText);
   metrics["server.storageCalls"] = countMatches(serverProdText, /\.storage\b/);
@@ -876,6 +907,22 @@ function main() {
       `[skip] ${skipped.join(", ")} (archive/scratch output is never counted)`,
     );
     lines.push(...toolingReport);
+    lines.push(
+      "[from] rule: an `untypedFrom(client, table)` call site counts as one " +
+        "`server.fromCalls` (and one `server.fromCallsIncludingTests`). " +
+        "`http/skills.ts` and `http/skills-marketplace.ts` issue 19 PostgREST " +
+        "table calls through that local wrapper, which the `.from(` rule cannot " +
+        "see: the call site names the wrapper, not the client. The definition " +
+        "line does not match - the `=` sits between the name and the " +
+        "parenthesis - so only invocations count. Counting them from ticket 21AD " +
+        "on (T-46) moved server.fromCalls 65 -> 84 as an OBSERVATION fix, not as " +
+        "a new dependency: no production call, SQL or schema changed. The wrapper " +
+        "is deliberately not generalised into 'any helper returning a `.from(` " +
+        "receiver' - exactly one such wrapper is known and a guessed pattern " +
+        "would count innocent identifiers; a new one must extend this rule by " +
+        "hand. Like the `.from(` rule this reads raw text, so a mention inside a " +
+        "comment is counted too (T-45, left open on purpose).",
+    );
     lines.push(
       "[rpc] rule: an RPC call site is counted in both `client.rpc(...)` and " +
         "`(client.rpc as any)(...)` form, with comments/strings/regex literals " +
