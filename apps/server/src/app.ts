@@ -63,6 +63,9 @@ import {
   createBrandKitReadRepository,
 } from "./db/brand-kit-read-repository.js";
 import {
+  createBrandKitWriteRepository,
+} from "./db/brand-kit-write-repository.js";
+import {
   createCanvasReadRepository,
   type CanvasReadRepository,
 } from "./db/canvas-read-repository.js";
@@ -453,13 +456,23 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // the asset rows of those kits through the PostgreSQL repository, built lazily
   // against the same pool as the other repositories and handed to the service
   // here. `brand_kits` and `brand_kit_assets` are owner-only, so the repository
-  // keys on the actor alone; `createUserClient` stays wired for the write
-  // routes, which did not move.
+  // keys on the actor alone.
+  //
+  // ADR-0001 / workorder 21Z: the remaining reads and EVERY write of the service
+  // now have the same two homes — `brand-kit-read-repository.ts` for the detail,
+  // its assets, its file paths, the next `sort_order` and a single asset row, and
+  // `brand-kit-write-repository.ts` for the eight write statements. Both are lazy
+  // (a pool getter, never a resolved pool), and `createUserClient` stays wired for
+  // Storage only: the upload, copy, remove and signing calls are workorder 22A and
+  // did not move.
   const brandKitService =
     options.brandKitService ??
     createBrandKitService({
       createUserClient,
       brandKitReadRepository: createBrandKitReadRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
+      brandKitWriteRepository: createBrandKitWriteRepository({
         getTransactionPool: () => getTransactionPool(databaseEnv),
       }),
     });

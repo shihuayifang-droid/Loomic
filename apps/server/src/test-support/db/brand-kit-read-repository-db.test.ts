@@ -3,7 +3,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   BrandKitReadError,
+  FIND_OWN_ASSET,
+  FIND_OWN_KIT,
+  LIST_OWN_KIT_ASSETS,
+  LIST_OWN_KIT_FILE_URLS,
   LIST_OWN_KITS,
+  READ_NEXT_SORT_ORDER,
   createBrandKitReadRepository,
   type BrandKitReadRepository,
 } from "../../db/brand-kit-read-repository.js";
@@ -396,11 +401,16 @@ async function insertAsset(
   kitId: string,
   assetType: BrandKitAssetType,
   displayName: string,
+  createdAt: string,
 ): Promise<void> {
+  // `created_at` is explicit for the same reason the kits' is: workorder 21Z reads
+  // assets in `sort_order asc, created_at asc`, and a fixture that leaned on `now()`
+  // would make the order of two same-sort_order rows depend on insert timing.
   await db.query(
-    `insert into public.brand_kit_assets (kit_id, asset_type, display_name, sort_order)
-     values ($1, $2::public.brand_kit_asset_type, $3, 0)`,
-    [kitId, assetType, displayName],
+    `insert into public.brand_kit_assets
+       (kit_id, asset_type, display_name, sort_order, created_at, updated_at)
+     values ($1, $2::public.brand_kit_asset_type, $3, 0, $4, $4)`,
+    [kitId, assetType, displayName, createdAt],
   );
 }
 
@@ -447,10 +457,19 @@ beforeAll(async () => {
     updatedAt: KIT_THREE_UPDATED_AT,
   });
 
-  await insertAsset(KIT_ONE, "color", "Brand red");
-  await insertAsset(KIT_ONE, "color", "Brand blue");
-  await insertAsset(KIT_ONE, "logo", "Primary logo");
-  await insertAsset(KIT_THREE, "font", "Heading font");
+  await insertAsset(KIT_ONE, "color", "Brand red", "2026-01-10T09:00:00.000Z");
+  await insertAsset(KIT_ONE, "color", "Brand blue", "2026-01-10T09:00:01.000Z");
+  await insertAsset(KIT_ONE, "logo", "Primary logo", "2026-01-10T09:00:02.000Z");
+  await insertAsset(KIT_THREE, "font", "Heading font", "2026-03-10T09:00:00.000Z");
+
+  // Workorder 21Z needs a real storage path to read back: the logo of K1 is the
+  // one file-backed asset in the fixture, and `deleteKit`'s cleanup reads exactly
+  // this column. K3's font asset stays NULL so "no path" is covered too.
+  await db.query(
+    `update public.brand_kit_assets set file_url = $2
+      where kit_id = $1 and display_name = $3`,
+    [KIT_ONE, "a/kit-one/primary-logo.png", "Primary logo"],
+  );
 }, 120_000);
 
 afterAll(async () => {
@@ -705,5 +724,278 @@ describe("brand kit read repository: bad binds and read-only behaviour", () => {
     // UPDATE trigger, so an identical set is proof no write ran behind the read.
     expect(await allKits()).toEqual(kitsBefore);
     expect(await allAssets()).toEqual(assetsBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workorder 21Z: the five detail-path reads, answered against the same fixture
+// and the same policies. Each case performs the question TWICE — through the
+// repository (privileged, so its own predicate is the only gate) and through
+// `asUser()` with NO caller filter at all (only the RLS policy may narrow it) —
+// and requires the two answers to be equal.
+// ---------------------------------------------------------------------------
+
+/** The logo asset of K1, whose `file_url` the fixture sets — a real signed path. */
+const KIT_ONE_LOGO_PATH = "a/kit-one/primary-logo.png";
+
+/** (1)/(3) `findOwnKit` versus the policy alone. */
+type RawKitDetailRow = RawKitRow & { guidance_text: string | null };
+
+async function kitDetailViaRlsOnly(
+  actorId: string,
+  kitId: string,
+): Promise<Record<string, unknown> | null> {
+  return asUser(db, actorId, async (tx) => {
+    const rows = await tx.query<RawKitDetailRow>(
+      `select id, name, is_default, guidance_text, cover_url, created_at, updated_at
+         from public.brand_kits where id = $1::uuid`,
+      [kitId],
+    );
+
+    const row = rows.rows[0];
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      name: row.name,
+      is_default: row.is_default,
+      guidance_text: row.guidance_text,
+      cover_url: row.cover_url,
+      created_at: isoOf(row.created_at),
+      updated_at: isoOf(row.updated_at),
+    };
+  });
+}
+
+async function assetIdsByKit(kitId: string): Promise<string[]> {
+  return (
+    await db.query<{ id: string }>(
+      "select id from public.brand_kit_assets where kit_id = $1 order by sort_order, created_at, id",
+      [kitId],
+    )
+  ).rows.map((row) => row.id);
+}
+
+async function assetIdByName(kitId: string, displayName: string): Promise<string> {
+  const rows = (
+    await db.query<{ id: string }>(
+      "select id from public.brand_kit_assets where kit_id = $1 and display_name = $2",
+      [kitId, displayName],
+    )
+  ).rows;
+
+  expect(rows).toHaveLength(1);
+  return rows[0]!.id;
+}
+
+describe("brand kit read repository: the detail-path reads", () => {
+  it("case 10: `findOwnKit` answers the caller's own detail row and `null` for anybody else", async () => {
+    const viaRepository = await repository.findOwnKit({
+      actorId: OWNER_A_ID,
+      kitId: KIT_ONE,
+    });
+
+    expect(viaRepository).toEqual({
+      id: KIT_ONE,
+      name: KIT_ONE_NAME,
+      is_default: true,
+      guidance_text: null,
+      cover_url: KIT_ONE_COVER,
+      created_at: KIT_ONE_CREATED_AT,
+      updated_at: KIT_ONE_UPDATED_AT,
+    });
+    // The policy alone, with the caller filter removed, answers the same thing.
+    expect(await kitDetailViaRlsOnly(OWNER_A_ID, KIT_ONE)).toEqual(viaRepository);
+
+    // A kit that is not the actor's answers `null` — never a row, never a leak.
+    for (const [actorId, kitId] of [
+      [OWNER_B_ID, KIT_ONE],
+      [OWNER_C_ID, KIT_ONE],
+      [OWNER_A_ID, KIT_THREE],
+      [OWNER_C_ID, KIT_THREE],
+    ] as const) {
+      expect(await repository.findOwnKit({ actorId, kitId })).toBeNull();
+      expect(await kitDetailViaRlsOnly(actorId, kitId)).toBeNull();
+    }
+  });
+
+  it("case 11: `listOwnKitAssets` answers the publisher's order and refuses a foreign kit", async () => {
+    const forA = await repository.listOwnKitAssets({
+      actorId: OWNER_A_ID,
+      kitId: KIT_ONE,
+    });
+
+    // Three rows of K1, in `sort_order asc, created_at asc` — the fixture gives
+    // them all sort_order 0, so the published order is creation order.
+    expect(forA.map((asset) => asset.display_name)).toEqual([
+      "Brand red",
+      "Brand blue",
+      "Primary logo",
+    ]);
+    expect(forA.map((asset) => asset.id)).toEqual(await assetIdsByKit(KIT_ONE));
+    // The ten-column projection really is ten columns.
+    expect(Object.keys(forA[0] ?? {})).toEqual([
+      "id",
+      "asset_type",
+      "display_name",
+      "role",
+      "sort_order",
+      "text_content",
+      "file_url",
+      "metadata",
+      "created_at",
+      "updated_at",
+    ]);
+    expect(forA.map((asset) => asset.asset_type)).toEqual(["color", "color", "logo"]);
+    // `metadata` defaults to `{}` on these rows, and it is published as it arrived.
+    expect(forA[2]?.metadata).toEqual({});
+    expect(forA[2]?.file_url).toBe(KIT_ONE_LOGO_PATH);
+
+    // The policy alone agrees, for every identity.
+    for (const [actorId, kitId] of [
+      [OWNER_A_ID, KIT_ONE],
+      [OWNER_A_ID, KIT_TWO],
+      [OWNER_B_ID, KIT_ONE],
+      [OWNER_B_ID, KIT_THREE],
+      [OWNER_C_ID, KIT_ONE],
+    ] as const) {
+      const byRepository = await repository.listOwnKitAssets({ actorId, kitId });
+      const byRlsOnly = await asUser(db, actorId, async (tx) =>
+        (
+          await tx.query<{ id: string }>(
+            `select id from public.brand_kit_assets
+               where kit_id = $1::uuid order by sort_order asc, created_at asc`,
+            [kitId],
+          )
+        ).rows.map((row) => row.id),
+      );
+
+      expect(byRepository.map((asset) => asset.id)).toEqual(byRlsOnly);
+    }
+  });
+
+  it("case 12: `listOwnKitFileUrls` answers only paths of the actor's own kit", async () => {
+    await expect(
+      repository.listOwnKitFileUrls({ actorId: OWNER_A_ID, kitId: KIT_ONE }),
+    ).resolves.toEqual([KIT_ONE_LOGO_PATH]);
+
+    // K2 has no asset at all, K3 belongs to B, and C owns nothing.
+    await expect(
+      repository.listOwnKitFileUrls({ actorId: OWNER_A_ID, kitId: KIT_TWO }),
+    ).resolves.toEqual([]);
+    await expect(
+      repository.listOwnKitFileUrls({ actorId: OWNER_A_ID, kitId: KIT_THREE }),
+    ).resolves.toEqual([]);
+    await expect(
+      repository.listOwnKitFileUrls({ actorId: OWNER_B_ID, kitId: KIT_ONE }),
+    ).resolves.toEqual([]);
+    await expect(
+      repository.listOwnKitFileUrls({ actorId: OWNER_B_ID, kitId: KIT_THREE }),
+    ).resolves.toEqual([]);
+  });
+
+  it("case 13: `readNextSortOrder` matches the removed `max(sort_order) + 1`, per type", async () => {
+    // The fixture puts every K1 asset at sort_order 0, so the next value is 1 for
+    // every type present and 0 for a type that has none.
+    await expect(
+      repository.readNextSortOrder({
+        actorId: OWNER_A_ID,
+        kitId: KIT_ONE,
+        assetType: "color",
+      }),
+    ).resolves.toBe(1);
+    await expect(
+      repository.readNextSortOrder({
+        actorId: OWNER_A_ID,
+        kitId: KIT_ONE,
+        assetType: "font",
+      }),
+    ).resolves.toBe(0);
+
+    // A kit that is not the actor's answers 0, exactly like an absent asset list.
+    for (const [actorId, kitId] of [
+      [OWNER_B_ID, KIT_ONE],
+      [OWNER_C_ID, KIT_ONE],
+      [OWNER_A_ID, KIT_THREE],
+    ] as const) {
+      await expect(
+        repository.readNextSortOrder({ actorId, kitId, assetType: "color" }),
+      ).resolves.toBe(0);
+    }
+  });
+
+  it("case 14: `findOwnAsset` answers the actor's own row and `null` otherwise", async () => {
+    const assetId = await assetIdByName(KIT_ONE, "Brand red");
+
+    const found = await repository.findOwnAsset({
+      actorId: OWNER_A_ID,
+      kitId: KIT_ONE,
+      assetId,
+    });
+
+    expect(found?.id).toBe(assetId);
+    expect(found?.asset_type).toBe("color");
+    expect(found?.display_name).toBe("Brand red");
+
+    // `null` for the wrong kit, the wrong actor, and the wrong asset.
+    await expect(
+      repository.findOwnAsset({ actorId: OWNER_A_ID, kitId: KIT_TWO, assetId }),
+    ).resolves.toBeNull();
+    await expect(
+      repository.findOwnAsset({ actorId: OWNER_B_ID, kitId: KIT_ONE, assetId }),
+    ).resolves.toBeNull();
+    await expect(
+      repository.findOwnAsset({
+        actorId: OWNER_A_ID,
+        kitId: KIT_ONE,
+        assetId: KIT_TWO,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("case 15: a malformed uuid is a 22P02 failure on every new read, and every row is untouched", async () => {
+    const kitsBefore = await allKits();
+    const assetsBefore = await allAssets();
+
+    const calls: Array<[string, (actorId: string) => Promise<unknown>]> = [
+      [FIND_OWN_KIT, (actorId) => repository.findOwnKit({ actorId, kitId: INVALID_ID })],
+      [
+        LIST_OWN_KIT_ASSETS,
+        (actorId) => repository.listOwnKitAssets({ actorId, kitId: INVALID_ID }),
+      ],
+      [
+        LIST_OWN_KIT_FILE_URLS,
+        (actorId) => repository.listOwnKitFileUrls({ actorId, kitId: INVALID_ID }),
+      ],
+      [
+        READ_NEXT_SORT_ORDER,
+        (actorId) =>
+          repository.readNextSortOrder({
+            actorId,
+            kitId: INVALID_ID,
+            assetType: "color",
+          }),
+      ],
+      [
+        FIND_OWN_ASSET,
+        (actorId) =>
+          repository.findOwnAsset({ actorId, kitId: KIT_ONE, assetId: INVALID_ID }),
+      ],
+    ];
+
+    for (const [operation, call] of calls) {
+      const error = await call(OWNER_A_ID).catch((reason: unknown) => reason);
+
+      expect(error).toBeInstanceOf(BrandKitReadError);
+      expect((error as BrandKitReadError).operation).toBe(operation);
+      expect(((error as BrandKitReadError).cause as { code?: string }).code).toBe(
+        "22P02",
+      );
+    }
+
+    expect(await allKits()).toEqual(kitsBefore);
+    expect(await allAssets()).toEqual(assetsBefore);
+    // The pool is still usable after five rolled-back transactions.
+    await expect(viaRepository(OWNER_A_ID)).resolves.toEqual(EXPECTED_FOR_A);
   });
 });

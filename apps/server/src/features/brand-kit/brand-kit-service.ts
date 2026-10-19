@@ -13,9 +13,18 @@ import type {
   UserSupabaseClient,
 } from "../../supabase/user.js";
 import type {
+  BrandKitAssetRow,
   BrandKitListResult,
   BrandKitReadRepository,
+  KitDetailRow,
 } from "../../db/brand-kit-read-repository.js";
+import type {
+  BrandKitAssetCopy,
+  BrandKitAssetInsert,
+  BrandKitAssetPatch,
+  BrandKitKitPatch,
+  BrandKitWriteRepository,
+} from "../../db/brand-kit-write-repository.js";
 
 const BRAND_KIT_BUCKET = "brand-kit-assets";
 const SIGNED_URL_EXPIRY_SECONDS = 3600;
@@ -106,18 +115,43 @@ export function createBrandKitService(options: {
    * wire is a compile error instead.
    */
   brandKitReadRepository: BrandKitReadRepository;
+  /**
+   * ADR-0001 / workorder 21Z: the PostgreSQL home of every brand kit WRITE.
+   *
+   * REQUIRED for the same reason `brandKitReadRepository` is: this service has
+   * exactly one assembly point (`app.ts`), and workorder 21X measured that an
+   * OPTIONAL dependency fails silently when its one wiring line is dropped — the
+   * type check still exits 0 and the write only fails at runtime. Required means
+   * a missing wire is a compile error instead.
+   */
+  brandKitWriteRepository: BrandKitWriteRepository;
 }): BrandKitService {
+  /**
+   * ADR-0001 / workorder 21Z: `fetchKitDetail` takes the USER, not a
+   * user-scoped client.
+   *
+   * The two reads moved to `BrandKitReadRepository` (owner-only ACL written into
+   * the SQL), and a user-scoped client is created only when there really is a
+   * file asset whose path needs a signed URL. The signing logic itself is
+   * unchanged — this method is still the reason `createKit`, `updateKit` and
+   * `getKit` can end up creating a client.
+   */
   async function fetchKitDetail(
-    client: UserSupabaseClient,
+    user: AuthenticatedUser,
     kitId: string,
   ): Promise<BrandKitDetail> {
-    const { data: kit, error: kitError } = await client
-      .from("brand_kits")
-      .select("id, name, is_default, guidance_text, cover_url, created_at, updated_at")
-      .eq("id", kitId)
-      .maybeSingle();
+    // The removed PostgREST read answered a FAILED query and "no such kit"
+    // differently — `brand_kit_not_found` / 500 versus `brand_kit_not_found` /
+    // 404 — so the two outcomes are kept apart here too, even though both look
+    // like a bug at first glance. Workorder 21Z freezes them as they are.
+    let kit: KitDetailRow | null;
 
-    if (kitError) {
+    try {
+      kit = await options.brandKitReadRepository.findOwnKit({
+        actorId: user.id,
+        kitId,
+      });
+    } catch {
       throw new BrandKitServiceError(
         "brand_kit_not_found",
         KIT_NOT_FOUND_MESSAGE,
@@ -133,16 +167,14 @@ export function createBrandKitService(options: {
       );
     }
 
-    const { data: assets, error: assetsError } = await client
-      .from("brand_kit_assets")
-      .select(
-        "id, asset_type, display_name, role, sort_order, text_content, file_url, metadata, created_at, updated_at",
-      )
-      .eq("kit_id", kitId)
-      .order("sort_order", { ascending: true })
-      .order("created_at", { ascending: true });
+    let assetRows: BrandKitAssetRow[];
 
-    if (assetsError) {
+    try {
+      assetRows = await options.brandKitReadRepository.listOwnKitAssets({
+        actorId: user.id,
+        kitId,
+      });
+    } catch {
       throw new BrandKitServiceError(
         "brand_kit_query_failed",
         KIT_QUERY_FAILED_MESSAGE,
@@ -150,11 +182,12 @@ export function createBrandKitService(options: {
       );
     }
 
-    const mappedAssets = (assets ?? []).map(mapAssetRow);
+    const mappedAssets = assetRows.map(mapAssetRow);
 
     // Resolve signed URLs for file-based assets (logo/image)
     const fileAssets = mappedAssets.filter((a) => a.file_url);
     if (fileAssets.length > 0) {
+      const client = options.createUserClient(user.accessToken);
       const paths = fileAssets.map((a) => a.file_url!);
       const { data: signedData } = await client.storage
         .from(BRAND_KIT_BUCKET)
@@ -250,21 +283,29 @@ export function createBrandKitService(options: {
     },
 
     async getKit(user, kitId) {
-      const client = options.createUserClient(user.accessToken);
-      return fetchKitDetail(client, kitId);
+      // No user-scoped client here: the detail is read through the repository, and
+      // `fetchKitDetail` creates one only if a file path needs a signed URL.
+      return fetchKitDetail(user, kitId);
     },
 
     async createKit(user, input) {
-      const client = options.createUserClient(user.accessToken);
       const name = input.name?.trim() || "\u672A\u547D\u540D";
 
-      const { data: kit, error } = await client
-        .from("brand_kits")
-        .insert({ user_id: user.id, name })
-        .select("id")
-        .single();
+      // ADR-0001 / workorder 21Z: the insert runs in
+      // `BrandKitWriteRepository.insertOwnKit`, whose `user_id = $1::uuid` is the
+      // INSERT half of `brand_kits_user_policy` written out — a privileged
+      // connection bypasses the policy, so the statement's own predicate is the
+      // only gate. `guidance_text` is passed as null, which is what "column not
+      // named by the removed insert" meant (it is nullable with no default).
+      let kit: { id: string };
 
-      if (error || !kit) {
+      try {
+        kit = await options.brandKitWriteRepository.insertOwnKit({
+          actorId: user.id,
+          name,
+          guidanceText: null,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_create_failed",
           KIT_CREATE_FAILED_MESSAGE,
@@ -272,21 +313,23 @@ export function createBrandKitService(options: {
         );
       }
 
-      return fetchKitDetail(client, kit.id);
+      return fetchKitDetail(user, kit.id);
     },
 
     async updateKit(user, kitId, input) {
-      const client = options.createUserClient(user.accessToken);
-
-      // If setting as default, clear existing default first
+      // If setting as default, clear existing default first.
+      //
+      // ADR-0001 / workorder 21Z: this stays a SEPARATE statement from the update
+      // below, exactly as it was. Merging the two into one transaction would look
+      // tidier and WOULD change the failure behaviour — today a successful clear
+      // followed by a failed update leaves the user with no default kit, and that
+      // is the behaviour this migration has to keep.
       if (input.is_default === true) {
-        const { error: clearError } = await client
-          .from("brand_kits")
-          .update({ is_default: false })
-          .eq("user_id", user.id)
-          .eq("is_default", true);
-
-        if (clearError) {
+        try {
+          await options.brandKitWriteRepository.clearOwnDefault({
+            actorId: user.id,
+          });
+        } catch {
           throw new BrandKitServiceError(
             "brand_kit_update_failed",
             KIT_UPDATE_FAILED_MESSAGE,
@@ -295,22 +338,27 @@ export function createBrandKitService(options: {
         }
       }
 
-      const payload: Record<string, unknown> = {};
-      if (input.name !== undefined) payload.name = input.name.trim();
-      if (input.guidance_text !== undefined) payload.guidance_text = input.guidance_text;
-      if (input.is_default !== undefined) payload.is_default = input.is_default;
+      const patch: BrandKitKitPatch = {};
+      if (input.name !== undefined) patch.name = input.name.trim();
+      if (input.guidance_text !== undefined) patch.guidance_text = input.guidance_text;
+      if (input.is_default !== undefined) patch.is_default = input.is_default;
 
-      if (Object.keys(payload).length === 0) {
-        return fetchKitDetail(client, kitId);
+      if (Object.keys(patch).length === 0) {
+        return fetchKitDetail(user, kitId);
       }
 
-      const { error: updateError, count } = await client
-        .from("brand_kits")
-        .update(payload)
-        .eq("id", kitId)
-        .eq("user_id", user.id);
-
-      if (updateError) {
+      try {
+        // The touched-row count is deliberately not inspected: the removed write
+        // only logged a note about `count === 0` and let the follow-up detail read
+        // decide between 404 and 200. An update that matched nothing — the kit is
+        // not the actor's, or it does not exist — therefore still ends up as the
+        // 404 that `fetchKitDetail` raises.
+        await options.brandKitWriteRepository.updateOwnKit({
+          actorId: user.id,
+          kitId,
+          patch,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_update_failed",
           KIT_UPDATE_FAILED_MESSAGE,
@@ -318,25 +366,18 @@ export function createBrandKitService(options: {
         );
       }
 
-      if (count === 0) {
-        // Supabase returns count=0 when head:true is used; since we don't use
-        // head:true the count may be null. Only treat an explicit 0 as not-found.
-        // In practice, the fetchKitDetail below will catch not-found scenarios.
-      }
-
-      return fetchKitDetail(client, kitId);
+      return fetchKitDetail(user, kitId);
     },
 
     async deleteKit(user, kitId) {
-      const client = options.createUserClient(user.accessToken);
+      let existing: KitDetailRow | null;
 
-      const { data: existing, error: findError } = await client
-        .from("brand_kits")
-        .select("id")
-        .eq("id", kitId)
-        .maybeSingle();
-
-      if (findError) {
+      try {
+        existing = await options.brandKitReadRepository.findOwnKit({
+          actorId: user.id,
+          kitId,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_delete_failed",
           KIT_DELETE_FAILED_MESSAGE,
@@ -352,28 +393,36 @@ export function createBrandKitService(options: {
         );
       }
 
-      // Clean up storage objects for file-based assets
-      const { data: fileAssets } = await client
-        .from("brand_kit_assets")
-        .select("file_url")
-        .eq("kit_id", kitId)
-        .not("file_url", "is", null);
+      // Clean up storage objects for file-based assets.
+      //
+      // ADR-0001 / workorder 21Z: this path read SWALLOWED its error before the
+      // migration and still does — a failed lookup means "no paths", the kit is
+      // deleted anyway and the objects are left behind. Turning it into a 500
+      // would be a behaviour change this workorder explicitly does not own.
+      let fileUrls: string[] = [];
 
-      if (fileAssets && fileAssets.length > 0) {
-        const paths = fileAssets
-          .map((a) => a.file_url)
-          .filter((p): p is string => !!p);
-        if (paths.length > 0) {
-          await client.storage.from(BRAND_KIT_BUCKET).remove(paths);
-        }
+      try {
+        fileUrls = await options.brandKitReadRepository.listOwnKitFileUrls({
+          actorId: user.id,
+          kitId,
+        });
+      } catch {
+        // Swallowed on purpose: see above, and the removed read did the same.
       }
 
-      const { error: deleteError } = await client
-        .from("brand_kits")
-        .delete()
-        .eq("id", kitId);
+      const paths = fileUrls.filter((path) => !!path);
 
-      if (deleteError) {
+      if (paths.length > 0) {
+        const client = options.createUserClient(user.accessToken);
+        await client.storage.from(BRAND_KIT_BUCKET).remove(paths);
+      }
+
+      try {
+        await options.brandKitWriteRepository.deleteOwnKit({
+          actorId: user.id,
+          kitId,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_delete_failed",
           KIT_DELETE_FAILED_MESSAGE,
@@ -383,52 +432,79 @@ export function createBrandKitService(options: {
     },
 
     async createAsset(user, kitId, input) {
-      const client = options.createUserClient(user.accessToken);
+      // ADR-0001 / workorder 21Z: NO user-scoped client on this path at all —
+      // nothing here touches Storage. The kit probe, the sort-order read and the
+      // insert are three repository calls, and each keeps the outcome it had.
+      let kit: KitDetailRow | null;
 
-      // Verify kit exists
-      const { data: kit, error: kitError } = await client
-        .from("brand_kits")
-        .select("id")
-        .eq("id", kitId)
-        .maybeSingle();
-
-      if (kitError || !kit) {
+      try {
+        kit = await options.brandKitReadRepository.findOwnKit({
+          actorId: user.id,
+          kitId,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_not_found",
           KIT_NOT_FOUND_MESSAGE,
-          kitError ? 500 : 404,
+          500,
         );
       }
 
-      // Get max sort_order for this kit + asset_type
-      const { data: maxRow } = await client
-        .from("brand_kit_assets")
-        .select("sort_order")
-        .eq("kit_id", kitId)
-        .eq("asset_type", input.asset_type)
-        .order("sort_order", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      if (!kit) {
+        throw new BrandKitServiceError(
+          "brand_kit_not_found",
+          KIT_NOT_FOUND_MESSAGE,
+          404,
+        );
+      }
 
-      const nextSortOrder = (maxRow?.sort_order ?? -1) + 1;
+      // Get max sort_order for this kit + asset_type.
+      //
+      // Swallowed on purpose: a failed read here meant "no rows", so the next
+      // asset got sort_order 0. That is the pre-migration behaviour exactly, and
+      // workorder 21Z freezes it rather than fixing it.
+      let nextSortOrder = 0;
 
-      const { data: asset, error: insertError } = await client
-        .from("brand_kit_assets")
-        .insert({
-          kit_id: kitId,
-          asset_type: input.asset_type,
-          display_name: input.display_name,
-          text_content: input.text_content ?? null,
-          role: input.role ?? null,
-          sort_order: nextSortOrder,
-          metadata: (input.metadata ?? {}) as import("@loomic/shared").Json,
-        })
-        .select(
-          "id, asset_type, display_name, role, sort_order, text_content, file_url, metadata, created_at, updated_at",
-        )
-        .single();
+      try {
+        nextSortOrder = await options.brandKitReadRepository.readNextSortOrder({
+          actorId: user.id,
+          kitId,
+          assetType: input.asset_type,
+        });
+      } catch {
+        nextSortOrder = 0;
+      }
 
-      if (insertError || !asset) {
+      const asset: BrandKitAssetInsert = {
+        asset_type: input.asset_type,
+        display_name: input.display_name,
+        text_content: input.text_content ?? null,
+        role: input.role ?? null,
+        sort_order: nextSortOrder,
+        // The removed insert sent `input.metadata ?? {}`; the column default is
+        // also `'{}'`, so both spellings store the same value.
+        metadata: input.metadata ?? {},
+        // The removed insert never named `file_url`: the column default (NULL)
+        // applied. Binding NULL is the same row.
+        file_url: null,
+      };
+
+      let created: BrandKitAssetRow | null;
+
+      try {
+        created = await options.brandKitWriteRepository.insertOwnAsset({
+          actorId: user.id,
+          kitId,
+          asset,
+        });
+      } catch {
+        created = null;
+      }
+
+      // A `null` answer is the repository's refused-insert shape (the kit turned
+      // out not to be the actor's) and a throw is a real failure: both produced
+      // `brand_kit_asset_create_failed` / 500 before the migration.
+      if (!created) {
         throw new BrandKitServiceError(
           "brand_kit_asset_create_failed",
           ASSET_CREATE_FAILED_MESSAGE,
@@ -436,52 +512,63 @@ export function createBrandKitService(options: {
         );
       }
 
-      return mapAssetRow(asset);
+      return mapAssetRow(created);
     },
 
     async updateAsset(user, kitId, assetId, input) {
-      const client = options.createUserClient(user.accessToken);
+      // ADR-0001 / workorder 21Z: no user-scoped client on this path — nothing
+      // here touches Storage.
+      const patch: BrandKitAssetPatch = {};
+      if (input.display_name !== undefined) patch.display_name = input.display_name;
+      if (input.text_content !== undefined) patch.text_content = input.text_content;
+      if (input.role !== undefined) patch.role = input.role;
+      if (input.sort_order !== undefined) patch.sort_order = input.sort_order;
+      if (input.metadata !== undefined) patch.metadata = input.metadata;
 
-      const payload: Record<string, unknown> = {};
-      if (input.display_name !== undefined) payload.display_name = input.display_name;
-      if (input.text_content !== undefined) payload.text_content = input.text_content;
-      if (input.role !== undefined) payload.role = input.role;
-      if (input.sort_order !== undefined) payload.sort_order = input.sort_order;
-      if (input.metadata !== undefined) payload.metadata = input.metadata;
+      if (Object.keys(patch).length === 0) {
+        // Nothing to update, just fetch and return current state.
+        let current: BrandKitAssetRow | null;
 
-      if (Object.keys(payload).length === 0) {
-        // Nothing to update, just fetch and return current state
-        const { data: current, error } = await client
-          .from("brand_kit_assets")
-          .select(
-            "id, asset_type, display_name, role, sort_order, text_content, file_url, metadata, created_at, updated_at",
-          )
-          .eq("id", assetId)
-          .eq("kit_id", kitId)
-          .maybeSingle();
-
-        if (error || !current) {
+        try {
+          current = await options.brandKitReadRepository.findOwnAsset({
+            actorId: user.id,
+            kitId,
+            assetId,
+          });
+        } catch {
+          // A FAILED read and a missing row both answered
+          // `brand_kit_asset_not_found` before the migration, but with 500 and
+          // 404 respectively. That asymmetry is frozen here (workorder 21Z §6).
           throw new BrandKitServiceError(
             "brand_kit_asset_not_found",
             ASSET_NOT_FOUND_MESSAGE,
-            error ? 500 : 404,
+            500,
+          );
+        }
+
+        if (!current) {
+          throw new BrandKitServiceError(
+            "brand_kit_asset_not_found",
+            ASSET_NOT_FOUND_MESSAGE,
+            404,
           );
         }
 
         return mapAssetRow(current);
       }
 
-      const { data: asset, error: updateError } = await client
-        .from("brand_kit_assets")
-        .update(payload)
-        .eq("id", assetId)
-        .eq("kit_id", kitId)
-        .select(
-          "id, asset_type, display_name, role, sort_order, text_content, file_url, metadata, created_at, updated_at",
-        )
-        .maybeSingle();
+      let asset: BrandKitAssetRow | null;
 
-      if (updateError) {
+      try {
+        asset = await options.brandKitWriteRepository.updateOwnAsset({
+          actorId: user.id,
+          kitId,
+          assetId,
+          patch,
+        });
+      } catch {
+        // A failed UPDATE is `brand_kit_update_failed` / 500 — not the
+        // asset-not-found pair above. Both codes are pre-migration behaviour.
         throw new BrandKitServiceError(
           "brand_kit_update_failed",
           KIT_UPDATE_FAILED_MESSAGE,
@@ -501,16 +588,15 @@ export function createBrandKitService(options: {
     },
 
     async deleteAsset(user, kitId, assetId) {
-      const client = options.createUserClient(user.accessToken);
+      let existing: BrandKitAssetRow | null;
 
-      const { data: existing, error: findError } = await client
-        .from("brand_kit_assets")
-        .select("id, file_url")
-        .eq("id", assetId)
-        .eq("kit_id", kitId)
-        .maybeSingle();
-
-      if (findError) {
+      try {
+        existing = await options.brandKitReadRepository.findOwnAsset({
+          actorId: user.id,
+          kitId,
+          assetId,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_delete_failed",
           KIT_DELETE_FAILED_MESSAGE,
@@ -526,18 +612,20 @@ export function createBrandKitService(options: {
         );
       }
 
-      // Clean up storage object if this asset has a file
+      // Clean up storage object if this asset has a file. This is the only step
+      // on the path that still needs a user-scoped client.
       if (existing.file_url) {
+        const client = options.createUserClient(user.accessToken);
         await client.storage.from(BRAND_KIT_BUCKET).remove([existing.file_url]);
       }
 
-      const { error: deleteError } = await client
-        .from("brand_kit_assets")
-        .delete()
-        .eq("id", assetId)
-        .eq("kit_id", kitId);
-
-      if (deleteError) {
+      try {
+        await options.brandKitWriteRepository.deleteOwnAsset({
+          actorId: user.id,
+          kitId,
+          assetId,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_delete_failed",
           KIT_DELETE_FAILED_MESSAGE,
@@ -547,22 +635,34 @@ export function createBrandKitService(options: {
     },
 
     async uploadAsset(user, kitId, assetType, fileName, fileBuffer, mimeType) {
-      const client = options.createUserClient(user.accessToken);
+      // Verify kit exists and belongs to user — through the repository, BEFORE the
+      // user-scoped client is created: the upload path must not open a PostgREST
+      // client just to answer a 404.
+      let kit: KitDetailRow | null;
 
-      // Verify kit exists and belongs to user
-      const { data: kit, error: kitError } = await client
-        .from("brand_kits")
-        .select("id")
-        .eq("id", kitId)
-        .maybeSingle();
-
-      if (kitError || !kit) {
+      try {
+        kit = await options.brandKitReadRepository.findOwnKit({
+          actorId: user.id,
+          kitId,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_not_found",
           KIT_NOT_FOUND_MESSAGE,
-          kitError ? 500 : 404,
+          500,
         );
       }
+
+      if (!kit) {
+        throw new BrandKitServiceError(
+          "brand_kit_not_found",
+          KIT_NOT_FOUND_MESSAGE,
+          404,
+        );
+      }
+
+      // Storage: the ONLY reason this method still creates a user-scoped client.
+      const client = options.createUserClient(user.accessToken);
 
       // Upload to storage
       const timestamp = Date.now();
@@ -584,35 +684,49 @@ export function createBrandKitService(options: {
         );
       }
 
-      // Get max sort_order
-      const { data: maxRow } = await client
-        .from("brand_kit_assets")
-        .select("sort_order")
-        .eq("kit_id", kitId)
-        .eq("asset_type", assetType)
-        .order("sort_order", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      // Get max sort_order. Swallowed on purpose, exactly as on the createAsset
+      // path: a failed read meant "no rows", so the next asset got sort_order 0.
+      let nextSortOrder = 0;
 
-      const nextSortOrder = (maxRow?.sort_order ?? -1) + 1;
+      try {
+        nextSortOrder = await options.brandKitReadRepository.readNextSortOrder({
+          actorId: user.id,
+          kitId,
+          assetType,
+        });
+      } catch {
+        nextSortOrder = 0;
+      }
 
       // Create asset record — store object path in file_url
       const displayName = fileName.replace(/\.[^.]+$/, "");
-      const { data: asset, error: insertError } = await client
-        .from("brand_kit_assets")
-        .insert({
-          kit_id: kitId,
-          asset_type: assetType,
-          display_name: displayName,
-          file_url: objectPath,
-          sort_order: nextSortOrder,
-        })
-        .select(
-          "id, asset_type, display_name, role, sort_order, text_content, file_url, metadata, created_at, updated_at",
-        )
-        .single();
+      const asset: BrandKitAssetInsert = {
+        asset_type: assetType,
+        display_name: displayName,
+        text_content: null,
+        role: null,
+        sort_order: nextSortOrder,
+        // The removed insert named neither `metadata` nor `text_content`, so both
+        // column defaults applied — `'{}'` and NULL. Binding those same values
+        // writes the same row; passing nothing is not possible with a fixed
+        // statement, which is exactly why they are written out here.
+        metadata: {},
+        file_url: objectPath,
+      };
 
-      if (insertError || !asset) {
+      let created: BrandKitAssetRow | null;
+
+      try {
+        created = await options.brandKitWriteRepository.insertOwnAsset({
+          actorId: user.id,
+          kitId,
+          asset,
+        });
+      } catch {
+        created = null;
+      }
+
+      if (!created) {
         // Clean up uploaded file on DB failure
         await client.storage.from(BRAND_KIT_BUCKET).remove([objectPath]);
         throw new BrandKitServiceError(
@@ -627,7 +741,7 @@ export function createBrandKitService(options: {
         .from(BRAND_KIT_BUCKET)
         .createSignedUrl(objectPath, SIGNED_URL_EXPIRY_SECONDS);
 
-      const mapped = mapAssetRow(asset);
+      const mapped = mapAssetRow(created);
       if (urlData?.signedUrl) {
         mapped.file_url = urlData.signedUrl;
       }
@@ -635,35 +749,41 @@ export function createBrandKitService(options: {
     },
 
     async duplicateKit(user, kitId) {
-      const client = options.createUserClient(user.accessToken);
+      // Fetch source kit — the same owner-only detail read as everywhere else, on
+      // a path that must not open a user-scoped client just to look.
+      let source: KitDetailRow | null;
 
-      // Fetch source kit
-      const { data: source, error: sourceError } = await client
-        .from("brand_kits")
-        .select("name, guidance_text")
-        .eq("id", kitId)
-        .maybeSingle();
-
-      if (sourceError || !source) {
+      try {
+        source = await options.brandKitReadRepository.findOwnKit({
+          actorId: user.id,
+          kitId,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_not_found",
           KIT_NOT_FOUND_MESSAGE,
-          sourceError ? 500 : 404,
+          500,
+        );
+      }
+
+      if (!source) {
+        throw new BrandKitServiceError(
+          "brand_kit_not_found",
+          KIT_NOT_FOUND_MESSAGE,
+          404,
         );
       }
 
       // Create new kit (never copy is_default)
-      const { data: newKit, error: createError } = await client
-        .from("brand_kits")
-        .insert({
-          user_id: user.id,
-          name: `${source.name} (副本)`,
-          guidance_text: source.guidance_text,
-        })
-        .select("id")
-        .single();
+      let newKit: { id: string };
 
-      if (createError || !newKit) {
+      try {
+        newKit = await options.brandKitWriteRepository.insertOwnKit({
+          actorId: user.id,
+          name: `${source.name} (副本)`,
+          guidanceText: source.guidance_text,
+        });
+      } catch {
         throw new BrandKitServiceError(
           "brand_kit_create_failed",
           KIT_CREATE_FAILED_MESSAGE,
@@ -671,15 +791,28 @@ export function createBrandKitService(options: {
         );
       }
 
-      // Copy non-file assets (colors, fonts) directly
-      const { data: assets } = await client
-        .from("brand_kit_assets")
-        .select("asset_type, display_name, role, sort_order, text_content, file_url, metadata")
-        .eq("kit_id", kitId)
-        .order("sort_order", { ascending: true });
+      // Copy non-file assets (colors, fonts) directly.
+      //
+      // ADR-0001 / workorder 21Z: this read SWALLOWED its error before the
+      // migration and still does — a failed lookup means "no assets to copy", the
+      // duplicate is still returned, and that is exactly what happens now.
+      let assets: BrandKitAssetRow[] = [];
 
-      if (assets && assets.length > 0) {
-        const copies = [];
+      try {
+        assets = await options.brandKitReadRepository.listOwnKitAssets({
+          actorId: user.id,
+          kitId,
+        });
+      } catch {
+        // Swallowed on purpose: see above, and the removed read did the same.
+      }
+
+      if (assets.length > 0) {
+        // Storage is the ONLY reason this path creates a user-scoped client, and
+        // it is created only when there is at least one asset to look at.
+        const client = options.createUserClient(user.accessToken);
+        const copies: BrandKitAssetCopy[] = [];
+
         for (const asset of assets) {
           let newFileUrl: string | null = null;
 
@@ -696,7 +829,6 @@ export function createBrandKitService(options: {
           }
 
           copies.push({
-            kit_id: newKit.id,
             asset_type: asset.asset_type,
             display_name: asset.display_name,
             role: asset.role,
@@ -707,26 +839,32 @@ export function createBrandKitService(options: {
           });
         }
 
-        await client.from("brand_kit_assets").insert(copies);
+        // ADR-0001 / workorder 21Z: this batch insert IGNORED its error before the
+        // migration and still does — the duplicate comes back either way, with
+        // whatever rows made it in. `kit_id` is bound once for the whole batch.
+        try {
+          await options.brandKitWriteRepository.insertOwnAssetCopies({
+            actorId: user.id,
+            kitId: newKit.id,
+            copies,
+          });
+        } catch {
+          // Swallowed on purpose: see above, and the removed write did the same.
+        }
       }
 
-      return fetchKitDetail(client, newKit.id);
+      return fetchKitDetail(user, newKit.id);
     },
   };
 }
 
-function mapAssetRow(row: {
-  id: string;
-  asset_type: string;
-  display_name: string;
-  role: string | null;
-  sort_order: number;
-  text_content: string | null;
-  file_url: string | null;
-  metadata: unknown;
-  created_at: string;
-  updated_at: string;
-}): BrandKitAsset {
+/**
+ * ADR-0001 / workorder 21Z: the row this maps is now the ten-column
+ * `BrandKitAssetRow` the two repositories answer, not a PostgREST result. The
+ * mapping itself is unchanged — including `metadata ?? {}`, which is the one place
+ * a SQL NULL becomes the `{}` the response contract requires.
+ */
+function mapAssetRow(row: BrandKitAssetRow): BrandKitAsset {
   return {
     id: row.id,
     asset_type: row.asset_type as BrandKitAsset["asset_type"],

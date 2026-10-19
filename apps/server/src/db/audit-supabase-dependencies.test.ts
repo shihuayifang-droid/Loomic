@@ -770,11 +770,29 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // for the brand-kit write routes, which did not move. Its cases name no client
     // method either, so `fromCallsIncludingTests` follows `fromCalls` down again.
     // The RPC counters are untouched: this migration removed no RPC call site.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(98);
+    // Workorder 21Z then moved the remaining 22 PostgREST TABLE calls of that same
+    // file — the kit insert, the default clear, the kit update and delete, the
+    // asset insert, update and delete, the next-sort-order read, the file-path
+    // read, the kit-detail read, the kit-detail asset read and the duplicate's
+    // batch copy — so both counters below move down together again (98->76). That
+    // is a real coupling removal rather than a counting change: every one of them
+    // now runs through `BrandKitReadRepository` or the new
+    // `BrandKitWriteRepository` (pure `pg`, built in `app.ts` beside the other
+    // repositories), with each RLS policy translated verbatim into the statement's
+    // OWN predicate — `user_id` for `brand_kits`, the owning-kit `exists` clause
+    // for `brand_kit_assets`, and no workspace, project, role or admin clause
+    // derived from anything else. The published wire shape, every error code,
+    // status and message, and the four places that swallowed a failure on purpose
+    // are unchanged; the seven Storage calls of that file did not move (they belong
+    // to workorder 22A), which is why `server.storageCalls` and the RPC counters
+    // below stay exactly where workorder 21Y left them. The new and modified test
+    // files name no client method either, so `fromCallsIncludingTests` follows
+    // `fromCalls` down again.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(76);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(98);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(76);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
