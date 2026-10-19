@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { HexColorPicker } from "react-colorful";
 
+import { AppDropdown, type AppDropdownItem } from "@/components/ui/app-dropdown";
+
 /* ── Preset color swatches for background picker ── */
 const BG_PRESETS = ["transparent","#000000","#FFFFFF","#d3f256","#6C5CE7","#00B894","#FD79A8","#0984E3"] as const;
 
@@ -129,8 +131,6 @@ function ElementRow({ el, onSelect }: { el: ExcalidrawEl; onSelect: (id: string)
 export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, filesOpen, onToggleFiles, leftPanelOpen }: CanvasBottomBarProps) {
   /* ── Zoom state ── */
   const [zoom, setZoom] = useState(1);
-  const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
-  const zoomBtnRef = useRef<HTMLButtonElement>(null);
 
   /* ── Background color state ── */
   const [bgColor, setBgColor] = useState("#FFFFFF");
@@ -172,8 +172,8 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
     applyZoom(Math.max(excalidrawApi.getAppState().zoom.value / ZOOM_STEP, ZOOM_MIN));
   }, [excalidrawApi, applyZoom]);
 
-  const handleZoomTo = useCallback((v: number) => { applyZoom(v); setZoomMenuOpen(false); }, [applyZoom]);
-  const handleFitAll = useCallback(() => { excalidrawApi?.scrollToContent(); setZoomMenuOpen(false); }, [excalidrawApi]);
+  const handleZoomTo = useCallback((v: number) => { applyZoom(v); }, [applyZoom]);
+  const handleFitAll = useCallback(() => { excalidrawApi?.scrollToContent(); }, [excalidrawApi]);
 
   /* ── Background color helpers ── */
   const applyBgColor = useCallback((hex: string) => {
@@ -190,11 +190,20 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
 
   /* ── (files list is now a separate panel component) ── */
 
+  /* ── Zoom preset menu items (ED-00b: click 展开，走 AppDropdown) ── */
+  const zoomItems = useMemo<AppDropdownItem[]>(() => [
+    ...ZOOM_PRESETS.map((v) => ({
+      id: String(v),
+      label: `${Math.round(v * 100)}%`,
+      onSelect: () => handleZoomTo(v),
+    })),
+    { id: "fit-all", label: "Fit All", onSelect: handleFitAll, separatorBefore: true },
+  ], [handleZoomTo, handleFitAll]);
+
   /* ── Toggle helpers (close sibling popovers) ── */
   const closeAllPopovers = useCallback(() => {
-    setZoomMenuOpen(false); setBgPickerOpen(false);
+    setBgPickerOpen(false);
   }, []);
-  const toggleZoomMenu = useCallback(() => { const next = !zoomMenuOpen; closeAllPopovers(); if (next) setZoomMenuOpen(true); }, [zoomMenuOpen, closeAllPopovers]);
   const toggleBgPicker = useCallback(() => { const next = !bgPickerOpen; closeAllPopovers(); if (next) setBgPickerOpen(true); }, [bgPickerOpen, closeAllPopovers]);
   const handleToggleLayers = useCallback(() => { closeAllPopovers(); onToggleLayers(); }, [closeAllPopovers, onToggleLayers]);
   const handleToggleFiles = useCallback(() => { closeAllPopovers(); onToggleFiles(); }, [closeAllPopovers, onToggleFiles]);
@@ -229,22 +238,15 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
 
         {/* ── Zoom controls ── */}
         <button type="button" className={btnClass} onClick={handleZoomOut} aria-label="Zoom out"><MinusIcon className="h-3.5 w-3.5" /></button>
-        <button ref={zoomBtnRef} type="button" className="min-w-[40px] text-center text-xs text-muted-foreground select-none cursor-pointer hover:text-foreground transition-colors" onClick={toggleZoomMenu}>
-          {Math.round(zoom * 100)}%
-        </button>
+        <AppDropdown
+          testid="canvas-zoom-dropdown"
+          label={`${Math.round(zoom * 100)}%`}
+          side="top"
+          triggerClassName="min-w-[40px] cursor-pointer text-center"
+          items={zoomItems}
+        />
         <button type="button" className={btnClass} onClick={handleZoomIn} aria-label="Zoom in"><PlusIcon className="h-3.5 w-3.5" /></button>
       </div>
-
-      {/* ── Zoom preset popover ── */}
-      <Popover open={zoomMenuOpen} triggerRef={zoomBtnRef} onClose={() => setZoomMenuOpen(false)}>
-        <div className="flex flex-col gap-0.5 min-w-[100px]">
-          {ZOOM_PRESETS.map((v) => (
-            <button key={v} type="button" className="px-3 py-1.5 text-xs text-left rounded-md hover:bg-muted transition-colors text-foreground" onClick={() => handleZoomTo(v)}>{Math.round(v * 100)}%</button>
-          ))}
-          <div className="h-px bg-border my-0.5" />
-          <button type="button" className="px-3 py-1.5 text-xs text-left rounded-md hover:bg-muted transition-colors text-foreground" onClick={handleFitAll}>Fit All</button>
-        </div>
-      </Popover>
 
       {/* ── Background color picker popover ── */}
       <Popover open={bgPickerOpen} triggerRef={bgBtnRef} onClose={() => setBgPickerOpen(false)} className="w-[260px] rounded-2xl p-3">
