@@ -15,17 +15,34 @@
  * Whichever reports the terminal state first resolves the promise. Dropping the
  * poll would make the whole flow depend on the socket staying up for ten minutes,
  * which is the fragility we are removing.
+ *
+ * GN-30: `retrying` is NOT terminal. A retrying job is still coming, so the
+ * wait continues and nothing is rejected — only `succeeded / failed / canceled`
+ * end it (see `lib/job-status.ts`, the single definition). The socket event
+ * carries `attempt` but not `max_attempts`, so the first `retrying` triggers one
+ * REST read for the denominator and the answer is cached: the cap cannot change
+ * under a running job, and asking again on every attempt would turn a status
+ * stream into a poll.
  */
 import type { WebSocketHandle } from "../hooks/use-websocket";
+import { isTerminalJobStatus, normalizeJobStatus } from "./job-status";
 import { fetchJob, type JobRecord } from "./server-api";
 
-const TERMINAL = new Set(["succeeded", "failed", "dead_letter", "canceled"]);
+/** What the UI gets on every status change. */
+export interface JobProgress {
+  status: string;
+  elapsedMs?: number;
+  /** 1-based attempt number, when the source reports one. */
+  attempt?: number;
+  /** Total attempts the job may use. Absent until a retrying job told us. */
+  maxAttempts?: number;
+}
 
 export interface AwaitJobOptions {
   ws?: WebSocketHandle | undefined;
   signal?: AbortSignal | undefined;
   /** Called on every status change, for UI that wants to show progress. */
-  onProgress?: (info: { status: string; elapsedMs?: number }) => void;
+  onProgress?: (info: JobProgress) => void;
   /** Safety-net poll interval. Deliberately slow — the socket is the fast path. */
   pollIntervalMs?: number;
   /**
@@ -48,6 +65,10 @@ export class JobWaitTimeout extends Error {
 export class JobFailed extends Error {
   constructor(
     public readonly jobId: string,
+    /**
+     * The job's `error_code` (e.g. `timeout`, `upstream_busy`). Kept so the
+     * error catalogue can turn it into user copy instead of a generic line.
+     */
     public readonly code: string,
     message: string,
   ) {
@@ -75,6 +96,14 @@ export async function awaitJobCompletion(
     let pollTimer: ReturnType<typeof setTimeout> | undefined;
     let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 
+    /**
+     * GN-30: `max_attempts` is not on the socket event, so a retrying job would
+     * read `重试中` with no fraction. We ask REST once, the first time we see
+     * `retrying`, and keep the answer for the rest of this wait.
+     */
+    let maxAttempts: number | undefined;
+    let maxAttemptsAsked = false;
+
     const cleanup = () => {
       unsubscribe?.();
       if (pollTimer) clearTimeout(pollTimer);
@@ -99,6 +128,44 @@ export async function awaitJobCompletion(
       timeoutMs,
     );
 
+    /** Builds the payload without claiming fields a source does not have. */
+    const progressOf = (
+      status: string,
+      elapsedMs: number | undefined,
+      attempt: number | undefined,
+    ): JobProgress => ({
+      status,
+      ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+      ...(attempt !== undefined ? { attempt } : {}),
+      ...(maxAttempts !== undefined ? { maxAttempts } : {}),
+    });
+
+    /**
+     * One REST read per wait, only when a retrying job left the denominator
+     * unknown. A failed read is not worth retrying: the label degrades to
+     * `重试中`, which is still true.
+     */
+    const learnMaxAttempts = (
+      status: string,
+      attempt: number | undefined,
+      elapsedMs: number | undefined,
+    ) => {
+      if (maxAttemptsAsked) return;
+      maxAttemptsAsked = true;
+      void fetchJob(accessToken, jobId)
+        .then(({ job }) => {
+          if (settled) return;
+          if (typeof job.max_attempts === "number") {
+            maxAttempts = job.max_attempts;
+          }
+          // Re-emit so the caller can draw "2/3" now that the cap is known.
+          onProgress?.(progressOf(status, elapsedMs, attempt));
+        })
+        .catch((e: unknown) => {
+          console.warn("[await-job] Could not read max_attempts for", jobId, e);
+        });
+    };
+
     /** Shared terminal handling, whichever source reported it. */
     const settleFromStatus = (
       status: string,
@@ -111,7 +178,7 @@ export async function awaitJobCompletion(
         // than resolving with nothing.
         void fetchJob(accessToken, jobId)
           .then((fetched) => finish(() => resolve(fetched.job)))
-          .catch((e) => finish(() => reject(e)));
+          .catch((e: unknown) => finish(() => reject(e)));
         return;
       }
       finish(() =>
@@ -131,13 +198,21 @@ export async function awaitJobCompletion(
     if (ws) {
       unsubscribe = ws.onEvent((event: any) => {
         if (event?.type !== "job.progress" || event.jobId !== jobId) return;
-        onProgress?.({ status: event.status, elapsedMs: event.elapsedMs });
-        if (TERMINAL.has(event.status)) {
+        const status = normalizeJobStatus(String(event.status));
+        const elapsedMs =
+          typeof event.elapsedMs === "number" ? event.elapsedMs : undefined;
+        const attempt =
+          typeof event.attempt === "number" ? event.attempt : undefined;
+        onProgress?.(progressOf(status, elapsedMs, attempt));
+        if (status === "retrying") learnMaxAttempts(status, attempt, elapsedMs);
+        if (isTerminalJobStatus(status)) {
           settleFromStatus(
-            event.status,
+            status,
             // The event carries the job's result payload on success; shape it
             // like a JobRecord so both paths resolve with the same thing.
-            event.result ? ({ id: jobId, status: event.status, result: event.result } as JobRecord) : null,
+            event.result
+              ? ({ id: jobId, status, result: event.result } as JobRecord)
+              : null,
             event.error,
           );
         }
@@ -149,8 +224,12 @@ export async function awaitJobCompletion(
       if (settled) return;
       try {
         const { job } = await fetchJob(accessToken, jobId);
-        onProgress?.({ status: job.status });
-        if (TERMINAL.has(job.status)) return settleFromStatus(job.status, job);
+        const status = normalizeJobStatus(job.status);
+        if (typeof job.max_attempts === "number") maxAttempts = job.max_attempts;
+        const attempt =
+          typeof job.attempt_count === "number" ? job.attempt_count : undefined;
+        onProgress?.(progressOf(status, undefined, attempt));
+        if (isTerminalJobStatus(status)) return settleFromStatus(status, job);
       } catch {
         // A failed read is not a failed job; try again on the next tick.
       }

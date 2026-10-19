@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import type { WebSocketHandle } from "../hooks/use-websocket";
+import { formatRetryLabel } from "../lib/job-status";
 import {
   GENERATOR_SPECS,
   findGeneratorSpec,
@@ -88,6 +89,9 @@ const GeneratingOverlay = memo(function GeneratingOverlay({
   screenW,
   screenH,
   model,
+  jobStatus,
+  jobAttempt,
+  jobMaxAttempts,
 }: {
   id: string;
   screenX: number;
@@ -95,6 +99,10 @@ const GeneratingOverlay = memo(function GeneratingOverlay({
   screenW: number;
   screenH: number;
   model?: string;
+  /** GN-30: the job's last reported status, written by the video panel. */
+  jobStatus?: string;
+  jobAttempt?: number;
+  jobMaxAttempts?: number;
 }) {
   return (
     <div
@@ -122,7 +130,11 @@ const GeneratingOverlay = memo(function GeneratingOverlay({
           </span>
         )}
         <span className="mt-1 text-[11px] text-muted-foreground">
-          Generating...
+          {/* GN-30: a retrying job is still coming, so the placeholder says so
+              instead of looking identical to the first attempt. */}
+          {jobStatus === "retrying"
+            ? formatRetryLabel(jobAttempt, jobMaxAttempts)
+            : "Generating..."}
         </span>
       </div>
       <div className="absolute inset-0 animate-shimmer-scan">
@@ -248,9 +260,14 @@ export function CanvasToolMenu({ accessToken, excalidrawApi, leftPanelOpen, ws }
           (el: any) => !el.isDeleted && isGeneratingElement(el),
         );
 
-        // Quick identity check: IDs + positions as a serialized key
+        // Quick identity check: IDs + positions as a serialized key.
+        // GN-30: the job status belongs in the key too — otherwise an element
+        // that stays in the same place never re-renders when it starts
+        // retrying, and the overlay would keep saying "Generating...".
         const genKey = generatingRaw.map((el: any) =>
-          `${el.id}:${el.x}:${el.y}:${el.width}:${el.height}`
+          `${el.id}:${el.x}:${el.y}:${el.width}:${el.height}` +
+          `:${el.customData?.jobStatus ?? ""}:${el.customData?.jobAttempt ?? ""}` +
+          `:${el.customData?.jobMaxAttempts ?? ""}`
         ).join("|");
 
         if (genKey !== prevGeneratingKeyRef.current) {
@@ -262,6 +279,15 @@ export function CanvasToolMenu({ accessToken, excalidrawApi, leftPanelOpen, ws }
             screenW: (el.width as number) * zoom,
             screenH: (el.height as number) * zoom,
             ...(el.customData?.model ? { model: el.customData.model as string } : {}),
+            ...(typeof el.customData?.jobStatus === "string"
+              ? { jobStatus: el.customData.jobStatus as string }
+              : {}),
+            ...(typeof el.customData?.jobAttempt === "number"
+              ? { jobAttempt: el.customData.jobAttempt as number }
+              : {}),
+            ...(typeof el.customData?.jobMaxAttempts === "number"
+              ? { jobMaxAttempts: el.customData.jobMaxAttempts as number }
+              : {}),
           }));
           setGeneratingElements(generating);
         }

@@ -670,6 +670,14 @@ export type JobRecord = {
   result?: Record<string, unknown> | null;
   error_code?: string | null;
   error_message?: string | null;
+  /**
+   * GN-30 (`attempt_count` / `max_attempts` on shared's `BackgroundJob`): the
+   * poll path can report "attempt 2 of 3" straight off the REST row. They stay
+   * optional because the socket path shapes a JobRecord out of a
+   * `job.progress` event, which carries neither.
+   */
+  attempt_count?: number;
+  max_attempts?: number;
 };
 
 export type GenerateVideoResponse = {

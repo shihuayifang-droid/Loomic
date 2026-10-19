@@ -13,7 +13,9 @@ import {
 } from "../../lib/canvas-video-generator";
 import type { VideoModelInfo } from "../../lib/server-api";
 import { fetchVideoModels, submitVideoJob } from "../../lib/server-api";
-import { awaitJobCompletion } from "../../lib/await-job";
+import { awaitJobCompletion, type JobProgress } from "../../lib/await-job";
+import { errorCodeOf, lookupError } from "../../lib/error-catalog";
+import { formatRetryLabel } from "../../lib/job-status";
 import type { WebSocketHandle } from "../../hooks/use-websocket";
 // No longer needs poster frame extraction -- videos use embeddable elements
 
@@ -62,6 +64,12 @@ export function VideoGeneratorPanel({
   const [resolution, setResolution] = useState(data.resolution);
   const [loading, setLoading] = useState(data.status === "generating");
   const [error, setError] = useState<string | null>(data.errorMessage ?? null);
+  /**
+   * GN-30: the last status the job reported. Held in state (not only written to
+   * customData) because the status line has to re-render on `retrying`, and the
+   * canvas overlay reads the same facts off `customData`.
+   */
+  const [jobProgress, setJobProgress] = useState<JobProgress | null>(null);
   const [models, setModels] = useState<VideoModelInfo[]>([]);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [showParamsPopover, setShowParamsPopover] = useState(false);
@@ -245,6 +253,7 @@ export function VideoGeneratorPanel({
 
     setLoading(true);
     setError(null);
+    setJobProgress(null);
     updateVideoGeneratorElement(excalidrawApi, elementId, {
       status: "generating",
       prompt: prompt.trim(),
@@ -282,7 +291,14 @@ export function VideoGeneratorPanel({
         {
           ws,
           signal: controller.signal,
-          onProgress: ({ status, elapsedMs }) => {
+          onProgress: ({ status, elapsedMs, attempt, maxAttempts }) => {
+            // GN-30: `attempt` / `maxAttempts` ride along so the overlay can draw
+            // 「重试中（2/3）」; `retrying` is not a failure and must not look like one.
+            setJobProgress({
+              status,
+              ...(attempt !== undefined ? { attempt } : {}),
+              ...(maxAttempts !== undefined ? { maxAttempts } : {}),
+            });
             updateVideoGeneratorElement(excalidrawApi, elementId, {
               status: "generating",
               prompt: prompt.trim(),
@@ -292,6 +308,8 @@ export function VideoGeneratorPanel({
               resolution,
               ...(elapsedMs != null ? { elapsedMs } : {}),
               jobStatus: status,
+              ...(attempt !== undefined ? { jobAttempt: attempt } : {}),
+              ...(maxAttempts !== undefined ? { jobMaxAttempts: maxAttempts } : {}),
             } as any);
           },
         },
@@ -359,9 +377,12 @@ export function VideoGeneratorPanel({
       console.error("[video-gen] Generation error:", err);
       const handled = handleGenerationError(err);
       if (!handled) {
-        setError("视频生成失败，请重试或更换模型。");
+        // X-40 一期: the copy comes from the catalogue by code, not from a string
+        // written here — a job that failed with `timeout` now says so.
+        setError(lookupError(errorCodeOf(err)).message);
       }
       setLoading(false);
+      setJobProgress(null);
       updateVideoGeneratorElement(excalidrawApi, elementId, {
         status: "error",
         errorMessage: "生成失败",
@@ -385,6 +406,21 @@ export function VideoGeneratorPanel({
 
   const resolutionLabel = currentPriceRate?.displayResolution ?? resolution;
   const paramsLabel = `${aspectRatio} \u00B7 ${duration}s \u00B7 ${resolutionLabel}`;
+
+  /**
+   * GN-30 status line. State goes in `data-state` (testid never changes with
+   * state — CONVENTIONS.md §1.2); the text is what the user reads.
+   * `retrying` gets the 「重试中（2/3）」 placeholder instead of a failure message.
+   */
+  const jobStatus = jobProgress?.status ?? (loading ? "running" : "idle");
+  const jobStatusLabel =
+    jobStatus === "retrying"
+      ? formatRetryLabel(jobProgress?.attempt, jobProgress?.maxAttempts)
+      : jobStatus === "queued"
+        ? "排队中"
+        : jobStatus === "running"
+          ? "生成中"
+          : "";
 
   return createPortal(
     <div
@@ -469,6 +505,16 @@ export function VideoGeneratorPanel({
           className="min-h-[44px] max-h-[140px] w-full resize-none border-none bg-transparent text-[14px] leading-[22px] text-foreground placeholder:text-muted-foreground focus:outline-none [&::-webkit-scrollbar]:hidden"
         />
       </div>
+
+      {jobStatusLabel && (
+        <div
+          data-testid="canvas-video-generator-status"
+          data-state={jobStatus}
+          className="mx-4 mb-2 text-[11px] tabular-nums text-muted-foreground"
+        >
+          {jobStatusLabel}
+        </div>
+      )}
 
       {error && (
         <div className="mx-4 mb-2 rounded-lg bg-destructive/10 px-2 py-1.5 text-xs text-destructive">

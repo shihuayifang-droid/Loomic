@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef } from "react";
 
 import type { StreamEvent } from "@loomic/shared";
 
+import { isTerminalJobStatus, normalizeJobStatus } from "../lib/job-status";
 import { fetchJob } from "../lib/server-api";
 
 // --- Constants ---
@@ -12,8 +13,8 @@ import { fetchJob } from "../lib/server-api";
 const POLL_INTERVAL_MS = 5_000;
 /** Maximum total polling duration before giving up (ms) */
 const MAX_POLL_DURATION_MS = 10 * 60 * 1_000; // 10 minutes
-/** Terminal job statuses that should stop polling */
-const TERMINAL_FAILURE_STATUSES = new Set(["failed", "dead_letter", "canceled"]);
+// GN-30: the terminal set lives in lib/job-status.ts, imported by both waiters,
+// so `retrying` keeps polling and `dead_letter` reads as `failed` in one place.
 
 // --- Types ---
 
@@ -120,8 +121,9 @@ export function useJobFallbackPolling({
 
         try {
           const { job } = await fetchJob(token, jobId);
+          const status = normalizeJobStatus(job.status);
 
-          if (job.status === "succeeded" && job.result) {
+          if (status === "succeeded" && job.result) {
             console.log(
               `[job-fallback] Job ${jobId} succeeded after fallback polling (${Math.round(elapsed / 1000)}s)`,
             );
@@ -132,9 +134,11 @@ export function useJobFallbackPolling({
             return;
           }
 
-          if (TERMINAL_FAILURE_STATUSES.has(job.status)) {
+          // GN-30: only succeeded / failed / canceled stop the poll. A `retrying`
+          // job is still coming, so it keeps polling like `running` does.
+          if (isTerminalJobStatus(status)) {
             console.warn(
-              `[job-fallback] Job ${jobId} reached terminal status: ${job.status}`,
+              `[job-fallback] Job ${jobId} reached terminal status: ${status}`,
             );
             stopPolling(jobId);
             return;
