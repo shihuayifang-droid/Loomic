@@ -793,4 +793,3 @@ describe("project write repository: bad binds change nothing", () => {
     expect((await projectSnapshot(PERSONAL_PROJECT)).name).toBe("Still writable");
   });
 });
-
