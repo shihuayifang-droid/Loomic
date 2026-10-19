@@ -354,3 +354,50 @@ describe("ImageToolbar（ED-00 / ED-00a，纯展示）", () => {
     expect(screen.queryAllByTestId("image-toolbar-separator")).toHaveLength(0);
   });
 });
+
+/**
+ * 工单 30N（ED-00g 裁决 6）· `showLabels`
+ *
+ * 这一段是**追加**的，上面 30F 的用例一个字都没改：不传 prop 时渲染结果与之前完全一致，
+ * 所以那条「尺寸 32×32」「按钮 3 个」「aria-label」全部照旧成立。
+ */
+describe("ImageToolbar · showLabels（工单 30N，ED-00g）", () => {
+  it("showLabels 为 true 时在图标后面渲染工具名文本", () => {
+    render(<ImageToolbar tools={toolDefinitions()} onToolSelect={vi.fn()} showLabels />);
+
+    // 入口组与导出组两个按钮都有文本；unavailable 的工具照旧不渲染
+    expect(screen.getByText("快捷编辑")).toBeInTheDocument();
+    expect(screen.getByText("下载")).toBeInTheDocument();
+
+    // 只是多了文本，没有多出按钮：按钮仍是 入口 ｜ 编辑动作（仅「更多」）｜ 导出
+    expect(buttonTestids()).toEqual([
+      "image-toolbar-quick-edit",
+      "image-toolbar-more",
+      "image-toolbar-download",
+    ]);
+    // 文本渲染在按钮内部（图标后面），不是旁边的兄弟节点
+    expect(screen.getByTestId("image-toolbar-quick-edit")).toHaveTextContent("快捷编辑");
+  });
+
+  it("showLabels 为 false 或不传时不渲染工具名文本（默认形态保持不变）", () => {
+    const { unmount } = render(
+      <ImageToolbar tools={toolDefinitions()} onToolSelect={vi.fn()} showLabels={false} />,
+    );
+
+    expect(screen.queryByText("快捷编辑")).toBeNull();
+    expect(screen.queryByText("下载")).toBeNull();
+    // 图标占位仍在（文本没渲染不等于按钮空了）
+    expect(screen.getByTestId("image-toolbar-quick-edit")).toBeInTheDocument();
+    unmount();
+
+    // 完全不传 prop（30F 的调用方式）
+    render(<ImageToolbar tools={toolDefinitions()} onToolSelect={vi.fn()} />);
+    expect(screen.queryByText("快捷编辑")).toBeNull();
+    expect(screen.queryByText("下载")).toBeNull();
+    for (const button of screen.getAllByRole("button")) {
+      if (button.getAttribute("data-testid") === "image-toolbar-more") continue;
+      // 不显示名称时按钮还是 32×32（30F 的尺寸断言在这一支上原样成立）
+      expect(button).toHaveStyle({ width: `${TOOLBAR_BUTTON}px`, height: `${TOOLBAR_BUTTON}px` });
+    }
+  });
+});

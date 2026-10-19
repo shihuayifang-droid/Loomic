@@ -30,6 +30,12 @@ import { ImageToolbarMoreMenu } from "./image-toolbar-more-menu";
  *
  * 跟随对象定位、选中态这些要改 `canvas-editor.tsx`（脏文件），等 T-47 之后做。
  * 所以这里没有任何定位/开合逻辑，只有「给一组定义 → 排出一条工具条」。
+ *
+ * ## 工单 30N 的唯一改动点：`showLabels`
+ *
+ * ED-00g 的自定义工具栏要用同一条工具条当预览条，并且要能显示工具名。所以这里多了一个
+ * 可选 prop `showLabels`（默认 `false` = 本单之前的纯图标形态，现有测试一字不改）。
+ * 除它以外本文件没有第二处改动 —— 预览条与真实工具条共用一个组件，正是 ED-00g「前端要点」。
  */
 
 /** ED-00a 尺寸常量。写在容器的 style 上，测试可以直接断言（验收 1：容器 44、按钮 32）。 */
@@ -103,10 +109,20 @@ function ToolGlyph({ icon }: { icon: string }) {
 function ToolButton({
   tool,
   onSelect,
+  showLabels,
 }: {
   tool: ToolDefinition;
   onSelect: (toolId: string) => void;
+  showLabels: boolean;
 }) {
+  /**
+   * 显示工具名时按钮不能还是 32×32（一行中文塞不进去），所以按内容撑开、高度不变；
+   * 不显示时**一个像素都不变**，30F 的尺寸断言原样成立（工单 §2 裁决 6）。
+   */
+  const buttonStyle: React.CSSProperties = showLabels
+    ? { height: TOOLBAR_BUTTON }
+    : { width: TOOLBAR_BUTTON, height: TOOLBAR_BUTTON };
+
   return (
     <Tooltip>
       <TooltipTrigger
@@ -118,12 +134,17 @@ function ToolButton({
             data-testid={tool.testid}
             aria-label={tool.label}
             onClick={() => onSelect(tool.id)}
-            style={{ width: TOOLBAR_BUTTON, height: TOOLBAR_BUTTON }}
-            className={TOOL_BUTTON_CLASS}
+            style={buttonStyle}
+            className={showLabels ? `${TOOL_BUTTON_CLASS} gap-1 px-2` : TOOL_BUTTON_CLASS}
           />
         }
       >
         <ToolGlyph icon={tool.icon} />
+        {/* ED-00g 裁决 6：图标后面渲染 `tool.label`。按钮的可访问名称仍是 `aria-label`
+            （工具名），所以这段文本只作视觉，不额外挂 role。 */}
+        {showLabels ? (
+          <span className="text-xs whitespace-nowrap">{tool.label}</span>
+        ) : null}
       </TooltipTrigger>
       {/* Tooltip 在 focus 上同样展开，所以 Tab 到按钮也会出 tooltip（ED-00a 验收 2）。 */}
       <TooltipContent data-testid="image-toolbar-tooltip">{tooltipLabel(tool)}</TooltipContent>
@@ -146,6 +167,11 @@ export type ImageToolbarProps = {
   /** 整份工具定义（来自 `useToolDefinitions`）。本组件只取 `enabled` 的。 */
   tools: ToolDefinition[];
   onToolSelect: (toolId: string) => void;
+  /**
+   * ED-00g 裁决 6：为 `true` 时在图标后面渲染 `tool.label`（自定义工具栏的预览条要用）。
+   * 默认 `false`，保持 30F 的纯图标形态 —— 不传这个 prop 时现有测试一字不改地通过。
+   */
+  showLabels?: boolean;
 };
 
 type ToolbarGroup = {
@@ -153,7 +179,7 @@ type ToolbarGroup = {
   children: React.ReactNode;
 };
 
-export function ImageToolbar({ tools, onToolSelect }: ImageToolbarProps) {
+export function ImageToolbar({ tools, onToolSelect, showLabels = false }: ImageToolbarProps) {
   const enabledMainTools = tools.filter(
     (tool) => tool.availability === "enabled" && tool.default_slot === "main",
   );
@@ -178,7 +204,7 @@ export function ImageToolbar({ tools, onToolSelect }: ImageToolbarProps) {
   if (entryTool !== undefined) {
     groups.push({
       key: "entry",
-      children: <ToolButton tool={entryTool} onSelect={onToolSelect} />,
+      children: <ToolButton tool={entryTool} onSelect={onToolSelect} showLabels={showLabels} />,
     });
   }
 
@@ -187,7 +213,7 @@ export function ImageToolbar({ tools, onToolSelect }: ImageToolbarProps) {
     children: (
       <>
         {actionTools.map((tool) => (
-          <ToolButton key={tool.id} tool={tool} onSelect={onToolSelect} />
+          <ToolButton key={tool.id} tool={tool} onSelect={onToolSelect} showLabels={showLabels} />
         ))}
         {/* ED-00f：编辑按钮的最后一个是「⋯ 更多」，它的 testid 是 `image-toolbar-more`。 */}
         <span
@@ -203,7 +229,7 @@ export function ImageToolbar({ tools, onToolSelect }: ImageToolbarProps) {
   if (exportTool !== undefined) {
     groups.push({
       key: "export",
-      children: <ToolButton tool={exportTool} onSelect={onToolSelect} />,
+      children: <ToolButton tool={exportTool} onSelect={onToolSelect} showLabels={showLabels} />,
     });
   }
 
