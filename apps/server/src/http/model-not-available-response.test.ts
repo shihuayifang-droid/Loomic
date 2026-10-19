@@ -206,10 +206,12 @@ describe("POST /api/jobs/image-generation: an unregistered model is a 400", () =
     });
 
     expect(quote).toHaveBeenCalledTimes(1);
-    expect(quote.mock.calls[0]?.[0]).toMatchObject({
-      modelId: MODEL_ID,
-      entryPoint: "canvas_generator",
-    });
+    expect(quote).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelId: MODEL_ID,
+        entryPoint: "canvas_generator",
+      }),
+    );
     expect(tierGuard.checkConcurrency).toHaveBeenCalledTimes(1);
   });
 });
