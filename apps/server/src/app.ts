@@ -121,6 +121,8 @@ import { createJobOwnerWriteRepository } from "./db/job-owner-write-repository.j
 import { createJobConcurrencyRepository } from "./db/job-concurrency-repository.js";
 import { createJobTransitionRepository } from "./db/job-transition-repository.js";
 import { createCreditReadRepository } from "./db/credit-read-repository.js";
+import { createCreditLedgerWriteRepository } from "./db/credit-ledger-write-repository.js";
+import { createPricingRuleRepository } from "./db/pricing-rule-repository.js";
 import {
   createJobCreditsLinkRepository,
   type JobCreditsLinkRepository,
@@ -139,6 +141,10 @@ import {
   createTierGuard,
   type TierGuard,
 } from "./features/credits/tier-guard.js";
+import {
+  createPriceQuoter,
+  type PriceQuoter,
+} from "./features/pricing/price-quoter.js";
 import {
   createJobService,
   type JobService,
@@ -222,6 +228,13 @@ export type BuildAppOptions = {
   paymentService?: PaymentService;
   profileWriteRepository?: ProfileWriteRepository;
   tierGuard?: TierGuard;
+  /**
+   * ADR-0001 / workorder 31B: the runtime price of a generation. Injectable for
+   * the same reason `tierGuard` is — a test can hand the app its own quoter and
+   * observe what a route asks the price table for. Production passes nothing here
+   * and gets the real quoter over `pricing_rules`.
+   */
+  priceQuoter?: PriceQuoter;
   uploadService?: UploadService;
   mockEventDelayMs?: number;
   projectReadRepository?: ProjectReadRepository;
@@ -659,6 +672,24 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         getTransactionPool: () => getTransactionPool(databaseEnv),
       }),
     });
+  // 工单31B: the charge stops being a constant compiled into `@loomic/shared` and
+  // becomes a QUOTE against `pricing_rules` (BL-14 第 3 条 / GN-07). Both halves
+  // are built lazily against the same pool as everything above:
+  //
+  //   pricingRuleRepository  — read the candidate rules and "is this model known"
+  //   creditLedgerWriteRepository — INSERT the 0-amount consume row a PENDING
+  //                                 price leaves behind (metadata.price_pending)
+  //
+  // `withBilling` throws when billing is on and `priceQuoter` is missing, so the
+  // wiring below is the single line that keeps the whole app from being free.
+  const pricingRuleRepository = createPricingRuleRepository({
+    getTransactionPool: () => getTransactionPool(databaseEnv),
+  });
+  const priceQuoter =
+    options.priceQuoter ?? createPriceQuoter({ pricingRuleRepository });
+  const creditLedgerWriteRepository = createCreditLedgerWriteRepository({
+    getTransactionPool: () => getTransactionPool(databaseEnv),
+  });
 
   // Payment service — only created when Lemon Squeezy is configured
   let paymentService: PaymentService | undefined = options.paymentService;
@@ -725,6 +756,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     ...(jobService ? { jobService } : {}),
     creditService,
     tierGuard,
+    // 工单31B: the two dependencies of the price quote, on the same path the
+    // tier guard already takes into the Agent runtime.
+    priceQuoter,
+    creditLedgerWriteRepository,
     viewerService,
   });
 
@@ -830,12 +865,24 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     viewerService,
     ...(jobService ? { jobService } : {}),
     ...(tierGuard ? { tierGuard } : {}),
+    // 工单31B: the price table + the pending ledger row, on the same path the
+    // tier guard takes into these routes.
+    priceQuoter,
+    creditLedgerWriteRepository,
     // Lets the video route push job.progress instead of holding the request open.
     ...(connectionManager ? { connectionManager } : {}),
   });
   void registerCreditRoutes(app, { auth, creditService, viewerService });
   if (jobService) {
-    void registerJobRoutes(app, { auth, creditService, jobService, tierGuard, viewerService });
+    void registerJobRoutes(app, {
+      auth,
+      creditService,
+      jobService,
+      tierGuard,
+      priceQuoter,
+      creditLedgerWriteRepository,
+      viewerService,
+    });
   }
   void registerSkillRoutes(app, { auth, skillRepository, viewerService });
   void registerMarketplaceRoutes(app, { auth, skillRepository, viewerService });

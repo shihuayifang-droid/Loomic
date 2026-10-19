@@ -15,6 +15,8 @@ import { CreditServiceError } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
 import { TierGuardError } from "../features/credits/tier-guard.js";
 import { withBilling } from "../features/credits/with-billing.js";
+import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
+import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import type { JobService } from "../features/jobs/job-service.js";
 import { JobServiceError } from "../features/jobs/job-service.js";
 import { watchJob } from "../features/jobs/job-watcher.js";
@@ -46,6 +48,13 @@ export async function registerGenerateRoutes(
     creditService?: CreditService;
     jobService?: JobService;
     tierGuard?: TierGuard;
+    /**
+     * Workorder 31B: the price comes from the price table, and a PENDING price
+     * leaves a 0-amount ledger row. Both are passed straight through to
+     * `withBilling`, which refuses to run with billing on and no quoter.
+     */
+    priceQuoter?: PriceQuoter;
+    creditLedgerWriteRepository?: CreditLedgerWriteRepository;
     uploadService: UploadService;
     viewerService: ViewerService;
     /** Needed to push job.progress. Absent = no progress events, jobs still run. */
@@ -97,6 +106,7 @@ export async function registerGenerateRoutes(
           user,
           workspaceId: viewer.workspace.id,
           modelId: model,
+          entryPoint: "canvas_generator",
           guard: {
             jobType: "image_generation",
             quality: payload.quality ?? "hd",
@@ -224,6 +234,7 @@ export async function registerGenerateRoutes(
           user,
           workspaceId,
           modelId: model,
+          entryPoint: "canvas_generator",
           guard: {
             jobType: "video_generation",
             ...(payload.duration != null ? { duration: payload.duration } : {}),

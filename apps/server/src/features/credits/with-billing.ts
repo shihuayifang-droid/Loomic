@@ -8,7 +8,7 @@
 //     deductCredits fail instead, which means they created a job first and then
 //     cancelled it — leaving a cancelled job behind for every "out of credits".
 //   - POST /api/jobs/video-generation passed `duration` but NOT `resolution`
-//     into calculateCreditCost, while the other two video paths passed both. So
+//     into the cost calculation, while the other two video paths passed both. So
 //     the same 1080p Veo request billed at the 720p rate through that route
 //     (resolutionMultipliers 1080p: 2 was never applied) — we undercharged.
 //   - Refund-on-failure existed in exactly one of the six.
@@ -56,15 +56,37 @@
 // makes the refund one-shot (`refund_credits` does not de-duplicate by job id).
 // A refund that cannot be completed leaves `credits_refund_pending` on the job,
 // which is what the background compensator (T-40) reconciles.
+//
+// THE PRICE COMES FROM THE TABLE — the fourth obligation (workorder 31B)
+// Until 31B this function asked the tier guard for a cost, and that function
+// answered from constants compiled into `@loomic/shared` — with a `DEFAULT_*_COST`
+// fallback, so an unregistered model id was charged the fallback price instead of
+// being refused. BL-14 puts every price in `pricing_rules` and GN-07 makes "no
+// row" a refusal, so the price is now a QUOTE:
+//
+//   not registered / no rule matched -> refused before any job or balance read:
+//       `onRejected({ kind: "model_not_available" })` then a 400
+//       `model_not_available` error. Nothing is created, charged or written.
+//   price_status "pending"           -> run for 0 AND leave a ledger row
+//       (`recordPendingConsume`, amount 0, `metadata.price_pending = true`) so
+//       "used but not priced yet" survives in the books.
+//   price_status "active"            -> charge `total_price` exactly as before.
+//
+// "Pending" and "free" are NOT the same thing: an active price of 0 is a decision
+// (no ledger row, unchanged behaviour), while pending is the absence of one.
 import type {
   BackgroundJob,
+  EntryPoint,
   ImageQualityLevel,
+  PriceDetail,
   VideoResolution,
 } from "@loomic/shared";
 import { PLAN_CONFIGS } from "@loomic/shared";
 
+import type { CreditLedgerWriteRepository } from "../../db/credit-ledger-write-repository.js";
 import type { AuthenticatedUser } from "../../supabase/user.js";
 import type { CreateJobInput, JobService } from "../jobs/job-service.js";
+import type { PriceQuoter } from "../pricing/price-quoter.js";
 import { CreditServiceError, type CreditService } from "./credit-service.js";
 import { TierGuardError, type TierGuard } from "./tier-guard.js";
 
@@ -94,13 +116,31 @@ export type BillingRejection =
       requiredAmount: number;
       plan: string;
       dailyClaimed: boolean;
-    };
+    }
+  // Workorder 31B / GN-07: the price table has no usable row for this model, so
+  // the request never became a job. This is not a tier limit — upgrading the plan
+  // does not make the model sellable, and nothing was charged.
+  | { kind: "model_not_available"; modelId: string };
 
 export interface BillingDeps {
   /** Absent = credit system not configured; guards and charging are skipped. */
   creditService?: CreditService;
   /** Absent = same as above. Both must be present for any billing to happen. */
   tierGuard?: TierGuard;
+  /**
+   * The price of this request (workorder 31B). REQUIRED whenever billing is on:
+   * the two dependencies above say "billing is enabled", and this one says "and
+   * we know what it costs". Missing it with billing on is a wiring mistake and
+   * throws below — falling back to 0 here would make one forgotten line free for
+   * every workspace.
+   */
+  priceQuoter?: PriceQuoter;
+  /**
+   * The ledger row a PENDING price leaves behind (workorder 31B). Only reached
+   * when the quote answers `pending`; absent then, the request fails loudly
+   * rather than running for 0 with no record of why.
+   */
+  creditLedgerWriteRepository?: CreditLedgerWriteRepository;
   /** Required whenever `request.job` is set. */
   jobService?: JobService;
 }
@@ -109,6 +149,14 @@ export interface BillingRequest {
   user: AuthenticatedUser;
   workspaceId: string;
   modelId: string;
+  /**
+   * Which entry point asked (GN-09: `agent` / `canvas_generator` / …).
+   *
+   * REQUIRED on purpose (workorder 31B ruling 3): the price table matches on it,
+   * so a call site that forgets it must fail the build rather than quietly quote
+   * the wildcard row for every entry point.
+   */
+  entryPoint: EntryPoint;
   guard: BillingGuardSpec;
   /** Goes on the credit transaction, e.g. "Image generation: <model>". */
   description: string;
@@ -138,8 +186,17 @@ export interface BillingRequest {
 export interface BillingOutcome {
   /** Present only when `request.job` was supplied. */
   job?: BackgroundJob;
-  /** 0 when the credit system is not configured or the model is free. */
+  /** 0 when the credit system is not configured, the model is free, or it is pending. */
   creditsCost: number;
+  /**
+   * What the quote said (workorder 31B, ruling in T3): `"pending"` = the price is
+   * not set yet and this run leaves a 0-amount ledger row; `"active"` = the table
+   * priced it. `null` when billing is switched off, because then nobody quoted
+   * anything.
+   *
+   * Nothing reads it yet — BL-22 (next ticket) is where it becomes visible.
+   */
+  priceStatus: "pending" | "active" | null;
 }
 
 /**
@@ -153,8 +210,8 @@ export async function withBilling<T>(
   request: BillingRequest,
   run: (outcome: BillingOutcome) => Promise<T>,
 ): Promise<T> {
-  const { creditService, tierGuard, jobService } = deps;
-  const { user, workspaceId, modelId, guard, description } = request;
+  const { creditService, tierGuard, priceQuoter, creditLedgerWriteRepository, jobService } = deps;
+  const { user, workspaceId, modelId, entryPoint, guard, description } = request;
 
   if (request.job && !jobService) {
     // A wiring mistake, not a runtime condition: the caller asked for a job and
@@ -166,7 +223,28 @@ export async function withBilling<T>(
   }
 
   const billingEnabled = !!creditService && !!tierGuard;
+
+  if (billingEnabled && !priceQuoter) {
+    // Workorder 31B ruling 7, written the same way as the jobService check above:
+    // with billing on, "we do not know the price" must never degrade into "so it
+    // is free". One forgotten wiring line would otherwise make every generation
+    // on the deployment cost 0 and produce no complaint.
+    throw new Error(
+      "withBilling: deps.creditService and deps.tierGuard are set but " +
+        "deps.priceQuoter is missing. Wire a price quoter (or turn billing off).",
+    );
+  }
+
   let creditsCost = 0;
+  // The quote, once it answered. Kept as ONE value so "billing is off" (null) and
+  // "the price is pending" (status "pending") can never be confused, and so the
+  // pending branch below reads a value that is guaranteed complete instead of
+  // three loose variables that could drift apart.
+  let quoted: {
+    status: "pending" | "active";
+    detail: PriceDetail;
+    ruleId: string;
+  } | null = null;
 
   if (billingEnabled) {
     let effectiveQuality: ImageQualityLevel = "hd";
@@ -190,20 +268,51 @@ export async function withBilling<T>(
       throw err;
     }
 
-    creditsCost = tierGuard.calculateCreditCost(
-      modelId,
-      guard.jobType,
+    // Workorder 31B ruling 4 — what to ask the price table for.
+    //
+    // Images: the QUALITY AFTER `plan_max` is resolved, so the plan's own maximum
+    // is the tier that gets priced (asking for `plan_max` would match the wildcard
+    // row and quietly price a hd request off the model default).
+    // Video: the requested resolution, or `"unspecified"`. Video only has a
+    // default row today, so that answer is the default row — expected, not a bug.
+    const searchKey =
       guard.jobType === "image_generation"
-        ? { quality: effectiveQuality }
-        : {
-            ...(guard.duration != null ? { duration: guard.duration } : {}),
-            ...(guard.resolution ? { resolution: guard.resolution } : {}),
-          },
-    );
+        ? effectiveQuality
+        : (guard.resolution ?? "unspecified");
+
+    // One clock reading per request (ruling 5): `at` decides which rules are in
+    // force, and quoting twice with two different "now"s could straddle an
+    // activation time inside a single charge.
+    const outcome = await priceQuoter!.quote({
+      modelId,
+      entryPoint,
+      searchKey,
+      at: new Date(),
+    });
+
+    if (!outcome.ok) {
+      // Ruling 6: refuse BEFORE the job exists and before the balance read. A
+      // model the table does not know is not sellable at any price, so there is
+      // nothing to create, nothing to check and nothing to charge.
+      request.onRejected?.({ kind: "model_not_available", modelId });
+      throw new CreditServiceError(
+        "model_not_available",
+        `Model "${modelId}" is not available for generation.`,
+        400,
+      );
+    }
+
+    quoted = {
+      status: outcome.detail.price_status,
+      detail: outcome.detail,
+      ruleId: outcome.ruleId,
+    };
+    creditsCost = outcome.detail.total_price;
   }
 
   // Balance pre-check. Previously only the agent paths did this; without it the
   // HTTP paths created a job, failed the deduction, then cancelled the job.
+  // A pending price is 0, so it never reaches here — exactly like a free one.
   if (billingEnabled && creditsCost > 0) {
     const balanceInfo = await creditService.getBalance(workspaceId);
     if (balanceInfo.balance < creditsCost) {
@@ -230,6 +339,46 @@ export async function withBilling<T>(
       jobType: guard.jobType,
       payload: request.job.payload,
     });
+  }
+
+  // Workorder 31B ruling 8 — the pending ledger row, and it comes BEFORE the
+  // billing confirmation below:
+  //
+  //   job -> pending ledger row -> setCreditsInfo(job, 0, null) -> run
+  //
+  // The row is written whether or not there is a job: the synchronous image route
+  // creates none, and "this model was used while unpriced" is exactly the fact
+  // that must survive from that route too (`jobId` is then null).
+  if (billingEnabled && quoted?.status === "pending") {
+    if (!creditLedgerWriteRepository) {
+      // Not silently skipped: a pending run that leaves no ledger row is
+      // indistinguishable from one that never happened, which is the whole point
+      // of this branch. Same reaction as a failed write (ruling 8, below).
+      const missingLedger = new Error(
+        "withBilling: the quoted price is pending but " +
+          "deps.creditLedgerWriteRepository is missing. Wire the credit ledger " +
+          "writer (or price the model) so the 0-amount consume row has an owner.",
+      );
+      if (job) await jobService!.cancelJob(user, job.id).catch(() => {});
+      throw missingLedger;
+    }
+
+    try {
+      await creditLedgerWriteRepository.recordPendingConsume({
+        workspaceId,
+        userId: user.id,
+        jobId: job?.id ?? null,
+        description,
+        ruleId: quoted.ruleId,
+        priceDetail: quoted.detail,
+      });
+    } catch (ledgerError) {
+      // Ruling 8: the same reaction as a failed `setCreditsInfo` — the job must
+      // not stay startable when the record of what it costs could not be written.
+      // The cancel's own failure is swallowed so the caller sees the write error.
+      if (job) await jobService!.cancelJob(user, job.id).catch(() => {});
+      throw ledgerError;
+    }
   }
 
   // Charge before running. Deliberately not moved after generation: the balance
@@ -290,13 +439,18 @@ export async function withBilling<T>(
       }
     }
   } else if (job) {
-    // Workorder 21H1: the two paths that charge nothing still have to RECORD
-    // that they charged nothing. `createJob` enqueues the job before this
-    // function runs, so the worker may already be holding the message; with
-    // `credits_cost` left NULL (a free model, or a deployment with the credit
-    // system switched off) that message is indistinguishable from a job whose
-    // charge has not happened yet, and the worker's billing gate would defer it
-    // for ten minutes and then fail it as `billing_not_confirmed`.
+    // Workorder 21H1: the paths that charge nothing still have to RECORD that
+    // they charged nothing. `createJob` enqueues the job before this function
+    // runs, so the worker may already be holding the message; with `credits_cost`
+    // left NULL that message is indistinguishable from a job whose charge has not
+    // happened yet, and the worker's billing gate would defer it for ten minutes
+    // and then fail it as `billing_not_confirmed`.
+    //
+    // Three paths reach this branch: a deployment with the credit system switched
+    // off, an ACTIVE price of 0 (a decision), and a PENDING price (no decision
+    // yet, workorder 31B). The last one has already left its 0-amount ledger row
+    // above — that row records *why* the cost was 0, this confirmation only
+    // records *that* it is.
     //
     // Writing `0` is the confirmation: a terminal, non-null cost the gate reads
     // as "billed". `null` is the transaction id because no transaction exists —
@@ -318,7 +472,7 @@ export async function withBilling<T>(
   }
 
   try {
-    return await run({ ...(job ? { job } : {}), creditsCost });
+    return await run({ ...(job ? { job } : {}), creditsCost, priceStatus: quoted?.status ?? null });
   } catch (error) {
     // Only refund what nobody else will. With a job, worker.ts's dead-letter
     // handler owns it and refunding here would double-refund.

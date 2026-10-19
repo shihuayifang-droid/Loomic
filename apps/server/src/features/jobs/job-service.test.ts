@@ -33,6 +33,7 @@ import {
 } from "../credits/credit-service.js";
 import type { TierGuard } from "../credits/tier-guard.js";
 import { withBilling, type BillingRejection } from "../credits/with-billing.js";
+import type { PriceQuoter } from "../pricing/price-quoter.js";
 import { JobServiceError, createJobService, type JobService } from "./job-service.js";
 import type { ExecutorContext, JobExecutor } from "./job-executor.js";
 import { processJobMessage } from "./process-job-message.js";
@@ -2990,19 +2991,64 @@ function makeBillingHarness(scenario: BillingScenario = {}) {
     async checkConcurrency(workspaceId: string) {
       mark(`billing:checkConcurrency:${workspaceId}`);
     },
-    calculateCreditCost() {
-      mark(`billing:calculateCreditCost:${scenario.cost ?? 10}`);
-      return scenario.cost ?? 10;
-    },
   } as unknown as TierGuard;
+
+  // 工单31B: the price is a QUOTE against the price table now, not a cost function
+  // on the tier guard. The marker keeps the same trace POSITION (the price is
+  // resolved after the guards and before the balance read) and the same number,
+  // so the ordered sequences below only rename the one entry.
+  const priceQuoter = {
+    async quote(_input: {
+      modelId: string;
+      entryPoint: string;
+      searchKey: string;
+      at: Date;
+    }) {
+      const cost = scenario.cost ?? 10;
+      mark(`billing:quote:${cost}`);
+
+      return {
+        ok: true as const,
+        detail: {
+          base_price: cost,
+          unit_name: "次",
+          unit_count: 1,
+          unit_price: cost,
+          total_price: cost,
+          search_key: "hd",
+          search_key_matched: "hd",
+          time_variant_period: "normal" as const,
+          disable_unlimited: false,
+          entry_point: "canvas_generator" as const,
+          extras: [],
+          price_status: "active" as const,
+        },
+        ruleId: "rule-21h0",
+      };
+    },
+  } as unknown as PriceQuoter;
+
+  const creditLedgerWriteRepository = {
+    async recordPendingConsume() {
+      mark("billing:recordPendingConsume");
+      return { transactionId: "tx-pending" };
+    },
+  };
 
   const bill = (options: { onRejected?: (rejection: BillingRejection) => void } = {}) =>
     withBilling(
-      { creditService, tierGuard, jobService: harness.service },
+      {
+        creditService,
+        tierGuard,
+        priceQuoter,
+        creditLedgerWriteRepository,
+        jobService: harness.service,
+      },
       {
         user: WRITE_USER,
         workspaceId: "ws-1",
         modelId: "model-21h0",
+        entryPoint: "canvas_generator",
         guard: { jobType: "image_generation", quality: "hd" },
         description: "Image generation: model-21h0",
         job: { payload: { prompt: "a red fox" }, refs: { canvasId: "canvas-1" } },
@@ -3047,7 +3093,7 @@ describe("withBilling through the real JobService: where the money sits in the w
       "billing:checkModelAccess:pro:model-21h0",
       "billing:checkResolution:hd",
       "billing:checkConcurrency:ws-1",
-      "billing:calculateCreditCost:10",
+      "billing:quote:10",
       "billing:getBalance",
     ]);
     expect(harness.insertOp()).toBeUndefined();
@@ -3239,7 +3285,7 @@ describe("withBilling through the real JobService: where the money sits in the w
       "billing:checkModelAccess:pro:model-21h0",
       "billing:checkResolution:hd",
       "billing:checkConcurrency:ws-1",
-      "billing:calculateCreditCost:10",
+      "billing:quote:10",
       "billing:getBalance",
       "read:canvases",
       "insert:background_jobs",

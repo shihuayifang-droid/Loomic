@@ -1,6 +1,5 @@
 // @credits-system — Tier enforcement: model access, resolution limits, concurrency guards per plan
 import type {
-  BackgroundJobType,
   BillingErrorCode,
   ImageQualityLevel,
   SubscriptionPlan,
@@ -10,8 +9,6 @@ import {
   canAccessModel,
   canUseResolution,
   canUseVideoResolution,
-  getImageCreditCost,
-  getVideoCreditCost,
   PLAN_CONFIGS,
 } from "@loomic/shared";
 
@@ -39,6 +36,14 @@ export class TierGuardError extends Error {
 
 // ── Types ────────────────────────────────────────────────────
 
+/**
+ * 守卫本身只管「这个套餐能不能做这件事」。
+ *
+ * 工单31B 把价格从这里移走了：`calculateCreditCost` 已删除，价格改由
+ * `features/pricing/price-quoter.ts` 去价目表问一次（BL-14 第 3 条 / GN-07）。
+ * 留在本模块里的成本函数只剩 shared 的两个（`http/image-models.ts`、
+ * `http/video-models.ts` 仍在用，留给 31C 删）。
+ */
 export type TierGuard = {
   checkModelAccess(plan: SubscriptionPlan, modelId: string): void;
   checkResolution(plan: SubscriptionPlan, quality: ImageQualityLevel): void;
@@ -47,11 +52,6 @@ export type TierGuard = {
     workspaceId: string,
     plan: SubscriptionPlan,
   ): Promise<void>;
-  calculateCreditCost(
-    modelId: string,
-    jobType: BackgroundJobType,
-    params?: { quality?: ImageQualityLevel; duration?: number; resolution?: VideoResolution },
-  ): number;
 };
 
 // ── Factory ──────────────────────────────────────────────────
@@ -118,15 +118,6 @@ export function createTierGuard(options: {
           429,
         );
       }
-    },
-
-    calculateCreditCost(modelId, jobType, params) {
-      if (jobType === "image_generation") {
-        const quality: ImageQualityLevel = params?.quality ?? "hd";
-        return getImageCreditCost(modelId, quality);
-      }
-      // video_generation
-      return getVideoCreditCost(modelId, params?.duration, params?.resolution);
     },
   };
 }

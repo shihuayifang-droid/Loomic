@@ -89,8 +89,7 @@ beforeAll(async () => {
 describe("migration harness", () => {
   it("loads every migration in supabase/migrations", () => {
     const files = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith(".sql"));
-    // 31A: +1 migration (pricing_rules)
-    expect(applied.length).toBe(41);
+    // 31B: total is pinned by the audit baseline (sql.migrations); here only "every file applied"
     expect(applied.length).toBe(files.length);
   });
 

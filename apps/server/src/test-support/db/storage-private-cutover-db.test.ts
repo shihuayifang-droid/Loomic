@@ -528,8 +528,7 @@ beforeAll(async () => {
 describe("X-52 final private storage cutover (工单18)", () => {
   it("case 1: includes the cutover migration in order", () => {
     const files = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith(".sql"));
-    // 31A: +1 migration (pricing_rules)
-    expect(applied.length).toBe(41);
+    // 31B: total is pinned by the audit baseline (sql.migrations); here only "every file applied"
     expect(applied.length).toBe(files.length);
     // 31A: cutover is no longer the last migration; assert it is applied and ordered, not that it is last
     const cutoverIndex = applied.indexOf(CUTOVER_MIGRATION);

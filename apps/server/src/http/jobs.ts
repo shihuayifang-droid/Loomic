@@ -28,6 +28,8 @@ import {
   type TierGuard,
 } from "../features/credits/tier-guard.js";
 import { withBilling } from "../features/credits/with-billing.js";
+import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
+import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 
@@ -38,6 +40,13 @@ export async function registerJobRoutes(
     creditService?: CreditService;
     jobService: JobService;
     tierGuard?: TierGuard;
+    /**
+     * Workorder 31B: the price comes from the price table, and a PENDING price
+     * leaves a 0-amount ledger row. Passed straight through to `withBilling`,
+     * which refuses to run with billing on and no quoter.
+     */
+    priceQuoter?: PriceQuoter;
+    creditLedgerWriteRepository?: CreditLedgerWriteRepository;
     viewerService: ViewerService;
   },
 ) {
@@ -58,6 +67,7 @@ export async function registerJobRoutes(
           user,
           workspaceId: viewer.workspace.id,
           modelId: model,
+          entryPoint: "canvas_generator",
           // This request has no `quality` field, so bill at the plan maximum —
           // what this route already did via getPlanConfig(sub.plan).
           guard: { jobType: "image_generation", quality: "plan_max" },
@@ -119,6 +129,7 @@ export async function registerJobRoutes(
           user,
           workspaceId: viewer.workspace.id,
           modelId: model,
+          entryPoint: "canvas_generator",
           guard: {
             jobType: "video_generation",
             // BEHAVIOUR FIX: this route used to pass only `duration` into the

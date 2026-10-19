@@ -19,7 +19,12 @@ export class CreditServiceError extends Error {
     | "credit_claim_failed"
     | "credit_deduct_failed"
     | "credit_refund_failed"
-    | "credit_plan_update_failed";
+    | "credit_plan_update_failed"
+    // 工单31B / GN-07: the price table has no usable row for this model. Raised by
+    // `with-billing.ts` before any job or charge exists, and carried by this class
+    // so the two HTTP error mappers that already handle it stay the only place a
+    // billing refusal is turned into a status code.
+    | "model_not_available";
 
   constructor(
     code: CreditServiceError["code"],

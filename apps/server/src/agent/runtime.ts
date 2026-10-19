@@ -48,6 +48,8 @@ import type { SubmitVideoJobFn } from "./tools/video-generate.js";
 import type { CreditService } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
 import { withBilling } from "../features/credits/with-billing.js";
+import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
+import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import {
   getPlanConfig,
   type BillingErrorCode,
@@ -463,6 +465,13 @@ type CreateAgentRuntimeOptions = {
   now?: () => string;
   runIdFactory?: () => string;
   tierGuard?: TierGuard;
+  /**
+   * Workorder 31B: the price of a generation comes from the price table, and a
+   * PENDING price leaves a 0-amount ledger row. Both reach `withBilling` through
+   * `{ ...options }`, which refuses to run with billing on and no quoter.
+   */
+  priceQuoter?: PriceQuoter;
+  creditLedgerWriteRepository?: CreditLedgerWriteRepository;
   viewerService?: ViewerService;
   /**
    * Workspace skill read repository (workorder 21AC). The enabled skills of the
@@ -1069,6 +1078,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               user,
               workspaceId,
               modelId: input.model,
+              entryPoint: "agent",
               guard: {
                 jobType: "image_generation",
                 quality: (input.quality as ImageQualityLevel) ?? "hd",
@@ -1093,6 +1103,16 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   pushBillingErrorAndAbort(
                     run, canvasId, options,
                     rejection.error.code, rejection.error.message,
+                  );
+                } else if (rejection.kind === "model_not_available") {
+                  // 工单31B / GN-07: the price table knows nothing about this
+                  // model, so the run stops before a job exists. Same channel as
+                  // the other billing refusals — code + message, then abort — so
+                  // the client shows one kind of failure for all of them.
+                  pushBillingErrorAndAbort(
+                    run, canvasId, options,
+                    "model_not_available",
+                    `Model "${rejection.modelId}" is not available.`,
                   );
                 } else {
                   pushBillingErrorAndAbort(
@@ -1314,6 +1334,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               user,
               workspaceId,
               modelId: input.model,
+              entryPoint: "agent",
               guard: {
                 jobType: "video_generation",
                 ...(input.duration != null ? { duration: input.duration } : {}),
@@ -1344,6 +1365,16 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   pushBillingErrorAndAbort(
                     run, canvasId, options,
                     rejection.error.code, rejection.error.message,
+                  );
+                } else if (rejection.kind === "model_not_available") {
+                  // 工单31B / GN-07: the price table knows nothing about this
+                  // model, so the run stops before a job exists. Same channel as
+                  // the other billing refusals — code + message, then abort — so
+                  // the client shows one kind of failure for all of them.
+                  pushBillingErrorAndAbort(
+                    run, canvasId, options,
+                    "model_not_available",
+                    `Model "${rejection.modelId}" is not available.`,
                   );
                 } else {
                   pushBillingErrorAndAbort(

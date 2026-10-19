@@ -88,6 +88,10 @@ export const billingErrorCodeSchema = z.enum([
   "model_not_accessible",
   "resolution_not_allowed",
   "concurrency_limit",
+  // 工单31B / GN-07: the price table has no row for this model, so it is not
+  // sellable at all. Deliberately separate from `model_not_accessible` (a plan
+  // limit): upgrading the plan does not fix this one, and nothing was charged.
+  "model_not_available",
 ]);
 
 export type BillingErrorCode = z.infer<typeof billingErrorCodeSchema>;

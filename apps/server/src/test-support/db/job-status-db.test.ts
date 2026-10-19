@@ -1,8 +1,22 @@
 import { randomUUID } from "node:crypto";
+import { readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { PGlite } from "@electric-sql/pglite";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { createMigratedDb, createUser } from "./pglite-db.js";
+
+/**
+ * 工单31B T0: the migration COUNT is no longer pinned here. It is pinned once, in
+ * the audit baseline (`sql.migrations` / `sql.migrationsActive`), and case 5 only
+ * asserts that every file in the directory was applied. Same helper and same
+ * shape as `rls-baseline.test.ts` — the directory is the source of truth, this
+ * file must not have to change when a migration is added.
+ */
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(HERE, "..", "..", "..", "..", "..");
+const MIGRATIONS_DIR = join(REPO_ROOT, "supabase", "migrations");
 
 const USER_A = "00000000-0000-0000-0000-00000000000a";
 
@@ -94,7 +108,8 @@ describe("job status enum gains retrying", () => {
   });
 
   it("case 5: all migrations still load", () => {
-    // 31A: +1 migration (pricing_rules)
-    expect(applied.length).toBe(41);
+    // 31B: total is pinned by the audit baseline (sql.migrations); here only "every file applied"
+    const files = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith(".sql"));
+    expect(applied.length).toBe(files.length);
   });
 });
