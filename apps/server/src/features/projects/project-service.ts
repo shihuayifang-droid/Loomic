@@ -15,6 +15,7 @@ import {
   type ProjectListRow,
   type ProjectReadRepository,
 } from "../../db/project-read-repository.js";
+import type { ProjectWriteRepository } from "../../db/project-write-repository.js";
 import {
   isTransportFailure,
   withTransportRetry,
@@ -121,10 +122,18 @@ export function createProjectService(options: {
    * for the thumbnail lookup) instead of falling back to PostgREST.
    */
   projectReadRepository?: ProjectReadRepository;
+  /**
+   * Workorder 21AA: the three project WRITES — archive, the thumbnail reference
+   * and the name / brand-kit patch — are the PostgreSQL repository's. Required,
+   * not optional: every construction point passes one, and a service that could
+   * be built without one would have to answer a write it cannot perform. The
+   * repository's own predicate is the authorization (`projects_update_owner`
+   * translated verbatim), so no call site here can widen a write.
+   */
+  projectWriteRepository: ProjectWriteRepository;
 }): ProjectService {
   return {
     async archiveProject(user, projectId) {
-      const client = options.createUserClient(user.accessToken);
       const repository = options.projectReadRepository;
 
       // ADR-0001 / workorder 20E: the existence (and visibility) check is the
@@ -133,9 +142,11 @@ export function createProjectService(options: {
       // PostgREST lookup it replaces did — which is what keeps "already archived"
       // and "not yours" one answer, the existing 404.
       //
-      // Only the lookup moved: the UPDATE below, its timestamp and the number of
-      // calls are unchanged, and the two are deliberately not merged (no lock, no
-      // CAS, no count check).
+      // ADR-0001 / workorder 21AA: the archive write is the write repository's now.
+      // It is still a SECOND call and deliberately not merged with the lookup: the
+      // two statements answer different questions (may this caller see it / may
+      // this caller write it), and merging them would change which one produces the
+      // 404. No lock, no CAS and no row-count check are added either.
       if (!repository) {
         throw new ProjectServiceError(
           "project_delete_failed",
@@ -166,12 +177,20 @@ export function createProjectService(options: {
         );
       }
 
-      const { error: updateError } = await client
-        .from("projects")
-        .update({ archived_at: new Date().toISOString() })
-        .eq("id", projectId);
-
-      if (updateError) {
+      // The write repository's statement sets `archived_at` from the database
+      // clock. The timestamp the removed write computed here was never read
+      // anywhere else — it was bound into that one column and the route answers
+      // 204 with no body — so the two are the same value with one less clock.
+      //
+      // Zero rows is NOT an error: an administrator who can read this project but
+      // may not write it reaches exactly that answer, and the removed write
+      // answered 204 for it too.
+      try {
+        await options.projectWriteRepository.archiveOwnProject({
+          actorId: user.id,
+          projectId,
+        });
+      } catch {
         throw new ProjectServiceError(
           "project_delete_failed",
           PROJECT_DELETE_FAILED_MESSAGE,
@@ -461,12 +480,19 @@ export function createProjectService(options: {
         );
       }
 
-      const { error: updateError } = await client
-        .from("projects")
-        .update({ thumbnail_path: objectPath })
-        .eq("id", projectId);
-
-      if (updateError) {
+      // ADR-0001 / workorder 21AA: the reference write is the write repository's
+      // now. The order of the three side effects is unchanged — object, metadata
+      // row, reference — and so is the message: a failed reference is the existing
+      // `project_create_failed` 500 with "Failed to save thumbnail reference.".
+      // Zero rows stays silent: the object and the asset row are already in place,
+      // and the removed write did not inspect the count either.
+      try {
+        await options.projectWriteRepository.setOwnProjectThumbnail({
+          actorId: user.id,
+          projectId,
+          thumbnailPath: objectPath,
+        });
+      } catch {
         throw new ProjectServiceError(
           "project_create_failed",
           "Failed to save thumbnail reference.",
@@ -495,34 +521,35 @@ export function createProjectService(options: {
     },
 
     async updateProject(user, projectId, input) {
-      const client = options.createUserClient(user.accessToken);
+      const patch: { name?: string; brand_kit_id?: string | null } = {};
+      if (input.brand_kit_id !== undefined) patch.brand_kit_id = input.brand_kit_id;
+      if (input.name !== undefined) patch.name = input.name;
 
-      const payload: Record<string, unknown> = {};
-      if (input.brand_kit_id !== undefined) payload.brand_kit_id = input.brand_kit_id;
-      if (input.name !== undefined) payload.name = input.name;
-
-      if (Object.keys(payload).length === 0) {
+      // Nothing to change: no statement is sent, which is what the removed code
+      // did as well (it returned before building an empty update).
+      if (Object.keys(patch).length === 0) {
         return;
       }
 
-      const { error: updateError, count } = await client
-        .from("projects")
-        .update(payload)
-        .eq("id", projectId);
-
-      if (updateError) {
+      // ADR-0001 / workorder 21AA: the patch is the write repository's now, as ONE
+      // fixed statement whose shape does not depend on which keys are present.
+      //
+      // Zero rows stays a 204. The removed code wanted a 404 there, but the branch
+      // could never run: the update asked for no row count, so `count` was always
+      // null and `count === 0` was never true. The published contract is therefore
+      // "a patch that touches nothing still answers 204", and this migration keeps
+      // it rather than quietly turning a dead branch into a live 404.
+      try {
+        await options.projectWriteRepository.updateOwnProject({
+          actorId: user.id,
+          projectId,
+          patch,
+        });
+      } catch {
         throw new ProjectServiceError(
           "project_update_failed",
           PROJECT_UPDATE_FAILED_MESSAGE,
           500,
-        );
-      }
-
-      if (count === 0) {
-        throw new ProjectServiceError(
-          "project_not_found",
-          PROJECT_NOT_FOUND_MESSAGE,
-          404,
         );
       }
     },

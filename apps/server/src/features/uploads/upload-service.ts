@@ -4,6 +4,7 @@ import type {
   AssetReadRepository,
   AssetReadRow,
 } from "../../db/asset-read-repository.js";
+import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { ProjectReadRepository } from "../../db/project-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type {
@@ -69,10 +70,19 @@ export function createUploadService(options: {
   projectReadRepository?: ProjectReadRepository;
   /**
    * Workorder 20E: the asset row `record_project_asset` created, and the row
-   * `deleteAsset` locates before removing the object. Same wire-it-or-fail rule as
-   * above; the existing 500 (upload) / 404 (delete) are the answers.
+   * `deleteAsset` locates before removing the object — and, since workorder 21AA,
+   * the row `getAssetUrl` locates before signing it. Same wire-it-or-fail rule as
+   * above; the existing 500 (upload) / 404 (get, delete) are the answers.
    */
   assetReadRepository?: AssetReadRepository;
+  /**
+   * Workorder 21AA: the row delete at the end of `deleteAsset` is the PostgreSQL
+   * repository's. Required, not optional: every construction point passes one, and
+   * the repository's own predicate is the authorization
+   * (`asset_objects_delete_self` translated verbatim), so no call site here can
+   * widen a delete. Nothing else in this file writes a table.
+   */
+  assetWriteRepository: AssetWriteRepository;
 }): UploadService {
   return {
     async uploadFile(user, input) {
@@ -234,21 +244,40 @@ export function createUploadService(options: {
     },
 
     async getAssetUrl(user, assetId) {
-      const client = options.createUserClient(user.accessToken);
+      const repository = options.assetReadRepository;
 
-      const { data: assetRow, error } = await client
-        .from("asset_objects")
-        .select("bucket, object_path")
-        .eq("id", assetId)
-        .single();
+      // ADR-0001 / workorder 21AA: the row that names the bucket and the object is
+      // `AssetReadRepository.findReadableAsset`'s now — the same statement
+      // `deleteAsset` already used, so the two paths cannot disagree about what an
+      // asset the caller may read is.
+      //
+      // Its ACL is the SELECT policy translated verbatim, and it answers
+      // "no such asset", "not yours" and "already gone" as one `null`. A failure is
+      // folded into the same answer on purpose: this route published a 404 for a
+      // transport failure before the migration and keeps doing so, which is the one
+      // place in this file where the two are deliberately indistinguishable.
+      let assetRow: AssetReadRow | null = null;
 
-      if (error || !assetRow) {
+      if (repository) {
+        try {
+          assetRow = await repository.findReadableAsset({
+            actorId: user.id,
+            assetId,
+          });
+        } catch {
+          assetRow = null;
+        }
+      }
+
+      if (!assetRow) {
         throw new UploadServiceError(
           "asset_not_found",
           "Asset not found.",
           404,
         );
       }
+
+      const client = options.createUserClient(user.accessToken);
 
       return getAssetUrl(client, assetRow.bucket, assetRow.object_path);
     },
@@ -281,18 +310,22 @@ export function createUploadService(options: {
         );
       }
 
-      // The order is part of the contract: the object first, the row second. The
-      // DELETE below is NOT migrated — it stays the user client's PostgREST call.
+      // The order is part of the contract: the object first, the row second.
       await client.storage
         .from(assetRow.bucket)
         .remove([assetRow.object_path]);
 
-      const { error: deleteError } = await client
-        .from("asset_objects")
-        .delete()
-        .eq("id", assetId);
-
-      if (deleteError) {
+      // ADR-0001 / workorder 21AA: the row delete is the write repository's now.
+      // Its SQL is `asset_objects_delete_self` translated verbatim, so the caller
+      // still cannot delete a row it could not have deleted through the policy —
+      // and zero rows still answers 204, exactly as the removed delete did, because
+      // nothing here inspects the count.
+      try {
+        await options.assetWriteRepository.deleteOwnAsset({
+          actorId: user.id,
+          assetId,
+        });
+      } catch {
         throw new UploadServiceError(
           "upload_failed",
           "Failed to delete asset record.",

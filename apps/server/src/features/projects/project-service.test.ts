@@ -10,6 +10,13 @@ import {
   ProjectReadError,
   type ProjectReadRepository,
 } from "../../db/project-read-repository.js";
+import {
+  ARCHIVE_OWN_PROJECT,
+  SET_OWN_PROJECT_THUMBNAIL,
+  UPDATE_OWN_PROJECT,
+  ProjectWriteError,
+  type ProjectWriteRepository,
+} from "../../db/project-write-repository.js";
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import type {
   AuthenticatedUser,
@@ -164,6 +171,96 @@ function makeRepositoryStub(
   return { repository: repository as unknown as ProjectReadRepository, calls };
 }
 
+type WriteRepositoryCall = { method: string; input: Record<string, unknown> };
+
+/**
+ * Workorder 21AA: the three project WRITES are the PostgreSQL repository's. The
+ * fake records the calls and answers a row count, so the service contract — which
+ * ids and which patch it passes down, how it classifies a throw and a zero count —
+ * is what gets asserted. `updated: 0` is the interesting answer on three paths
+ * (archive, thumbnail, patch) because it must stay silent, so the default is 1 and
+ * each case opts into 0 explicitly.
+ */
+function makeWriteRepositoryStub(
+  config: {
+    archiveUpdated?: number;
+    archiveError?: Error;
+    thumbnailUpdated?: number;
+    thumbnailError?: Error;
+    updateUpdated?: number;
+    updateError?: Error;
+  } = {},
+) {
+  const calls: WriteRepositoryCall[] = [];
+
+  const repository = {
+    async archiveOwnProject(input: Record<string, unknown>) {
+      calls.push({ method: ARCHIVE_OWN_PROJECT, input });
+      if (config.archiveError) throw config.archiveError;
+      return { updated: config.archiveUpdated ?? 1 };
+    },
+    async setOwnProjectThumbnail(input: Record<string, unknown>) {
+      calls.push({ method: SET_OWN_PROJECT_THUMBNAIL, input });
+      if (config.thumbnailError) throw config.thumbnailError;
+      return { updated: config.thumbnailUpdated ?? 1 };
+    },
+    async updateOwnProject(input: Record<string, unknown>) {
+      calls.push({ method: UPDATE_OWN_PROJECT, input });
+      if (config.updateError) throw config.updateError;
+      return { updated: config.updateUpdated ?? 1 };
+    },
+  };
+
+  return { repository: repository as unknown as ProjectWriteRepository, calls };
+}
+
+/**
+ * Workorder 21AA: a user client that carries ONLY the two surfaces these flows are
+ * still allowed to use — Storage and the `create_project_with_canvas` RPC. Reading
+ * the table accessor throws, so a regression back to PostgREST for any of the three
+ * project writes fails here loudly instead of passing quietly against a builder
+ * nobody forbade.
+ */
+function makeStorageOnlyClient(options: {
+  signedPath?: string;
+  rpcError?: { message: string } | null;
+} = {}) {
+  const uploads: string[] = [];
+  const rpcs: string[] = [];
+
+  const client = {
+    get from(): never {
+      throw new Error("the project write flows must not touch a table");
+    },
+    storage: {
+      from(bucket: string) {
+        return {
+          upload: async (path: string) => {
+            uploads.push(path);
+            return { data: { path }, error: null };
+          },
+          createSignedUrl: async (path: string) => ({
+            data: {
+              signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+            },
+            error: null,
+          }),
+          getPublicUrl: (path: string) => ({
+            data: { publicUrl: `https://cdn.test/${bucket}/${path}` },
+          }),
+        };
+      },
+    },
+    rpc: async (name: string) => {
+      rpcs.push(name);
+      if (options.rpcError) return { data: null, error: options.rpcError };
+      return { data: { asset_id: "asset-thumb" }, error: null };
+    },
+  };
+
+  return { client: client as unknown as UserSupabaseClient, uploads, rpcs };
+}
+
 function makeViewerStub(teamWorkspace: {
   id: string;
   name: string;
@@ -244,6 +341,7 @@ describe("createProjectService with the team workspace", () => {
       // X-52 工单12: the service now records asset metadata through the admin
       // client. These cases exercise create/list only, so it is never called.
       getAdminClient: () => client as unknown as never,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
     const project = await service.createProject(USER, { name: "My Project" });
@@ -278,6 +376,7 @@ describe("createProjectService with the team workspace", () => {
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
     const projects = await service.listProjects(USER);
@@ -308,6 +407,7 @@ describe("createProjectService with the team workspace", () => {
       createUserClient: () => client,
       viewerService: makeViewerStub(null),
       getAdminClient: () => client as unknown as never,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
     const error = await service
@@ -332,6 +432,7 @@ describe("getProject delegating to the project read repository", () => {
   ) {
     const { client } = makeClientStub({});
     const stub = makeRepositoryStub(config);
+    const writeStub = makeWriteRepositoryStub();
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
@@ -339,9 +440,10 @@ describe("getProject delegating to the project read repository", () => {
       ...(options.withRepository
         ? { projectReadRepository: stub.repository }
         : {}),
+      projectWriteRepository: writeStub.repository,
     });
 
-    return { service, calls: stub.calls };
+    return { service, calls: stub.calls, writeCalls: writeStub.calls };
   }
 
   it("case 6: the repository's detail row is the DTO, with the caller as actor", async () => {
@@ -405,6 +507,14 @@ describe("getProject delegating to the project read repository", () => {
     expect(error?.code).toBe("project_query_failed");
     expect(calls).toEqual([]);
   });
+
+  it("case 9b: the read path never reaches the write repository", async () => {
+    const { service, writeCalls } = makeService({ detail: DETAIL_ROW });
+
+    await service.getProject(USER, "project-1");
+
+    expect(writeCalls).toEqual([]);
+  });
 });
 
 describe("listProjects delegating to the project read repository", () => {
@@ -423,6 +533,7 @@ describe("listProjects delegating to the project read repository", () => {
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
     const projects = await service.listProjects(USER);
@@ -452,6 +563,7 @@ describe("listProjects delegating to the project read repository", () => {
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
     await expect(service.listProjects(USER)).resolves.toEqual([]);
@@ -470,6 +582,7 @@ describe("listProjects delegating to the project read repository", () => {
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
     const error = await service
@@ -493,6 +606,7 @@ describe("listProjects delegating to the project read repository", () => {
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
     const error = await service
@@ -517,6 +631,7 @@ describe("listProjects delegating to the project read repository", () => {
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
     const error = await service
@@ -535,6 +650,7 @@ describe("listProjects delegating to the project read repository", () => {
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
     const error = await service
@@ -550,28 +666,22 @@ describe("listProjects delegating to the project read repository", () => {
 
 // X-52: a thumbnail URL is a project asset URL, so it is signed — and when it
 // cannot be signed the answer is an error, never a permanent public address.
+//
+// ADR-0001 / workorder 21AA: the reference write is the write repository's now, and
+// the user client carries ONLY Storage — its table accessor throws, so a regression
+// back to PostgREST on this path cannot pass.
 describe("saveThumbnail answers with a signed URL", () => {
-  function makeThumbnailService(options: { signError?: { message: string } | null }) {
+  function makeThumbnailService(options: {
+    signError?: { message: string } | null;
+    writeUpdated?: number;
+    writeError?: Error;
+  }) {
     const signedCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
     // 工单20E: the workspace lookup is the repository's now, so the fixture has to
     // answer it — a client stub can no longer carry the lookup.
     const lookupCalls: Array<{ actorId: string; projectId: string }> = [];
 
     const client = {
-      from(table: string) {
-        const chain = {
-          select: () => chain,
-          update: () => chain,
-          eq: () => chain,
-          single: async () => ({
-            data: table === "projects" ? { workspace_id: TEAM_ID } : null,
-            error: null,
-          }),
-          then: (resolve: (value: unknown) => unknown) =>
-            Promise.resolve({ data: null, error: null }).then(resolve),
-        };
-        return chain;
-      },
       storage: {
         from(bucket: string) {
           return {
@@ -593,6 +703,9 @@ describe("saveThumbnail answers with a signed URL", () => {
         },
       },
       rpc: async () => ({ data: { asset_id: "asset-thumb" }, error: null }),
+      get from(): never {
+        throw new Error("saveThumbnail must not touch a table");
+      },
     };
 
     const repository = {
@@ -604,14 +717,20 @@ describe("saveThumbnail answers with a signed URL", () => {
       },
     };
 
+    const writeStub = makeWriteRepositoryStub({
+      thumbnailUpdated: options.writeUpdated ?? 1,
+      ...(options.writeError ? { thumbnailError: options.writeError } : {}),
+    });
+
     const service = createProjectService({
       createUserClient: () => client as unknown as UserSupabaseClient,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       getAdminClient: () => client as unknown as never,
       projectReadRepository: repository as unknown as ProjectReadRepository,
+      projectWriteRepository: writeStub.repository,
     });
 
-    return { service, signedCalls, lookupCalls };
+    return { service, signedCalls, lookupCalls, writeCalls: writeStub.calls };
   }
 
   it("case 4: the thumbnail URL is a signature, not a public URL", async () => {
@@ -633,6 +752,18 @@ describe("saveThumbnail answers with a signed URL", () => {
         expiresIn: 3600,
       },
     ]);
+    // 21AA: the reference went through the write repository, with the same object
+    // path the bucket received.
+    expect(stub.writeCalls).toEqual([
+      {
+        method: SET_OWN_PROJECT_THUMBNAIL,
+        input: {
+          actorId: USER_ID,
+          projectId: "project-1",
+          thumbnailPath: `${TEAM_ID}/project-1/thumbnail.png`,
+        },
+      },
+    ]);
   });
 
   it("case 5: a signing failure is reported instead of falling back to a public URL", async () => {
@@ -647,6 +778,43 @@ describe("saveThumbnail answers with a signed URL", () => {
     expect(error?.statusCode).toBe(500);
     expect(error?.message).not.toContain("http");
   });
+
+  it("case 5b: a failed reference write is the existing 500 with its own message", async () => {
+    const stub = makeThumbnailService({
+      writeError: new ProjectWriteError(SET_OWN_PROJECT_THUMBNAIL, new Error("boom")),
+    });
+
+    const error = await stub.service
+      .saveThumbnail(USER, "project-1", Buffer.from("thumb"), "image/png")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_create_failed");
+    expect(error?.message).toBe("Failed to save thumbnail reference.");
+    // The repository's own text is not what the client is shown.
+    expect(error?.message).not.toContain("setOwnProjectThumbnail");
+    // The reference was attempted once, and the signing step never ran.
+    expect(stub.writeCalls).toHaveLength(1);
+    expect(stub.signedCalls).toEqual([]);
+  });
+
+  it("case 5c: a reference write that touches no row is still the existing success", async () => {
+    // The object and the metadata row are already in place by then; the removed
+    // write did not inspect the count, so a zero count must not turn into an error.
+    const stub = makeThumbnailService({ writeUpdated: 0 });
+
+    const result = await stub.service.saveThumbnail(
+      USER,
+      "project-1",
+      Buffer.from("thumb"),
+      "image/png",
+    );
+
+    expect(result.thumbnailUrl).toContain("token=sig");
+    expect(stub.writeCalls).toHaveLength(1);
+  });
 });
 
 // ADR-0001 step 2e (工单20E): `archiveProject`'s existence and visibility check is
@@ -658,31 +826,12 @@ describe("archiveProject delegating to the project read repository", () => {
       detail?: unknown;
       detailError?: Error;
       updateError?: { message: string } | null;
+      writeUpdated?: number;
       withRepository?: boolean;
     } = {},
   ) {
-    const updatePatches: Array<Record<string, unknown>> = [];
-    const tables: string[] = [];
     const calls: RepositoryCall[] = [];
-
-    const client = {
-      from(table: string) {
-        tables.push(table);
-        const chain = {
-          update: (patch: Record<string, unknown>) => {
-            updatePatches.push(patch);
-            return chain;
-          },
-          eq: () => chain,
-          then: (resolve: (value: unknown) => unknown) =>
-            Promise.resolve({
-              data: null,
-              error: config.updateError ?? null,
-            }).then(resolve),
-        };
-        return chain;
-      },
-    };
+    const client = makeStorageOnlyClient();
 
     const repository = {
       async findReadableProject(input: Record<string, unknown>) {
@@ -692,22 +841,28 @@ describe("archiveProject delegating to the project read repository", () => {
       },
     };
 
+    const writeStub = makeWriteRepositoryStub({
+      archiveUpdated: config.writeUpdated ?? 1,
+      ...(config.updateError ? { archiveError: config.updateError as Error } : {}),
+    });
+
     const service = createProjectService({
-      createUserClient: () => client as unknown as UserSupabaseClient,
+      createUserClient: () => client.client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
+      getAdminClient: () => client.client as unknown as never,
       ...(config.withRepository === false
         ? {}
         : {
             projectReadRepository:
               repository as unknown as ProjectReadRepository,
           }),
+      projectWriteRepository: writeStub.repository,
     });
 
-    return { service, calls, updatePatches, tables };
+    return { service, calls, writeCalls: writeStub.calls };
   }
 
-  it("case 16: the lookup asks the repository first, then the single UPDATE runs with an ISO archived_at", async () => {
+  it("case 16: the lookup asks the repository first, then the archive write runs once", async () => {
     const harness = makeArchiveHarness({ detail: DETAIL_ROW });
 
     await expect(
@@ -720,18 +875,27 @@ describe("archiveProject delegating to the project read repository", () => {
         input: { actorId: USER_ID, projectId: "project-1" },
       },
     ]);
-    // Exactly one write, and it is the unchanged one: same table, one column, and
-    // the timestamp is still generated at call time.
-    expect(harness.tables).toEqual(["projects"]);
-    expect(harness.updatePatches).toHaveLength(1);
-    const patch = harness.updatePatches[0] ?? {};
-    expect(Object.keys(patch)).toEqual(["archived_at"]);
-    expect(patch["archived_at"]).toMatch(
-      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
-    );
-    expect(
-      Number.isNaN(Date.parse(String(patch["archived_at"]))),
-    ).toBe(false);
+    // Exactly one write, with the actor and the project: the timestamp is the
+    // statement's `now()` now, so nothing here carries a value any more.
+    expect(harness.writeCalls).toEqual([
+      {
+        method: ARCHIVE_OWN_PROJECT,
+        input: { actorId: USER_ID, projectId: "project-1" },
+      },
+    ]);
+  });
+
+  it("case 16b: a write that touches no row is still the existing success, not a 404", async () => {
+    // This is the administrator's path: readable, not writable. The removed write
+    // answered 204 as well, because an update behind `USING` that matched nothing
+    // is not an error.
+    const harness = makeArchiveHarness({ detail: DETAIL_ROW, writeUpdated: 0 });
+
+    await expect(
+      harness.service.archiveProject(USER, "project-1"),
+    ).resolves.toBeUndefined();
+
+    expect(harness.writeCalls).toHaveLength(1);
   });
 
   it("case 17: a null lookup is the existing 404 and nothing is written", async () => {
@@ -746,8 +910,7 @@ describe("archiveProject delegating to the project read repository", () => {
     expect(error?.statusCode).toBe(404);
     expect(error?.code).toBe("project_not_found");
     expect(error?.message).toBe("Project not found.");
-    expect(harness.updatePatches).toEqual([]);
-    expect(harness.tables).toEqual([]);
+    expect(harness.writeCalls).toEqual([]);
   });
 
   it("case 18: a repository failure is the existing project_delete_failed 500 and nothing is written", async () => {
@@ -766,8 +929,25 @@ describe("archiveProject delegating to the project read repository", () => {
     expect(error?.message).toBe("Unable to delete project.");
     // The repository's own text is not what the client is shown.
     expect(error?.message).not.toContain("findReadableProject");
-    expect(harness.updatePatches).toEqual([]);
-    expect(harness.tables).toEqual([]);
+    expect(harness.writeCalls).toEqual([]);
+  });
+
+  it("case 18b: a failed archive write is the same fixed 500 project_delete_failed", async () => {
+    const harness = makeArchiveHarness({
+      detail: DETAIL_ROW,
+      updateError: new Error("project write failed (archiveOwnProject)"),
+    });
+
+    const error = await harness.service
+      .archiveProject(USER, "project-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_delete_failed");
+    expect(error?.message).toBe("Unable to delete project.");
+    expect(error?.message).not.toContain("archiveOwnProject");
   });
 
   it("case 19: a service built without the repository answers 500 and touches no table", async () => {
@@ -782,8 +962,108 @@ describe("archiveProject delegating to the project read repository", () => {
     expect(error?.statusCode).toBe(500);
     expect(error?.code).toBe("project_delete_failed");
     expect(harness.calls).toEqual([]);
-    expect(harness.updatePatches).toEqual([]);
-    expect(harness.tables).toEqual([]);
+    expect(harness.writeCalls).toEqual([]);
+  });
+});
+
+// ADR-0001 / workorder 21AA: `PATCH /api/projects/:projectId` is one fixed statement
+// in the write repository's hands. What has to hold at the service boundary: the
+// patch that goes down, the empty patch that goes nowhere, the 500 on a throw, and
+// the 204 on a zero count (the removed 404 branch was unreachable, because the
+// update never asked for a row count).
+describe("updateProject delegating to the project write repository", () => {
+  function makeUpdateHarness(
+    config: { writeUpdated?: number; writeError?: Error } = {},
+  ) {
+    const client = makeStorageOnlyClient();
+    const writeStub = makeWriteRepositoryStub({
+      updateUpdated: config.writeUpdated ?? 1,
+      ...(config.writeError ? { updateError: config.writeError } : {}),
+    });
+
+    const service = createProjectService({
+      createUserClient: () => client.client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client.client as unknown as never,
+      projectWriteRepository: writeStub.repository,
+    });
+
+    return { service, writeCalls: writeStub.calls };
+  }
+
+  it("case 23: a name-only patch reaches the repository with the actor and the project", async () => {
+    const harness = makeUpdateHarness();
+
+    await expect(
+      harness.service.updateProject(USER, "project-1", { name: "Renamed" }),
+    ).resolves.toBeUndefined();
+
+    expect(harness.writeCalls).toEqual([
+      {
+        method: UPDATE_OWN_PROJECT,
+        input: {
+          actorId: USER_ID,
+          projectId: "project-1",
+          patch: { name: "Renamed" },
+        },
+      },
+    ]);
+  });
+
+  it("case 24: a brand-kit patch keeps an explicit null, so clearing is distinguishable", async () => {
+    const harness = makeUpdateHarness();
+
+    await harness.service.updateProject(USER, "project-1", {
+      brand_kit_id: null,
+    });
+
+    expect(harness.writeCalls).toEqual([
+      {
+        method: UPDATE_OWN_PROJECT,
+        input: {
+          actorId: USER_ID,
+          projectId: "project-1",
+          patch: { brand_kit_id: null },
+        },
+      },
+    ]);
+  });
+
+  it("case 25: an empty patch calls the repository zero times", async () => {
+    const harness = makeUpdateHarness();
+
+    await expect(
+      harness.service.updateProject(USER, "project-1", {}),
+    ).resolves.toBeUndefined();
+
+    expect(harness.writeCalls).toEqual([]);
+  });
+
+  it("case 26: a failed write is the existing project_update_failed 500", async () => {
+    const harness = makeUpdateHarness({
+      writeError: new Error("project write failed (updateOwnProject)"),
+    });
+
+    const error = await harness.service
+      .updateProject(USER, "project-1", { name: "Renamed" })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_update_failed");
+    expect(error?.message).toBe("Unable to update project.");
+    expect(error?.message).not.toContain("updateOwnProject");
+  });
+
+  it("case 27: a zero-row patch is still a 204, never the old unreachable 404", async () => {
+    const harness = makeUpdateHarness({ writeUpdated: 0 });
+
+    await expect(
+      harness.service.updateProject(USER, "project-1", { name: "Renamed" }),
+    ).resolves.toBeUndefined();
+
+    expect(harness.writeCalls).toHaveLength(1);
   });
 });
 
@@ -818,7 +1098,6 @@ describe("saveThumbnail lookup retry", () => {
     const inputs: Array<Record<string, unknown>> = [];
     const uploads: string[] = [];
     const rpcs: string[] = [];
-    const updatePatches: Array<Record<string, unknown>> = [];
 
     const repository = {
       async findReadableProjectWorkspaceForMutation(input: {
@@ -840,52 +1119,27 @@ describe("saveThumbnail lookup retry", () => {
       },
     };
 
-    const client = {
-      from(table: string) {
-        const chain = {
-          update: (patch: Record<string, unknown>) => {
-            updatePatches.push(patch);
-            return chain;
-          },
-          eq: () => chain,
-          then: (resolve: (value: unknown) => unknown) =>
-            Promise.resolve({ data: null, error: null }).then(resolve),
-        };
-        return chain;
-      },
-      storage: {
-        from(bucket: string) {
-          return {
-            upload: async (path: string) => {
-              uploads.push(path);
-              return { data: { path }, error: null };
-            },
-            createSignedUrl: async (path: string) => ({
-              data: {
-                signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
-              },
-              error: null,
-            }),
-            getPublicUrl: (path: string) => ({
-              data: { publicUrl: `https://cdn.test/${bucket}/${path}` },
-            }),
-          };
-        },
-      },
-      rpc: async (name: string) => {
-        rpcs.push(name);
-        return { data: { asset_id: "asset-thumb" }, error: null };
-      },
-    };
+    // ADR-0001 / workorder 21AA: the reference write is the write repository's, and
+    // the client below carries ONLY Storage and the RPC — its table accessor throws.
+    const client = makeStorageOnlyClient();
+    const writeStub = makeWriteRepositoryStub();
 
     const service = createProjectService({
-      createUserClient: () => client as unknown as UserSupabaseClient,
+      createUserClient: () => client.client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
+      getAdminClient: () => client.client as unknown as never,
       projectReadRepository: repository as unknown as ProjectReadRepository,
+      projectWriteRepository: writeStub.repository,
     });
 
-    return { service, attempts, inputs, uploads, rpcs, updatePatches };
+    return {
+      service,
+      attempts,
+      inputs,
+      uploads: client.uploads,
+      rpcs: client.rpcs,
+      writeCalls: writeStub.calls,
+    };
   }
 
   // The two failures below are the two real pg transport shapes: the driver's own
@@ -935,8 +1189,15 @@ describe("saveThumbnail lookup retry", () => {
         `${TEAM_ID}/project-1/thumbnail.png`,
       ]);
       expect(harness.rpcs).toEqual(["record_project_asset"]);
-      expect(harness.updatePatches).toEqual([
-        { thumbnail_path: `${TEAM_ID}/project-1/thumbnail.png` },
+      expect(harness.writeCalls).toEqual([
+        {
+          method: SET_OWN_PROJECT_THUMBNAIL,
+          input: {
+            actorId: USER_ID,
+            projectId: "project-1",
+            thumbnailPath: `${TEAM_ID}/project-1/thumbnail.png`,
+          },
+        },
       ]);
     } finally {
       vi.useRealTimers();
@@ -964,7 +1225,7 @@ describe("saveThumbnail lookup retry", () => {
     // Nothing was written: no object, no metadata row, no reference.
     expect(harness.uploads).toEqual([]);
     expect(harness.rpcs).toEqual([]);
-    expect(harness.updatePatches).toEqual([]);
+    expect(harness.writeCalls).toEqual([]);
   });
 
   it("case 22: three transport failures stop after three attempts with the same fixed 503", async () => {
@@ -992,7 +1253,7 @@ describe("saveThumbnail lookup retry", () => {
       expect(error?.message).toBe("Unable to look up project.");
       expect(harness.uploads).toEqual([]);
       expect(harness.rpcs).toEqual([]);
-      expect(harness.updatePatches).toEqual([]);
+      expect(harness.writeCalls).toEqual([]);
     } finally {
       vi.useRealTimers();
     }

@@ -788,11 +788,29 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // below stay exactly where workorder 21Y left them. The new and modified test
     // files name no client method either, so `fromCallsIncludingTests` follows
     // `fromCalls` down again.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(76);
+    // Workorder 21AA then moved the five remaining TABLE calls of the two files
+    // that write projects and assets — the `projects` archive, the `projects`
+    // thumbnail reference, the `projects` name/brand-kit patch, and the two
+    // `asset_objects` calls of the asset URL read and the asset row delete — so
+    // both counters below move down together again (76->71). That is a real
+    // coupling removal rather than a counting change: they now run through the new
+    // `ProjectWriteRepository` and `AssetWriteRepository` (pure `pg`, built in
+    // `app.ts` beside the other repositories), and the asset URL read reuses
+    // `AssetReadRepository.findReadableAsset`, which `deleteAsset` already used.
+    // Each RLS policy is translated verbatim into the statement's OWN predicate —
+    // `created_by` plus the `private.is_workspace_member` body for `projects_update_owner`,
+    // the three conjuncts of `asset_objects_delete_self` (author, membership, and the
+    // project's `can_write_project`) for the delete — with no administrator escape and
+    // no archive filter, because the policies have neither. The published wire shape,
+    // every error code, status and message, and all three "zero rows is still a
+    // success" answers are unchanged; Storage (23) and the RPC counters did not move,
+    // because this workorder touched neither. The new and modified test files name no
+    // client method either, so `fromCallsIncludingTests` follows `fromCalls` down again.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(71);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(76);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(71);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

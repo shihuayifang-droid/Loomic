@@ -13,7 +13,13 @@ import { describe, expect, it } from "vitest";
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import { createProjectService } from "../projects/project-service.js";
 import type { AssetReadRepository } from "../../db/asset-read-repository.js";
+import {
+  DELETE_OWN_ASSET,
+  AssetWriteError,
+  type AssetWriteRepository,
+} from "../../db/asset-write-repository.js";
 import type { ProjectReadRepository } from "../../db/project-read-repository.js";
+import type { ProjectWriteRepository } from "../../db/project-write-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 import { createUploadService, UploadServiceError } from "./upload-service.js";
@@ -33,6 +39,7 @@ function makeStubs(options: {
   uploadError?: { message: string } | null;
   assetRow?: Record<string, unknown> | null;
   assetReadError?: { message: string } | null;
+  assetDeleteError?: { message: string } | null;
 }) {
   const rpcs: RpcCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
@@ -42,10 +49,16 @@ function makeStubs(options: {
   const events: string[] = [];
 
   // 工单20E: both read-only lookups belong to the repositories now, so the fixture
-  // answers them there. A regression back to PostgREST would find no query builder
-  // for `projects` at all and explode rather than pass quietly.
+  // answers them there.
+  //
+  // ADR-0001 / workorder 21AA: so does the asset row delete, and the `getAssetUrl`
+  // read that used to be the last PostgREST call here. The user client below
+  // therefore carries ONLY Storage and the `record_project_asset` RPC; its table
+  // accessor throws, so any regression back to PostgREST explodes here instead of
+  // passing quietly.
   const projectLookups: Array<{ actorId: string; projectId: string }> = [];
   const assetLookups: Array<{ actorId: string; assetId: string }> = [];
+  const assetDeletes: Array<{ actorId: string; assetId: string }> = [];
 
   const projectRepository = {
     async findReadableProjectWorkspaceForMutation(input: {
@@ -78,29 +91,20 @@ function makeStubs(options: {
     },
   };
 
+  const assetWriteRepository = {
+    async deleteOwnAsset(input: { actorId: string; assetId: string }) {
+      assetDeletes.push(input);
+      // Recorded in the SAME ordered log as the storage calls, so "the object goes
+      // first, the row second" stays provable.
+      events.push(`delete-row:${input.assetId}`);
+      if (options.assetDeleteError) throw options.assetDeleteError;
+      return { deleted: 1 };
+    },
+  };
+
   const userClient = {
-    from(table: string) {
-      const chain = {
-        select: () => chain,
-        delete: () => {
-          events.push(`delete:${table}`);
-          return chain;
-        },
-        eq: () => chain,
-        single: async () => {
-          if (table === "asset_objects") {
-            return {
-              data:
-                options.assetRow === undefined ? defaultAssetRow : options.assetRow,
-              error: options.assetReadError ?? null,
-            };
-          }
-          return { data: null, error: null };
-        },
-        then: (resolve: (value: unknown) => unknown) =>
-          Promise.resolve({ data: null, error: null }).then(resolve),
-      };
-      return chain;
+    get from(): never {
+      throw new Error("the upload write flows must not touch a table");
     },
     storage: {
       from(bucket: string) {
@@ -156,6 +160,8 @@ function makeStubs(options: {
     getAdminClient: () => adminClient as unknown as AdminSupabaseClient,
     projectReadRepository: projectRepository as unknown as ProjectReadRepository,
     assetReadRepository: assetRepository as unknown as AssetReadRepository,
+    assetWriteRepository:
+      assetWriteRepository as unknown as AssetWriteRepository,
   });
 
   return {
@@ -167,6 +173,7 @@ function makeStubs(options: {
     events,
     projectLookups,
     assetLookups,
+    assetDeletes,
     userClient,
   };
 }
@@ -297,23 +304,13 @@ describe("uploadFile records project ownership", () => {
 describe("saveThumbnail records the thumbnail as a project asset", () => {
   function makeProjectService(options: { rpcError?: { message: string } | null }) {
     const rpcs: RpcCall[] = [];
-    const updates: Array<Record<string, unknown>> = [];
+    const referenceWrites: Array<Record<string, unknown>> = [];
 
+    // ADR-0001 / workorder 21AA: the reference write is the project write
+    // repository's now, so the user client here carries ONLY Storage.
     const userClient = {
-      from(table: string) {
-        const chain = {
-          select: () => chain,
-          update: (patch: Record<string, unknown>) => {
-            updates.push(patch);
-            return chain;
-          },
-          eq: () => chain,
-          single: async () => ({
-            data: table === "projects" ? { workspace_id: TEAM_WORKSPACE } : null,
-            error: null,
-          }),
-        };
-        return chain;
+      get from(): never {
+        throw new Error("saveThumbnail must not touch a table");
       },
       storage: {
         from(bucket: string) {
@@ -334,6 +331,13 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
       },
     };
 
+    const projectWriteRepository = {
+      async setOwnProjectThumbnail(input: Record<string, unknown>) {
+        referenceWrites.push(input);
+        return { updated: 1 };
+      },
+    };
+
     const service = createProjectService({
       createUserClient: () => userClient as unknown as UserSupabaseClient,
       viewerService: {} as ViewerService,
@@ -343,6 +347,8 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
           return { workspace_id: TEAM_WORKSPACE };
         },
       } as unknown as ProjectReadRepository,
+      projectWriteRepository:
+        projectWriteRepository as unknown as ProjectWriteRepository,
       getAdminClient: () =>
         ({
           rpc: async (name: string, params: Record<string, unknown>) => {
@@ -353,7 +359,7 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
         }) as unknown as AdminSupabaseClient,
     });
 
-    return { service, rpcs, updates };
+    return { service, rpcs, referenceWrites };
   }
 
   it("case 8: the thumbnail is recorded against its project", async () => {
@@ -371,6 +377,13 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
     expect(stub.rpcs[0]?.params.p_object_path).toBe(
       `${TEAM_WORKSPACE}/${PROJECT}/thumbnail.png`,
     );
+    expect(stub.referenceWrites).toEqual([
+      {
+        actorId: "user-1",
+        projectId: PROJECT,
+        thumbnailPath: `${TEAM_WORKSPACE}/${PROJECT}/thumbnail.png`,
+      },
+    ]);
   });
 
   it("case 9: a metadata failure is reported and the reference is not saved", async () => {
@@ -380,7 +393,7 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
       stub.service.saveThumbnail(USER, PROJECT, Buffer.from("thumb"), "image/png"),
     ).rejects.toThrow(/thumbnail metadata/i);
 
-    expect(stub.updates).toHaveLength(0);
+    expect(stub.referenceWrites).toHaveLength(0);
   });
 });
 
@@ -575,11 +588,37 @@ describe("the migrated lookups of the upload write flows", () => {
       { actorId: "user-1", assetId: "asset-1" },
     ]);
     // The bucket and the path come from the row the repository answered, and the
-    // order is the existing contract: object first, row second.
+    // order is the existing contract: object first, row second. The row delete is
+    // the write repository's now, and it lands in the same ordered log.
     expect(stub.events).toEqual([
       "remove:canvases/legacy.png",
-      "delete:asset_objects",
+      "delete-row:asset-1",
     ]);
+    expect(stub.removals).toEqual(["canvases/legacy.png"]);
+    expect(stub.assetDeletes).toEqual([{ actorId: "user-1", assetId: "asset-1" }]);
+  });
+
+  it("case 16b: a failed row delete is the existing 500 upload_failed", async () => {
+    const stub = makeStubs({
+      assetRow: CANVAS_ASSET_ROW,
+      assetDeleteError: new AssetWriteError(
+        DELETE_OWN_ASSET,
+        new Error("boom"),
+      ),
+    });
+
+    const error = await stub.service
+      .deleteAsset(USER, "asset-1")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as UploadServiceError);
+
+    expect(error).toBeInstanceOf(UploadServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("upload_failed");
+    expect(error?.message).toBe("Failed to delete asset record.");
+    // The repository's own text is not what the client is shown.
+    expect(error?.message).not.toContain("deleteOwnAsset");
+    // The object was already gone when the row delete failed — the existing order.
     expect(stub.removals).toEqual(["canvases/legacy.png"]);
   });
 
@@ -616,17 +655,47 @@ describe("the migrated lookups of the upload write flows", () => {
     expect(stub.events).toEqual([]);
   });
 
-  it("case 19: getAssetUrl is not part of the migration and still reads through the caller's client", async () => {
+  // Workorder 21AA: this is the ONE deliberate contract change of the ticket. Case 19
+  // used to assert that `getAssetUrl` was excluded from the migration and kept its
+  // own table read. It is now the repository's read instead — the same
+  // `findReadableAsset` `deleteAsset` already used — because the ticket's
+  // "do not build a second read method" rule (an existing one answers exactly this
+  // question) and the "no table access left" rule point at the same conclusion.
+  it("case 19: getAssetUrl asks the repository and reads no table", async () => {
     const stub = makeStubs({ assetRow: CANVAS_ASSET_ROW });
 
     const url = await stub.service.getAssetUrl(USER, "asset-1");
 
-    // The independent read API keeps its own PostgREST read: the repository is not
-    // asked at all.
-    expect(stub.assetLookups).toEqual([]);
+    expect(stub.assetLookups).toEqual([
+      { actorId: "user-1", assetId: "asset-1" },
+    ]);
     expect(stub.signedCalls).toEqual([
       { bucket: "canvases", path: "canvases/legacy.png", expiresIn: 3600 },
     ]);
     expect(url).toContain("token=sig");
+    // Nothing was deleted and nothing was written: this is a read path.
+    expect(stub.events).toEqual(["sign:canvases/legacy.png"]);
+    expect(stub.assetDeletes).toEqual([]);
+  });
+
+  it("case 19b: a repository failure and a missing row are both the existing 404", async () => {
+    const failed = makeStubs({
+      assetReadError: new Error("asset read failed (findReadableAsset)"),
+    });
+    const missing = makeStubs({ assetRow: null });
+
+    for (const stub of [failed, missing]) {
+      const error = await stub.service
+        .getAssetUrl(USER, "asset-1")
+        .then(() => null)
+        .catch((thrown: unknown) => thrown as UploadServiceError);
+
+      expect(error).toBeInstanceOf(UploadServiceError);
+      expect(error?.statusCode).toBe(404);
+      expect(error?.code).toBe("asset_not_found");
+      expect(error?.message).toBe("Asset not found.");
+      // Nothing was signed, and the client was never even built for a missing row.
+      expect(stub.signedCalls).toEqual([]);
+    }
   });
 });

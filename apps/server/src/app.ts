@@ -89,10 +89,12 @@ import {
   createProjectReadRepository,
   type ProjectReadRepository,
 } from "./db/project-read-repository.js";
+import { createProjectWriteRepository } from "./db/project-write-repository.js";
 import {
   createAssetReadRepository,
   type AssetReadRepository,
 } from "./db/asset-read-repository.js";
+import { createAssetWriteRepository } from "./db/asset-write-repository.js";
 import {
   createTeamAdminReadRepository,
   type TeamAdminReadRepository,
@@ -451,6 +453,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       viewerService,
       getAdminClient,
       projectReadRepository,
+      // ADR-0001 / workorder 21AA: the three project writes — archive, the
+      // thumbnail reference and the name / brand-kit patch — are the write
+      // repository's now, built lazily against the same pool as the read
+      // repository beside it. Like the other write paths it has no PostgREST
+      // fallback: `createUserClient` stays wired for Storage and the
+      // `create_project_with_canvas` RPC, and for nothing else in this service.
+      projectWriteRepository: createProjectWriteRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
     });
   // ADR-0001 / workorder 21Y: `listKits` reads the caller's own brand kits and
   // the asset rows of those kits through the PostgreSQL repository, built lazily
@@ -521,6 +532,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       getAdminClient,
       projectReadRepository,
       assetReadRepository,
+      // ADR-0001 / workorder 21AA: the asset row delete behind
+      // `DELETE /api/assets/:assetId` is the write repository's now, built the same
+      // lazy way as the read repository above. `assetReadRepository` stays exactly
+      // as it was — it is still the row read `uploadFile`, `deleteAsset` and (since
+      // this workorder) `getAssetUrl` all use. Storage and the
+      // `record_project_asset` RPC keep `createUserClient` / `getAdminClient`.
+      assetWriteRepository: createAssetWriteRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
     });
   const pgmq = env.supabaseDbUrl
     ? createPgmqClient(env.supabaseDbUrl)
