@@ -14,14 +14,11 @@ import {
   MarketplaceError,
 } from "../features/skills/marketplace-service.js";
 
-import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
-import type {
-  RequestAuthenticator,
-  UserSupabaseClient,
-} from "../supabase/user.js";
+import { SkillRepositoryError } from "../db/skill-repository.js";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const untypedFrom = (client: UserSupabaseClient, table: string) => (client as any).from(table);
+import type { SkillRepository } from "../db/skill-repository.js";
+import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
+import type { RequestAuthenticator } from "../supabase/user.js";
 
 // ---------------------------------------------------------------------------
 // Skill row mappers (duplicated from skills.ts to avoid circular imports)
@@ -111,11 +108,24 @@ function generateSlug(name: string): string {
 // Route registration
 // ---------------------------------------------------------------------------
 
+/**
+ * The marketplace routes (workorder 21AE).
+ *
+ * The four table calls of the install route now run through `SkillRepository`, a
+ * pure `pg` repository built in `app.ts`. Only the CALL TARGET changed: the
+ * status codes, error codes, messages and every swallow are the ones this file
+ * published before. The four T-61 behaviours frozen by the workorder are
+ * untouched — `source_url` / `package_name` still go into `metadata` instead of
+ * their own columns, and a Zod error still answers 500.
+ *
+ * The user-scoped Supabase client is no longer a parameter: nothing in this file
+ * can reach PostgREST any more.
+ */
 export async function registerMarketplaceRoutes(
   app: FastifyInstance,
   options: {
     auth: RequestAuthenticator;
-    createUserClient: (accessToken: string) => UserSupabaseClient;
+    skillRepository: SkillRepository;
     viewerService: ViewerService;
   },
 ) {
@@ -172,15 +182,16 @@ export async function registerMarketplaceRoutes(
       const { packageName } = marketplaceInstallRequestSchema.parse(request.body);
       const viewer = await options.viewerService.ensureViewer(user);
       const workspaceId = viewer.workspace.id;
-      const client = options.createUserClient(user.accessToken);
 
       // Download and parse from npm registry
       const { imported, packageName: pkgName } = await installFromMarketplace(packageName);
       const slug = generateSlug(imported.manifest.name);
 
-      // Insert skill
-      const { data: skillData, error: skillError } = await untypedFrom(client, "skills")
-        .insert({
+      // Insert skill. The `source_url` / `package_name` columns are still NOT written
+      // — they keep going into `metadata` (frozen T-61 behaviour).
+      let skillData: SkillRow;
+      try {
+        skillData = await options.skillRepository.insertOwnSkill(user.id, {
           name: imported.manifest.name,
           slug,
           description: imported.manifest.description,
@@ -188,57 +199,66 @@ export async function registerMarketplaceRoutes(
           version: imported.manifest.version ?? "1.0",
           license: imported.manifest.license ?? null,
           category: "custom",
-          source: "user",
-          skill_content: imported.skillContent,
+          skillContent: imported.skillContent,
           metadata: {
             ...(imported.manifest.metadata ?? {}),
             source_url: `https://www.npmjs.com/package/${packageName}`,
             package_name: pkgName,
           },
-          created_by: user.id,
-        })
-        .select("*")
-        .single();
-
-      if (skillError) {
+        });
+      } catch (skillError) {
         request.log.error({ err: skillError }, "marketplace install DB insert failed");
-        if (skillError.code === "23505") {
+        if (
+          skillError instanceof SkillRepositoryError &&
+          skillError.sqlstate === "23505"
+        ) {
           return sendError(reply, "marketplace_install_failed", "This skill is already installed.", 409);
         }
         return sendError(reply, "marketplace_install_failed", "Failed to save marketplace skill.");
       }
 
-      // Insert files
-      if (imported.files.length > 0 && skillData?.id) {
-        const fileRows = imported.files.map((f) => ({
-          skill_id: skillData.id,
-          file_path: f.filePath,
-          content: f.content,
-          mime_type: f.mimeType,
-        }));
-        const { error: fileError } = await untypedFrom(client, "skill_files").insert(fileRows);
-        if (fileError) {
+      // Insert files. Non-fatal, exactly as before.
+      if (imported.files.length > 0 && skillData.id) {
+        try {
+          await options.skillRepository.insertOwnSkillFiles(
+            user.id,
+            skillData.id,
+            imported.files.map((f) => ({
+              filePath: f.filePath,
+              content: f.content,
+              mimeType: f.mimeType,
+            })),
+          );
+        } catch (fileError) {
           request.log.error({ err: fileError }, "marketplace install file insert failed (non-fatal)");
         }
       }
 
-      // Auto-install to workspace
-      if (skillData?.id) {
-        await untypedFrom(client, "workspace_skills").upsert(
-          { workspace_id: workspaceId, skill_id: skillData.id, enabled: true, installed_by: user.id },
-          { onConflict: "workspace_id,skill_id" },
-        );
+      // Auto-install to workspace. The result was NEVER inspected before the
+      // migration — `await` plus a discarded answer — so a refusal is swallowed
+      // here as well; only the skill insert decides the status code.
+      if (skillData.id) {
+        try {
+          await options.skillRepository.upsertWorkspaceSkill(
+            user.id,
+            workspaceId,
+            skillData.id,
+            true,
+          );
+        } catch {
+          // Deliberately swallowed: the removed upsert's error was never read.
+        }
       }
 
-      // Return full skill detail with files
-      const { data: fileData } = await untypedFrom(client, "skill_files")
-        .select("*")
-        .eq("skill_id", skillData.id)
-        .order("file_path", { ascending: true });
+      // Return full skill detail with files. A failed read-back was swallowed
+      // before the migration (frozen §1 M4) and stays swallowed.
+      const fileData = await options.skillRepository
+        .listVisibleSkillFiles(user.id, skillData.id)
+        .catch(() => []);
 
       const skill = {
         ...mapSkillDetailRow(skillData),
-        files: (fileData ?? []).map(mapSkillFileRow),
+        files: fileData.map(mapSkillFileRow),
       };
 
       return reply.code(201).send(skillDetailResponseSchema.parse({ skill }));

@@ -967,14 +967,35 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // innocent identifiers - so a future wrapper of this shape has to extend it by
     // hand. It reads raw text like the from-call rule, which is why a mention
     // inside a comment is counted too; T-45 stays open on purpose.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(84);
+    // Workorder 21AE then moved all nineteen of those call sites out of PostgREST
+    // and into `db/skill-repository.ts` (ten fixed statements built in `app.ts`
+    // beside the other repositories), and deleted the two `untypedFrom` wrapper
+    // definitions with them. So both counters below move DOWN together (84->63):
+    // nineteen call sites plus the two definition lines, whose own `from` casts
+    // were the only part of those two files the from-call rule could see. That is
+    // a real coupling removal rather than a counting change: the two HTTP files
+    // no longer name a Supabase client at all, and each RLS policy is translated
+    // verbatim into its statement's OWN predicate — `skills_select_all`,
+    // `skills_insert_user`, `skills_update_user` and `skills_delete_user` for the
+    // registry, `skill_files_select` / `skill_files_insert` for the files,
+    // `ws_skills_select` for the workspace list, and BOTH branches of
+    // `private.is_workspace_admin_or_owner` (the `workspaces.owner_user_id` one
+    // included) for install, toggle and uninstall. The published wire shape, every
+    // error code, status and message, all six swallowed failures and the four
+    // T-61 bug-level behaviours are unchanged. `server.storageCalls` (23) and the
+    // RPC counters below did not move, because this workorder touched neither, and
+    // the `[from] rule` itself is KEPT — it reads 0 call sites now, but a future
+    // wrapper of the same shape still has to be counted by hand. The new and
+    // modified test files name no client method either, so
+    // `fromCallsIncludingTests` follows `fromCalls` down again.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(63);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing. The wrapper
     // fixtures above are assembled the same way (`UNTYPED_FROM_CALL`), so a
     // literal token there cannot inflate this counter either - the two server
     // counters below still agree exactly.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(84);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(63);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

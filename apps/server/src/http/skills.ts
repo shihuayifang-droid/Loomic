@@ -11,18 +11,15 @@ import {
   workspaceSkillToggleRequestSchema,
 } from "@loomic/shared";
 
-import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
-import type {
-  RequestAuthenticator,
-  UserSupabaseClient,
-} from "../supabase/user.js";
+import { SkillRepositoryError } from "../db/skill-repository.js";
 
-/**
- * Helper to bypass Supabase generated types for tables not yet in the schema
- * (skills, workspace_skills). Returns untyped client so PostgREST queries compile.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const untypedFrom = (client: UserSupabaseClient, table: string) => (client as any).from(table);
+import type {
+  SkillFileRecord,
+  SkillPatch,
+  SkillRepository,
+} from "../db/skill-repository.js";
+import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
+import type { RequestAuthenticator } from "../supabase/user.js";
 
 type SkillErrorCode =
   | "feature_disabled"
@@ -37,11 +34,23 @@ type SkillErrorCode =
   | "skill_uninstall_failed"
   | "skill_toggle_failed";
 
+/**
+ * The skill routes (workorder 21AE).
+ *
+ * Every table call of this file now runs through `SkillRepository`, a pure `pg`
+ * repository built in `app.ts`. The routes themselves only swapped the CALL
+ * TARGET: the status codes, error codes, messages, mappers and the six places
+ * that swallow a failure on purpose are the ones this file published before, and
+ * the four bug-level behaviours frozen as T-61 are untouched.
+ *
+ * The user-scoped Supabase client is no longer a parameter: nothing in this file
+ * can reach PostgREST any more.
+ */
 export async function registerSkillRoutes(
   app: FastifyInstance,
   options: {
     auth: RequestAuthenticator;
-    createUserClient: (accessToken: string) => UserSupabaseClient;
+    skillRepository: SkillRepository;
     viewerService: ViewerService;
   },
 ) {
@@ -55,18 +64,9 @@ export async function registerSkillRoutes(
       const user = await options.auth.authenticate(request);
       if (!user) return sendUnauthenticated(reply);
 
-      const client = options.createUserClient(user.accessToken);
-      const { data, error } = await untypedFrom(client, "skills")
-        .select("*")
-        .order("is_featured", { ascending: false })
-        .order("name", { ascending: true });
+      const rows = await options.skillRepository.listVisibleSkills(user.id);
 
-      if (error) {
-        request.log.error({ err: error }, "skills list query failed");
-        return sendSkillError(reply, "skill_query_failed", "Unable to load skills.");
-      }
-
-      const skills = (data ?? []).map(mapSkillRow);
+      const skills = rows.map(mapSkillRow);
       return reply.code(200).send(skillListResponseSchema.parse({ skills }));
     } catch (error) {
       request.log.error({ err: error }, "skills list error");
@@ -81,16 +81,7 @@ export async function registerSkillRoutes(
       if (!user) return sendUnauthenticated(reply);
 
       const { id } = request.params as { id: string };
-      const client = options.createUserClient(user.accessToken);
-      const { data, error } = await untypedFrom(client, "skills")
-        .select("*")
-        .eq("id", id)
-        .maybeSingle();
-
-      if (error) {
-        request.log.error({ err: error }, "skill detail query failed");
-        return sendSkillError(reply, "skill_query_failed", "Unable to load skill.");
-      }
+      const data = await options.skillRepository.findVisibleSkill(user.id, id);
 
       if (!data) {
         return sendSkillError(
@@ -101,15 +92,16 @@ export async function registerSkillRoutes(
         );
       }
 
-      // Fetch associated files
-      const { data: fileData } = await untypedFrom(client, "skill_files")
-        .select("*")
-        .eq("skill_id", id)
-        .order("file_path", { ascending: true });
+      // Fetch associated files. A failed read stays NON-FATAL here (workorder
+      // 21AE §1 #3): the detail answer simply carries no files, which is what the
+      // removed read did when it ignored its own error.
+      const fileRows = await options.skillRepository
+        .listVisibleSkillFiles(user.id, id)
+        .catch((): SkillFileRecord[] => []);
 
       const skill = {
         ...mapSkillDetailRow(data),
-        files: (fileData ?? []).map(mapSkillFileRow),
+        files: fileRows.map(mapSkillFileRow),
       };
       return reply.code(200).send(skillDetailResponseSchema.parse({ skill }));
     } catch (error) {
@@ -125,19 +117,15 @@ export async function registerSkillRoutes(
       if (!user) return sendUnauthenticated(reply);
 
       const { id } = request.params as { id: string };
-      const client = options.createUserClient(user.accessToken);
 
-      const { data, error } = await untypedFrom(client, "skill_files")
-        .select("*")
-        .eq("skill_id", id)
-        .order("file_path", { ascending: true });
+      const rows = await options.skillRepository.listVisibleSkillFiles(
+        user.id,
+        id,
+      );
 
-      if (error) {
-        request.log.error({ err: error }, "skill files list failed");
-        return sendSkillError(reply, "skill_file_query_failed", "Unable to load skill files.");
-      }
-
-      return reply.code(200).send({ files: (data ?? []).map(mapSkillFileRow) });
+      // Not through a response schema — unchanged: this route answered the raw
+      // `{ files }` object before the migration and still does.
+      return reply.code(200).send({ files: rows.map(mapSkillFileRow) });
     } catch (error) {
       request.log.error({ err: error }, "skill files list error");
       return sendSkillError(reply, "skill_file_query_failed", "Unable to load skill files.");
@@ -152,26 +140,21 @@ export async function registerSkillRoutes(
 
       const payload = skillCreateRequestSchema.parse(request.body);
       const slug = generateSlug(payload.name);
-      const client = options.createUserClient(user.accessToken);
 
-      const { data, error } = await untypedFrom(client, "skills")
-        .insert({
+      let data: SkillRow;
+      try {
+        data = await options.skillRepository.insertOwnSkill(user.id, {
           name: payload.name,
           slug,
           description: payload.description,
           category: payload.category,
-          skill_content: payload.skillContent,
-          icon_name: payload.iconName ?? null,
-          source: "user",
-          created_by: user.id,
-        })
-        .select("*")
-        .single();
-
-      if (error) {
+          skillContent: payload.skillContent,
+          iconName: payload.iconName ?? null,
+        });
+      } catch (error) {
         request.log.error({ err: error }, "skill create failed");
         // Check for unique slug conflict
-        if (error.code === "23505") {
+        if (error instanceof SkillRepositoryError && error.sqlstate === "23505") {
           return sendSkillError(
             reply,
             "skill_create_failed",
@@ -183,29 +166,32 @@ export async function registerSkillRoutes(
       }
 
       // Insert associated files if provided
-      if (payload.files?.length && data?.id) {
-        const fileRows = payload.files.map((f) => ({
-          skill_id: data.id,
-          file_path: f.filePath,
-          content: f.content,
-          mime_type: f.mimeType ?? "text/plain",
-        }));
-        const { error: fileError } = await untypedFrom(client, "skill_files").insert(fileRows);
-        if (fileError) {
+      if (payload.files?.length && data.id) {
+        try {
+          await options.skillRepository.insertOwnSkillFiles(
+            user.id,
+            data.id,
+            payload.files.map((f) => ({
+              filePath: f.filePath,
+              content: f.content,
+              mimeType: f.mimeType ?? "text/plain",
+            })),
+          );
+        } catch (fileError) {
           // Non-fatal: skill was created but files failed — log and continue
           request.log.error({ err: fileError }, "skill file insert failed (non-fatal)");
         }
       }
 
-      // Fetch files back so the response includes them
-      const { data: fileData } = await untypedFrom(client, "skill_files")
-        .select("*")
-        .eq("skill_id", data.id)
-        .order("file_path", { ascending: true });
+      // Fetch files back so the response includes them. This read was swallowed
+      // before the migration (§1 #7) and stays swallowed.
+      const fileData = await options.skillRepository
+        .listVisibleSkillFiles(user.id, data.id)
+        .catch((): SkillFileRecord[] => []);
 
       const skill = {
         ...mapSkillDetailRow(data),
-        files: (fileData ?? []).map(mapSkillFileRow),
+        files: fileData.map(mapSkillFileRow),
       };
       return reply.code(201).send(skillDetailResponseSchema.parse({ skill }));
     } catch (error) {
@@ -247,20 +233,20 @@ export async function registerSkillRoutes(
 
       const { id } = request.params as { id: string };
       const payload = skillUpdateRequestSchema.parse(request.body);
-      const client = options.createUserClient(user.accessToken);
 
-      // Build the update object with only provided fields
-      const updates: Record<string, unknown> = {};
+      // Build the patch with only provided fields. `name` and `slug` are ONE edit:
+      // a rename always rewrites the slug, exactly as before the migration.
+      const patch: SkillPatch = {};
       if (payload.name !== undefined) {
-        updates.name = payload.name;
-        updates.slug = generateSlug(payload.name);
+        patch.name = payload.name;
+        patch.slug = generateSlug(payload.name);
       }
-      if (payload.description !== undefined) updates.description = payload.description;
-      if (payload.category !== undefined) updates.category = payload.category;
-      if (payload.skillContent !== undefined) updates.skill_content = payload.skillContent;
-      if (payload.iconName !== undefined) updates.icon_name = payload.iconName;
+      if (payload.description !== undefined) patch.description = payload.description;
+      if (payload.category !== undefined) patch.category = payload.category;
+      if (payload.skillContent !== undefined) patch.skill_content = payload.skillContent;
+      if (payload.iconName !== undefined) patch.icon_name = payload.iconName;
 
-      if (Object.keys(updates).length === 0) {
+      if (Object.keys(patch).length === 0) {
         return reply.code(400).send(
           applicationErrorResponseSchema.parse({
             error: {
@@ -271,16 +257,15 @@ export async function registerSkillRoutes(
         );
       }
 
-      const { data, error } = await untypedFrom(client, "skills")
-        .update(updates)
-        .eq("id", id)
-        .eq("created_by", user.id) // RLS also enforces this; belt-and-suspenders
-        .select("*")
-        .maybeSingle();
-
-      if (error) {
+      let data: SkillRow | null;
+      try {
+        // The ownership predicate ("created_by = the actor") is the statement's own
+        // WHERE clause now, which is what the removed `.eq` and the RLS policy
+        // together enforced.
+        data = await options.skillRepository.updateOwnSkill(user.id, id, patch);
+      } catch (error) {
         request.log.error({ err: error }, "skill update failed");
-        if (error.code === "23505") {
+        if (error instanceof SkillRepositoryError && error.sqlstate === "23505") {
           return sendSkillError(
             reply,
             "skill_update_failed",
@@ -322,19 +307,13 @@ export async function registerSkillRoutes(
       if (!user) return sendUnauthenticated(reply);
 
       const { id } = request.params as { id: string };
-      const client = options.createUserClient(user.accessToken);
 
-      const { error, count } = await untypedFrom(client, "skills")
-        .delete({ count: "exact" })
-        .eq("id", id)
-        .eq("created_by", user.id); // RLS also enforces this
+      const { deleted } = await options.skillRepository.deleteOwnSkill(
+        user.id,
+        id,
+      );
 
-      if (error) {
-        request.log.error({ err: error }, "skill delete failed");
-        return sendSkillError(reply, "skill_delete_failed", "Unable to delete skill.");
-      }
-
-      if (count === 0) {
+      if (deleted === 0) {
         return sendSkillError(
           reply,
           "skill_not_found",
@@ -362,34 +341,24 @@ export async function registerSkillRoutes(
 
       const viewer = await options.viewerService.ensureViewer(user);
       const workspaceId = viewer.workspace.id;
-      const client = options.createUserClient(user.accessToken);
 
-      // Join workspace_skills with skills to return full skill info + install status
-      const { data, error } = await untypedFrom(client, "workspace_skills")
-        .select("skill_id, enabled, installed_at, skills(*)")
-        .eq("workspace_id", workspaceId)
-        .order("installed_at", { ascending: false });
+      // The install rows joined to their skill, with the install status. The join
+      // carries the skill-visibility predicate and the WHERE carries the membership
+      // one, so a private skill of somebody else — and a workspace the actor is not
+      // a member of — contribute no row at all. That is the "invisible skills are
+      // filtered out" answer the removed `.filter((row) => row.skills !== null)`
+      // produced client-side, now done by the database.
+      const data = await options.skillRepository.listWorkspaceInstalledSkills(
+        user.id,
+        workspaceId,
+      );
 
-      if (error) {
-        request.log.error({ err: error }, "workspace skills list query failed");
-        return sendSkillError(
-          reply,
-          "skill_query_failed",
-          "Unable to load workspace skills.",
-        );
-      }
-
-      const skills = ((data ?? []) as any[])
-        .filter((row) => row.skills !== null)
-        .map((row) => {
-          const s = row.skills as SkillRow;
-          return {
-            ...mapSkillRow(s),
-            installed: true,
-            enabled: row.enabled,
-            installedAt: row.installed_at,
-          };
-        });
+      const skills = data.map((row) => ({
+        ...mapSkillRow(row),
+        installed: true,
+        enabled: row.enabled,
+        installedAt: row.installed_at,
+      }));
 
       return reply
         .code(200)
@@ -424,15 +393,15 @@ export async function registerSkillRoutes(
 
       const viewer = await options.viewerService.ensureViewer(user);
       const workspaceId = viewer.workspace.id;
-      const client = options.createUserClient(user.accessToken);
 
-      // Verify skill exists
-      const { data: skill, error: skillError } = await untypedFrom(client, "skills")
-        .select("id")
-        .eq("id", body.skillId)
-        .maybeSingle();
+      // Verify the skill exists AND is visible to the actor. This check is the only
+      // thing that stops "install somebody else's private skill": the foreign key
+      // does not run the RLS policy, so the check cannot be dropped.
+      const skill = await options.skillRepository
+        .findVisibleSkill(user.id, body.skillId)
+        .catch(() => null);
 
-      if (skillError || !skill) {
+      if (!skill) {
         return sendSkillError(
           reply,
           "skill_not_found",
@@ -441,17 +410,14 @@ export async function registerSkillRoutes(
         );
       }
 
-      const { error } = await untypedFrom(client, "workspace_skills").upsert(
-        {
-          workspace_id: workspaceId,
-          skill_id: body.skillId,
-          enabled: true,
-          installed_by: user.id,
-        },
-        { onConflict: "workspace_id,skill_id" },
-      );
-
-      if (error) {
+      try {
+        await options.skillRepository.upsertWorkspaceSkill(
+          user.id,
+          workspaceId,
+          body.skillId,
+          true,
+        );
+      } catch (error) {
         request.log.error({ err: error }, "skill install failed");
         return sendSkillError(
           reply,
@@ -480,23 +446,16 @@ export async function registerSkillRoutes(
       const { skillId } = request.params as { skillId: string };
       const viewer = await options.viewerService.ensureViewer(user);
       const workspaceId = viewer.workspace.id;
-      const client = options.createUserClient(user.accessToken);
 
-      const { error, count } = await untypedFrom(client, "workspace_skills")
-        .delete({ count: "exact" })
-        .eq("workspace_id", workspaceId)
-        .eq("skill_id", skillId);
+      // A non-admin deletes ZERO rows and the route answers 404 — never 403. That
+      // is the behaviour this route published before the migration and it is kept.
+      const { deleted } = await options.skillRepository.deleteWorkspaceSkill(
+        user.id,
+        workspaceId,
+        skillId,
+      );
 
-      if (error) {
-        request.log.error({ err: error }, "skill uninstall failed");
-        return sendSkillError(
-          reply,
-          "skill_uninstall_failed",
-          "Unable to uninstall skill.",
-        );
-      }
-
-      if (count === 0) {
+      if (deleted === 0) {
         return sendSkillError(
           reply,
           "skill_not_found",
@@ -526,15 +485,14 @@ export async function registerSkillRoutes(
       const payload = workspaceSkillToggleRequestSchema.parse(request.body);
       const viewer = await options.viewerService.ensureViewer(user);
       const workspaceId = viewer.workspace.id;
-      const client = options.createUserClient(user.accessToken);
 
-      // Verify skill exists in the catalog
-      const { data: skill, error: skillError } = await untypedFrom(client, "skills")
-        .select("id")
-        .eq("id", skillId)
-        .maybeSingle();
+      // Verify the skill exists in the catalogue AND is visible to the actor — the
+      // same "cannot reach somebody else's private skill" guard as the install route.
+      const skill = await options.skillRepository
+        .findVisibleSkill(user.id, skillId)
+        .catch(() => null);
 
-      if (skillError || !skill) {
+      if (!skill) {
         return sendSkillError(
           reply,
           "skill_not_found",
@@ -544,17 +502,14 @@ export async function registerSkillRoutes(
       }
 
       // Upsert: create workspace_skills row if not installed, or update enabled state
-      const { error } = await untypedFrom(client, "workspace_skills").upsert(
-        {
-          workspace_id: workspaceId,
-          skill_id: skillId,
-          enabled: payload.enabled,
-          installed_by: user.id,
-        },
-        { onConflict: "workspace_id,skill_id" },
-      );
-
-      if (error) {
+      try {
+        await options.skillRepository.upsertWorkspaceSkill(
+          user.id,
+          workspaceId,
+          skillId,
+          payload.enabled,
+        );
+      } catch (error) {
         request.log.error({ err: error }, "skill toggle failed");
         return sendSkillError(
           reply,

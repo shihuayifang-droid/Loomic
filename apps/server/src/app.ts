@@ -99,6 +99,7 @@ import { createAssetWriteRepository } from "./db/asset-write-repository.js";
 import {
   createWorkspaceSkillReadRepository,
 } from "./db/workspace-skill-read-repository.js";
+import { createSkillRepository, type SkillRepository } from "./db/skill-repository.js";
 import {
   createTeamAdminReadRepository,
   type TeamAdminReadRepository,
@@ -226,6 +227,14 @@ export type BuildAppOptions = {
   projectReadRepository?: ProjectReadRepository;
   projectService?: ProjectService;
   settingsService?: SettingsService;
+  /**
+   * ADR-0001 / workorder 21AE: the only path to the `skills`, `skill_files` and
+   * `workspace_skills` tables. Injectable for the same reason the other
+   * repositories are — the route tests hand the app a double and observe which
+   * actor, workspace and values each route passes down (and that nothing reaches
+   * PostgREST). Production passes nothing here and gets the real repository.
+   */
+  skillRepository?: SkillRepository;
   teamAdminReadRepository?: TeamAdminReadRepository;
   teamAdminService?: TeamAdminService;
   teamMembershipService?: TeamMembershipService;
@@ -677,6 +686,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const workspaceSkillReadRepository = createWorkspaceSkillReadRepository({
     getTransactionPool: () => getTransactionPool(databaseEnv),
   });
+  // ADR-0001 / workorder 21AE: the nineteen skill table calls of the two HTTP
+  // files — the skills registry, its files and the per-workspace installs — are
+  // PostgreSQL now, so this repository is built exactly like the others above:
+  // lazily, against the same pool, with no fallback. A missing pool is a failure
+  // on the call, never a silent return to PostgREST.
+  const skillRepository =
+    options.skillRepository ??
+    createSkillRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   const agentRuns = createAgentRunService({
     agentPersistenceService,
     ...(options.agentFactory ? { agentFactory: options.agentFactory } : {}),
@@ -818,8 +837,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   if (jobService) {
     void registerJobRoutes(app, { auth, creditService, jobService, tierGuard, viewerService });
   }
-  void registerSkillRoutes(app, { auth, createUserClient, viewerService });
-  void registerMarketplaceRoutes(app, { auth, createUserClient, viewerService });
+  void registerSkillRoutes(app, { auth, skillRepository, viewerService });
+  void registerMarketplaceRoutes(app, { auth, skillRepository, viewerService });
 
   // Payment routes — only registered when Lemon Squeezy is configured
   if (paymentService) {

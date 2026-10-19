@@ -921,7 +921,11 @@ function main() {
         "receiver' - exactly one such wrapper is known and a guessed pattern " +
         "would count innocent identifiers; a new one must extend this rule by " +
         "hand. Like the `.from(` rule this reads raw text, so a mention inside a " +
-        "comment is counted too (T-45, left open on purpose).",
+        "comment is counted too (T-45, left open on purpose). Workorder 21AE " +
+        "moved all nineteen call sites into `db/skill-repository.ts` and deleted " +
+        "the two wrapper definitions, so the call count of this rule is 0 from " +
+        "21AE on (84 -> 63); the rule is KEPT, not removed, because a future " +
+        "wrapper of the same shape still has to be counted by hand.",
     );
     lines.push(
       "[rpc] rule: an RPC call site is counted in both `client.rpc(...)` and " +
