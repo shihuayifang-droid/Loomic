@@ -8,6 +8,7 @@ export * from "./supabase/database.js";
 export * from "./brand-kit-contracts.js";
 export * from "./job-contracts.js";
 export * from "./model-catalog.js";
+export * from "./pricing.js";
 export * from "./skill-contracts.js";
 export * from "./tool-definitions.js";
 export * from "./ws-protocol.js";
