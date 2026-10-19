@@ -8,6 +8,8 @@ import { z } from "zod";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
+import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
+import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
 import {
   AgentProjectAssetError,
   createAgentProjectAssetService,
@@ -52,6 +54,14 @@ const persistSandboxFileSchema = z.object({
 });
 
 export type PersistSandboxFileDeps = {
+  /**
+   * The canvas → project link behind the object key's workspace (workorder 21AC).
+   * Required for the same reason the admin client is: without it the asset
+   * service cannot name an owner's workspace, and this tool uploads a host file.
+   */
+  canvasReadRepository: CanvasReadRepository;
+  /** The compensated row delete when signing fails (workorder 21AC). */
+  assetWriteRepository: AssetWriteRepository;
   createUserClient: (accessToken: string) => SupabaseClient;
   /**
    * Service-role client getter. Required: ownership is recorded through the
@@ -84,8 +94,13 @@ function isInsideRoot(root: string, candidate: string): boolean {
  * The `sub` claim of the caller's JWT — the user id every asset row is filed
  * under. Local decode only: the token was already verified before the run was
  * accepted, and re-verifying here would add a round trip to a tool call.
+ *
+ * Exported because the `get_brand_kit` tool needs the SAME answer (workorder
+ * 21AC): its reads are owner-keyed, so the actor must come from the token that
+ * authorises the call and nowhere else. Two decoders would be two chances to
+ * disagree.
  */
-function readSubject(accessToken: string): string | null {
+export function readSubject(accessToken: string): string | null {
   try {
     const payload = decodeJwt(accessToken);
     return typeof payload.sub === "string" && payload.sub.length > 0
@@ -98,6 +113,8 @@ function readSubject(accessToken: string): string | null {
 
 export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
   const agentAssets = createAgentProjectAssetService({
+    canvasReadRepository: deps.canvasReadRepository,
+    assetWriteRepository: deps.assetWriteRepository,
     createUserClient: (accessToken) =>
       deps.createUserClient(accessToken) as unknown as UserSupabaseClient,
     getAdminClient: deps.getAdminClient,

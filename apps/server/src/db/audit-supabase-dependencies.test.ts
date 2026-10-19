@@ -806,11 +806,35 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // success" answers are unchanged; Storage (23) and the RPC counters did not move,
     // because this workorder touched neither. The new and modified test files name no
     // client method either, so `fromCallsIncludingTests` follows `fromCalls` down again.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(71);
+    // Workorder 21AC then moved the six remaining TABLE calls of the Agent side — the
+    // `canvases` embedded `projects(workspace_id)` lookup and the `asset_objects` row
+    // delete of `features/storage/agent-project-assets.ts`, the `brand_kits` and
+    // `brand_kit_assets` reads of `agent/tools/brand-kit.ts`, and the
+    // `workspace_skills`-joined-`skills` and `skill_files` reads of
+    // `agent/workspace-skills.ts` — so both counters below move down together again
+    // (71->65). That is a real coupling removal rather than a counting change: four of
+    // the six reuse an existing repository asked with the run's own actor
+    // (`CanvasReadRepository.findReadableCanvasProjectLink`,
+    // `AssetWriteRepository.deleteOwnAsset`, `BrandKitReadRepository.findOwnKit` and
+    // `listOwnKitAssets`), and the two skill reads go through the new
+    // `WorkspaceSkillReadRepository` (pure `pg`, built in `app.ts` beside the other
+    // repositories). Each RLS policy is translated verbatim into its statement's OWN
+    // predicate — `private.can_read_project` for the canvas link (no archive filter,
+    // because that predicate has none), the three conjuncts of
+    // `asset_objects_delete_self` for the compensation delete, the owner-only
+    // `brand_kits_user_policy` for the kit, and `ws_skills_select` +
+    // `skills_select_all` + `skill_files_select` for the skills — while every
+    // swallowed error (the kit read, the asset read, the skill read, the file read and
+    // the compensation's own failure) stays swallowed, exactly as before. Storage (23)
+    // and the RPC counters did not move: the brand-kit bucket signing and the
+    // `record_project_asset` RPC still run on the clients they always used. The four
+    // new test files name no client method either, so `fromCallsIncludingTests`
+    // follows `fromCalls` down again.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(65);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(71);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(65);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —

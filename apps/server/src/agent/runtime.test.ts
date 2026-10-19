@@ -23,7 +23,37 @@
 // times one was attempted is asserted to be zero. The read itself is a fake
 // repository that records every ask, so "which actor asked for which asset" and
 // "was the read attempted at all" are measured rather than assumed.
+//
+// 工单21AC: the same "measure the wiring, do not assume it" rule now covers the
+// three repositories the Agent side needs — the canvas read, the asset-row
+// compensation delete and the owner-keyed brand kit read. They are REQUIRED
+// properties of `createLoomicDeepAgent`'s options and of `createMainAgentTools`'
+// deps, so a missing one is a compile error; the cases at the end of this file go
+// one step further and check the OBJECTS actually reach the tool factory, and that
+// the tool built from them answers from the repository instead of a table read.
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+/**
+ * A pass-through spy on the tool factory: the real `createMainAgentTools` still
+ * runs (so the tools below are the tools a run would get), and every call is
+ * recorded so the arguments are observable. `vi.mock` is hoisted, hence
+ * `vi.hoisted` for the spy itself.
+ */
+const mainAgentToolsSpy = vi.hoisted(() => vi.fn());
+
+vi.mock("./tools/index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./tools/index.js")>();
+  return {
+    ...actual,
+    createMainAgentTools: (
+      ...args: Parameters<typeof actual.createMainAgentTools>
+    ) => {
+      mainAgentToolsSpy(...args);
+      return actual.createMainAgentTools(...args);
+    },
+  };
+});
+
 
 import type { ImageAttachment } from "@loomic/shared";
 
@@ -31,17 +61,26 @@ import type {
   AssetReadRepository,
   AssetReadRow,
 } from "../db/asset-read-repository.js";
+import type { AssetWriteRepository } from "../db/asset-write-repository.js";
+import type {
+  BrandKitAssetRow,
+  BrandKitReadRepository,
+  KitDetailRow,
+} from "../db/brand-kit-read-repository.js";
 import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
 } from "../db/canvas-read-repository.js";
+import type { ServerEnv } from "../config/env.js";
 import type { UserSupabaseClient } from "../supabase/user.js";
+import { createLoomicDeepAgent } from "./deep-agent.js";
 import {
   readCanvasProjectLinkForRun,
   readCanvasSummaryForRun,
   resolveAttachmentContent,
   resolveCanvasProjectId,
 } from "./runtime.js";
+import { createMainAgentTools } from "./tools/index.js";
 
 const BUCKET = "project-assets";
 const OBJECT_PATH = "ws-team/p/a.png";
@@ -962,5 +1001,176 @@ describe("resolveCanvasProjectId (21R)", () => {
     // "not found" and "not accessible" stay indistinguishable on purpose: the
     // message must not become an existence oracle over other people's canvases.
     expect(h.linkCalls).toHaveLength(1);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// 工单21AC: the three repositories reach the agent's tools, and the tool they
+// build reads through them instead of a table.
+//
+// This is the wiring proof for `app.ts → runtime → deep-agent → tools/index`:
+// every one of those layers declares the repositories as REQUIRED, so a missing
+// one is a compile error, and the cases below additionally check that the very
+// objects a runtime is built with are the ones the tool factory receives and the
+// tool calls. Nothing here is a mock of the seam being tested — the real
+// `createMainAgentTools` runs and the real `get_brand_kit` tool is invoked.
+// ---------------------------------------------------------------------------
+
+const WIRING_KIT_ID = "00000000-0000-0000-0000-0000000000b1";
+
+/** A structurally valid JWT whose `sub` is the acting user; only the payload is read. */
+const WIRING_TOKEN = `header.${Buffer.from(
+  JSON.stringify({ sub: ACTOR, email: "a@t" }),
+).toString("base64url")}.signature`;
+
+const WIRING_KIT: KitDetailRow = {
+  id: WIRING_KIT_ID,
+  name: "Acme Brand",
+  is_default: true,
+  guidance_text: null,
+  cover_url: null,
+  created_at: "2026-01-01T00:00:00.000Z",
+  updated_at: "2026-01-02T00:00:00.000Z",
+};
+
+const WIRING_ASSETS: BrandKitAssetRow[] = [
+  {
+    id: "asset-color",
+    asset_type: "color",
+    display_name: "Brand red",
+    role: "primary",
+    sort_order: 0,
+    text_content: "#D4A574",
+    file_url: null,
+    metadata: {},
+    created_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-01T00:00:00.000Z",
+  },
+];
+
+describe("工单21AC: the Agent-side repositories are wired to the tools", () => {
+  afterEach(() => {
+    mainAgentToolsSpy.mockClear();
+  });
+
+  it("case 1: `createLoomicDeepAgent` passes the SAME three repository objects to the tool factory", () => {
+    const assetWriteRepository = {
+      async deleteOwnAsset() {
+        throw new Error("deleteOwnAsset is not used by this case");
+      },
+    } as unknown as AssetWriteRepository;
+    const brandKitReadRepository = {
+      async findOwnKit() {
+        return null;
+      },
+    } as unknown as BrandKitReadRepository;
+    const canvasReadRepository = {
+      async findReadableCanvasProjectLink() {
+        return null;
+      },
+    } as unknown as CanvasReadRepository;
+
+    createLoomicDeepAgent({
+      assetWriteRepository,
+      brandKitReadRepository,
+      canvasReadRepository,
+      backendResult: { factory: (() => ({})) as never },
+      // The filesystem backend mode is the one that needs no canvas id; the model
+      // is named explicitly so no provider env var is consulted.
+      env: {
+        agentBackendMode: "filesystem",
+        agentFilesRoot: "/tmp/loomic-runtime-wiring",
+        skillsRoot: "/tmp/loomic-runtime-wiring-skills",
+        agentModel: "deepseek-v4-flash",
+      } as unknown as ServerEnv,
+      model: "openai:gpt-4o-mini",
+    });
+
+    expect(mainAgentToolsSpy).toHaveBeenCalledTimes(1);
+    const deps = mainAgentToolsSpy.mock.calls[0]?.[1] as Record<string, unknown>;
+
+    // IDENTITY, not equality: the tool factory must receive the runtime's own
+    // repositories, never a copy or a second construction of them.
+    expect(deps["assetWriteRepository"]).toBe(assetWriteRepository);
+    expect(deps["brandKitReadRepository"]).toBe(brandKitReadRepository);
+    expect(deps["canvasReadRepository"]).toBe(canvasReadRepository);
+  });
+
+  it("case 2: the `get_brand_kit` tool built from those deps answers from the repository, and never reads a table", async () => {
+    const kitAsks: Array<{ actorId: string; kitId: string }> = [];
+    const assetAsks: Array<{ actorId: string; kitId: string }> = [];
+
+    const brandKitReadRepository = {
+      async listOwnKits(): Promise<never> {
+        throw new Error("listOwnKits is not used by this tool");
+      },
+      async findOwnKit(input: {
+        actorId: string;
+        kitId: string;
+      }): Promise<KitDetailRow | null> {
+        kitAsks.push({ ...input });
+        return WIRING_KIT;
+      },
+      async listOwnKitAssets(input: {
+        actorId: string;
+        kitId: string;
+      }): Promise<BrandKitAssetRow[]> {
+        assetAsks.push({ ...input });
+        return WIRING_ASSETS;
+      },
+      async listOwnKitFileUrls(): Promise<never> {
+        throw new Error("listOwnKitFileUrls is not used by this tool");
+      },
+      async readNextSortOrder(): Promise<never> {
+        throw new Error("readNextSortOrder is not used by this tool");
+      },
+      async findOwnAsset(): Promise<never> {
+        throw new Error("findOwnAsset is not used by this tool");
+      },
+    } as unknown as BrandKitReadRepository;
+
+    let tableReads = 0;
+    const signingClient = {
+      from: (table: string) => {
+        tableReads += 1;
+        throw new Error(`unexpected table read in runtime wiring test: ${table}`);
+      },
+      storage: {
+        from: () => ({
+          createSignedUrls: async () => ({ data: [], error: null }),
+        }),
+      },
+    };
+
+    const tools = createMainAgentTools({} as never, {
+      assetWriteRepository: {} as unknown as AssetWriteRepository,
+      brandKitReadRepository,
+      canvasReadRepository: {} as unknown as CanvasReadRepository,
+      brandKitId: WIRING_KIT_ID,
+      createUserClient: () => signingClient as unknown as UserSupabaseClient,
+    });
+
+    const kitTool = tools.find((entry) => entry.name === "get_brand_kit");
+    expect(kitTool).toBeDefined();
+
+    const published = JSON.parse(
+      String(
+        await kitTool!.invoke(
+          {},
+          { configurable: { access_token: WIRING_TOKEN } },
+        ),
+      ),
+    );
+
+    // The answer came from the injected repository, asked with the token's subject.
+    expect(published.kit_name).toBe("Acme Brand");
+    expect(published.colors).toEqual([
+      { name: "Brand red", hex: "#D4A574", role: "primary" },
+    ]);
+    expect(kitAsks).toEqual([{ actorId: ACTOR, kitId: WIRING_KIT_ID }]);
+    expect(assetAsks).toEqual([{ actorId: ACTOR, kitId: WIRING_KIT_ID }]);
+    // And the client it signs URLs with was never asked for a table.
+    expect(tableReads).toBe(0);
   });
 });

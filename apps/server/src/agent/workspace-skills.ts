@@ -1,4 +1,8 @@
-import type { UserSupabaseClient } from "../supabase/user.js";
+import type {
+  SkillFileRow,
+  WorkspaceSkillReadRepository,
+  WorkspaceSkillRow,
+} from "../db/workspace-skill-read-repository.js";
 
 /**
  * A file bundled with a skill (scripts/, references/, assets/).
@@ -35,67 +39,81 @@ export interface WorkspaceSkillEntry {
  * repository, not here. This function only fetches the skills installed and
  * enabled in the workspace it is handed, and only returns those with non-empty
  * `skill_content`.
+ *
+ * Workorder 21AC moved both reads to `WorkspaceSkillReadRepository`, asked with
+ * the run's own `userId`. That repository translates `ws_skills_select`,
+ * `skills_select_all` and `skill_files_select` into its statements, so the two
+ * questions that mattered before still hold:
+ *
+ * - a non-member of the workspace loads NO skills;
+ * - another member's private user skill stays invisible even when its install is
+ *   enabled — which is why the two lists can disagree with the install count.
+ *
+ * Both reads degrade instead of throwing, exactly as the PostgREST reads did:
+ *
+ * - the skill read failing or answering nothing is an empty list (the run simply
+ *   has no workspace skills);
+ * - the FILE read failing leaves every skill in place with no files, because the
+ *   old code read `data` and ignored `error` there.
+ *
+ * The actor is passed separately from the workspace on purpose: membership and
+ * skill ownership are two different questions and neither may be derived from
+ * the other.
  */
-export async function loadWorkspaceSkills(
-  userClient: UserSupabaseClient,
-  workspaceId: string,
-): Promise<WorkspaceSkillEntry[]> {
+export async function loadWorkspaceSkills(input: {
+  repository: WorkspaceSkillReadRepository;
+  actorId: string;
+  workspaceId: string;
+}): Promise<WorkspaceSkillEntry[]> {
+  const { repository, actorId, workspaceId } = input;
   if (!workspaceId) return [];
 
-  // Query enabled workspace skills with full skill data.
-  // NOTE: workspace_skills / skills tables may not yet be in the generated
-  // Supabase types — use `as any` to bypass PostgREST type checking.
-  const { data: rows, error } = await (userClient as any)
-    .from("workspace_skills")
-    .select(
-      "skill:skills(id, slug, name, description, skill_content, metadata)",
-    )
-    .eq("workspace_id", workspaceId)
-    .eq("enabled", true);
-
-  if (error || !rows?.length) return [];
-
-  // Step 3: Batch-load associated files for all enabled skills
-  const skillIds = (rows as any[])
-    .map((r: any) => r.skill?.id)
-    .filter((id: unknown): id is string => typeof id === "string");
-
-  const filesBySkillId = new Map<string, SkillFileEntry[]>();
-  if (skillIds.length > 0) {
-    const { data: fileRows } = await (userClient as any)
-      .from("skill_files")
-      .select("skill_id, file_path, content")
-      .in("skill_id", skillIds);
-
-    if (fileRows?.length) {
-      for (const fr of fileRows as Array<{ skill_id: string; file_path: string; content: string }>) {
-        const existing = filesBySkillId.get(fr.skill_id) ?? [];
-        existing.push({ path: fr.file_path, content: fr.content });
-        filesBySkillId.set(fr.skill_id, existing);
-      }
-    }
+  let rows: WorkspaceSkillRow[];
+  try {
+    rows = await repository.listEnabledWorkspaceSkills({ actorId, workspaceId });
+  } catch {
+    // Non-fatal: the agent runs without workspace skills.
+    return [];
   }
 
-  // Step 4: Map to WorkspaceSkillEntry, filtering out skills without DB content
-  return (rows as Array<{ skill: Record<string, unknown> | null }>)
-    .map((row: { skill: Record<string, unknown> | null }) => {
-      const skill = row.skill;
-      if (!skill?.skill_content) {
-        if (skill?.slug) {
-          console.warn(
-            `[workspace-skills] Skill "${skill.slug}" is enabled but has empty content — skipping`,
-          );
-        }
-        return null;
-      }
-      const slug = skill.slug as string;
-      return {
-        name: slug,
-        description: skill.description as string,
-        path: `/workspace-skills/${slug}/SKILL.md`,
-        content: skill.skill_content as string,
-        files: filesBySkillId.get(skill.id as string) ?? [],
-      };
-    })
-    .filter((entry): entry is WorkspaceSkillEntry => entry !== null);
+  if (rows.length === 0) return [];
+
+  // Batch-load associated files for all enabled skills. A failed read leaves the
+  // skills themselves intact — see the header.
+  const skillIds = rows.map((row) => row.id);
+
+  let fileRows: SkillFileRow[] = [];
+  try {
+    fileRows = await repository.listSkillFiles({ actorId, skillIds });
+  } catch {
+    fileRows = [];
+  }
+
+  const filesBySkillId = new Map<string, SkillFileEntry[]>();
+  for (const file of fileRows) {
+    const existing = filesBySkillId.get(file.skill_id) ?? [];
+    existing.push({ path: file.file_path, content: file.content });
+    filesBySkillId.set(file.skill_id, existing);
+  }
+
+  // Map to WorkspaceSkillEntry, filtering out skills without DB content.
+  const entries: WorkspaceSkillEntry[] = [];
+  for (const skill of rows) {
+    if (!skill.skill_content) {
+      console.warn(
+        `[workspace-skills] Skill "${skill.slug}" is enabled but has empty content — skipping`,
+      );
+      continue;
+    }
+
+    entries.push({
+      name: skill.slug,
+      description: skill.description,
+      path: `/workspace-skills/${skill.slug}/SKILL.md`,
+      content: skill.skill_content,
+      files: filesBySkillId.get(skill.id) ?? [],
+    });
+  }
+
+  return entries;
 }

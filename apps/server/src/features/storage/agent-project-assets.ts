@@ -11,8 +11,9 @@
 //
 // So the order below is the contract, not an implementation detail:
 //
-//   1. resolve the canvas with the USER's JWT (their RLS decides what exists),
-//   2. upload with that same client,
+//   1. resolve the canvas through the canvas repository for the acting user (its
+//      ACL decides what exists),
+//   2. upload with the user's own client,
 //   3. record ownership through the service-role-only `record_project_asset`,
 //      which derives project/team-workspace FROM THE CANVAS — never from a path
 //      and never from the caller's personal billing workspace (Q1),
@@ -23,11 +24,25 @@
 //      no caller was ever handed an id for (工单14 fixup T3),
 //   7. return { assetId, bucket, objectPath, mimeType, byteSize, signedUrl }.
 //
+// Workorder 21AC moved the TWO TABLE reads/writes of that sequence off the
+// caller's PostgREST client: step 1 is `CanvasReadRepository`'s
+// `findReadableCanvasProjectLink` (the same `private.can_read_project` predicate
+// the embedded `project:projects(workspace_id)` read relied on) and step 6's row
+// delete is `AssetWriteRepository`'s `deleteOwnAsset` (the same
+// `asset_objects_delete_self` policy). Both are REQUIRED, not optional: an
+// optional dependency that is not wired fails silently at the one moment it
+// matters, which is the failure this whole sequence exists to prevent.
+//
 // There is no fallback URL anywhere on this path. `getPublicUrl` is not called,
 // a provider URL is not returned, and a `data:` URL is not substituted: any of
 // those would silently restore the exact dependency this ticket removes.
 import type { AgentAssetReference } from "@loomic/shared";
 
+import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
+import type {
+  CanvasProjectLinkRow,
+  CanvasReadRepository,
+} from "../../db/canvas-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 import {
@@ -123,6 +138,10 @@ export function buildAgentObjectPath(args: {
 }
 
 export function createAgentProjectAssetService(options: {
+  /** The canvas → project link the object key's workspace comes from (21AC). */
+  canvasReadRepository: CanvasReadRepository;
+  /** The compensated row delete when signing fails (21AC). */
+  assetWriteRepository: AssetWriteRepository;
   createUserClient: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
 }): AgentProjectAssetService {
@@ -139,7 +158,10 @@ export function createAgentProjectAssetService(options: {
       }
 
       const client = options.createUserClient(input.accessToken);
-      const workspaceId = await resolveCanvasWorkspaceId(client, canvasId);
+      const workspaceId = await resolveCanvasWorkspaceId(
+        options.canvasReadRepository,
+        { actorId: input.createdBy, canvasId },
+      );
       const buffer = Buffer.isBuffer(input.content)
         ? input.content
         : Buffer.from(input.content);
@@ -226,7 +248,11 @@ export function createAgentProjectAssetService(options: {
         // T-23's real inventory can find it. Nothing is logged or returned that
         // contains a URL: a signed URL is a bearer token, and a failed signing
         // has not produced one anyway. The URL is never rolled back to anything.
-        await removeRecordedAssetMetadata(client, assetId, objectPath);
+        await removeRecordedAssetMetadata(
+          options.assetWriteRepository,
+          { actorId: input.createdBy, assetId },
+          objectPath,
+        );
         await removeUploadedObject(client, objectPath, "sign_failed", assetId);
         throw new AgentProjectAssetError(
           "sign_failed",
@@ -249,29 +275,35 @@ export function createAgentProjectAssetService(options: {
 }
 
 /**
- * Read the canvas through the USER's client so RLS is part of the answer: a
- * canvas this user cannot see returns no row, and the persist is refused rather
- * than filed against a guessed workspace.
+ * Read the canvas → project link for the ACTING USER through the canvas
+ * repository (workorder 21AC).
+ *
+ * The read this replaces was an embedded `project:projects(workspace_id)` lookup
+ * on the caller's own PostgREST client, so RLS decided what existed: a canvas the
+ * user could not read answered no row and the persist was refused rather than
+ * filed against a guessed workspace. `findReadableCanvasProjectLink` is that same
+ * decision as SQL — `private.can_read_project`, translation for translation — so
+ * both outcomes below are unchanged: a failed read and an unreadable canvas are
+ * both `canvas_not_found`, with the messages the caller already produced.
  */
 async function resolveCanvasWorkspaceId(
-  client: UserSupabaseClient,
-  canvasId: string,
+  repository: CanvasReadRepository,
+  input: { actorId: string; canvasId: string },
 ): Promise<string> {
-  const { data, error } = await client
-    .from("canvases")
-    .select("project:projects(workspace_id)")
-    .eq("id", canvasId)
-    .maybeSingle();
+  let link: CanvasProjectLinkRow | null;
 
-  if (error) {
+  try {
+    link = await repository.findReadableCanvasProjectLink(input);
+  } catch (error) {
     throw new AgentProjectAssetError(
       "canvas_not_found",
-      `Canvas lookup failed: ${error.message}`,
+      `Canvas lookup failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
     );
   }
 
-  const workspaceId = (data?.project as { workspace_id?: string } | null)
-    ?.workspace_id;
+  const workspaceId = link?.workspace_id;
 
   if (!workspaceId) {
     throw new AgentProjectAssetError(
@@ -308,31 +340,42 @@ async function removeUploadedObject(
 /**
  * Undo the `asset_objects` row that `record_project_asset` just wrote.
  *
- * Deleted with the CALLER's client on purpose, even though the row was written
- * through the service-role RPC: `asset_objects_delete_self` already authorises
- * the creating user inside their own workspace, so the cleanup needs no
- * privilege the write path did not have. Reaching for the admin client here
- * would turn an error message into a way to delete rows user RLS protects.
+ * Deleted through `AssetWriteRepository.deleteOwnAsset` (workorder 21AC), whose
+ * statement is `asset_objects_delete_self` translated verbatim: author +
+ * workspace membership + `can_write_project`. That is the same ACL the caller's
+ * user-scoped client applied, so this cleanup still needs no privilege the write
+ * path did not have — and reaching for the admin client here would turn an error
+ * message into a way to delete rows user RLS protects.
  *
- * Best effort — a failure is reported on the safe log and never rethrown, so
- * the `sign_failed` the caller sees remains the reason the persist failed.
+ * Best effort — a failure is reported on the safe log and never rethrown, so the
+ * `sign_failed` the caller sees remains the reason the persist failed. Zero rows
+ * is not a failure (`deleted: 0` means the row was already gone or the predicate
+ * refused it) but it IS logged: something this module was told it had just
+ * created is no longer there, and the `(0 rows)` marker is how that shows up in
+ * the log instead of passing as a silent success.
  */
 async function removeRecordedAssetMetadata(
-  client: UserSupabaseClient,
-  assetId: string,
+  repository: AssetWriteRepository,
+  input: { actorId: string; assetId: string },
   objectPath: string,
 ): Promise<void> {
+  const logPrefix =
+    `[agent-project-assets] cleanup of a failed-to-sign metadata row FAILED ` +
+    `assetId=${input.assetId} bucket=${PROJECT_ASSET_BUCKET} path=${objectPath} `;
+
   try {
-    const { error } = await client
-      .from("asset_objects")
-      .delete()
-      .eq("id", assetId);
-    if (error) throw new Error(error.message);
+    const { deleted } = await repository.deleteOwnAsset(input);
+
+    if (deleted === 0) {
+      // The original code had no zero-row branch (the PostgREST delete did not
+      // report a count). Same message, with the marker appended.
+      console.error(`${logPrefix}cleanupReason=the row was not deleted (0 rows)`);
+    }
   } catch (error) {
     console.error(
-      `[agent-project-assets] cleanup of a failed-to-sign metadata row FAILED ` +
-        `assetId=${assetId} bucket=${PROJECT_ASSET_BUCKET} path=${objectPath} ` +
-        `cleanupReason=${error instanceof Error ? error.message : String(error)}`,
+      `${logPrefix}cleanupReason=${
+        error instanceof Error ? error.message : String(error)
+      }`,
     );
   }
 }

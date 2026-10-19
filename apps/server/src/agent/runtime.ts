@@ -23,10 +23,13 @@ import type {
   AssetReadRepository,
   AssetReadRow,
 } from "../db/asset-read-repository.js";
+import type { AssetWriteRepository } from "../db/asset-write-repository.js";
+import type { BrandKitReadRepository } from "../db/brand-kit-read-repository.js";
 import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
 } from "../db/canvas-read-repository.js";
+import type { WorkspaceSkillReadRepository } from "../db/workspace-skill-read-repository.js";
 import type { JobService } from "../features/jobs/job-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { AdminSupabaseClient } from "../supabase/admin.js";
@@ -422,13 +425,27 @@ type CreateAgentRuntimeOptions = {
    */
   assetReadRepository?: AssetReadRepository;
   /**
-   * Canvas read repository (workorder 20C). The automatic canvas summary is a
-   * pure read, so it goes through actor-carrying SQL that re-applies the
-   * canvas's project ACL instead of the caller's PostgREST client. Optional:
-   * without it the summary is simply absent, which is the same degradation a
-   * failed read already produced.
+   * Asset write repository (workorder 21AC). The compensation that removes the
+   * `asset_objects` row of a failed signing is a delete with the asset's own
+   * policy, so it goes through the repository the upload service already uses.
+   * Required: it is the only way that row can be removed, and a missing one would
+   * leave a half-created asset behind.
    */
-  canvasReadRepository?: CanvasReadRepository;
+  assetWriteRepository: AssetWriteRepository;
+  /**
+   * Brand kit read repository (workorder 21AC). `get_brand_kit`'s two reads are
+   * owner-keyed and belong to `brand-kit-read-repository.ts`. Required: without
+   * it the tool must not be offered at all, and "offered but unable to read" is
+   * the failure mode a required dependency prevents.
+   */
+  brandKitReadRepository: BrandKitReadRepository;
+  /**
+   * Canvas read repository (workorder 20C, made REQUIRED by 21AC). The automatic
+   * canvas summary, the run's canvas → project link and (since 21AC) the
+   * workspace every persisted asset is filed under all read through it, so a
+   * missing one would silently drop all three.
+   */
+  canvasReadRepository: CanvasReadRepository;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => unknown;
   /**
@@ -447,6 +464,14 @@ type CreateAgentRuntimeOptions = {
   runIdFactory?: () => string;
   tierGuard?: TierGuard;
   viewerService?: ViewerService;
+  /**
+   * Workspace skill read repository (workorder 21AC). The enabled skills of the
+   * run's workspace and their bundled files are one repository read each, with
+   * the membership and skill-visibility policies written into the statements.
+   * Required: the loader degrades to "no skills" on a FAILED read, so an unwired
+   * repository would silently remove every workspace skill from every run.
+   */
+  workspaceSkillReadRepository: WorkspaceSkillReadRepository;
 };
 
 /**
@@ -754,6 +779,12 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
     ((agentOptions) =>
       createLoomicDeepAgent({
         ...agentOptions,
+        // Workorder 21AC: the three repositories every Agent-side table call now
+        // goes through are injected HERE, so a caller that builds the runtime
+        // cannot hand the agent a different set than the one it runs on.
+        assetWriteRepository: options.assetWriteRepository,
+        brandKitReadRepository: options.brandKitReadRepository,
+        canvasReadRepository: options.canvasReadRepository,
         ...(options.createUserClient
           ? { createUserClient: options.createUserClient }
           : {}),
@@ -911,11 +942,15 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         accessToken && createUserClient
           ? linkTask
               .then((link) =>
-                link
-                  ? loadWorkspaceSkills(
-                      createUserClient(accessToken) as UserSupabaseClient,
-                      link.workspace_id,
-                    )
+                link && run.userId
+                  ? loadWorkspaceSkills({
+                      // Workorder 21AC: the skills and their files are read by the
+                      // repository, as the run's own user — the workspace alone
+                      // never authorises another member's private skill.
+                      repository: options.workspaceSkillReadRepository,
+                      actorId: run.userId,
+                      workspaceId: link.workspace_id,
+                    })
                   : [],
               )
               .catch((err) => {
@@ -1493,6 +1528,11 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             const fileName = `gen-${slug}-${Date.now()}.${ext}`;
 
             const agentAssets = createAgentProjectAssetService({
+              // Workorder 21AC: the canvas → project link and the compensation
+              // delete are the two repositories' jobs now; the ordering and the
+              // error codes of this sequence are unchanged.
+              canvasReadRepository: options.canvasReadRepository,
+              assetWriteRepository: options.assetWriteRepository,
               createUserClient: (token) =>
                 createClient(token) as UserSupabaseClient,
               getAdminClient,
@@ -1620,6 +1660,13 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         }
 
         agent = resolvedAgentFactory({
+          // Workorder 21AC. `resolvedAgentFactory` injects these too, but the
+          // factory's own signature requires them at every call site — which is the
+          // point: a custom `agentFactory` cannot be handed a runtime whose
+          // repositories it does not know about.
+          assetWriteRepository: options.assetWriteRepository,
+          brandKitReadRepository: options.brandKitReadRepository,
+          canvasReadRepository: options.canvasReadRepository,
           backendResult,
           ...(brandKitId ? { brandKitId } : {}),
           ...(run.canvasId ? { canvasId: run.canvasId } : {}),

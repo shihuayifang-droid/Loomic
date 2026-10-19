@@ -4,6 +4,11 @@ import { join } from "node:path";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
+import type {
+  CanvasProjectLinkRow,
+  CanvasReadRepository,
+} from "../../db/canvas-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import {
   createPersistSandboxFileTool,
@@ -51,6 +56,8 @@ type Harness = {
   createSignedUrl: ReturnType<typeof vi.fn>;
   rpc: ReturnType<typeof vi.fn>;
   remove: ReturnType<typeof vi.fn>;
+  /** How many table reads the caller's client was asked for — must stay zero. */
+  tableReads: () => number;
   config: Record<string, unknown>;
 };
 
@@ -60,6 +67,8 @@ function makeHarness(
     rpcError?: { message: string } | null;
     /** Omit the canvas id so the tool has no owner to file the object under. */
     noCanvas?: boolean;
+    /** The canvas → project link answers nothing, i.e. the ACL hid the canvas. */
+    canvasHidden?: boolean;
   } = {},
 ): Harness {
   const upload = vi
@@ -70,18 +79,14 @@ function makeHarness(
     error: null,
   });
   const remove = vi.fn().mockResolvedValue({ data: null, error: null });
+  let tableReads = 0;
 
   const client = {
-    from: () => {
-      const chain = {
-        select: () => chain,
-        eq: () => chain,
-        maybeSingle: async () => ({
-          data: { project: { workspace_id: WORKSPACE } },
-          error: null,
-        }),
-      };
-      return chain;
+    // 工单21AC moved the canvas lookup to the repository, so the caller's client
+    // has NO table surface left: a read through it is a regression and throws.
+    from: (table: string) => {
+      tableReads += 1;
+      throw new Error(`unexpected table read in persist-sandbox-file test: ${table}`);
     },
     storage: {
       from: vi.fn(() => ({ upload, createSignedUrl, remove })),
@@ -94,8 +99,33 @@ function makeHarness(
       : { data: { asset_id: "asset-1" }, error: null },
   );
 
+  const canvasReadRepository = {
+    async findReadableCanvasProjectLink(): Promise<CanvasProjectLinkRow | null> {
+      return overrides.canvasHidden
+        ? null
+        : { project_id: "project-1", workspace_id: WORKSPACE, brand_kit_id: null };
+    },
+    async findReadableCanvasContent(): Promise<never> {
+      throw new Error("findReadableCanvasContent is not used by this path");
+    },
+    async listReadableSucceededImageJobs(): Promise<never> {
+      throw new Error("listReadableSucceededImageJobs is not used by this path");
+    },
+    async listReadableCanvasAssets(): Promise<never> {
+      throw new Error("listReadableCanvasAssets is not used by this path");
+    },
+  } as unknown as CanvasReadRepository;
+
+  const assetWriteRepository = {
+    async deleteOwnAsset(): Promise<{ deleted: number }> {
+      return { deleted: 1 };
+    },
+  } as unknown as AssetWriteRepository;
+
   return {
     deps: {
+      canvasReadRepository,
+      assetWriteRepository,
       createUserClient: () => client as unknown as SupabaseClient,
       getAdminClient: () => ({ rpc }) as unknown as AdminSupabaseClient,
       sandboxDir,
@@ -104,6 +134,7 @@ function makeHarness(
     createSignedUrl,
     rpc,
     remove,
+    tableReads: () => tableReads,
     config: overrides.noCanvas
       ? { configurable: { access_token: ACCESS_TOKEN } }
       : RUN_CONFIG,
@@ -168,7 +199,7 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
     const sandboxDir = makeTempDir("loomic-persist-x1-");
     writeFileSync(join(sandboxDir, "out.png"), "png-bytes", "utf-8");
 
-    const { deps, rpc, config } = makeHarness(sandboxDir);
+    const { deps, rpc, config, tableReads } = makeHarness(sandboxDir);
     const persist = createPersistSandboxFileTool(deps);
 
     const parsed = JSON.parse(
@@ -181,6 +212,10 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
     expect(parsed.mimeType).toBe("image/png");
     expect(parsed.size).toBe("png-bytes".length);
     expect(String(parsed.url)).toContain("token=sig");
+
+    // 工单21AC: the canvas → project link is the repository's answer now, so the
+    // caller's client was never asked for a table.
+    expect(tableReads()).toBe(0);
 
     // Ownership came from the canvas, and the creator is the token's subject —
     // not a `configurable` field that could disagree with the JWT.
@@ -206,6 +241,26 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
 
     // An unowned object is worse than no object: nothing is written.
     expect(result).toMatch(NO_CANVAS);
+    expect(upload).toHaveBeenCalledTimes(0);
+    expect(rpc).toHaveBeenCalledTimes(0);
+  });
+
+  it("case 4: a canvas the repository cannot read is refused after reading the file but before any upload", async () => {
+    const sandboxDir = makeTempDir("loomic-persist-x4-");
+    writeFileSync(join(sandboxDir, "out.png"), "png-bytes", "utf-8");
+
+    // 工单21AC: the canvas → project link is `findReadableCanvasProjectLink`, so a
+    // canvas the caller may not read is a `null` answer rather than a row the tool
+    // could derive a workspace from.
+    const { deps, upload, rpc, config } = makeHarness(sandboxDir, {
+      canvasHidden: true,
+    });
+    const persist = createPersistSandboxFileTool(deps);
+
+    const result = String(await persist.invoke({ filePath: "/out.png" }, config));
+
+    expect(result).toContain("Error uploading file");
+    expect(result).toContain("not found or not accessible");
     expect(upload).toHaveBeenCalledTimes(0);
     expect(rpc).toHaveBeenCalledTimes(0);
   });

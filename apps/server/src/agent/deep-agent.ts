@@ -5,6 +5,9 @@ import { ChatVertexAI } from "@langchain/google-vertexai";
 import { createDeepAgent } from "deepagents";
 
 import { DEFAULT_AGENT_MODEL, DEFAULT_GOOGLE_AGENT_MODEL, type ServerEnv } from "../config/env.js";
+import type { AssetWriteRepository } from "../db/asset-write-repository.js";
+import type { BrandKitReadRepository } from "../db/brand-kit-read-repository.js";
+import type { CanvasReadRepository } from "../db/canvas-read-repository.js";
 import type { AdminSupabaseClient } from "../supabase/admin.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
 import { createAgentBackend, type AgentBackendResult } from "./backends/index.js";
@@ -22,9 +25,14 @@ export type LoomicAgent = Pick<
 >;
 
 export type LoomicAgentFactory = (options: {
+  assetWriteRepository: AssetWriteRepository;
   backendResult?: AgentBackendResult;
   brandKitId?: string | null;
+  /** Owner-keyed brand kit reads behind `get_brand_kit` (workorder 21AC). */
+  brandKitReadRepository: BrandKitReadRepository;
   canvasId?: string;
+  /** The canvas → project link behind every persisted asset (workorder 21AC). */
+  canvasReadRepository: CanvasReadRepository;
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => any;
@@ -41,9 +49,12 @@ export type LoomicAgentFactory = (options: {
 }) => LoomicAgent;
 
 export function createLoomicDeepAgent(options: {
+  assetWriteRepository: AssetWriteRepository;
   backendResult?: AgentBackendResult;
   brandKitId?: string | null;
+  brandKitReadRepository: BrandKitReadRepository;
   canvasId?: string;
+  canvasReadRepository: CanvasReadRepository;
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => any;
@@ -118,6 +129,9 @@ export function createLoomicDeepAgent(options: {
       : [],
     systemPrompt,
     tools: createMainAgentTools(backendResult.factory, {
+      assetWriteRepository: options.assetWriteRepository,
+      brandKitReadRepository: options.brandKitReadRepository,
+      canvasReadRepository: options.canvasReadRepository,
       createUserClient,
       ...(options.getAdminClient ? { getAdminClient: options.getAdminClient } : {}),
       ...(options.brandKitId != null ? { brandKitId: options.brandKitId } : {}),

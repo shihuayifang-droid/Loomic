@@ -1,6 +1,9 @@
 import type { StructuredTool } from "@langchain/core/tools";
 import type { BackendFactory, BackendProtocol } from "deepagents";
 
+import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
+import type { BrandKitReadRepository } from "../../db/brand-kit-read-repository.js";
+import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { ConnectionManager } from "../../ws/connection-manager.js";
 import { createBrandKitTool } from "./brand-kit.js";
@@ -54,6 +57,16 @@ export { createManipulateCanvasTool } from "./manipulate-canvas.js";
 export function createMainAgentTools(
   backend: BackendProtocol | BackendFactory,
   deps: {
+    /**
+     * The compensated asset-row delete behind a failed signing (workorder 21AC).
+     * Required, and required all the way down: an optional dependency that is
+     * silently missing fails at the one moment it is needed.
+     */
+    assetWriteRepository: AssetWriteRepository;
+    /** Owner-keyed brand kit reads — `get_brand_kit` no longer reads tables (21AC). */
+    brandKitReadRepository: BrandKitReadRepository;
+    /** The canvas → project link behind every persisted asset's workspace (21AC). */
+    canvasReadRepository: CanvasReadRepository;
     createUserClient: (accessToken: string) => any;
     /**
      * Service-role client getter (X-52). Required so the sandbox-file producer
@@ -84,6 +97,8 @@ export function createMainAgentTools(
   if (deps.sandboxDir && deps.getAdminClient) {
     tools.push(
       createPersistSandboxFileTool({
+        assetWriteRepository: deps.assetWriteRepository,
+        canvasReadRepository: deps.canvasReadRepository,
         createUserClient: deps.createUserClient,
         getAdminClient: deps.getAdminClient,
         sandboxDir: deps.sandboxDir,

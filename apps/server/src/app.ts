@@ -61,6 +61,7 @@ import {
 } from "./db/identity-read-repository.js";
 import {
   createBrandKitReadRepository,
+  type BrandKitReadRepository,
 } from "./db/brand-kit-read-repository.js";
 import {
   createBrandKitWriteRepository,
@@ -95,6 +96,9 @@ import {
   type AssetReadRepository,
 } from "./db/asset-read-repository.js";
 import { createAssetWriteRepository } from "./db/asset-write-repository.js";
+import {
+  createWorkspaceSkillReadRepository,
+} from "./db/workspace-skill-read-repository.js";
 import {
   createTeamAdminReadRepository,
   type TeamAdminReadRepository,
@@ -477,13 +481,20 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // (a pool getter, never a resolved pool), and `createUserClient` stays wired for
   // Storage only: the upload, copy, remove and signing calls are workorder 22A and
   // did not move.
+  // ADR-0001 / workorder 21AC: the brand kit read repository is built ONCE and
+  // shared. It backs `GET /api/brand-kits` and the detail path through the
+  // service, and (since this workorder) the Agent's `get_brand_kit` tool, which
+  // used to read the two tables on the caller's PostgREST client. Two instances
+  // would be two owners of the same ACL translation, so there is exactly one.
+  const brandKitReadRepository: BrandKitReadRepository =
+    createBrandKitReadRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
   const brandKitService =
     options.brandKitService ??
     createBrandKitService({
       createUserClient,
-      brandKitReadRepository: createBrandKitReadRepository({
-        getTransactionPool: () => getTransactionPool(databaseEnv),
-      }),
+      brandKitReadRepository,
       brandKitWriteRepository: createBrandKitWriteRepository({
         getTransactionPool: () => getTransactionPool(databaseEnv),
       }),
@@ -526,6 +537,19 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           getTransactionPool: () => getTransactionPool(databaseEnv),
         }),
       });
+  // ADR-0001 / workorder 21AA: the asset row delete behind
+  // `DELETE /api/assets/:assetId` is the write repository's now, built the same
+  // lazy way as the read repository above. `assetReadRepository` stays exactly
+  // as it was — it is still the row read `uploadFile`, `deleteAsset` and (since
+  // this workorder) `getAssetUrl` all use. Storage and the
+  // `record_project_asset` RPC keep `createUserClient` / `getAdminClient`.
+  //
+  // Workorder 21AC: the SAME instance is handed to the Agent runtime, because the
+  // compensation that removes the metadata row of a failed signing is that same
+  // delete with that same policy. Storage and the RPC still keep the clients.
+  const assetWriteRepository = createAssetWriteRepository({
+    getTransactionPool: () => getTransactionPool(databaseEnv),
+  });
   const uploadService =
     options.uploadService ??
     createUploadService({
@@ -533,15 +557,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       getAdminClient,
       projectReadRepository,
       assetReadRepository,
-      // ADR-0001 / workorder 21AA: the asset row delete behind
-      // `DELETE /api/assets/:assetId` is the write repository's now, built the same
-      // lazy way as the read repository above. `assetReadRepository` stays exactly
-      // as it was — it is still the row read `uploadFile`, `deleteAsset` and (since
-      // this workorder) `getAssetUrl` all use. Storage and the
-      // `record_project_asset` RPC keep `createUserClient` / `getAdminClient`.
-      assetWriteRepository: createAssetWriteRepository({
-        getTransactionPool: () => getTransactionPool(databaseEnv),
-      }),
+      assetWriteRepository,
     });
   const pgmq = env.supabaseDbUrl
     ? createPgmqClient(env.supabaseDbUrl)
@@ -653,10 +669,25 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const connectionManager = options.connectionManager ?? new ConnectionManager();
   const eventBuffer = new CanvasEventBuffer();
   setInterval(() => eventBuffer.cleanup(), 5 * 60 * 1000);
+  // ADR-0001 / workorder 21AC: the Agent run's two skill reads — the enabled
+  // skills of its workspace and their bundled files — are PostgreSQL reads now, so
+  // this repository is built exactly like the others above: lazily, against the
+  // same pool, with no fallback. The read fails closed as "no workspace skills"
+  // (the Agent's existing degradation) rather than reaching PostgREST.
+  const workspaceSkillReadRepository = createWorkspaceSkillReadRepository({
+    getTransactionPool: () => getTransactionPool(databaseEnv),
+  });
   const agentRuns = createAgentRunService({
     agentPersistenceService,
     ...(options.agentFactory ? { agentFactory: options.agentFactory } : {}),
     agentRunMetadataService,
+    // Workorder 21AC: the row delete of a failed signing, and the three reads the
+    // Agent side performs — the canvas → project link, the brand kit and the
+    // workspace skills. All four are the SAME instances the HTTP flows use; none
+    // of them is constructed twice.
+    assetWriteRepository,
+    brandKitReadRepository,
+    workspaceSkillReadRepository,
     // Workorder 21S: the Agent runtime reads the row behind an attachment's
     // `assetId` through the same repository the upload/project flows use.
     assetReadRepository,
