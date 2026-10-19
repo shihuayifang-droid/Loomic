@@ -16,6 +16,12 @@ import {
   type PixelBuffer,
 } from "../src/lib/adjust-render";
 
+// 30N 检查裁决：16ms 是 ED-01 验收 2 的规格数字，只在单独跑 bench 时断言；
+// 全量并行时 16 个 worker 争 CPU，墙钟会放大 2~3 倍（实测 7.76ms → 12.57/19.90ms），只做 4 倍兜底防数量级退化。
+const STRICT_BUDGET_MS = 16;
+const PARALLEL_GUARD_MS = STRICT_BUDGET_MS * 4;
+const benchMode = process.env.ADJUST_BENCH === "1";
+
 /**
  * 工单 30K T4 · ED-01 渲染内核。
  *
@@ -556,10 +562,12 @@ describe("验收 2（计算部分）：渲染耗时", () => {
     });
 
     const median = medianMs(image, perPixelOnly, 5);
+    const budgetMs = benchMode ? STRICT_BUDGET_MS : PARALLEL_GUARD_MS;
     console.log(
-      `[adjust-render] 验收 2 耗时：400×400 逐像素 11 项中位数 ${median.toFixed(2)}ms（断言 < 16ms）`,
+      `[adjust-render] 验收 2 耗时：400×400 逐像素 11 项中位数 ${median.toFixed(2)}ms` +
+        `（当前档位：${benchMode ? `严格档 ADJUST_BENCH=1，断言 < ${STRICT_BUDGET_MS}ms` : `并行兜底档，断言 < ${PARALLEL_GUARD_MS}ms`}）`,
     );
-    expect(median).toBeLessThan(16);
+    expect(median).toBeLessThan(budgetMs);
   });
 
   it("17 项全开：只记录耗时不作断言，并列出最费时的两项", () => {
