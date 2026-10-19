@@ -164,6 +164,7 @@ import { registerProjectRoutes } from "./http/projects.js";
 import { registerRunRoutes } from "./http/runs.js";
 import { registerSettingsRoutes } from "./http/settings.js";
 import { registerTeamGate } from "./http/team-gate.js";
+import { registerToolRoutes } from "./http/tools.js";
 import { registerUploadRoutes } from "./http/uploads.js";
 import { registerSkillRoutes } from "./http/skills.js";
 import { registerMarketplaceRoutes } from "./http/skills-marketplace.js";
@@ -735,6 +736,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     auth,
     brandKitService,
   });
+  // ED-00k / workorder 21AB: the per-image tool definition table. It is static
+  // configuration, so the registration needs nothing but the authenticator.
+  void registerToolRoutes(app, { auth });
   void registerAdminTeamRoutes(app, {
     auth,
     teamAdminService,
