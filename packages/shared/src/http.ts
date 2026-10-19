@@ -177,6 +177,11 @@ export const applicationErrorCodeSchema = z.enum([
   "credit_refund_failed",
   "credit_plan_update_failed",
   "model_not_accessible",
+  // Workorder 31B: the price table has no usable row for this model, so
+  // `withBilling` refuses with a 400 before the job exists. Without this value
+  // the HTTP error path's `applicationErrorResponseSchema.parse()` threw a
+  // ZodError and the client got a 500 instead of the intended 400.
+  "model_not_available",
   "resolution_not_allowed",
   "concurrency_limit",
   "variant_not_found",

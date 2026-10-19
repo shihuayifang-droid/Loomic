@@ -105,6 +105,9 @@ export const APP_ERROR_CATALOG: Record<ApplicationErrorCode, ErrorEntry> = {
   project_slug_taken: fixable("这个项目名已被占用，请换一个。"),
   resolution_not_allowed: fixable("当前模型不支持这个分辨率，请修改参数后重试。"),
   model_not_accessible: fixable("当前套餐不能使用这个模型，请更换模型。"),
+  // Workorder 31B: the code lives in shared's enum now (the price table has no
+  // row for the model), so it is an exhaustive-catalogue entry, not an EXTRA one.
+  model_not_available: fixable("这个模型暂不可用，请更换模型。"),
   feature_disabled: fixable("这个功能暂未开放。"),
 
   // service — everything else: our side or upstream, retry later
@@ -180,7 +183,6 @@ export const EXTRA_ERROR_CATALOG: Record<string, ErrorEntry> = {
 
   // user_fixable (GN-07 / MD-11 / GN-23 / X-11)
   model_not_allowed: fixable("当前不能使用这个模型，请更换模型。"),
-  model_not_available: fixable("这个模型暂不可用，请更换模型。"),
   quote_mismatch: fixable("价格已经变化，请重新确认后再试。"),
   tool_disabled: fixable("这个工具暂不可用，请取消勾选后重试。"),
 
