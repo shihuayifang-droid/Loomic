@@ -90,7 +90,7 @@ export function BrandKitSidebar({
                   e.stopPropagation();
                   onDeleteKit(kit.id);
                 }}
-                className="hidden shrink-0 rounded p-1 opacity-0 transition-all cursor-pointer hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 md:block"
+                className="hidden shrink-0 rounded p-1 opacity-0 transition-all cursor-pointer hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 focus-visible:opacity-100 md:block"
                 aria-label={`Delete ${kit.name}`}
               >
                 <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />

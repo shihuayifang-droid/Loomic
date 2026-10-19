@@ -15,9 +15,10 @@ const options: { key: BillingPeriod; label: string }[] = [
 
 export function PricingToggle({ value, onChange }: PricingToggleProps) {
   return (
-    <div className="bg-muted inline-flex items-center gap-1 rounded-full p-1">
+    <div role="tablist" aria-label="计费周期" className="bg-muted inline-flex items-center gap-1 rounded-full p-1">
       {options.map(({ key, label }) => (
         <button data-testid={`pricing-toggle-${key}`}
+          role="tab" aria-selected={value === key}
           key={key}
           type="button"
           onClick={() => onChange(key)}

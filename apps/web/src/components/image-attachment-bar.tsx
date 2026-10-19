@@ -59,7 +59,8 @@ export function ImageAttachmentBar({ attachments, onRemove, onRetry }: ImageAtta
           <button data-testid="attachment-remove"
             type="button"
             onClick={() => onRemove(att.id)}
-            className="absolute -right-1 -top-1 hidden h-4 w-4 items-center justify-center rounded-full bg-primary text-primary-foreground group-hover:flex"
+            className="absolute -right-1 -top-1 flex opacity-0 group-hover:opacity-100 focus-visible:opacity-100 h-4 w-4 items-center justify-center rounded-full bg-primary text-primary-foreground"
+            aria-label="Remove attachment"
           >
             <svg className="h-2.5 w-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3}>
               <path d="M18 6 6 18M6 6l12 12" />

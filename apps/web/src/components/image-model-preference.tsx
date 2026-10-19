@@ -99,9 +99,10 @@ export function ImageModelPreferencePopover({
       <div className="flex flex-col gap-3 py-2">
         {/* Tab switcher */}
         <div className="px-3">
-          <div className="flex rounded-lg bg-muted p-0.5">
+          <div role="tablist" aria-label="Model type" className="flex rounded-lg bg-muted p-0.5">
             {(["image", "video"] as const).map((tab) => (
               <button data-testid={`agent-model-preference-tab-${tab}`}
+                role="tab" aria-selected={activeTab === tab}
                 key={tab}
                 type="button"
                 onClick={() => setActiveTab(tab)}
@@ -124,6 +125,7 @@ export function ImageModelPreferencePopover({
               {activeTab === "image" ? "Image Model" : "Video Model"}
             </span>
             <button data-testid="agent-model-preference-auto-toggle"
+              aria-pressed={currentPreference.mode === "auto"}
               type="button"
               onClick={() =>
                 currentSetMode(currentPreference.mode === "auto" ? "manual" : "auto")
@@ -155,6 +157,7 @@ export function ImageModelPreferencePopover({
             const selected = currentPreference.models.includes(m.id);
             return (
               <button data-testid={`agent-model-preference-item-${m.id.replace(/\//g, "-")}`}
+                aria-pressed={selected}
                 key={m.id}
                 type="button"
                 onClick={() => currentToggleModel(m.id)}

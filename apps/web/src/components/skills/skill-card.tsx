@@ -190,7 +190,7 @@ export function SkillCard({
               render={
                 <button data-testid="skills-card-menu-trigger"
                   type="button"
-                  className="rounded-md p-0.5 text-muted-foreground opacity-0 transition-opacity hover:bg-muted group-hover:opacity-100"
+                  className="rounded-md p-0.5 text-muted-foreground opacity-0 transition-opacity hover:bg-muted group-hover:opacity-100 focus-visible:opacity-100"
                   onClick={(e) => e.stopPropagation()}
                 />
               }

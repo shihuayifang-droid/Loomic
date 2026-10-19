@@ -368,7 +368,7 @@ export default function HomePage() {
                     requestDelete(project.id);
                   }}
                   aria-label={`Delete ${project.name}`}
-                  className="absolute right-3 top-3 z-10 flex size-8 items-center justify-center rounded-[4px] bg-foreground/70 text-background opacity-0 transition-all duration-300 hover:bg-foreground/80 group-hover:opacity-100 sm:right-5 sm:top-5"
+                  className="absolute right-3 top-3 z-10 flex size-8 items-center justify-center rounded-[4px] bg-foreground/70 text-background opacity-0 transition-all duration-300 hover:bg-foreground/80 group-hover:opacity-100 focus-visible:opacity-100 sm:right-5 sm:top-5"
                 >
                   <Trash2 size={14} />
                 </button>

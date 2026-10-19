@@ -273,7 +273,7 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
               <button data-testid={`canvas-background-swatch-${hex.replace(/#/g, "")}`} key={hex} type="button"
                 className={`h-6 w-6 shrink-0 rounded-full border hover:scale-110 transition-transform ${bgColor === hex ? "border-foreground ring-1 ring-foreground ring-offset-1 ring-offset-card" : "border-border"}`}
                 style={hex === "transparent" ? CHECKER_STYLE : { backgroundColor: hex }}
-                onClick={() => applyBgColor(hex)} aria-label={`Set background to ${hex}`} />
+                onClick={() => applyBgColor(hex)} aria-label={`Set background to ${hex}`} aria-pressed={bgColor === hex} />
             ))}
           </div>
           {/* Hex input row */}

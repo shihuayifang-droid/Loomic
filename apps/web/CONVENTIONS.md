@@ -106,6 +106,25 @@ testid 里出现的词，必须和用户在界面上看到的这个名字对得�
 **显示值只进 `aria-valuetext`，不许覆盖 `aria-valuenow`**：档位/单位/百分号这类格式化信息一旦写进
 `aria-valuenow`，读屏器读到的数就和滑块实际位置对不上了。
 
+### 2.3 ARIA 与键盘可达（X-06，工单 30I）
+
+1. **toggle 用 `aria-pressed`，分段控件用 `role="tablist"` + `role="tab"` + `aria-selected`。**
+   分段控件的状态写在 `aria-selected`（`true` / `false`）上，不要靠 class 或文案表达当前选中项。
+   外层的 `tablist` 要有 `aria-label`（例如「计费周期」）。不加 `aria-controls`、不做方向键漫游
+   （那两项不在 X-06 范围内）。
+2. **悬停显形的元素必须同时能键盘显形，而且 class 写在同一个字符串里。**
+   同一处 class 列表里既有 `opacity-0` 又有 `group-hover:opacity-100` 的，必须同时带
+   `focus-visible:opacity-100`（或 `focus-within:opacity-100` / `group-focus-within:opacity-100`，
+   容器显形时用后两个）。写到别的字符串里无效 —— lint 是按行检查的。
+3. **不许用 `hidden group-hover:flex`。** `display:none` 的元素不可能被 Tab 聚焦，所以「悬停才显形」
+   在键盘上等于不存在。要显隐藏用 `flex opacity-0 group-hover:opacity-100 focus-visible:opacity-100`；
+   `invisible` 配 `group-hover:visible` 的，必须同时有 `focus-visible:visible`。
+4. **JSX 属性里不许写 `\u` 转义。** JSX 的属性字符串字面量不处理 JS 转义，`title="\u4e0b\u8f7d"`
+   渲染出来就是那 12 个字符的原文（30I T0 探针实测：`getAttribute("title")` 就是 `\u4e0b\u8f7d`）。
+   中文字面量直接写；图标按钮同时给 `title` 与 `aria-label`，可访问名称才不会变成乱码。
+
+以上四条由 `test/a11y-lint.test.ts` 执行（逐行扫描 `src/**/*.tsx`）；本文件只写约定，规则实现不在测试外重复。
+
 ---
 
 ## 3. 交互约定：下拉一律 click 展开，hover 只出 tooltip（ED-00b）

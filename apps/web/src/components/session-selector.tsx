@@ -211,7 +211,7 @@ export function SessionSelector({
                       <button data-testid="chat-session-item-delete"
                         type="button"
                         aria-label={`Delete ${s.title}`}
-                        className="hidden group-hover:flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-destructive transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
+                        className="flex opacity-0 group-hover:opacity-100 focus-visible:opacity-100 h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:text-destructive transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
                         onClick={(e) => {
                           e.stopPropagation();
                           setConfirmingId(s.id);

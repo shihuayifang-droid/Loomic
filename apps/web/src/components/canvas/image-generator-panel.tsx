@@ -421,7 +421,8 @@ export function ImageGeneratorPanel({
                   <button data-testid="canvas-image-generator-ref-remove"
                     type="button"
                     onClick={() => setRefImages((prev) => prev.filter((r) => r.id !== img.id))}
-                    className="absolute -top-1 -right-1 hidden group-hover:flex h-3.5 w-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground text-[8px]"
+                    className="absolute -top-1 -right-1 flex opacity-0 group-hover:opacity-100 focus-visible:opacity-100 h-3.5 w-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground text-[8px]"
+                    aria-label="Remove reference image"
                   >
                     x
                   </button>

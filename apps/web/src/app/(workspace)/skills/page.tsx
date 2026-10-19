@@ -347,9 +347,10 @@ export default function SkillsPage() {
       </p>
 
       {/* Tab navigation -- scrollable on narrow screens */}
-      <div className="mb-4 flex items-center gap-1 overflow-x-auto border-b border-border sm:mb-6">
+      <div role="tablist" aria-label="技能分类" className="mb-4 flex items-center gap-1 overflow-x-auto border-b border-border sm:mb-6">
         {TABS.map((tab) => (
           <button data-testid={`skills-tab-${tab}`}
+            role="tab" aria-selected={activeTab === tab}
             key={tab}
             type="button"
             onClick={() => setActiveTab(tab)}

@@ -474,12 +474,13 @@ const ImageArtifactCard = React.memo(function ImageArtifactCard({
           loading="lazy"
         />
         {/* Gradient overlay with download button */}
-        <div className="absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/40 to-transparent opacity-0 group-hover:opacity-100 transition-opacity">
+        <div className="absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-black/40 to-transparent opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
           <button data-testid="chat-tool-block-download"
             type="button"
             onClick={handleDownload}
             className="absolute bottom-2 right-2 flex h-7 w-7 items-center justify-center rounded-lg bg-white/20 backdrop-blur-sm text-white hover:bg-white/30 transition-colors"
-            title="\u4e0b\u8f7d\u56fe\u7247"
+            title="下载图片"
+            aria-label="下载图片"
           >
             <svg
               className="h-3.5 w-3.5"

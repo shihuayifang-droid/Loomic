@@ -614,9 +614,10 @@ export function VideoGeneratorPanel({
                 <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                   Aspect Ratio
                 </div>
-                <div className="flex gap-1">
+                <div role="tablist" aria-label="Aspect Ratio" className="flex gap-1">
                   {ASPECT_RATIOS.map((r) => (
                     <button data-testid={`canvas-video-generator-params-ratio-${r.replace(/:/g, "-")}`}
+                      role="tab" aria-selected={r === aspectRatio}
                       key={r}
                       type="button"
                       onClick={() => handleAspectRatioChange(r)}
@@ -636,9 +637,10 @@ export function VideoGeneratorPanel({
                 <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                   Duration
                 </div>
-                <div className="flex flex-wrap gap-1">
+                <div role="tablist" aria-label="Duration" className="flex flex-wrap gap-1">
                   {durationOptions.map((d) => (
                     <button data-testid={`canvas-video-generator-params-duration-${d}`}
+                      role="tab" aria-selected={d === duration}
                       key={d}
                       type="button"
                       onClick={() => handleDurationChange(d)}
@@ -658,13 +660,14 @@ export function VideoGeneratorPanel({
                 <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                   Resolution
                 </div>
-                <div className="flex gap-1">
+                <div role="tablist" aria-label="Resolution" className="flex gap-1">
                   {resolutionOptions.map((value) => {
                     const providerLabel = currentModel?.pricing?.rates.find(
                       (rate) => rate.resolution === value,
                     )?.displayResolution;
                     return (
                       <button data-testid={`canvas-video-generator-params-resolution-${value}`}
+                        role="tab" aria-selected={value === resolution}
                         key={value}
                         type="button"
                         onClick={() => handleResolutionChange(value)}

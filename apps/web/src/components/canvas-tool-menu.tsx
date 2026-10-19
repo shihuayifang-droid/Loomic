@@ -359,6 +359,7 @@ export function CanvasToolMenu({ accessToken, excalidrawApi, leftPanelOpen, ws }
 
           return (
             <button data-testid={`canvas-tool-menu-tool-${tool}`}
+              aria-pressed={isActive}
               key={tool}
               type="button"
               title={TOOL_LABELS[tool]}
@@ -387,6 +388,7 @@ export function CanvasToolMenu({ accessToken, excalidrawApi, leftPanelOpen, ws }
           const isActive = active?.kind === spec.kind;
           return (
             <button data-testid={`canvas-tool-menu-create-${spec.kind}`}
+              aria-pressed={isActive}
               key={spec.kind}
               type="button"
               title={label}
