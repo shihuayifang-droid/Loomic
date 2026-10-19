@@ -333,4 +333,3 @@ describe("T3 面板接线：图像面板的两个入口", () => {
     ).toBeGreaterThan(0);
   });
 });
-
