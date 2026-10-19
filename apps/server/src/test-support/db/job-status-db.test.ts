@@ -94,6 +94,7 @@ describe("job status enum gains retrying", () => {
   });
 
   it("case 5: all migrations still load", () => {
-    expect(applied.length).toBe(40);
+    // 31A: +1 migration (pricing_rules)
+    expect(applied.length).toBe(41);
   });
 });

@@ -219,7 +219,8 @@ const ANCHORS = [
   { label: "sql.rlsTables", value: 32, key: "sql.rlsEnabledTables" },
   { label: "config.envFamily", value: 8, key: "config.supabaseEnvVariableFamily" },
   { label: "manifests", value: 3, key: "manifests.withSupabaseSdk" },
-  { label: "sql.migrations", value: 37, key: "sql.migrationsActive" },
+  // 31A: +1 migration (pricing_rules)
+  { label: "sql.migrations", value: 38, key: "sql.migrationsActive" },
 ];
 
 function parseArgs(argv) {

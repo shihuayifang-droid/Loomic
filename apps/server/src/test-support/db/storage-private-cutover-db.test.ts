@@ -528,7 +528,8 @@ beforeAll(async () => {
 describe("X-52 final private storage cutover (工单18)", () => {
   it("case 1: the migration set grows from 39 to 40 and matches the directory", () => {
     const files = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith(".sql"));
-    expect(applied.length).toBe(40);
+    // 31A: +1 migration (pricing_rules)
+    expect(applied.length).toBe(41);
     expect(applied.length).toBe(files.length);
     expect(applied).toContain(CUTOVER_MIGRATION);
     // Applied last: a migration that lands out of order is not the cutover.
