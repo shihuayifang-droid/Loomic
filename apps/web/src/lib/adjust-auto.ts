@@ -12,10 +12,10 @@
  * `renderAdjust` 之后，第二轮建议应当接近 0（工单 §3-T4 的收敛要求）。
  *
  * - `exposure`：把平均亮度推到 0.5 的指数校正，`100·log2(0.5 / 平均亮度)`。
- * - `contrast`：按曝光后的分位跨度算，把跨度拉到 1 的线性斜率，`100·(1/span − 1)`。
- * - `whites` / `blacks`：在曝光与对比度之后的预测分位上，把上限/下限平移到 1/0；
+ * - `contrast`：按 exposure 之后的分位跨度算，把跨度拉到 1 的线性斜率，`100·(1/span − 1)`。
+ * - `whites` / `blacks`：在 exposure 与 contrast 之后的预测分位上，把上限/下限平移到 1/0；
  *   幅度按 `TONE_EDGE` 的权重反解 —— 权重函数与渲染共用 `toneWeight()`。
- * - `vibrance`：把（曝光后的）平均色度推向 `AUTO_VIBRANCE_TARGET`；反解用的是渲染里那条
+ * - `vibrance`：把（exposure 之后的）平均色度推向 `AUTO_VIBRANCE_TARGET`；反解用的是渲染里那条
  *   `k = 1 + t·(1 − 色度)`，同时乘上「有色像素占比」，全灰的图因此建议 0
  *   （对灰图提色度没有意义，而且那些像素的色度本来就是 0）。
  */
@@ -85,8 +85,8 @@ function toneParam(kind: ToneKind, from: number, to: number): number | null {
 /**
  * 根据一帧算出 5 个建议值。只看像素统计，**不跑渲染**。
  *
- * 中间量都按渲染的固定顺序向前预测：先曝光（乘性，分位与均值同比例缩放），
- * 再对比度（绕 0.5 线性拉伸），最后才是四个色调权重与 vibrance。
+ * 中间量都按渲染的固定顺序向前预测：先 exposure（乘性，分位与均值同比例缩放），
+ * 再 contrast（绕 0.5 线性拉伸），最后才是四个色调权重与 vibrance。
  */
 export function autoAdjust(src: PixelBuffer): AutoAdjustResult {
   const { width, height, data } = src;
@@ -129,20 +129,20 @@ export function autoAdjust(src: PixelBuffer): AutoAdjustResult {
   );
   const exposureGain = 2 ** (exposure / 100);
 
-  // ② contrast：按曝光之后的分位跨度算（k = 1 + t，CONTRAST_GAIN = 1 → t = 1/span − 1）
+  // ② contrast：按 exposure 之后的分位跨度算（k = 1 + t，CONTRAST_GAIN = 1 → t = 1/span − 1）
   const scaledLow = clamp01(low * exposureGain);
   const scaledHigh = clamp01(high * exposureGain);
   const scaledSpan = scaledHigh - scaledLow;
   const contrast = scaledSpan <= 0 ? 100 : clampParam(100 * (1 / scaledSpan - 1));
   const contrastGain = 1 + contrast / 100;
 
-  // ③ whites / blacks：在曝光与对比度之后的预测分位上，把上限/下限推到 1/0
+  // ③ whites / blacks：在 exposure 与 contrast 之后的预测分位上，把上限/下限推到 1/0
   const predictedHigh = clamp01(0.5 + (scaledHigh - 0.5) * contrastGain);
   const predictedLow = clamp01(0.5 + (scaledLow - 0.5) * contrastGain);
   const whites = toneParam("whites", predictedHigh, 1) ?? 0;
   const blacks = toneParam("blacks", predictedLow, 0) ?? 0;
 
-  // ④ vibrance：色度随曝光与对比度同比例放大（未溢出时），再按 k = 1 + t·(1 − 色度) 反解
+  // ④ vibrance：色度随 exposure 与 contrast 同比例放大（未溢出时），再按 k = 1 + t·(1 − 色度) 反解
   //    target/current 的偏差对应 t = (目标/当前 − 1) / (1 − 当前色度)
   const scaledChroma = clamp01(meanChroma * exposureGain * contrastGain);
   const vibrance =

@@ -428,7 +428,7 @@ function applyPerPixel(
 
 // --- 邻域链（固定顺序：clarity → sharpen → glamour → bloom） ----------------
 
-/** 反锐化：x ← x + amount × (x − blur)。 */
+/** unsharp（邻域锐度算子）：x ← x + amount × (x − blur)。 */
 function unsharpInPlace(
   planes: readonly [Float32Array, Float32Array, Float32Array],
   width: number,
