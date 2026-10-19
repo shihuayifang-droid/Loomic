@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { PricingToggle } from "../src/app/pricing/components/pricing-toggle";
@@ -71,6 +71,36 @@ describe("X-06 状态 ARIA", () => {
     for (const name of ["关闭 (Esc)", "缩小 (-)", "放大 (+)", "左右翻转", "上下翻转", "逆时针旋转", "顺时针旋转 (R)", "重置"]) {
       expect(screen.getByRole("button", { name }), `按名称找不到按钮：${name}`).toBeTruthy();
     }
+  });
+
+  it("ImageLightbox：8 个工具按钮各有独立 testid，旧的共用 testid 出现 0 次（T-63）", () => {
+    // 本文件没开 `globals: true`，RTL 的自动 cleanup 不生效：上一例渲染的灯箱还挂在
+    // document.body 上，不清掉的话「恰好 1 次」的断言会读到 2 个。
+    cleanup();
+    render(<ImageLightbox src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="预览图" onClose={() => {}} />);
+
+    // 工单 30L §3 T1 的表：8 个按钮、8 个不同的 testid
+    const testids = [
+      "chat-image-lightbox-zoom-out",
+      "chat-image-lightbox-zoom-in",
+      "chat-image-lightbox-flip-x",
+      "chat-image-lightbox-flip-y",
+      "chat-image-lightbox-rotate-ccw",
+      "chat-image-lightbox-rotate-cw",
+      "chat-image-lightbox-reset",
+      "chat-image-lightbox-download",
+    ];
+    for (const testid of testids) {
+      expect(screen.getAllByTestId(testid), `${testid} 应恰好出现 1 次`).toHaveLength(1);
+    }
+
+    // 拆分前这 8 个按钮共用 `chat-image-lightbox-open`，拆完必须变成 0 次
+    expect(screen.queryAllByTestId("chat-image-lightbox-open")).toHaveLength(0);
+
+    // testid 与语义的对应关系：下载按钮的可访问名称就是「下载」
+    const download = screen.getByTestId("chat-image-lightbox-download");
+    expect(download).toBe(screen.getByRole("button", { name: "下载" }));
+    expect(download.getAttribute("aria-label")).toBe("下载");
   });
 
   it("源码断言：T1 六个文件的 aria-pressed= / aria-selected= 行数等于工单 §5 的表", () => {

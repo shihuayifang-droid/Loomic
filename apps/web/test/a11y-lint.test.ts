@@ -263,6 +263,13 @@ describe("X-06 a11y lint", () => {
     expect(lintSource(`<button title="\\u4e0b\\u8f7d" />`)[0]?.rule).toBe("R4");
     expect(lintSource(`<button title="下载" aria-label="下载" />`)).toEqual([]);
 
+    // R4 与比较运算符的对照（工单 30L T3）：
+    //   JS 表达式里的 `\u` 转义是正确的，`!==` 的 `=` 前面是 `!`（不是 JSX 属性的 `=`）→ 放行
+    expect(lintSource('if (c !== "\\u00A0") {}')).toEqual([]);
+    //   同一串放进 JSX 属性里就必须报，且只报 1 条 R4
+    expect(lintSource('<i title="\\u4e0b" />')).toHaveLength(1);
+    expect(lintSource('<i title="\\u4e0b" />')[0]?.rule).toBe("R4");
+
     // 行号口径：违例落在真实那一行
     expect(lintSource(["const a = 1;", "<div", `  className="hidden group-hover:flex"`, "/>"].join("\n"))).toEqual([
       { rule: "R2", line: 3, text: `className="hidden group-hover:flex"` },

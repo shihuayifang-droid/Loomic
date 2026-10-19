@@ -10,15 +10,17 @@ import { createPortal } from "react-dom";
 
 function LightboxBtn({
   title,
+  testid,
   onClick,
   children,
 }: {
   title: string;
+  testid: string;
   onClick: () => void;
   children: React.ReactNode;
 }) {
   return (
-    <button data-testid="chat-image-lightbox-open"
+    <button data-testid={testid}
       type="button"
       title={title}
       aria-label={title}
@@ -227,41 +229,41 @@ export function ImageLightbox({
         className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-1 rounded-full bg-black/50 px-2 py-1.5 backdrop-blur-md"
         onClick={(e) => e.stopPropagation()}
       >
-        <LightboxBtn title="缩小 (-)" onClick={handleZoomOut}>
+        <LightboxBtn title="缩小 (-)" testid="chat-image-lightbox-zoom-out" onClick={handleZoomOut}>
           <path d="M5 12h14" />
         </LightboxBtn>
         <span className="min-w-[42px] text-center text-xs text-white/80 select-none">
           {Math.round(scale * 100)}%
         </span>
-        <LightboxBtn title="放大 (+)" onClick={handleZoomIn}>
+        <LightboxBtn title="放大 (+)" testid="chat-image-lightbox-zoom-in" onClick={handleZoomIn}>
           <path d="M12 5v14M5 12h14" />
         </LightboxBtn>
         <div className="mx-1 h-4 w-px bg-white/20" />
-        <LightboxBtn title="左右翻转" onClick={handleFlipX}>
+        <LightboxBtn title="左右翻转" testid="chat-image-lightbox-flip-x" onClick={handleFlipX}>
           <path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3" />
           <path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3" />
           <path d="M12 20V4" />
         </LightboxBtn>
-        <LightboxBtn title="上下翻转" onClick={handleFlipY}>
+        <LightboxBtn title="上下翻转" testid="chat-image-lightbox-flip-y" onClick={handleFlipY}>
           <path d="M3 8V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3" />
           <path d="M3 16v3a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3" />
           <path d="M4 12h16" />
         </LightboxBtn>
         <div className="mx-1 h-4 w-px bg-white/20" />
-        <LightboxBtn title="逆时针旋转" onClick={handleRotateCCW}>
+        <LightboxBtn title="逆时针旋转" testid="chat-image-lightbox-rotate-ccw" onClick={handleRotateCCW}>
           <path d="M3.51 15a9 9 0 1 0 2.13-9.36L3 8" />
           <path d="M3 3v5h5" />
         </LightboxBtn>
-        <LightboxBtn title="顺时针旋转 (R)" onClick={handleRotateCW}>
+        <LightboxBtn title="顺时针旋转 (R)" testid="chat-image-lightbox-rotate-cw" onClick={handleRotateCW}>
           <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" />
           <path d="M21 3v5h-5" />
         </LightboxBtn>
         <div className="mx-1 h-4 w-px bg-white/20" />
-        <LightboxBtn title="重置" onClick={handleReset}>
+        <LightboxBtn title="重置" testid="chat-image-lightbox-reset" onClick={handleReset}>
           <circle cx="12" cy="12" r="3" />
           <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
         </LightboxBtn>
-        <LightboxBtn title="下载" onClick={handleDownload}>
+        <LightboxBtn title="下载" testid="chat-image-lightbox-download" onClick={handleDownload}>
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
         </LightboxBtn>
       </div>
