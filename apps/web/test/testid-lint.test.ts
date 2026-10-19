@@ -17,6 +17,16 @@ import { describe, expect, it } from "vitest";
  *   - `/* … *\/` 注释里可能写着标签或 testid → 先抹掉（保留换行，行号才不漂）；
  *   - 行注释不能靠「删 // 到行尾」处理：`/\\//g` 这种正则里的 `//` 会被误当成注释，
  *     所以只在「该行去掉前缀空白后以 // 开头」时整行跳过。
+ *
+ * 工单 30H T1（T-60）堵表达式旁路：`data-testid={…}` 以前整条跳过，等于写成任意表达式
+ * 就能绕过前缀表。现在按 Kiro 的 D1 裁决 **C** 处理，见 `testidExpressionErrors()`：
+ *   (a) 标识符 `testid` / `testId` / `*Testid` / `*TestId` —— 组件透传 prop，放行；
+ *   (b) 成员访问以 `.testid` 结尾（值来自定义数据，如 `tool.testid`），放行；
+ *   (c) 模板字符串 —— 保持原处理（`${…}` 换成 x 后查前缀，前缀由调用方给）；
+ *   (d) **标识符先在同一文件里找 `const X = "…"` / `= '…'` 的声明**：找得到就取字面量，
+ *       照普通字面量做正则检查 + 前缀检查（`image-toolbar.tsx:137` 的
+ *       `TOOLBAR_SEPARATOR_TESTID` 由此解析出 `image-toolbar-separator` 并通过）；
+ *       找不到才回落到 (a)。其余一律判为不合规 —— 不为让 lint 过而改组件。
  */
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -34,7 +44,11 @@ const DIRTY_TSX = new Set(["canvas-editor.tsx", "chat-input.tsx", "chat-sidebar.
 const INTERACTIVE_TAG_RE = /<(button|input|textarea|select|Button)\b/g;
 const INTERACTIVE_ROLE_RE = /role="(menuitem|tab|option|dialog)"/g;
 const BLOCK_COMMENT_RE = /\{?\/\*[\s\S]*?\*\//g;
-const TESTID_ATTR_RE = /data-testid\s*=\s*(\{`([^`]*)`\}|"([^"]*)"|\{[^}]*\})/g;
+/**
+ * 四组：1=整个属性值、2=模板字面量内容、3=普通字符串字面量、4=JSX 表达式 `{…}` 的原文。
+ * 表达式那一支放在最后，是为了不打乱前三个已有分组的编号（断言1/2 直接按下标取值）。
+ */
+const TESTID_ATTR_RE = /data-testid\s*=\s*(\{`([^`]*)`\}|"([^"]*)"|\{([^}]*)\})/g;
 
 /**
  * 工单 30D（Kiro 对 30C 检查的第 3 条裁定）：`.` 只允许出现在**末段**，且必须是带小数点的数字。
@@ -135,6 +149,103 @@ export function collectTestidValues(source: string): TestidValue[] {
 /** 「前缀由调用方给」：模板第一段就是 `${...}`，换 x 之后长相是 `x-…`。 */
 function hasCallerPrefix(template: string | undefined): boolean {
   return template !== undefined && template.startsWith("${");
+}
+
+// --- 表达式形式（工单 30H T1 / T-60，D1 裁决 C）-------------------------------
+
+/** 属性值是 `{…}` 表达式时，被扫出来的一条。 */
+type TestidExpression = {
+  file: string;
+  line: number;
+  /** 花括号里的原文（已 trim） */
+  expression: string;
+  /** 同文件 `const X = "…"` 解析出的字面量；`null` = 同一文件里找不到声明 */
+  resolved: string | null;
+};
+
+const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/;
+const MEMBER_RE = /^[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)+$/;
+
+/**
+ * (a) 组件透传 prop：`testid` / `testId`，或以 `Testid` / `TestId` 结尾。
+ * 注意是**区分大小写**的：全大写 `SOME_TESTID` 不在 (a) 里 —— 那正是 T-60 要堵的
+ * 「用常量把真实值藏起来」，它只能靠 (d) 的同文件解析通过。
+ */
+function isPassthroughIdentifier(name: string): boolean {
+  return name === "testid" || name === "testId" || /(?:Testid|TestId)$/.test(name);
+}
+
+const SAME_FILE_CONST_PATTERNS = new Map<string, RegExp>();
+
+function sameFileConstPattern(name: string): RegExp {
+  const cached = SAME_FILE_CONST_PATTERNS.get(name);
+  if (cached !== undefined) return cached;
+  // 标识符只可能是 [A-Za-z0-9_$]，没有正则元字符，可以直接拼进 pattern。
+  const pattern = new RegExp(
+    String.raw`(?:^|[\s;{}])(?:export\s+)?const\s+${name}\s*(?::\s*[^=;\n]+)?=\s*(?:"([^"\n]*)"|'([^'\n]*)')`,
+  );
+  SAME_FILE_CONST_PATTERNS.set(name, pattern);
+  return pattern;
+}
+
+/** (d) 在**同一文件**里找 `const <name> = "…"` / `= '…'`，返回字面量；找不到返回 null。 */
+export function resolveSameFileConst(source: string, name: string): string | null {
+  const match = sameFileConstPattern(name).exec(stripBlockComments(source));
+  if (match === null) return null;
+  return match[1] ?? match[2] ?? null;
+}
+
+/** 抽出源文件里所有 `data-testid={…}`（字面量与模板不在这里，它们在断言1/2 里）。 */
+export function collectTestidExpressions(source: string): TestidExpression[] {
+  const text = stripBlockComments(source);
+  const found: TestidExpression[] = [];
+  for (const match of text.matchAll(TESTID_ATTR_RE)) {
+    const index = match.index ?? 0;
+    if (isLineComment(text, index)) continue;
+    if (match[2] !== undefined || match[3] !== undefined) continue; // 模板 / 普通字面量
+    const expression = (match[4] ?? "").trim();
+    found.push({
+      file: "",
+      line: lineAt(text, index),
+      expression,
+      resolved: IDENTIFIER_RE.test(expression)
+        ? resolveSameFileConst(text, expression)
+        : null,
+    });
+  }
+  return found;
+}
+
+/**
+ * 表达式形式 testid 的检查结果（空数组 = 通过）。
+ *
+ * 顺序按 D1：先把同文件常量解析成字面量、照普通字面量检查；解析不到才回落到 (a)；
+ * (b) 成员访问要求以 `.testid` 结尾；(c) 模板字符串根本走不到这里。
+ */
+export function testidExpressionErrors(
+  expression: string,
+  resolved: string | null,
+  prefixes: readonly string[],
+): string[] {
+  const source = expression.trim();
+  if (source === "") return ["属性值是空表达式 {}"];
+  if (resolved !== null) {
+    const errors = testidValueErrors(resolved, prefixes, false);
+    return errors.map((error) => `${source} 解析为 "${resolved}"，${error}`);
+  }
+  if (IDENTIFIER_RE.test(source)) {
+    return isPassthroughIdentifier(source)
+      ? []
+      : [
+          `表达式不在放行清单内（同一文件里找不到 const ${source} = "…" 的声明，且 ${source} 不是 testid/testId/*Testid/*TestId 透传 prop）`,
+        ];
+  }
+  if (MEMBER_RE.test(source)) {
+    return source.endsWith(".testid")
+      ? []
+      : [`表达式不在放行清单内（成员访问 ${source} 不以 .testid 结尾）`];
+  }
+  return [`表达式不在放行清单内（既不是标识符、成员访问，也不是模板字符串）：${source}`];
 }
 
 /** CONVENTIONS §6 的表格 → 前缀列表（不含结尾连字符）。 */
@@ -321,5 +432,91 @@ describe("X-05 testid lint", () => {
     }
     // 段数下限仍在：只剩一段时不合规（正则本身就要求至少两段）
     expect(TESTID_NAME_RE.test("canvas")).toBe(false);
+  });
+
+  it("表达式自检（30H/T-60，D1-C）：同文件常量解析出的字面量按普通字面量通过", () => {
+    const fake = [
+      "/** 分隔线的 testid（照 image-toolbar.tsx:42-43 的写法）。 */",
+      'export const TOOLBAR_SEPARATOR_TESTID = "image-toolbar-separator";',
+      "export function Separator() {",
+      "  return <span data-testid={TOOLBAR_SEPARATOR_TESTID} />;",
+      "}",
+    ].join("\n");
+    const [entry] = collectTestidExpressions(fake);
+    expect(entry?.expression).toBe("TOOLBAR_SEPARATOR_TESTID");
+    expect(entry?.resolved, "同文件常量必须解析出字面量").toBe("image-toolbar-separator");
+    // 解析出来的值本身也合规（`image-` 在 CONVENTIONS §6 表里）
+    expect(testidExpressionErrors("TOOLBAR_SEPARATOR_TESTID", entry?.resolved ?? null, prefixes)).toEqual(
+      [],
+    );
+    // 同一个值换个写法也不许漏：不带字面量声明时它没有 (a) 的资格，必须被拒
+    expect(testidExpressionErrors("TOOLBAR_SEPARATOR_TESTID", null, prefixes).length).toBeGreaterThan(
+      0,
+    );
+  });
+
+  it("表达式自检（30H/T-60，D1-C）：同文件常量解析出不合规字面量仍然被拒", () => {
+    const fake = [
+      'const BAD_TESTID = "BadName";',
+      "export function Widget() {",
+      "  return <div data-testid={BAD_TESTID} />;",
+      "}",
+    ].join("\n");
+    const [entry] = collectTestidExpressions(fake);
+    expect(entry?.resolved).toBe("BadName");
+    const errors = testidExpressionErrors(entry?.expression ?? "", entry?.resolved ?? null, prefixes);
+    expect(errors.length, "常量解析为不合规字面量时必须拒绝").toBeGreaterThan(0);
+    // 拒绝的理由必须是「字面量本身不合规」，而不是「没解析到」
+    expect(errors.join("\n")).toContain("BadName");
+  });
+
+  it("表达式自检（30H/T-60，D1-C）：跨文件 import 的常量解析不到，且不属于 (a) 就拒绝", () => {
+    const fake = [
+      'import { SHARED_TESTID } from "./tool-testids";',
+      "export function Widget() {",
+      "  return <div data-testid={SHARED_TESTID} />;",
+      "}",
+    ].join("\n");
+    const [entry] = collectTestidExpressions(fake);
+    expect(entry?.expression).toBe("SHARED_TESTID");
+    expect(entry?.resolved, "跨文件常量在同一文件里找不到声明").toBeNull();
+    const errors = testidExpressionErrors(entry?.expression ?? "", entry?.resolved ?? null, prefixes);
+    expect(errors.length).toBeGreaterThan(0);
+    // 报错要能定位：调用方按 `file:line` 拼，行号必须对得上第 3 行
+    expect(entry?.line).toBe(3);
+  });
+
+  it("表达式自检（30H/T-60）：(a) 透传 prop 与 (b) `.testid` 成员放行，裸常量与三元表达式拒绝", () => {
+    for (const good of ["testid", "testId", "itemTestid", "itemTestId", "tool.testid"]) {
+      const [entry] = collectTestidExpressions(`<div data-testid={${good}} />`);
+      expect(entry?.expression, `${good} 该被扫到`).toBe(good);
+      expect(
+        testidExpressionErrors(entry?.expression ?? "", entry?.resolved ?? null, prefixes),
+        `${good} 该放行`,
+      ).toEqual([]);
+    }
+    for (const bad of ["SOME_CONST", "TOOLBAR_SEPARATOR_TESTID", 'cond ? "a" : "b"']) {
+      const [entry] = collectTestidExpressions(`<div data-testid={${bad}} />`);
+      expect(entry?.expression, `${bad} 该被扫到`).toBe(bad);
+      expect(
+        testidExpressionErrors(entry?.expression ?? "", entry?.resolved ?? null, prefixes).length,
+        `${bad} 该被拒绝`,
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("断言2b（30H/T-60）：src 里表达式形式的 testid 零拒绝（同文件常量先解析成字面量）", () => {
+    const failures: string[] = [];
+    let expressionCount = 0;
+    for (const full of allTsx) {
+      for (const entry of collectTestidExpressions(fs.readFileSync(full, "utf8"))) {
+        expressionCount += 1;
+        for (const error of testidExpressionErrors(entry.expression, entry.resolved, prefixes)) {
+          failures.push(`${relPath(full)}:${entry.line} ${error}`);
+        }
+      }
+    }
+    expect(expressionCount, "一个表达式形式的 testid 都没扫到，扫描器失效了").toBeGreaterThan(0);
+    expect(failures, `表达式形式不合规：\n${failures.join("\n")}`).toEqual([]);
   });
 });
