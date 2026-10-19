@@ -22,11 +22,14 @@ import type {
   SkillDetailResponse,
   SkillListResponse,
   SkillUpdateRequest,
+  ToolDefinition,
   UploadResponse,
   ViewerResponse,
   WorkspaceSettingsResponse,
   WorkspaceSkillListResponse,
 } from "@loomic/shared";
+
+import { toolListResponseSchema } from "@loomic/shared";
 
 import { dedupeRequest } from "./dedupe-request";
 import { getServerBaseUrl } from "./env";
@@ -748,6 +751,27 @@ export async function fetchJob(
   });
   if (!response.ok) return handleErrorResponse(response);
   return (await response.json()) as JobResponse;
+}
+
+// --- Tool definitions API ---
+
+/**
+ * `GET /api/tools` — the ED-00k tool definition table (ED-00 工具条的唯一数据源).
+ *
+ * 返回值走 `toolListResponseSchema.parse` 而不是 `as ToolListResponse`：这张表是
+ * 前后端共用的契约（21AB），字段缺失、枚举越界、id 重复都必须在这里抛错。
+ * 静默降级（`as` 断言）的后果不是「少显示一个按钮」，而是拿半条定义去渲染工具条，
+ * 看起来像「这个工具没实现」，排查会往错的方向走。
+ */
+export async function fetchToolDefinitions(
+  accessToken: string,
+): Promise<ToolDefinition[]> {
+  const response = await fetch(`${getServerBaseUrl()}/api/tools`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  const body: unknown = await response.json();
+  return toolListResponseSchema.parse(body).tools;
 }
 
 // --- Skills API ---
