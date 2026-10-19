@@ -21,7 +21,7 @@ import {
   INITIAL_IMAGE_GENERATION_PREFERENCE_KEY,
 } from "../hooks/use-create-project";
 import type { ReadyAttachment } from "../hooks/use-image-attachments";
-import { useImageAttachments } from "../hooks/use-image-attachments";
+import { toCanvasRefAttachments, useImageAttachments } from "../hooks/use-image-attachments";
 import { useImageModelPreference } from "../hooks/use-image-model-preference";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
 import type { WebSocketHandle } from "../hooks/use-websocket";
@@ -397,21 +397,17 @@ export function ChatSidebar({
             )
             .map((el) => ({
               refId: el.id,
+              ...(el.assetId ? { assetId: el.assetId } : {}),
               url: el.storageUrl ?? el.dataUrl!,
               ...(el.thumbnailUrl ? { thumbnailUrl: el.thumbnailUrl } : {}),
             }));
 
         const existingIds = new Set(currentAttachments.map((a) => a.assetId));
-        const refAttachments: ReadyAttachment[] = canvasImages
-          .filter((ref) => !existingIds.has(ref.refId))
-          .map((ref) => ({
-            assetId: ref.refId,
-            url: ref.url,
-            ...(ref.thumbnailUrl ? { thumbnailUrl: ref.thumbnailUrl } : {}),
-            mimeType: "image/png",
-            source: "canvas-ref" as const,
-            name: `Canvas ${ref.refId.slice(0, 6)}`,
-          }));
+        // `assetId` is the only admissible identity — see toCanvasRefAttachments.
+        // The canvas element id used to be sent in its place, and the runtime
+        // answered with "attachment N references an asset that is not available to
+        // this user", failing the entire run over one un-resolvable reference.
+        const refAttachments = toCanvasRefAttachments(canvasImages, existingIds);
         if (refAttachments.length > 0) {
           currentAttachments = [...currentAttachments, ...refAttachments];
         }

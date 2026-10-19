@@ -84,6 +84,68 @@ export function toReadyAttachments(
   return ready;
 }
 
+/**
+ * One image a message refers to by chip.
+ *
+ * `refId` is the composer's own handle on it — the canvas ELEMENT id, and the id
+ * carried inside the `[图片:<refId>]` token. `assetId` is the stored object's
+ * identity, and it is the only thing an Agent run will authorise.
+ */
+export type CanvasReference = {
+  refId: string;
+  assetId?: string;
+  url: string;
+  thumbnailUrl?: string;
+};
+
+/**
+ * Turn the chips a sentence points at into submittable attachments.
+ *
+ * `assetId` is the ONLY admissible identity here. The runtime resolves it against
+ * the caller's own readable `asset_objects` rows and refuses the whole run when a
+ * reference cannot be resolved, so an element id sent in its place does not
+ * degrade the prompt — it kills the run with "attachment N references an asset
+ * that is not available to this user". That was the observed behaviour: the
+ * element id was passed as the asset id, and every message that referenced a
+ * canvas image failed while plain text messages worked.
+ *
+ * A reference with no `assetId` (a canvas object that predates the server's file
+ * projection) is therefore dropped rather than guessed at: the chip stays part of
+ * the sentence and the run still happens.
+ *
+ * Kept as a free function, like `toReadyAttachments`, so the rule is testable on
+ * its own instead of only through a rendered chat sidebar.
+ */
+export function toCanvasRefAttachments(
+  refs: readonly CanvasReference[],
+  existingAssetIds: ReadonlySet<string>,
+): ReadyAttachment[] {
+  const ready: ReadyAttachment[] = [];
+
+  for (const ref of refs) {
+    if (!ref.assetId) {
+      console.warn(
+        "[image-attachments] canvas reference has no assetId and is not attached:",
+        ref.refId,
+      );
+      continue;
+    }
+
+    if (existingAssetIds.has(ref.assetId)) continue;
+
+    ready.push({
+      assetId: ref.assetId,
+      url: ref.url,
+      ...(ref.thumbnailUrl ? { thumbnailUrl: ref.thumbnailUrl } : {}),
+      mimeType: "image/png",
+      source: "canvas-ref",
+      name: `Canvas ${ref.refId.slice(0, 6)}`,
+    });
+  }
+
+  return ready;
+}
+
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 

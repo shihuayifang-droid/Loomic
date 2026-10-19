@@ -31,7 +31,22 @@ import { ImageModelPreferencePopover } from "./image-model-preference";
  * message bubble never has to decode a multi-megabyte original to draw a 16px pill.
  */
 export type CanvasImageRef = {
+  /**
+   * The canvas ELEMENT id. It identifies the chip in the composer and the token
+   * in the message text (`[图片:<refId>]`) — it is not an attachment identity.
+   */
   refId: string;
+  /**
+   * The stored object's id (`asset_objects.id`), carried so the reference can
+   * actually be attached. The runtime resolves this value against the caller's
+   * own readable assets and refuses the whole run when it cannot; an element id
+   * is not an asset id and never resolves.
+   *
+   * Optional on the type because a canvas that predates the X-52 projection has
+   * no id to offer. Such a chip stays a readable reference and is deliberately
+   * NOT turned into an attachment.
+   */
+  assetId?: string;
   url: string;
   thumbnailUrl?: string;
 };
@@ -121,14 +136,16 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
   }));
 
   /**
-   * refId -> URLs, remembered when a chip is created.
+   * refId -> what the chip remembered about the referenced image.
    *
-   * Both variants are kept: `full` goes to the model, `thumb` is what the sent
-   * message bubble renders.
+   * Both URL variants are kept: `full` goes to the model, `thumb` is what the sent
+   * message bubble renders. `assetId` is the part that authorises the attachment —
+   * without it the runtime refuses the run, so it is remembered here, at the only
+   * moment the canvas selection still carries it.
    */
-  const canvasRefUrlsRef = useRef<Map<string, { full: string; thumb?: string }>>(
-    new Map(),
-  );
+  const canvasRefUrlsRef = useRef<
+    Map<string, { full: string; thumb?: string; assetId?: string }>
+  >(new Map());
 
   const handleSubmit = useCallback(() => {
     const composer = composerRef.current;
@@ -142,6 +159,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
         if (!urls) return null;
         return {
           refId,
+          ...(urls.assetId ? { assetId: urls.assetId } : {}),
           url: urls.full,
           ...(urls.thumb ? { thumbnailUrl: urls.thumb } : {}),
         };
@@ -289,6 +307,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
       canvasRefUrlsRef.current.set(el.id, {
         full,
         ...(thumb !== full ? { thumb } : {}),
+        ...(el.assetId ? { assetId: el.assetId } : {}),
       });
       pendingRefIdsRef.current.add(el.id);
     }

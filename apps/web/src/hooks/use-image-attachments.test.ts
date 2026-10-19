@@ -21,6 +21,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runCreateRequestSchema } from "@loomic/shared";
 
 import {
+  toCanvasRefAttachments,
   toReadyAttachments,
   useImageAttachments,
   type ImageAttachmentState,
@@ -212,5 +213,58 @@ describe("useImageAttachments submits the uploaded asset, not the preview (X-52)
     expect(result.current.attachments[0]?.error).toBeDefined();
     expect(result.current.attachments[0]?.preview).toContain("blob:");
     expect(result.current.readyAttachments).toHaveLength(0);
+  });
+});
+
+// The canvas-chip path: a sentence that references a canvas image attaches the
+// object behind it. The bug this pins is that the ELEMENT id was submitted as the
+// asset id, which the runtime answered by refusing the whole run
+// ("attachment 1 references an asset that is not available to this user") — the
+// first message of a conversation worked and every message referencing an image
+// failed, which is what made it look like a model problem.
+describe("toCanvasRefAttachments", () => {
+  const ref = {
+    refId: "element-abc123",
+    assetId: "5f4c4d65-a118-40bc-816c-e5185584a5da",
+    url: SIGNED,
+  };
+
+  it("submits the asset id, never the canvas element id", () => {
+    const ready = toCanvasRefAttachments([ref], new Set());
+
+    expect(ready).toHaveLength(1);
+    expect(ready[0]?.assetId).toBe(ref.assetId);
+    expect(ready[0]?.assetId).not.toBe(ref.refId);
+    expect(ready[0]).toMatchObject({ url: SIGNED, source: "canvas-ref" });
+  });
+
+  it("drops a reference with no asset id instead of guessing one", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const ready = toCanvasRefAttachments([{ refId: "element-abc123", url: SIGNED }], new Set());
+
+    // A missing attachment costs the prompt a reference; an invented id costs the
+    // user the whole run, and the element id is exactly such an invention.
+    expect(ready).toHaveLength(0);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("does not attach the same object twice", () => {
+    const ready = toCanvasRefAttachments([ref], new Set([ref.assetId]));
+    expect(ready).toHaveLength(0);
+  });
+
+  it("produces a shape the run contract accepts", () => {
+    const ready = toCanvasRefAttachments([ref], new Set());
+
+    const parsed = runCreateRequestSchema.safeParse({
+      sessionId: "session-1",
+      conversationId: "session-1",
+      prompt: "[图片:element-abc123] make it blue",
+      attachments: ready,
+    });
+
+    expect(parsed.success).toBe(true);
   });
 });

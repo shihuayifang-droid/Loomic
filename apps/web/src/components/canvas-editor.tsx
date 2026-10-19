@@ -84,6 +84,14 @@ export type CanvasSelectedElement = {
   storageUrl?: string;
   /** Downscaled variant, for thumbnails and inline chips only. */
   thumbnailUrl?: string;
+  /**
+   * The stored object's identity, read from the server's file projection
+   * (`files[fileId].assetId`). This — never the element's own `id` — is what an
+   * Agent run attaches: `resolveAttachmentContent` looks the value up in
+   * `asset_objects` with the caller's JWT, so an element id answers "not
+   * available to this user" and the whole run is refused.
+   */
+  assetId?: string;
 };
 
 type CanvasEditorProps = {
@@ -752,7 +760,11 @@ export function CanvasEditor({
                   // `storageUrl` is now the downscaled display variant, so reading
                   // it here would attach a 1024px re-encode to every message.
                   const rec = initialFilesRef.current[el.fileId] as
-                    | { storageUrl?: string; storageUrlOriginal?: string }
+                    | {
+                        storageUrl?: string;
+                        storageUrlOriginal?: string;
+                        assetId?: string;
+                      }
                     | undefined;
                   const fullUrl =
                     el.customData?.storageUrl ??
@@ -764,6 +776,11 @@ export function CanvasEditor({
                   const thumb = rec?.storageUrl ?? fullUrl;
                   if (typeof thumb === "string" && thumb) {
                     base.thumbnailUrl = thumb;
+                  }
+                  // The attachment identity: the server's projection of the stored
+                  // object, not anything derived from the element.
+                  if (typeof rec?.assetId === "string" && rec.assetId) {
+                    base.assetId = rec.assetId;
                   }
                 }
                 return base;
