@@ -39,10 +39,10 @@ export class TierGuardError extends Error {
 /**
  * 守卫本身只管「这个套餐能不能做这件事」。
  *
- * 工单31B 把价格从这里移走了：`calculateCreditCost` 已删除，价格改由
+ * 工单31B 把价格计算从这里移走了：本模块的成本函数已删除，价格改由
  * `features/pricing/price-quoter.ts` 去价目表问一次（BL-14 第 3 条 / GN-07）。
- * 留在本模块里的成本函数只剩 shared 的两个（`http/image-models.ts`、
- * `http/video-models.ts` 仍在用，留给 31C 删）。
+ * shared 里那两个成本函数仍被 `http/image-models.ts`、`http/video-models.ts`
+ * 使用，本单不删，留给 31C。
  */
 export type TierGuard = {
   checkModelAccess(plan: SubscriptionPlan, modelId: string): void;
