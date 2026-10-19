@@ -5,6 +5,7 @@ import { Lock, Plus, Zap } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
+import { useCompletionTitle } from "../../hooks/use-completion-title";
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
 import {
   type VideoGeneratorData,
@@ -108,6 +109,11 @@ export function VideoGeneratorPanel({
     [],
   );
   const { handleGenerationError } = useGenerationErrorHandler(errorActions);
+  /**
+   * CV-10：本轮完成提醒。`begin` / `end` 回调身份稳定（模块级单例），
+   * 面板只是把「提交成功 / 到达终态」这两件事告诉它，改不改标题由 hook 决定。
+   */
+  const { begin, end } = useCompletionTitle();
   // AbortController for in-flight generation requests so we can cancel on unmount
   const abortRef = useRef<AbortController | null>(null);
 
@@ -282,6 +288,13 @@ export function VideoGeneratorPanel({
       resolution,
     });
 
+    // CV-10：提交成功之后才登记本轮（jobId 在下面拿到）。成功、失败、取消都走同一个
+    // 结算口；同一个 id 重复结算由 endTask 幂等挡掉（工单 30H T2「重复 end 只算一次」）。
+    let jobId: string | null = null;
+    const settleJob = (ok: boolean): void => {
+      if (jobId !== null) end(jobId, ok);
+    };
+
     try {
       const inputImages: string[] = [];
       if (firstFrame) inputImages.push(firstFrame.dataUrl);
@@ -302,7 +315,13 @@ export function VideoGeneratorPanel({
           ...(inputImages.length ? { inputImages } : {}),
         },
       );
-      if (controller.signal.aborted) return;
+      // CV-10：job 提交成功即进入本轮，与该 job 最终成功与否无关。
+      jobId = submitted.jobId;
+      begin(jobId);
+      if (controller.signal.aborted) {
+        settleJob(false);
+        return;
+      }
 
       const job = await awaitJobCompletion(
         accessTokenRef.current,
@@ -335,7 +354,10 @@ export function VideoGeneratorPanel({
       );
 
       // Check if this generation was cancelled while awaiting
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) {
+        settleJob(false);
+        return;
+      }
 
       // The worker writes these into background_jobs.result.
       const jobResult = (job.result ?? {}) as {
@@ -357,7 +379,10 @@ export function VideoGeneratorPanel({
       const { convertToExcalidrawElements } = await import(
         "@excalidraw/excalidraw"
       );
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) {
+        settleJob(false);
+        return;
+      }
 
       const newElements = convertToExcalidrawElements([
         {
@@ -388,8 +413,13 @@ export function VideoGeneratorPanel({
         captureUpdate: "IMMEDIATELY",
       });
 
+      // CV-10：视频已经落到画布上 —— 这个任务成功结束。
+      settleJob(true);
       onClose();
     } catch (err) {
+      // CV-10：失败与取消都算「失败」（工单 §3 T4 已裁定）。中止也要结算，
+      // 否则这条任务永远留在 pending 里，下一轮的「全部任务结束」再也不会触发。
+      settleJob(false);
       // Ignore aborted requests (user cancelled or component unmounted)
       if (controller.signal.aborted) return;
 
@@ -421,6 +451,8 @@ export function VideoGeneratorPanel({
     elementBounds,
     onClose,
     handleGenerationError,
+    begin,
+    end,
   ]);
 
   // X-40 二期: 「稍后重试」重新提交一次，走的还是上面那一条提交路径。
