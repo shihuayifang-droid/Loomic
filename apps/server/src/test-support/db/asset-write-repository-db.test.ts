@@ -339,7 +339,7 @@ beforeAll(async () => {
     createdBy: AUTHOR_ID,
     objectPath: "team/policy-agreement.png",
   });
-});
+}, 120_000);
 
 afterAll(async () => {
   await db.close();

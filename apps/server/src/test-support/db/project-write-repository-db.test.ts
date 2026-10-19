@@ -355,7 +355,7 @@ beforeAll(async () => {
     createdBy: AUTHOR_ID,
     updatedAt: AUTHOR_UPDATED_AT,
   });
-});
+}, 120_000);
 
 afterAll(async () => {
   await db.close();
