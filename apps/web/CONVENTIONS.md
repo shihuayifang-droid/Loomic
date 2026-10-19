@@ -21,8 +21,12 @@
 
 四条硬规则：
 
-1. **全部小写 kebab-case**，只用 `[a-z0-9-]` 与 `.`（数值型取值允许小数点，如 `canvas-zoom-dropdown-item-0.5`）。
+1. **全部小写 kebab-case**，只用 `[a-z0-9-]` 与 `.`；其中**只有末段可以是带小数点的数字（如 `-0.5`），其余位置不得出现 `.`**。
    不用驼峰、不用下划线、不出现空格。
+   - ✅ 末段是带小数点的数字或普通段：`canvas-zoom-dropdown-item-0.5`、`canvas-zoom-dropdown-item-1`。
+   - ❌ `.` 出现在非末段，或末段的小数形态不完整：`canvas.zoom-item`、`canvas-zoom.dropdown-item`、
+     `canvas-zoom-item-.5`、`canvas-zoom-item-0.`。
+   - 这一条由 `test/testid-lint.test.ts` 强制（本次与工单 30D 一起改，两处说法必须一致）。
 2. **段数从长到短**：区域 → 组件 → 元素 → 值。父子关系在 testid 里用连字符表达，不靠 `__` 之类的分隔符。
 3. **参数化 testid 用规范名，不用下标**：`adjust-slider-exposure`，不要 `adjust-slider-0`。
    下标会随着配置顺序调整而失效，规范名不会。

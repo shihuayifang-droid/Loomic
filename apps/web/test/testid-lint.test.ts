@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
  * X-05 testid lint（工单 30C T5）
  *
  * 三条断言：
- *   1) `src/**\/*.tsx` 里所有 `data-testid` 字面量都匹配 `^[a-z0-9]+(-[a-z0-9]+)+$`；
+ *   1) `src/**\/*.tsx` 里所有 `data-testid` 字面量都匹配 `^[a-z0-9]+(-[a-z0-9]+)*-([a-z0-9]+|[0-9]+\.[0-9]+)$`；
  *   2) 第一段前缀都在 `CONVENTIONS.md` §6 的「已落地的区域前缀表」里（表在测试里解析）；
  *   3) 非脏文件里可交互元素的 testid 覆盖率 = 100%。
  *
@@ -36,7 +36,13 @@ const INTERACTIVE_ROLE_RE = /role="(menuitem|tab|option|dialog)"/g;
 const BLOCK_COMMENT_RE = /\{?\/\*[\s\S]*?\*\//g;
 const TESTID_ATTR_RE = /data-testid\s*=\s*(\{`([^`]*)`\}|"([^"]*)"|\{[^}]*\})/g;
 
-const TESTID_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)+$/;
+/**
+ * 工单 30D（Kiro 对 30C 检查的第 3 条裁定）：`.` 只允许出现在**末段**，且必须是带小数点的数字。
+ * 末段既可以是普通段 `[a-z0-9]+`（含纯数字 `1`），也可以是 `[0-9]+.[0-9]+`（如 `0.5`）；
+ * 正则整体要求至少两段，所以 `canvas-zoom-dropdown-item-1` 与 `…-item-0.5` 都合规，
+ * 而 `canvas.zoom-item` / `canvas-zoom-item-.5` / `canvas-zoom-item-0.` 不合规。
+ */
+const TESTID_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*-([a-z0-9]+|[0-9]+\.[0-9]+)$/;
 
 type TestidValue = {
   file: string;
@@ -226,7 +232,7 @@ describe("X-05 testid lint", () => {
     expect(dirtyPresent, "脏文件清单里的文件一个都没扫到，清单写错了").toBe(DIRTY_TSX.size);
   });
 
-  it("断言1：所有 testid 字面量匹配 ^[a-z0-9]+(-[a-z0-9]+)+$", () => {
+  it("断言1：所有 testid 字面量匹配 ^[a-z0-9]+(-[a-z0-9]+)*-([a-z0-9]+|[0-9]+\\.[0-9]+)$", () => {
     const failures = testidReport
       .filter((entry) => entry.value !== null)
       .filter((entry) => !TESTID_NAME_RE.test(entry.value as string))
@@ -295,5 +301,25 @@ describe("X-05 testid lint", () => {
     expect(testidValueErrors("x-menu", prefixes, true)).toEqual([]);
     // 不豁免的话它该被拦（证明豁免是唯一原因）
     expect(testidValueErrors("x-menu", prefixes, false).length).toBeGreaterThan(0);
+  });
+
+  it("规则自检（30D）：`.` 只在末段、且末段是带小数点的数字；其余位置出现 `.` 一律拦下", () => {
+    // 正例：末段是带小数点数字 / 是普通段（纯数字）都合规
+    for (const good of ["canvas-zoom-dropdown-item-0.5", "canvas-zoom-dropdown-item-1"]) {
+      expect(TESTID_NAME_RE.test(good), `${good} 该被判为合规`).toBe(true);
+      expect(testidValueErrors(good, prefixes, false), `${good} 不该被拦`).toEqual([]);
+    }
+    // 反例：`.` 出现在非末段，或末段的小数形态不完整
+    for (const bad of [
+      "canvas.zoom-item",
+      "canvas-zoom.dropdown-item",
+      "canvas-zoom-item-.5",
+      "canvas-zoom-item-0.",
+    ]) {
+      expect(TESTID_NAME_RE.test(bad), `${bad} 不该被判为合规`).toBe(false);
+      expect(testidValueErrors(bad, prefixes, false).length, `${bad} 该被拦下`).toBeGreaterThan(0);
+    }
+    // 段数下限仍在：只剩一段时不合规（正则本身就要求至少两段）
+    expect(TESTID_NAME_RE.test("canvas")).toBe(false);
   });
 });
