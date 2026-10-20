@@ -160,7 +160,7 @@ type FakeApi = {
  * `push()` 包在 `act()` 里：帧是外部事件（Excalidraw 的 onChange）驱动进来的，
  * 不包的话 setState 在 act 之外发生，React 会警告且断言可能看到旧树。
  */
-function setup(options: { files?: Record<string, unknown> } = {}) {
+function setup(options: { files?: Record<string, unknown>; download?: ReturnType<typeof vi.fn> } = {}) {
   const listeners: Array<(elements: Element[], appState: AppState) => void> = [];
   const api: FakeApi = {
     onChange: vi.fn((listener: (elements: Element[], appState: AppState) => void) => {
@@ -176,7 +176,14 @@ function setup(options: { files?: Record<string, unknown> } = {}) {
     ),
   };
 
-  render(<ImageToolbarLayer excalidrawApi={api as never} accessToken="test-token" />);
+  // 不给 `download` 时**连 prop 都不传**，走组件默认的 `downloadTransformed`。
+  const props: Parameters<typeof ImageToolbarLayer>[0] = {
+    excalidrawApi: api as never,
+    accessToken: "test-token",
+  };
+  if (options.download !== undefined) props.download = options.download;
+
+  render(<ImageToolbarLayer {...props} />);
 
   const push = (elements: Element[], appState: AppState) => {
     act(() => {
@@ -188,7 +195,9 @@ function setup(options: { files?: Record<string, unknown> } = {}) {
 }
 
 /** 一次「选中一张图」的普通开局。 */
-function setupSelectedImage(options: { files?: Record<string, unknown> } = {}) {
+function setupSelectedImage(
+  options: { files?: Record<string, unknown>; download?: ReturnType<typeof vi.fn> } = {},
+) {
   const harness = setup(options);
   harness.push([imageElement(), rectangleElement()], makeAppState());
   return harness;
@@ -447,5 +456,36 @@ describe("ImageToolbarLayer：二级条的下载", () => {
     }).not.toThrow();
 
     expect(toastMock.toast).toHaveBeenCalledWith(DOWNLOAD_FAILED_MESSAGE);
+  });
+
+  it("有原图时：下载函数收到 dataURL、customData 里的文件名和当前状态", () => {
+    const download = vi.fn();
+    setupSelectedImage({ download });
+    enterFlipRotate();
+
+    fireEvent.click(screen.getByTestId("image-toolbar-flip-rotate-download"));
+
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(download).toHaveBeenCalledWith("data:image/png;base64,AAAA", "cat.png", {
+      angle: 0,
+      flipH: false,
+      flipV: false,
+    });
+    expect(toastMock.toast).not.toHaveBeenCalled();
+  });
+
+  it("先水平翻转再下载：state 带 flipH=true", async () => {
+    const download = vi.fn();
+    const { api } = setupSelectedImage({ download });
+    enterFlipRotate();
+
+    fireEvent.click(screen.getByTestId("image-toolbar-flip-rotate-flip-h"));
+    await waitFor(() => expect(api.updateScene).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByTestId("image-toolbar-flip-rotate-download"));
+
+    const lastCall = download.mock.calls[download.mock.calls.length - 1];
+    expect(lastCall?.[2]).toEqual({ angle: 0, flipH: true, flipV: false });
+    expect(lastCall?.[1]).toBe("cat.png");
   });
 });

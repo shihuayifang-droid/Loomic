@@ -2,8 +2,8 @@
  * ED-00e · 选中内容 → 工具条形态（纯函数，不碰 DOM、不依赖 Excalidraw 类型）
  *
  * 规格表在 `docs/项目/hahart/00-需求与策划/功能需求/ED-逐图编辑.md` 的 ED-00e（约 L168–190），
- * 共 9 行。本模块只认下面这个抽象的 `kind`：从 Excalidraw 元素映射到 `kind` 的工作要改
- * `canvas-editor.tsx`（脏文件），留到接入画布时再做。
+ * 共 9 行。本模块只认下面这个抽象的 `kind`；Excalidraw 元素到 `kind` 的映射见本文件的
+ * {@link elementKind}（工单 30Q 接入画布时加入）。
  *
  * ## 判定优先级（工单 30E §1 的 Kiro 裁定，写在这里免得下一个人再猜一遍）
  *

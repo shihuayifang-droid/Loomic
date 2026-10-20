@@ -80,6 +80,11 @@ export type ExcalidrawFileLike = {
 export type ImageToolbarLayerProps = {
   excalidrawApi: ExcalidrawApiLike;
   accessToken: string | null;
+  /**
+   * 下载函数，默认 {@link downloadTransformed}。
+   * 只有测试会传：模块内的 `downloadTransformed` 用 `vi.spyOn` 截不到，只能从外面注入。
+   */
+  download?: ((dataUrl: string, name: string, state: FlipRotateState) => void) | undefined;
 };
 
 /** 最近一帧里与渲染有关的全部信息。 */
@@ -222,7 +227,11 @@ export function downloadTransformed(dataUrl: string, name: string, state: FlipRo
   image.src = dataUrl;
 }
 
-export function ImageToolbarLayer({ excalidrawApi, accessToken }: ImageToolbarLayerProps) {
+export function ImageToolbarLayer({
+  excalidrawApi,
+  accessToken,
+  download,
+}: ImageToolbarLayerProps) {
   const { toast } = useToast();
   const definitions = useToolDefinitions(accessToken);
 
@@ -420,9 +429,9 @@ export function ImageToolbarLayer({ excalidrawApi, accessToken }: ImageToolbarLa
         toast(DOWNLOAD_FAILED_MESSAGE);
         return;
       }
-      downloadTransformed(dataUrl, downloadBaseName(el, file), state);
+      (download ?? downloadTransformed)(dataUrl, downloadBaseName(el, file), state);
     },
-    [snapshot, excalidrawApi, toast],
+    [snapshot, excalidrawApi, toast, download],
   );
 
   const exitFlipRotate = useCallback(() => setMode({ kind: "toolbar" }), []);
