@@ -156,4 +156,71 @@ describe("asset provenance repository (fake pool)", () => {
       repositoryFor(pool).readProvenance({ assetId: ASSET_ID }),
     ).resolves.toBeNull();
   });
+
+  it("case 7: a blank or over-long display name throws before any connection is opened", async () => {
+    for (const displayName of ["   ", "角".repeat(256)]) {
+      const { pool, connect } = createFakePool({});
+
+      await expect(
+        repositoryFor(pool).recordDisplayName({
+          actorId: null,
+          assetId: ASSET_ID,
+          displayName,
+        }),
+      ).rejects.toBeInstanceOf(AssetProvenanceError);
+      expect(connect).not.toHaveBeenCalled();
+    }
+  });
+
+  it("case 8: a valid write binds the trimmed display name and answers updated=1", async () => {
+    const { pool, calls } = createFakePool({
+      businessRows: [{ id: ASSET_ID }],
+    });
+
+    const result = await repositoryFor(pool).recordDisplayName({
+      actorId: "00000000-0000-0000-0000-0000000000a1",
+      assetId: ASSET_ID,
+      displayName: "  角色-小橘.png  ",
+    });
+
+    expect(result).toEqual({ updated: 1 });
+
+    const business = calls.find((call) =>
+      call.sql.includes("update public.asset_objects"),
+    );
+
+    expect(business?.params).toEqual([ASSET_ID, "角色-小橘.png"]);
+  });
+
+  it("case 9: a driver error on recordDisplayName is wrapped with a fixed message", async () => {
+    const { pool } = createFakePool({
+      businessError: new Error("connection to 10.0.0.1 refused: password=xyz"),
+    });
+
+    const failure = await repositoryFor(pool)
+      .recordDisplayName({
+        actorId: null,
+        assetId: ASSET_ID,
+        displayName: "角色-小橘.png",
+      })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    expect(failure).toBeInstanceOf(AssetProvenanceError);
+    expect((failure as AssetProvenanceError).message).toBe(
+      "asset provenance failed (recordDisplayName)",
+    );
+    expect((failure as AssetProvenanceError).message).not.toContain("10.0.0.1");
+    expect((failure as AssetProvenanceError).message).not.toContain("password");
+  });
+
+  it("case 10: readDisplayName answers null when the row does not exist", async () => {
+    const { pool } = createFakePool({ businessRows: [] });
+
+    await expect(
+      repositoryFor(pool).readDisplayName({ assetId: ASSET_ID }),
+    ).resolves.toBeNull();
+  });
 });

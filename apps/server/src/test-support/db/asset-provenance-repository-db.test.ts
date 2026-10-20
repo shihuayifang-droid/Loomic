@@ -159,4 +159,37 @@ describe("asset provenance repository: real SQL (GN-11)", () => {
 
     expect(after?.parentArtifactId).toBeNull();
   });
+
+  it("ED-05: a Chinese display name is stored and read back verbatim", async () => {
+    await expect(
+      repository.recordDisplayName({
+        actorId: USER_ID,
+        assetId: CHILD_ASSET_ID,
+        displayName: "角色-小橘.png",
+      }),
+    ).resolves.toEqual({ updated: 1 });
+
+    await expect(
+      repository.readDisplayName({ assetId: CHILD_ASSET_ID }),
+    ).resolves.toBe("角色-小橘.png");
+  });
+
+  it("ED-05: the CHECK refuses a blank display name written directly", async () => {
+    await expect(
+      db.query(
+        "update public.asset_objects set display_name = '   ' where id = $1::uuid",
+        [CHILD_ASSET_ID],
+      ),
+    ).rejects.toMatchObject({ code: "23514" });
+  });
+
+  it("ED-05: an asset without a display name reads back null", async () => {
+    const UNNAMED_ASSET_ID = "dddd0000-0000-4000-8000-0000000000c3";
+
+    await insertAsset(UNNAMED_ASSET_ID, `${workspaceId}/provenance/unnamed.png`);
+
+    await expect(
+      repository.readDisplayName({ assetId: UNNAMED_ASSET_ID }),
+    ).resolves.toBeNull();
+  });
 });

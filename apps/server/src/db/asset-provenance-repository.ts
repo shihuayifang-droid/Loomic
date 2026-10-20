@@ -47,14 +47,29 @@ export type AssetProvenanceRepository = {
   readProvenance(input: {
     assetId: string;
   }): Promise<(AssetProvenance & { assetId: string }) | null>;
+  /**
+   * ED-05: keep the name a person gave the file next to the ASCII object key.
+   * Answers how many rows it changed (0 or 1).
+   */
+  recordDisplayName(input: {
+    actorId: string | null;
+    assetId: string;
+    displayName: string;
+  }): Promise<{ updated: number }>;
+  /** Read that name back. null when the row is missing or carries no name. */
+  readDisplayName(input: { assetId: string }): Promise<string | null>;
 };
 
 export const RECORD_PROVENANCE = "recordProvenance";
 export const READ_PROVENANCE = "readProvenance";
+export const RECORD_DISPLAY_NAME = "recordDisplayName";
+export const READ_DISPLAY_NAME = "readDisplayName";
 
 export type AssetProvenanceOperation =
   | typeof RECORD_PROVENANCE
-  | typeof READ_PROVENANCE;
+  | typeof READ_PROVENANCE
+  | typeof RECORD_DISPLAY_NAME
+  | typeof READ_DISPLAY_NAME;
 
 export class AssetProvenanceError extends Error {
   readonly operation: AssetProvenanceOperation;
@@ -113,6 +128,22 @@ type ProvenanceRow = {
   source_job_id: string | null;
   parent_artifact_id: string | null;
 };
+
+const RECORD_DISPLAY_NAME_SQL = `
+update public.asset_objects
+   set display_name = $2::text
+ where id = $1::uuid
+returning id
+`;
+
+const READ_DISPLAY_NAME_SQL = `
+select display_name
+  from public.asset_objects
+ where id = $1::uuid
+`;
+
+/** ED-05: same rule as the `asset_objects_display_name_check` constraint. */
+const DISPLAY_NAME_MAX_LENGTH = 255;
 
 export function createAssetProvenanceRepository(options: {
   getTransactionPool: () => TransactionPool;
@@ -184,6 +215,55 @@ export function createAssetProvenanceRepository(options: {
         throw new AssetProvenanceError(READ_PROVENANCE, error);
       }
     },
+
+    async recordDisplayName(input) {
+      const displayName = validateRecordDisplayNameInput(input);
+
+      try {
+        const pool = options.getTransactionPool();
+
+        return await withPrivilegedTransaction(
+          pool,
+          input.actorId ? { userId: input.actorId } : null,
+          async (client) => {
+            const result = await client.query(RECORD_DISPLAY_NAME_SQL, [
+              input.assetId,
+              displayName,
+            ]);
+
+            return { updated: result.rows.length };
+          },
+        );
+      } catch (error) {
+        throw new AssetProvenanceError(RECORD_DISPLAY_NAME, error);
+      }
+    },
+
+    async readDisplayName(input) {
+      if (typeof input?.assetId !== "string" || input.assetId.length === 0) {
+        throw new AssetProvenanceError(
+          READ_DISPLAY_NAME,
+          new Error('asset provenance needs a non-empty "assetId"'),
+        );
+      }
+
+      try {
+        const pool = options.getTransactionPool();
+
+        return await withPrivilegedTransaction(pool, null, async (client) => {
+          const result = await client.query(READ_DISPLAY_NAME_SQL, [
+            input.assetId,
+          ]);
+          const row = result.rows[0] as { display_name: string | null } | undefined;
+
+          if (row === undefined || row.display_name === null) return null;
+
+          return row.display_name;
+        });
+      } catch (error) {
+        throw new AssetProvenanceError(READ_DISPLAY_NAME, error);
+      }
+    },
   };
 }
 
@@ -216,4 +296,43 @@ function validateRecordInput(input: {
       new Error("asset provenance needs a non-negative integer creditsCharged"),
     );
   }
+}
+
+/**
+ * ED-05: unusable input is refused before any connection is opened, and the
+ * name that reaches the database is the trimmed one.
+ */
+function validateRecordDisplayNameInput(input: {
+  assetId: string;
+  displayName: string;
+}): string {
+  if (typeof input?.assetId !== "string" || input.assetId.length === 0) {
+    throw new AssetProvenanceError(
+      RECORD_DISPLAY_NAME,
+      new Error('asset provenance needs a non-empty "assetId"'),
+    );
+  }
+
+  if (typeof input?.displayName !== "string") {
+    throw new AssetProvenanceError(
+      RECORD_DISPLAY_NAME,
+      new Error("asset provenance needs a string displayName"),
+    );
+  }
+
+  const trimmed = input.displayName.trim();
+
+  if (
+    trimmed.length < 1 ||
+    trimmed.length > DISPLAY_NAME_MAX_LENGTH
+  ) {
+    throw new AssetProvenanceError(
+      RECORD_DISPLAY_NAME,
+      new Error(
+        "asset provenance needs a displayName that is 1 to 255 characters after trimming",
+      ),
+    );
+  }
+
+  return trimmed;
 }
