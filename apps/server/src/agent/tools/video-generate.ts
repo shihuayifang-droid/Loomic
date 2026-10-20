@@ -1,6 +1,8 @@
 import { tool } from "langchain";
 import { z } from "zod";
 
+import { isModelVisibleFor } from "@loomic/shared";
+
 import {
   type AvailableVideoModel,
   getAvailableVideoModels,
@@ -362,7 +364,11 @@ export function createVideoGenerateTool(deps: {
     );
   }
 
-  const models = deps.availableModels ?? getAvailableVideoModels();
+  const models =
+    deps.availableModels ??
+    getAvailableVideoModels().filter((m) =>
+      isModelVisibleFor(m.id, "agent"),
+    );
 
   const modelSummary = models.length
     ? models.map((m) => `${m.displayName} (${m.id})`).join(", ")

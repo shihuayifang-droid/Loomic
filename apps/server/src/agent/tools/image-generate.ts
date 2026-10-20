@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { randomUUID } from "node:crypto";
 
-import type { AgentAssetReference } from "@loomic/shared";
+import { isModelVisibleFor, type AgentAssetReference } from "@loomic/shared";
 
 import { generateImage } from "../../generation/image-generation.js";
 import {
@@ -410,7 +410,11 @@ export function createImageGenerateTool(deps: {
 
   // Only text-to-image models. Listing an upscaler or background remover here
   // would let the LLM pick a model that ignores the prompt entirely.
-  const models = deps.availableModels ?? getAvailableImageModels("generate");
+  const models =
+    deps.availableModels ??
+    getAvailableImageModels("generate").filter((m) =>
+      isModelVisibleFor(m.id, "agent"),
+    );
 
   const modelSummary = models.length
     ? models.map((m) => `${m.displayName} (${m.id})`).join(", ")

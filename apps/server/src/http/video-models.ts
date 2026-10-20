@@ -5,6 +5,7 @@ import {
   MODEL_MIN_TIER,
   type SubscriptionPlan,
   canAccessModel,
+  modelVisibility,
 } from "@loomic/shared";
 
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
@@ -21,7 +22,9 @@ export async function registerVideoModelRoutes(
   },
 ) {
   app.get("/api/video-models", async (request, reply) => {
-    const models = getAvailableVideoModels();
+    const models = getAvailableVideoModels().filter(
+      (m) => modelVisibility(m.id).listed,
+    );
 
     // Try to authenticate — unauthenticated users still see models
     let userPlan: SubscriptionPlan | null = null;
@@ -45,6 +48,7 @@ export async function registerVideoModelRoutes(
       iconUrl: m.iconUrl,
       provider: m.provider,
       modality: "video" as const,
+      visibility: modelVisibility(m.id),
       accessible: userPlan !== null && canAccessModel(userPlan, m.id),
       minTier: MODEL_MIN_TIER[m.id] ?? "pro",
       capabilities: m.capabilities,

@@ -253,3 +253,46 @@ export function modalityOfCatalogModel(id: string): ModelModality | null {
   if (Object.prototype.hasOwnProperty.call(VIDEO_MODEL_CATALOG, id)) return "video";
   return null;
 }
+
+/**
+ * MD-01: the one visibility configuration every model surface filters by. An id
+ * absent here is listed and visible everywhere; an entry overrides only the
+ * fields it names. `listed: false` takes a model off every surface at once.
+ */
+export interface ModelVisibility {
+  listed: boolean;
+  agent_callable: boolean;
+  generator_visible: boolean;
+  in_preference: boolean;
+}
+
+export type ModelSurface = "agent" | "generator" | "preference";
+
+const DEFAULT_MODEL_VISIBILITY: ModelVisibility = {
+  listed: true,
+  agent_callable: true,
+  generator_visible: true,
+  in_preference: true,
+};
+
+/** Overrides by model id. Empty today: no model is restricted yet. */
+export const MODEL_VISIBILITY_OVERRIDES: Readonly<Record<string, Partial<ModelVisibility>>> = {};
+
+export function modelVisibility(
+  id: string,
+  overrides: Readonly<Record<string, Partial<ModelVisibility>>> = MODEL_VISIBILITY_OVERRIDES,
+): ModelVisibility {
+  return { ...DEFAULT_MODEL_VISIBILITY, ...(overrides[id] ?? {}) };
+}
+
+export function isModelVisibleFor(
+  id: string,
+  surface: ModelSurface,
+  overrides: Readonly<Record<string, Partial<ModelVisibility>>> = MODEL_VISIBILITY_OVERRIDES,
+): boolean {
+  const v = modelVisibility(id, overrides);
+  if (!v.listed) return false;
+  if (surface === "agent") return v.agent_callable;
+  if (surface === "generator") return v.generator_visible;
+  return v.in_preference;
+}

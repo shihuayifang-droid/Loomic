@@ -4,6 +4,7 @@ import type { FastifyInstance } from "fastify";
 import {
   canAccessModel,
   MODEL_MIN_TIER,
+  modelVisibility,
   type SubscriptionPlan,
 } from "@loomic/shared";
 
@@ -21,7 +22,9 @@ export async function registerImageModelRoutes(
   },
 ) {
   app.get("/api/image-models", async (request, reply) => {
-    const models = getAvailableImageModels();
+    const models = getAvailableImageModels().filter(
+      (m) => modelVisibility(m.id).listed,
+    );
 
     // Try to authenticate — unauthenticated users still see models
     let userPlan: SubscriptionPlan | null = null;
@@ -45,6 +48,7 @@ export async function registerImageModelRoutes(
       iconUrl: m.iconUrl,
       provider: m.provider,
       modality: "image" as const,
+      visibility: modelVisibility(m.id),
       accessible: userPlan !== null && canAccessModel(userPlan, m.id),
       minTier: MODEL_MIN_TIER[m.id] ?? "pro",
       // Exposed so the picker can gate the reference-image dropzone and the
