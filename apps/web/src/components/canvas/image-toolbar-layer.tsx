@@ -11,6 +11,10 @@ import { imageToolbarPosition } from "@/lib/toolbar-position";
 import { fetchAsDataURL } from "@/lib/canvas-elements";
 import { browserRenderCrop, commitCropOutput } from "@/lib/crop-commit";
 import { replaceImageInPlace } from "@/lib/tool-output-replace";
+import { browserDecode, browserEncode, commitAdjustOutput } from "@/lib/adjust-commit";
+import type { AutoAdjustResult } from "@/lib/adjust-auto";
+import { autoAdjust } from "@/lib/adjust-auto";
+import type { AdjustParams, PixelBuffer } from "@/lib/adjust-render";
 
 import { useToast } from "@/components/toast";
 import { useToolDefinitions } from "@/hooks/use-tool-definitions";
@@ -22,6 +26,7 @@ import {
   uploadToolOutput,
 } from "@/lib/server-api";
 
+import { AdjustToolSession } from "./adjust-tool-session";
 import { CropToolSession } from "./crop-tool-session";
 import { DownloadAllBar } from "./download-all-bar";
 import { FlipRotateBar } from "./flip-rotate-bar";
@@ -87,6 +92,9 @@ const DOWNLOAD_TOOL_ID = "download";
 /** ED-02: the main toolbar crop tool id. */
 const CROP_TOOL_ID = "crop";
 
+/** ED-01: the main toolbar adjust tool id. */
+const ADJUST_TOOL_ID = "adjust";
+
 /**
  * `excalidrawApi` 在本仓是 `any`（`canvas-editor.tsx:169`），这里只声明用到的 4 个方法。
  * 方法都可选：真实 API 一定都有，但测试里的假 API 按需给（`test/canvas-bottom-bar-zoom.test.tsx`
@@ -142,6 +150,10 @@ export type ImageToolbarLayerProps = {
   renderCrop?: ((sourceDataUrl: string, rect: CropRect) => Promise<Blob>) | undefined;
   /** ED-00j: load the original (signed URL) as a data URL. Test-injectable; default is fetchAsDataURL. */
   loadOriginal?: ((url: string) => Promise<string>) | undefined;
+  /** ED-01: decode a data URL to pixels. Test-injectable; default is {@link browserDecode}. */
+  decodePixels?: ((dataUrl: string) => Promise<PixelBuffer>) | undefined;
+  /** ED-01: encode pixels to a PNG Blob. Test-injectable; default is {@link browserEncode}. */
+  encodePixels?: ((pixels: PixelBuffer) => Promise<Blob>) | undefined;
 };
 
 /** ED-02 default size reader: load the data URL into an Image and read naturalWidth/Height. */
@@ -219,6 +231,13 @@ type Mode =
       kind: "crop";
       elementId: string;
       source: Size;
+      sourceDataUrl: string;
+      assetId: string;
+      fileName: string;
+    }
+  | {
+      kind: "adjust";
+      elementId: string;
       sourceDataUrl: string;
       assetId: string;
       fileName: string;
@@ -390,6 +409,8 @@ export function ImageToolbarLayer({
   readImageSize,
   renderCrop,
   loadOriginal,
+  decodePixels,
+  encodePixels,
 }: ImageToolbarLayerProps) {
   const { toast } = useToast();
   const definitions = useToolDefinitions(accessToken);
@@ -503,7 +524,7 @@ export function ImageToolbarLayer({
   // 二级条只在「选中的还是那一张图」时成立：选中集合一变就退回主工具条（工单 §3 裁决 5）。
   const selectedElementId = snapshot?.elementId ?? null;
   useEffect(() => {
-    if (mode.kind !== "flip-rotate" && mode.kind !== "crop") return;
+    if (mode.kind !== "flip-rotate" && mode.kind !== "crop" && mode.kind !== "adjust") return;
     if (selectedElementId !== mode.elementId) setMode({ kind: "toolbar" });
   }, [mode, selectedElementId]);
 
@@ -653,33 +674,52 @@ export function ImageToolbarLayer({
     }
   }, [snapshot, excalidrawApi, toast, accessToken, openDownload]);
 
+  /**
+   * ED-00j: load the ORIGINAL (signed URL) of a selected image as a data URL, never the canvas
+   * display copy. Shared by crop and adjust. Toasts and returns null when it cannot be had.
+   */
+  const loadOriginalOf = useCallback(
+    async (
+      el: ElementLike,
+    ): Promise<{ assetId: string; original: string; fileName: string } | null> => {
+      const files = excalidrawApi.getFiles?.() ?? {};
+      const fileId = typeof el.fileId === "string" ? el.fileId : "";
+      const file = fileId === "" ? undefined : files[fileId];
+      const assetId = file?.assetId;
+      if (
+        typeof assetId !== "string" ||
+        assetId === "" ||
+        accessToken === null ||
+        accessToken === ""
+      ) {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return null;
+      }
+      try {
+        const { url } = await getAssetUrl(accessToken, assetId);
+        if (typeof url !== "string" || url === "") {
+          toast(DOWNLOAD_FAILED_MESSAGE);
+          return null;
+        }
+        const original = await (loadOriginal ?? fetchAsDataURL)(url);
+        return { assetId, original, fileName: downloadBaseName(el, file) };
+      } catch {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return null;
+      }
+    },
+    [excalidrawApi, toast, loadOriginal, accessToken],
+  );
+
   /** ED-02: enter the crop panel for the selected image (needs dataURL, assetId and a known size). */
   const enterCrop = useCallback(async () => {
     const el = snapshot?.element as ElementLike | null | undefined;
     if (!el || typeof el.id !== "string") return;
     const elementId = el.id;
-    const files = excalidrawApi.getFiles?.() ?? {};
-    const fileId = typeof el.fileId === "string" ? el.fileId : "";
-    const file = fileId === "" ? undefined : files[fileId];
-    const assetId = file?.assetId;
-    if (
-      typeof assetId !== "string" ||
-      assetId === "" ||
-      accessToken === null ||
-      accessToken === ""
-    ) {
-      toast(DOWNLOAD_FAILED_MESSAGE);
-      return;
-    }
+    const loaded = await loadOriginalOf(el);
+    if (loaded === null) return;
     try {
-      // ED-00j: crop the ORIGINAL, never the canvas display copy (file.dataURL is a downsampled one).
-      const { url } = await getAssetUrl(accessToken, assetId);
-      if (typeof url !== "string" || url === "") {
-        toast(DOWNLOAD_FAILED_MESSAGE);
-        return;
-      }
-      const original = await (loadOriginal ?? fetchAsDataURL)(url);
-      const source: Size = await (readImageSize ?? defaultReadImageSize)(original);
+      const source: Size = await (readImageSize ?? defaultReadImageSize)(loaded.original);
       if (!(source.width > 0) || !(source.height > 0)) {
         toast(DOWNLOAD_FAILED_MESSAGE);
         return;
@@ -688,14 +728,88 @@ export function ImageToolbarLayer({
         kind: "crop",
         elementId,
         source,
-        sourceDataUrl: original,
-        assetId,
-        fileName: downloadBaseName(el, file),
+        sourceDataUrl: loaded.original,
+        assetId: loaded.assetId,
+        fileName: loaded.fileName,
       });
     } catch {
       toast(DOWNLOAD_FAILED_MESSAGE);
     }
-  }, [snapshot, excalidrawApi, toast, readImageSize, loadOriginal, accessToken]);
+  }, [snapshot, toast, readImageSize, loadOriginalOf]);
+
+  /** ED-01: enter the adjust panel on the original of the selected image. */
+  const enterAdjust = useCallback(async () => {
+    const el = snapshot?.element as ElementLike | null | undefined;
+    if (!el || typeof el.id !== "string") return;
+    if (!definitions.tools.some((tool) => tool.id === ADJUST_TOOL_ID)) return;
+    const elementId = el.id;
+    const loaded = await loadOriginalOf(el);
+    if (loaded === null) return;
+    setMode({
+      kind: "adjust",
+      elementId,
+      sourceDataUrl: loaded.original,
+      assetId: loaded.assetId,
+      fileName: loaded.fileName,
+    });
+  }, [snapshot, definitions.tools, loadOriginalOf]);
+
+  /** ED-01: auto-adjust from the histogram of the original. */
+  const handleAdjustAuto = useCallback(async (): Promise<AutoAdjustResult> => {
+    if (mode.kind !== "adjust") throw new Error("not in adjust mode");
+    return autoAdjust(await (decodePixels ?? browserDecode)(mode.sourceDataUrl));
+  }, [mode, decodePixels]);
+
+  /** ED-00i ①: render at the original size → upload as tool:adjust → replace in place (no resize). */
+  const handleAdjustDone = useCallback(
+    async (params: AdjustParams) => {
+      if (mode.kind !== "adjust") return;
+      const { elementId, sourceDataUrl, assetId, fileName } = mode;
+      if (accessToken === null || accessToken === "") {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return;
+      }
+      try {
+        const output = await commitAdjustOutput(
+          {
+            decode: decodePixels ?? browserDecode,
+            encode: encodePixels ?? browserEncode,
+            upload: (file, parent) =>
+              uploadToolOutput(accessToken, {
+                file,
+                source: "tool:adjust",
+                parentArtifactId: parent,
+              }).then((r) => ({ assetId: r.asset.id, url: r.url })),
+            loadAsDataUrl: fetchAsDataURL,
+            addFile: (f) => excalidrawApi.addFiles?.([f]),
+            newFileId: newCropFileId,
+          },
+          { sourceDataUrl, parentAssetId: assetId, params, fileName },
+        );
+        const scene =
+          elementsRef.current.length > 0
+            ? elementsRef.current
+            : Array.from(excalidrawApi.getSceneElements?.() ?? []);
+        if (scene.length === 0) return;
+        excalidrawApi.updateScene?.({
+          // No width/height: an adjustment never changes the size.
+          elements: replaceImageInPlace(scene, elementId, {
+            fileId: output.fileId,
+            assetId: output.assetId,
+            parentAssetId: assetId,
+            source: "tool:adjust",
+          }),
+          captureUpdate: "IMMEDIATELY",
+        });
+        setMode({ kind: "toolbar" });
+      } catch (err) {
+        toast(err instanceof Error && err.message !== "" ? err.message : DOWNLOAD_FAILED_MESSAGE);
+      }
+    },
+    [mode, accessToken, decodePixels, encodePixels, excalidrawApi, toast],
+  );
+
+  const exitAdjust = useCallback(() => setMode({ kind: "toolbar" }), []);
 
   /** ED-00i ①: crop at source pixels → upload as tool:crop → replace the element in place. */
   const handleCropDone = useCallback(
@@ -754,6 +868,10 @@ export function ImageToolbarLayer({
         void enterCrop();
         return;
       }
+      if (toolId === ADJUST_TOOL_ID) {
+        void enterAdjust();
+        return;
+      }
       if (toolId === FLIP_ROTATE_TOOL_ID) {
         enterFlipRotate();
         return;
@@ -766,7 +884,7 @@ export function ImageToolbarLayer({
       // 其余工具本单都不接（工单 §3 裁决 6）。
       toast(TOOL_PENDING_MESSAGE);
     },
-    [enterFlipRotate, enterCrop, handleDownloadOriginal, toast],
+    [enterFlipRotate, enterCrop, enterAdjust, handleDownloadOriginal, toast],
   );
 
   /**
@@ -834,6 +952,8 @@ export function ImageToolbarLayer({
     return null;
   }
 
+  const adjustTool = definitions.tools.find((tool) => tool.id === ADJUST_TOOL_ID);
+
   const position = imageToolbarPosition({
     el: {
       x: anchor.x ?? 0,
@@ -873,12 +993,27 @@ export function ImageToolbarLayer({
     <div
       ref={containerRef}
       data-testid="image-toolbar-layer"
-      data-state={mode.kind === "flip-rotate" ? "flip-rotate" : mode.kind === "crop" ? "crop" : "toolbar"}
+      data-state={
+        mode.kind === "flip-rotate"
+          ? "flip-rotate"
+          : mode.kind === "crop"
+            ? "crop"
+            : mode.kind === "adjust"
+              ? "adjust"
+              : "toolbar"
+      }
       data-placement={position.placement}
       className="absolute z-20"
       style={{ left: position.x, top: position.y }}
     >
-      {mode.kind === "crop" ? (
+      {mode.kind === "adjust" && adjustTool !== undefined ? (
+        <AdjustToolSession
+          tool={adjustTool}
+          onAuto={handleAdjustAuto}
+          onCancel={exitAdjust}
+          onDone={(params) => void handleAdjustDone(params)}
+        />
+      ) : mode.kind === "crop" ? (
         <CropToolSession
           source={mode.source}
           onCancel={exitCrop}

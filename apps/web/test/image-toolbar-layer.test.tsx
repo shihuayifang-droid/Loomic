@@ -56,6 +56,22 @@ const toolDefinitions = vi.hoisted(() => [
     file_prefix: null,
     event_type: null,
     disabled_rules: [{ id: "no_adjustment", message: "未做任何调整" }],
+    param_groups: [
+      {
+        id: "light",
+        label: "光",
+        params: [
+          {
+            id: "exposure",
+            label: "曝光",
+            min: -100,
+            max: 100,
+            defaultValue: 0,
+            display: { kind: "linear", a: 1, k: 0 },
+          },
+        ],
+      },
+    ],
     eta_seconds: null,
     agent_callable: false,
     availability: "enabled",
@@ -70,6 +86,26 @@ const toolDefinitions = vi.hoisted(() => [
     removable: true,
     consumes: false,
     pricing: null,
+    output_kind: "image",
+    output_format: null,
+    file_prefix: null,
+    event_type: null,
+    disabled_rules: [],
+    eta_seconds: null,
+    agent_callable: false,
+    availability: "enabled",
+  },
+  // 工单35U-fixup1：仍未接入的面板类工具（ED-12 未建），用来代表「未接入的工具」。
+  {
+    id: "erase",
+    label: "橡皮",
+    icon: "erase",
+    testid: "image-toolbar-erase",
+    form: "panel",
+    default_slot: "main",
+    removable: true,
+    consumes: true,
+    pricing: { generator: "erase", tiers: [] },
     output_kind: "image",
     output_format: null,
     file_prefix: null,
@@ -237,6 +273,9 @@ type HarnessOptions = {
   readImageSize?: ReturnType<typeof vi.fn>;
   renderCrop?: ReturnType<typeof vi.fn>;
   loadOriginal?: ReturnType<typeof vi.fn>;
+  /** 工单 35U：调整的解码 / 编码注入。 */
+  decodePixels?: ReturnType<typeof vi.fn>;
+  encodePixels?: ReturnType<typeof vi.fn>;
 };
 
 function setup(options: HarnessOptions = {}) {
@@ -267,6 +306,8 @@ function setup(options: HarnessOptions = {}) {
   if (options.readImageSize !== undefined) props.readImageSize = options.readImageSize;
   if (options.renderCrop !== undefined) props.renderCrop = options.renderCrop;
   if (options.loadOriginal !== undefined) props.loadOriginal = options.loadOriginal;
+  if (options.decodePixels !== undefined) props.decodePixels = options.decodePixels;
+  if (options.encodePixels !== undefined) props.encodePixels = options.encodePixels;
 
   render(<ImageToolbarLayer {...props} />);
 
@@ -506,10 +547,10 @@ describe("ImageToolbarLayer：翻转与旋转二级条", () => {
 });
 
 describe("ImageToolbarLayer：未接入的工具只弹 toast", () => {
-  it("点 image-toolbar-adjust：toast 被调用 1 次，updateScene 0 次", () => {
+  it("点 image-toolbar-erase：toast 被调用 1 次，updateScene 0 次", () => {
     const { api } = setupSelectedImage();
 
-    fireEvent.click(screen.getByTestId("image-toolbar-adjust"));
+    fireEvent.click(screen.getByTestId("image-toolbar-erase"));
 
     expect(toastMock.toast).toHaveBeenCalledTimes(1);
     expect(toastMock.toast).toHaveBeenCalledWith(TOOL_PENDING_MESSAGE);
@@ -843,5 +884,96 @@ describe("ImageToolbarLayer：裁剪（ED-02 / ED-00i，工单 35S）", () => {
     expect(getAssetUrlMock).toHaveBeenCalledWith("test-token", "a-orig");
     expect(loadOriginal).toHaveBeenCalledWith("https://x/original.png");
     expect(renderCrop.mock.calls[0]?.[0]).toBe("data:original");
+  });
+});
+
+describe("ImageToolbarLayer：调整（ED-01 / ED-00i，工单 35U）", () => {
+  const adjustableFiles = {
+    "file-1": {
+      dataURL: "data:image/png;base64,AAAA",
+      mimeType: "image/png",
+      assetId: "a-orig",
+    },
+  };
+
+  // A dim, low-contrast 2x2 image: its histogram sits far from the full range, so
+  // autoAdjust suggests non-zero values (exposure / contrast / whites / blacks).
+  const dimPixels = {
+    width: 2,
+    height: 2,
+    data: new Uint8ClampedArray([
+      60, 60, 60, 255, 70, 70, 70, 255, 80, 80, 80, 255, 90, 90, 90, 255,
+    ]),
+  };
+
+  it("ED-01: 调整 opens the adjust panel on the original", async () => {
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/original.png" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    setupSelectedImage({ files: adjustableFiles, loadOriginal });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-adjust"));
+
+    await waitFor(() => expect(layerState()).toBe("adjust"));
+    expect(screen.getByTestId("adjust-panel")).toBeInTheDocument();
+    expect(getAssetUrlMock).toHaveBeenCalledWith("test-token", "a-orig");
+  });
+
+  it("ED-01: 自动调整 writes the suggested values back", async () => {
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/original.png" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    const decodePixels = vi.fn(async () => dimPixels);
+    setupSelectedImage({ files: adjustableFiles, loadOriginal, decodePixels });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-adjust"));
+    await waitFor(() => expect(layerState()).toBe("adjust"));
+    expect(screen.getByTestId("adjust-done-button")).toBeDisabled();
+
+    fireEvent.click(screen.getByTestId("adjust-auto-button"));
+
+    await waitFor(() => expect(screen.getByTestId("adjust-done-button")).not.toBeDisabled());
+    expect(decodePixels).toHaveBeenCalledWith("data:image/png;base64,ORIG");
+  });
+
+  it("ED-00i: finishing an adjustment replaces the image in place without resizing", async () => {
+    uploadToolOutputMock.mockReset();
+    uploadToolOutputMock.mockResolvedValue({ asset: { id: "a-new" }, url: "https://x/c.png" });
+    fetchAsDataURLMock.mockReset();
+    fetchAsDataURLMock.mockResolvedValue("data:image/png;base64,ADJUSTED");
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/original.png" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    const decodePixels = vi.fn(async () => dimPixels);
+    const encodePixels = vi.fn(async () => new Blob(["png"], { type: "image/png" }));
+    const { api } = setupSelectedImage({
+      files: adjustableFiles,
+      loadOriginal,
+      decodePixels,
+      encodePixels,
+    });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-adjust"));
+    await waitFor(() => expect(layerState()).toBe("adjust"));
+    fireEvent.click(screen.getByTestId("adjust-auto-button"));
+    await waitFor(() => expect(screen.getByTestId("adjust-done-button")).not.toBeDisabled());
+    fireEvent.click(screen.getByTestId("adjust-done-button"));
+
+    await waitFor(() => expect(api.updateScene).toHaveBeenCalledTimes(1));
+    const call = api.updateScene.mock.calls[0]?.[0] as {
+      elements: Array<Record<string, any>>;
+      captureUpdate: string;
+    };
+    const replaced = call.elements.find((el) => el["id"] === "img-1");
+    expect(replaced?.["fileId"]).not.toBe("file-1");
+    expect(replaced?.["fileId"]).toBe(api.addFiles.mock.calls[0]?.[0]?.[0]?.id);
+    expect(replaced?.["customData"].toolSource).toBe("tool:adjust");
+    expect(replaced?.["width"]).toBe(80);
+    expect(replaced?.["height"]).toBe(60);
+    expect(call.captureUpdate).toBe("IMMEDIATELY");
+    expect(uploadToolOutputMock.mock.calls[0]?.[1]).toMatchObject({
+      source: "tool:adjust",
+      parentArtifactId: "a-orig",
+    });
   });
 });
