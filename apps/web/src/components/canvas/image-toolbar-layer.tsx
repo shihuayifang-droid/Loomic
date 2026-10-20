@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { CropRect, Size } from "@/lib/crop-geometry";
 import type { FlipRotateState } from "@/lib/flip-rotate";
@@ -14,6 +14,7 @@ import { replaceImageInPlace } from "@/lib/tool-output-replace";
 import { browserDecode, browserEncode, commitAdjustOutput } from "@/lib/adjust-commit";
 import type { AutoAdjustResult } from "@/lib/adjust-auto";
 import { autoAdjust } from "@/lib/adjust-auto";
+import { ADJUST_PREVIEW_BOX, makePreviewSource } from "@/lib/adjust-preview";
 import type { AdjustParams, PixelBuffer } from "@/lib/adjust-render";
 
 import { useToast } from "@/components/toast";
@@ -424,6 +425,15 @@ export function ImageToolbarLayer({
   const [toolbarWidth, setToolbarWidth] = useState(0);
   /** ED-05：zip 请求进行中（按钮 disabled + 文案「打包中…」）。 */
   const [downloadAllBusy, setDownloadAllBusy] = useState(false);
+  /**
+   * ED-01 预览：进调整面板时解码一次原图，结果留在这里。
+   * 预览小图由它降采样得到，「自动调整」的直方图也复用它，不再解码第二遍。
+   * `sourceDataUrl` 用来确认缓存和当前这张图是同一张。
+   */
+  const [adjustDecode, setAdjustDecode] = useState<{
+    sourceDataUrl: string;
+    pixels: PixelBuffer;
+  } | null>(null);
 
   /** 最近一帧的完整元素数组：写回 `angle` / `scale` 时要拿到**全场景**（不只是选中那个）。 */
   const elementsRef = useRef<unknown[]>([]);
@@ -752,13 +762,32 @@ export function ImageToolbarLayer({
       assetId: loaded.assetId,
       fileName: loaded.fileName,
     });
-  }, [snapshot, definitions.tools, loadOriginalOf]);
+    // 预览（35V）：先上面板，再解码一次原图留缓存；解码失败就不显示预览，面板照常可用。
+    try {
+      const pixels = await (decodePixels ?? browserDecode)(loaded.original);
+      setAdjustDecode({ sourceDataUrl: loaded.original, pixels });
+    } catch {
+      setAdjustDecode(null);
+    }
+  }, [snapshot, definitions.tools, loadOriginalOf, decodePixels]);
 
-  /** ED-01: auto-adjust from the histogram of the original. */
+  /** ED-01: auto-adjust from the histogram of the original（复用进面板时解码的缓存）。 */
   const handleAdjustAuto = useCallback(async (): Promise<AutoAdjustResult> => {
     if (mode.kind !== "adjust") throw new Error("not in adjust mode");
-    return autoAdjust(await (decodePixels ?? browserDecode)(mode.sourceDataUrl));
-  }, [mode, decodePixels]);
+    const cached =
+      adjustDecode !== null && adjustDecode.sourceDataUrl === mode.sourceDataUrl
+        ? adjustDecode.pixels
+        : null;
+    const pixels = cached ?? (await (decodePixels ?? browserDecode)(mode.sourceDataUrl));
+    return autoAdjust(pixels);
+  }, [mode, decodePixels, adjustDecode]);
+
+  /** ED-01 预览：缓存的原图 → 面板尺寸小图。只在缓存或模式变化时降采样一次。 */
+  const adjustPreviewSource = useMemo(() => {
+    if (mode.kind !== "adjust" || adjustDecode === null) return undefined;
+    if (adjustDecode.sourceDataUrl !== mode.sourceDataUrl) return undefined;
+    return makePreviewSource(adjustDecode.pixels, ADJUST_PREVIEW_BOX);
+  }, [mode, adjustDecode]);
 
   /** ED-00i ①: render at the original size → upload as tool:adjust → replace in place (no resize). */
   const handleAdjustDone = useCallback(
@@ -801,6 +830,7 @@ export function ImageToolbarLayer({
           }),
           captureUpdate: "IMMEDIATELY",
         });
+        setAdjustDecode(null);
         setMode({ kind: "toolbar" });
       } catch (err) {
         toast(err instanceof Error && err.message !== "" ? err.message : DOWNLOAD_FAILED_MESSAGE);
@@ -809,7 +839,10 @@ export function ImageToolbarLayer({
     [mode, accessToken, decodePixels, encodePixels, excalidrawApi, toast],
   );
 
-  const exitAdjust = useCallback(() => setMode({ kind: "toolbar" }), []);
+  const exitAdjust = useCallback(() => {
+    setAdjustDecode(null);
+    setMode({ kind: "toolbar" });
+  }, []);
 
   /** ED-00i ①: crop at source pixels → upload as tool:crop → replace the element in place. */
   const handleCropDone = useCallback(
@@ -1009,6 +1042,7 @@ export function ImageToolbarLayer({
       {mode.kind === "adjust" && adjustTool !== undefined ? (
         <AdjustToolSession
           tool={adjustTool}
+          previewSource={adjustPreviewSource}
           onAuto={handleAdjustAuto}
           onCancel={exitAdjust}
           onDone={(params) => void handleAdjustDone(params)}
