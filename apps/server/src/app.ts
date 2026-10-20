@@ -95,6 +95,7 @@ import {
   createAssetReadRepository,
   type AssetReadRepository,
 } from "./db/asset-read-repository.js";
+import { createAssetProvenanceRepository } from "./db/asset-provenance-repository.js";
 import { createAssetWriteRepository } from "./db/asset-write-repository.js";
 import {
   createWorkspaceSkillReadRepository,
@@ -573,6 +574,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const assetWriteRepository = createAssetWriteRepository({
     getTransactionPool: () => getTransactionPool(databaseEnv),
   });
+  // GN-11: provenance goes onto the asset row an upload just created, so the
+  // upload service records it — lazily against the same pool as its neighbours.
+  const assetProvenanceRepository = createAssetProvenanceRepository({
+    getTransactionPool: () => getTransactionPool(databaseEnv),
+  });
   const uploadService =
     options.uploadService ??
     createUploadService({
@@ -581,6 +587,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       projectReadRepository,
       assetReadRepository,
       assetWriteRepository,
+      assetProvenanceRepository,
     });
   const pgmq = env.supabaseDbUrl
     ? createPgmqClient(env.supabaseDbUrl)

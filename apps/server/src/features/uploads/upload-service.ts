@@ -4,6 +4,10 @@ import type {
   AssetReadRepository,
   AssetReadRow,
 } from "../../db/asset-read-repository.js";
+import type {
+  AssetProvenance,
+  AssetProvenanceRepository,
+} from "../../db/asset-provenance-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { ProjectReadRepository } from "../../db/project-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
@@ -38,6 +42,14 @@ export type UploadFileInput = {
   mimeType: string;
   workspaceId: string;
   projectId?: string | undefined;
+  /**
+   * GN-11 / X-P7: where the artifact came from. Omitted means a plain user
+   * upload (`user_upload`); a relay upload names the real source it produced
+   * itself, so relaying an artifact does not change its provenance.
+   */
+  provenance?:
+    | (Partial<Omit<AssetProvenance, "source">> & { source: string })
+    | undefined;
 };
 
 export type UploadService = {
@@ -83,6 +95,15 @@ export function createUploadService(options: {
    * widen a delete. Nothing else in this file writes a table.
    */
   assetWriteRepository: AssetWriteRepository;
+  /**
+   * GN-11: writes where the artifact came from onto the row it just created.
+   * Optional: absent simply means provenance is skipped, which is not an error —
+   * a caller that relays an artifact it produced itself passes one.
+   */
+  assetProvenanceRepository?: Pick<
+    AssetProvenanceRepository,
+    "recordProvenance"
+  >;
 }): UploadService {
   return {
     async uploadFile(user, input) {
@@ -224,6 +245,30 @@ export function createUploadService(options: {
           "Failed to record asset metadata.",
           500,
         );
+      }
+
+      // GN-11 / X-P7: an upload is a user upload unless the caller relays an
+      // artifact it produced itself, in which case it names the real source.
+      // Best effort: the object and its row exist, so a failure only warns.
+      if (options.assetProvenanceRepository) {
+        try {
+          await options.assetProvenanceRepository.recordProvenance({
+            actorId: user.id,
+            assetId,
+            provenance: {
+              source: input.provenance?.source ?? "user_upload",
+              operation: input.provenance?.operation ?? null,
+              modelId: input.provenance?.modelId ?? null,
+              prompt: input.provenance?.prompt ?? null,
+              creditsCharged: input.provenance?.creditsCharged ?? null,
+              actionId: input.provenance?.actionId ?? null,
+              sourceJobId: input.provenance?.sourceJobId ?? null,
+              parentArtifactId: input.provenance?.parentArtifactId ?? null,
+            },
+          });
+        } catch {
+          console.warn(`[asset-provenance] upload ${assetId}: provenance was not recorded`);
+        }
       }
 
       const url = await getAssetUrl(client, input.bucket, objectPath);

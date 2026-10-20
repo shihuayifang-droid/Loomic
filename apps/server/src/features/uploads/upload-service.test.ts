@@ -8,11 +8,12 @@
 //
 // Every metadata write in this file goes through the service_role-only RPC, so the
 // stub asserts on the RPC call rather than on an insert.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import { createProjectService } from "../projects/project-service.js";
 import type { AssetReadRepository } from "../../db/asset-read-repository.js";
+import type { AssetProvenanceRepository } from "../../db/asset-provenance-repository.js";
 import {
   DELETE_OWN_ASSET,
   AssetWriteError,
@@ -40,11 +41,18 @@ function makeStubs(options: {
   assetRow?: Record<string, unknown> | null;
   assetReadError?: { message: string } | null;
   assetDeleteError?: { message: string } | null;
+  provenance?: { failWith?: Error };
 }) {
   const rpcs: RpcCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
   const removals: string[] = [];
   const signedCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
+  /** GN-11: what `uploadFile` asked the provenance repository to record. */
+  const provenanceCalls: Array<{
+    actorId: string | null;
+    assetId: string;
+    provenance: Record<string, unknown>;
+  }> = [];
   /** Ordered side effects, so "remove before delete" is provable. */
   const events: string[] = [];
 
@@ -99,6 +107,19 @@ function makeStubs(options: {
       events.push(`delete-row:${input.assetId}`);
       if (options.assetDeleteError) throw options.assetDeleteError;
       return { deleted: 1 };
+    },
+  };
+
+  // GN-11: the provenance write the upload service performs once the row exists.
+  const provenanceRepository = {
+    async recordProvenance(input: {
+      actorId: string | null;
+      assetId: string;
+      provenance: Record<string, unknown>;
+    }) {
+      provenanceCalls.push(input);
+      if (options.provenance?.failWith) throw options.provenance.failWith;
+      return { updated: 1 };
     },
   };
 
@@ -162,6 +183,17 @@ function makeStubs(options: {
     assetReadRepository: assetRepository as unknown as AssetReadRepository,
     assetWriteRepository:
       assetWriteRepository as unknown as AssetWriteRepository,
+    // GN-11: injected only when the case asks for it, so the 21 cases above keep
+    // running against exactly the wiring they had.
+    ...(options.provenance
+      ? {
+          assetProvenanceRepository:
+            provenanceRepository as unknown as Pick<
+              AssetProvenanceRepository,
+              "recordProvenance"
+            >,
+        }
+      : {}),
   });
 
   return {
@@ -174,6 +206,7 @@ function makeStubs(options: {
     projectLookups,
     assetLookups,
     assetDeletes,
+    provenanceCalls,
     userClient,
   };
 }
@@ -697,5 +730,100 @@ describe("the migrated lookups of the upload write flows", () => {
       // Nothing was signed, and the client was never even built for a missing row.
       expect(stub.signedCalls).toEqual([]);
     }
+  });
+});
+
+// GN-11 / X-P7: an upload records where its artifact came from. A plain upload is
+// a `user_upload`; a caller that relays an artifact it produced itself (the
+// generate route does) names the real source, so relaying does not change it.
+describe("uploadFile records provenance (GN-11)", () => {
+  const PLAIN_PROVENANCE = {
+    source: "user_upload",
+    operation: null,
+    modelId: null,
+    prompt: null,
+    creditsCharged: null,
+    actionId: null,
+    sourceJobId: null,
+    parentArtifactId: null,
+  };
+
+  it("GN-11: a plain upload is recorded as user_upload", async () => {
+    const stub = makeStubs({ provenance: {} });
+
+    const result = await stub.service.uploadFile(USER, {
+      ...FILE,
+      workspaceId: TEAM_WORKSPACE,
+    });
+
+    expect(stub.provenanceCalls).toHaveLength(1);
+    expect(stub.provenanceCalls[0]).toEqual({
+      actorId: "user-1",
+      assetId: "asset-1",
+      provenance: PLAIN_PROVENANCE,
+    });
+    expect(result.asset.id).toBe("asset-1");
+  });
+
+  it("GN-11: a relayed artifact keeps the source its caller names", async () => {
+    const stub = makeStubs({ provenance: {} });
+
+    await stub.service.uploadFile(USER, {
+      ...FILE,
+      workspaceId: TEAM_WORKSPACE,
+      provenance: {
+        source: "generator",
+        operation: "image_generation",
+        modelId: "m-1",
+        prompt: "p",
+      },
+    });
+
+    expect(stub.provenanceCalls).toHaveLength(1);
+    expect(stub.provenanceCalls[0]?.provenance).toEqual({
+      source: "generator",
+      operation: "image_generation",
+      modelId: "m-1",
+      prompt: "p",
+      creditsCharged: null,
+      actionId: null,
+      sourceJobId: null,
+      parentArtifactId: null,
+    });
+  });
+
+  it("GN-11: a provenance failure warns once and the upload still succeeds", async () => {
+    const stub = makeStubs({ provenance: { failWith: new Error("db down") } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const result = await stub.service.uploadFile(USER, {
+        ...FILE,
+        workspaceId: TEAM_WORKSPACE,
+      });
+
+      expect(result.asset.id).toBe("asset-1");
+      expect(warn).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]?.[0]);
+      expect(message).toContain("provenance was not recorded");
+      expect(message).not.toContain("db down");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("GN-11: a failed metadata write records no provenance", async () => {
+    const stub = makeStubs({
+      rpcError: { message: "rpc exploded" },
+      provenance: {},
+    });
+
+    const error = await stub.service
+      .uploadFile(USER, { ...FILE, workspaceId: TEAM_WORKSPACE })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as UploadServiceError);
+
+    expect(error?.statusCode).toBe(500);
+    expect(stub.provenanceCalls).toEqual([]);
   });
 });

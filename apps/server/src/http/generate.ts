@@ -135,6 +135,7 @@ export async function registerGenerateRoutes(
             payload.prompt,
             user,
             options,
+            { modelId: model },
           );
           return { ...uploaded, result: generated };
         },
@@ -348,6 +349,7 @@ async function downloadAndUpload(
   prompt: string,
   user: AuthenticatedUser,
   deps: { uploadService: UploadService; viewerService: ViewerService },
+  provenance: { modelId: string },
 ): Promise<{ signedUrl: string; assetId: string }> {
   const response = await fetch(sourceUrl);
   if (!response.ok) {
@@ -367,6 +369,13 @@ async function downloadAndUpload(
     fileBuffer: buffer,
     mimeType,
     workspaceId: viewer.workspace.id,
+    // GN-11 / X-P7: this route produced the image, so relaying it into Storage
+    // records where it really came from instead of calling it a user upload.
+    provenance: {
+      source: "generator", operation: "image_generation",
+      modelId: provenance.modelId,
+      prompt,
+    },
   });
 
   return { signedUrl: result.url, assetId: result.asset.id };
