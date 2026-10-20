@@ -449,4 +449,29 @@ describe("admin team member routes", () => {
     expect(teamAdminCalls).toEqual([]);
     expect(listActorIds).toEqual([]);
   });
+
+  it("case 17: a non-uuid userId on PATCH is a 400 and never reaches the service (T-06)", async () => {
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/admin/team/members/not-a-uuid",
+      headers: bearer("admin-token"),
+      payload: { role: "admin" },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("invalid_request");
+    expect(teamAdminCalls.length).toBe(0);
+  });
+
+  it("case 18: a non-uuid userId on DELETE is a 400 and never reaches the service (T-06)", async () => {
+    const response = await app.inject({
+      method: "DELETE",
+      url: "/api/admin/team/members/not-a-uuid",
+      headers: bearer("admin-token"),
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("invalid_request");
+    expect(teamAdminCalls.length).toBe(0);
+  });
 });

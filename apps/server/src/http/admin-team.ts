@@ -23,6 +23,18 @@ import type {
 const FORBIDDEN_MESSAGE = "Only team admins can manage team members.";
 const UNAVAILABLE_MESSAGE = "Unable to verify team membership.";
 
+/** Member ids are auth user ids (uuid). Anything else is a malformed path (T-06). */
+const USER_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function sendInvalidUserId(reply: FastifyReply) {
+  return reply.code(400).send(
+    applicationErrorResponseSchema.parse({
+      error: { code: "invalid_request", message: "userId must be a uuid." },
+    }),
+  );
+}
+
 function sendError(reply: FastifyReply, error: unknown) {
   if (error instanceof TeamAdminError) {
     return reply.code(error.statusCode).send(
@@ -143,6 +155,10 @@ export async function registerAdminTeamRoutes(
       const user = await requireAdmin(request, reply);
       if (!user) return reply;
 
+      if (!USER_ID_PATTERN.test(request.params.userId)) {
+        return sendInvalidUserId(reply);
+      }
+
       const parsed = teamMemberRoleRequestSchema.safeParse(request.body);
 
       if (!parsed.success) {
@@ -176,6 +192,10 @@ export async function registerAdminTeamRoutes(
     async (request, reply) => {
       const user = await requireAdmin(request, reply);
       if (!user) return reply;
+
+      if (!USER_ID_PATTERN.test(request.params.userId)) {
+        return sendInvalidUserId(reply);
+      }
 
       try {
         const result = await options.teamAdminService.removeMember(
