@@ -16,6 +16,13 @@ import { describe, expect, it } from "vitest";
 import { CanvasServiceError } from "./canvas-service.js";
 
 /**
+ * Compares the two types themselves — no value assignment in between, so no
+ * literal narrowing can hide a mismatch. The `[A] extends [B]` tuples keep the
+ * conditional type from distributing over the members of a union.
+ */
+type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
+/**
  * Mirrors the CanvasErrorCode union. Kept as a literal list rather than derived
  * from the type, because a type cannot be enumerated at runtime — and a check
  * that silently covers nothing is worse than no check. Adding a member to the
@@ -33,14 +40,14 @@ describe("CanvasServiceError wire contract", () => {
   });
 
   it("the list above still covers the constructor's accepted codes", () => {
-    // Exhaustiveness, stated the way that actually holds: `CanvasServiceError["code"]`
-    // is the whole union the constructor takes, so it only stays assignable to the
-    // literal union of CODES above while the two are equal. A member added to the
-    // union without a line above stops this file compiling — which is the point,
-    // since a code the wire enum does not list is a code the client never receives.
-    const carried: CanvasServiceError["code"] = "service_unavailable";
-    const covered: (typeof CODES)[number] = carried;
-    const err = new CanvasServiceError(covered, "msg", 503);
+    // `Equal` compares the two types themselves, without going through a value
+    // assignment, so no literal narrowing can hide a mismatch: add or drop a
+    // member on one side only and the `exhaustive` line below stops compiling
+    // with TS2322. The check is that compilation, not the expect after it.
+    const exhaustive: Equal<CanvasServiceError["code"], (typeof CODES)[number]> = true;
+    expect(exhaustive).toBe(true);
+
+    const err = new CanvasServiceError("service_unavailable", "msg", 503);
     expect(err.code).toBe("service_unavailable");
     expect(err.statusCode).toBe(503);
   });

@@ -18,6 +18,13 @@ import { describe, expect, it } from "vitest";
 
 import { PaymentServiceError } from "./payment-service.js";
 
+/**
+ * Compares the two types themselves — no value assignment in between, so no
+ * literal narrowing can hide a mismatch. The `[A] extends [B]` tuples keep the
+ * conditional type from distributing over the members of a union.
+ */
+type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
 const PAYMENT_SERVICE_CODES = [
   "payment_not_configured",
   "variant_not_found",
@@ -36,16 +43,15 @@ describe("PaymentServiceError wire contract", () => {
   );
 
   it("the list above still covers the constructor's accepted codes", () => {
-    // Exhaustiveness, stated the way that actually holds: `PaymentServiceError["code"]`
-    // is the whole union the constructor takes, so it only stays assignable to the
-    // literal union of the list above while the two are equal. A member added to the
-    // class without a line here stops this file compiling — which is the point, since
-    // a code the wire enum does not list is a code the client never receives.
-    const carried: PaymentServiceError["code"] = "subscription_not_found";
-    const covered: (typeof PAYMENT_SERVICE_CODES)[number] = carried;
+    // `Equal` compares the two types themselves, without going through a value
+    // assignment, so no literal narrowing can hide a mismatch: add or drop a
+    // member on one side only and the `exhaustive` line below stops compiling
+    // with TS2322. The check is that compilation, not the expect after it.
+    const exhaustive: Equal<PaymentServiceError["code"], (typeof PAYMENT_SERVICE_CODES)[number]> = true;
+    expect(exhaustive).toBe(true);
 
     const error = new PaymentServiceError(
-      covered,
+      "subscription_not_found",
       "No active subscription.",
       404,
     );

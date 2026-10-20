@@ -773,6 +773,13 @@ describe("GET /api/workspace/settings: the read now runs on its repository", () 
 });
 
 /**
+ * Compares the two types themselves — no value assignment in between, so no
+ * literal narrowing can hide a mismatch. The `[A] extends [B]` tuples keep the
+ * conditional type from distributing over the members of a union.
+ */
+type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
+/**
  * Every code `SettingsServiceError` can carry must be one the wire schema accepts.
  *
  * `applicationErrorResponseSchema.parse()` runs INSIDE the route's error path
@@ -804,19 +811,18 @@ describe("SettingsServiceError wire contract", () => {
   );
 
   it("the list above still covers the constructor's accepted codes", () => {
-    // Exhaustiveness, stated the way that actually holds: `SettingsServiceError["code"]`
-    // is the whole union the constructor takes, so it only stays assignable to the
-    // literal union of the list above while the two are equal. A member added to the
-    // class without a line here stops this file compiling — which is the point, since
-    // a code the wire enum does not list is a code the client never receives.
+    // `Equal` compares the two types themselves, without going through a value
+    // assignment, so no literal narrowing can hide a mismatch: add or drop a
+    // member on one side only and the `exhaustive` line below stops compiling
+    // with TS2322. The check is that compilation, not the expect after it.
     // (`settings_not_found` has no throw site in the server today: the only two
     // `new SettingsServiceError(...)` calls pass the two codes around it. It is
     // listed because it IS part of the union, and the union is what reaches the route.)
-    const carried: SettingsServiceError["code"] = "settings_read_failed";
-    const covered: (typeof SETTINGS_SERVICE_CODES)[number] = carried;
+    const exhaustive: Equal<SettingsServiceError["code"], (typeof SETTINGS_SERVICE_CODES)[number]> = true;
+    expect(exhaustive).toBe(true);
 
     const error = new SettingsServiceError(
-      covered,
+      "settings_read_failed",
       "Unable to load workspace settings.",
       500,
     );
