@@ -1,4 +1,4 @@
-// Cross-check the models providers actually expose against the three tables in
+// Cross-check the models providers actually expose against the tier table in
 // packages/shared. Replaces the regex-over-source version, which produced false
 // negatives: providers declare ids inconsistently --
 //
@@ -13,11 +13,7 @@
 // registerAllProviders only registers those whose key is present, and this env
 // only has the kwjm key -- a live registration would show one provider out of
 // nine. Placeholders are safe: keys are only used when generate() is called.
-import {
-  IMAGE_MODEL_COSTS,
-  MODEL_MIN_TIER,
-  VIDEO_MODEL_COSTS,
-} from "@loomic/shared";
+import { MODEL_MIN_TIER } from "@loomic/shared";
 
 import { GoogleImageProvider } from "./src/generation/providers/google-image.js";
 import { GoogleVertexImageProvider } from "./src/generation/providers/google-vertex-image.js";
@@ -64,11 +60,7 @@ if (constructionFailures.length) {
 const imageIds = found.filter((f) => f.kind === "image");
 const videoIds = found.filter((f) => f.kind === "video");
 console.log(`providers expose: ${imageIds.length} image, ${videoIds.length} video`);
-console.log(
-  `tables: MODEL_MIN_TIER=${Object.keys(MODEL_MIN_TIER).length} ` +
-    `IMAGE_MODEL_COSTS=${Object.keys(IMAGE_MODEL_COSTS).length} ` +
-    `VIDEO_MODEL_COSTS=${Object.keys(VIDEO_MODEL_COSTS).length}`,
-);
+console.log(`tables: MODEL_MIN_TIER=${Object.keys(MODEL_MIN_TIER).length}`);
 
 let gaps = 0;
 function report(
@@ -98,29 +90,13 @@ report(
   MODEL_MIN_TIER,
   'defaults to "pro"',
 );
-report(
-  "image models absent from IMAGE_MODEL_COSTS",
-  imageIds,
-  IMAGE_MODEL_COSTS,
-  "defaults to {standard:5, hd:10, ultra:20}: billed at an invented price",
-);
-report(
-  "video models absent from VIDEO_MODEL_COSTS",
-  videoIds,
-  VIDEO_MODEL_COSTS,
-  "defaults to basePlusDuration(80): billed at an invented price",
-);
 
 const exposed = new Set(found.map((f) => f.id));
 const orphans = (table: Record<string, unknown>) =>
   Object.keys(table).filter((id) => !exposed.has(id)).sort();
 
 console.log("\n--- table entries no provider exposes (dead / renamed / key-gated) ---");
-for (const [label, table] of [
-  ["MODEL_MIN_TIER", MODEL_MIN_TIER],
-  ["IMAGE_MODEL_COSTS", IMAGE_MODEL_COSTS],
-  ["VIDEO_MODEL_COSTS", VIDEO_MODEL_COSTS],
-] as const) {
+for (const [label, table] of [["MODEL_MIN_TIER", MODEL_MIN_TIER]] as const) {
   const o = orphans(table as Record<string, unknown>);
   console.log(`${label}: ${o.length}`);
   for (const id of o) console.log(`    ${id}`);

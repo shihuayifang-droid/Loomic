@@ -1,6 +1,6 @@
 "use client";
 
-import { type VideoResolution, getVideoCreditCost } from "@loomic/shared";
+import type { VideoResolution } from "@loomic/shared";
 import { Lock, Plus, Zap } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -183,13 +183,6 @@ export function VideoGeneratorPanel({
   const currentPriceRate = currentModel?.pricing?.rates.find(
     (rate) => rate.resolution === resolution,
   );
-  const currentCreditCost = useMemo(() => {
-    try {
-      return getVideoCreditCost(model, duration, resolution as VideoResolution);
-    } catch {
-      return undefined;
-    }
-  }, [duration, model, resolution]);
 
   const handleAspectRatioChange = useCallback(
     (ratio: string) => {
@@ -779,11 +772,6 @@ export function VideoGeneratorPanel({
                 >
                   <path d="M6.9 4.36H5.385V.76c0-.84-.447-1.01-.991-.38L4 .835.677 4.685c-.457.525-.265.955.422.955h1.517v3.6c0 .84.446 1.01.991.38L4 9.165l3.323-3.85c.456-.525.265-.955-.422-.955" />
                 </svg>
-                {typeof currentCreditCost === "number" && (
-                  <span className="text-xs tabular-nums">
-                    {currentCreditCost}
-                  </span>
-                )}
               </>
             )}
           </button>

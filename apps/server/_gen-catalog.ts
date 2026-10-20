@@ -2,20 +2,18 @@
 //
 // 44 entries is too many to transcribe by hand without introducing exactly the
 // kind of drift this change is meant to remove, so the current values are read
-// out of the live registry plus the three existing tables and emitted as code.
+// out of the live registry and emitted as code.
 //
-// Behaviour must not change: where a model is missing from a table today, the
+// Behaviour must not change: where a model has no configured tier today, the
 // implicit fallback is written out explicitly and tagged NEEDS-REVIEW. Those tags
-// are the list of pricing/tier decisions that were never actually made -- notably
-// kwjm/gpt-image-2, the only image model currently in use, which has been billing
-// at the invented default of hd=10.
+// are the list of tier decisions that were never actually made -- notably
+// kwjm/gpt-image-2, the only image model currently in use.
+//
+// This generator deliberately emits NO prices: a price exists only in the
+// `pricing_rules` table (workorder 31C / BL-14).
 import { writeFileSync } from "node:fs";
 
-import {
-  IMAGE_MODEL_COSTS,
-  MODEL_MIN_TIER,
-  VIDEO_MODEL_COSTS,
-} from "@loomic/shared";
+import { MODEL_MIN_TIER } from "@loomic/shared";
 
 import { GoogleImageProvider } from "./src/generation/providers/google-image.js";
 import { GoogleVertexImageProvider } from "./src/generation/providers/google-vertex-image.js";
@@ -51,15 +49,6 @@ addVideo(() => new GoogleVertexVideoProvider({ project: "p", location: "us-centr
 addVideo(() => new MetasoVideoProvider(KEY));
 addVideo(() => new ReplicateVideoProvider(KEY));
 
-const DEFAULT_IMAGE_COST = { standard: 5, hd: 10, ultra: 20 };
-const DEFAULT_VIDEO_COST = {
-  calculation: "base_plus_duration",
-  base: 80,
-  includedSeconds: 0,
-  perAdditionalSecond: 0,
-  resolutionMultipliers: {},
-};
-
 const q = (s: string) => JSON.stringify(s);
 const reviewNotes: string[] = [];
 
@@ -69,12 +58,9 @@ const imageEntries = imageModels
   .sort((a, b) => a.id.localeCompare(b.id))
   .map((m) => {
     const tierKnown = m.id in MODEL_MIN_TIER;
-    const costKnown = m.id in IMAGE_MODEL_COSTS;
     const tier = MODEL_MIN_TIER[m.id] ?? "pro";
-    const cost = IMAGE_MODEL_COSTS[m.id] ?? DEFAULT_IMAGE_COST;
     const flags: string[] = [];
     if (!tierKnown) flags.push("tier");
-    if (!costKnown) flags.push("cost");
     if (flags.length) reviewNotes.push(`${m.id} (${flags.join(" + ")})`);
     const note = flags.length
       ? `\n    // NEEDS-REVIEW: ${flags.join(" and ")} was never configured; the value below is the old implicit default.`
@@ -82,7 +68,6 @@ const imageEntries = imageModels
     return `  ${q(m.id)}: {${note}
     provider: ${q(m.provider)},
     minTier: ${q(tier)},
-    cost: { standard: ${cost.standard}, hd: ${cost.hd}, ultra: ${cost.ultra} },
   },`;
   })
   .join("\n");
@@ -93,12 +78,9 @@ const videoEntries = videoModels
   .sort((a, b) => a.id.localeCompare(b.id))
   .map((m) => {
     const tierKnown = m.id in MODEL_MIN_TIER;
-    const costKnown = m.id in VIDEO_MODEL_COSTS;
     const tier = MODEL_MIN_TIER[m.id] ?? "pro";
-    const cost = VIDEO_MODEL_COSTS[m.id] ?? DEFAULT_VIDEO_COST;
     const flags: string[] = [];
     if (!tierKnown) flags.push("tier");
-    if (!costKnown) flags.push("cost");
     if (flags.length) reviewNotes.push(`${m.id} (${flags.join(" + ")})`);
     const note = flags.length
       ? `\n    // NEEDS-REVIEW: ${flags.join(" and ")} was never configured; the value below is the old implicit default.`
@@ -106,44 +88,41 @@ const videoEntries = videoModels
     return `  ${q(m.id)}: {${note}
     provider: ${q(m.provider)},
     minTier: ${q(tier)},
-    cost: ${JSON.stringify(cost)},
   },`;
   })
   .join("\n");
 
 const out = `// GENERATED as a starting point by apps/server/_gen-catalog.ts, then maintained by hand.
 //
-// Single source of truth for model business metadata: which plan may use a model
-// and what it costs. Lives in shared because both the server (tier guard, billing)
-// and the web app need it; providers stay in apps/server and own the technical
-// side (how to call the API, capabilities, limits).
+// Single source of truth for model business metadata: which plan may use a model.
+// Lives in shared because both the server (tier guard) and the web app need it;
+// providers stay in apps/server and own the technical side (how to call the API,
+// capabilities, limits).
+//
+// Prices are NOT here. A price exists only in the \`pricing_rules\` table (BL-14
+// 第 1 条) and is asked for at charge time by the price quoter.
 //
 // WHY THIS EXISTS
 // A model id used to be registered in up to three unrelated places -- the
-// provider's own \`models\` array, MODEL_MIN_TIER, and IMAGE_/VIDEO_MODEL_COSTS --
-// with no constraint between them and a silent fallback on every lookup. Missing
-// from the tier table meant "pro" (invisible to free/starter users); missing from
-// a cost table meant an invented price. An audit found 17 such gaps, including
-// \`kwjm/gpt-image-2\`, the only image model actually in use, which was billing at
-// the made-up default of hd=10.
+// provider's own \`models\` array, MODEL_MIN_TIER, and the cost tables -- with no
+// constraint between them and a silent fallback on every lookup. Missing from the
+// tier table meant "pro", invisible to free/starter users. An audit found 17 such
+// gaps, including \`kwjm/gpt-image-2\`, the only image model actually in use.
 //
-// Entries marked NEEDS-REVIEW carry those old implicit defaults, written out
-// explicitly so behaviour is unchanged. They are the pricing/tier decisions that
-// were never really made and still need a real answer.
+// Entries marked NEEDS-REVIEW had no configured tier and carry the old implicit
+// default written out explicitly so behaviour is unchanged. They are the tier
+// decisions that were never really made and still need a real answer.
 import type { SubscriptionPlan } from "./credits.js";
-import type { ImageModelCost, VideoModelCost } from "./credits.js";
 
 export interface ImageCatalogEntry {
   /** Provider that serves this model, for cross-checking against the registry. */
   provider: string;
   minTier: SubscriptionPlan;
-  cost: ImageModelCost;
 }
 
 export interface VideoCatalogEntry {
   provider: string;
   minTier: SubscriptionPlan;
-  cost: VideoModelCost;
 }
 
 export const IMAGE_MODEL_CATALOG = {

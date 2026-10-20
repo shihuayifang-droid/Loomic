@@ -1,4 +1,6 @@
-// @credits-system — Shared types, configs, and cost tables for the credits/billing system
+// @credits-system — Shared types and configs for the credits/billing system.
+// Prices are NOT here: a price exists only in the `pricing_rules` table (BL-14)
+// and is asked for at charge time by the price quoter.
 import { z } from "zod";
 
 import { IMAGE_MODEL_CATALOG, VIDEO_MODEL_CATALOG } from "./model-catalog.js";
@@ -160,53 +162,11 @@ export function getPlanConfig(plan: SubscriptionPlan): PlanConfig {
   return PLAN_CONFIGS[plan];
 }
 
-// ── Model credit costs ──────────────────────────────────────
-
-export interface ImageModelCost {
-  standard: number;
-  hd: number;
-  ultra: number;
-}
-
-export type VideoModelCost =
-  | {
-      calculation: "base_plus_duration";
-      /** Credits covering the included duration at 720p. */
-      base: number;
-      includedSeconds: number;
-      perAdditionalSecond: number;
-      resolutionMultipliers: Partial<Record<VideoResolution, number>>;
-    }
-  | {
-      calculation: "per_second";
-      /** Credits charged for every generated second at each resolution. */
-      rates: Partial<Record<VideoResolution, number>>;
-    };
-
-/**
- * Credit costs per image generation, by model and quality.
- * Models not listed default to { standard: 5, hd: 10, ultra: 20 }.
- */
-const DEFAULT_IMAGE_COST: ImageModelCost = {
-  standard: 5,
-  hd: 10,
-  ultra: 20,
-};
-
-/**
- * Credit costs per video generation by model.
- * Base cost is for the cheapest configuration; actual cost scales with
- * duration and resolution.
- */
-const DEFAULT_VIDEO_COST: VideoModelCost = basePlusDuration(80);
-
-// ── Catalog-derived tables ──────────────────────────────────
+// ── Catalog-derived tier table ───────────────────────────────
 //
-// These replace the three hand-maintained tables above. The catalog
-// (model-catalog.ts) is now the single place a model's plan and price are
+// The catalog (model-catalog.ts) is the single place a model's plan tier is
 // declared, so a model can no longer be present in one table and missing from
-// another — which is what produced 17 silent fallbacks, including the only image
-// model actually in use billing at an invented default.
+// another — which is what produced 17 silent fallbacks.
 //
 // Derived at module load rather than written out again, so there is exactly one
 // copy of each value.
@@ -220,80 +180,6 @@ export const MODEL_MIN_TIER: Record<string, SubscriptionPlan> =
       ([id, entry]) => [id, entry.minTier] as const,
     ),
   ]);
-
-export const IMAGE_MODEL_COSTS: Record<string, ImageModelCost> =
-  Object.fromEntries(
-    Object.entries(IMAGE_MODEL_CATALOG).map(
-      ([id, entry]) => [id, entry.cost] as const,
-    ),
-  );
-
-export const VIDEO_MODEL_COSTS: Record<string, VideoModelCost> =
-  Object.fromEntries(
-    Object.entries(VIDEO_MODEL_CATALOG).map(
-      ([id, entry]) => [id, entry.cost] as const,
-    ),
-  );
-
-/** Calculate the credit cost for an image generation. */
-export function getImageCreditCost(
-  modelId: string,
-  quality: ImageQualityLevel = "hd",
-): number {
-  const costs = IMAGE_MODEL_COSTS[modelId] ?? DEFAULT_IMAGE_COST;
-  return costs[quality];
-}
-
-/** Calculate the credit cost for a video generation. */
-export function getVideoCreditCost(
-  modelId: string,
-  durationSeconds?: number,
-  resolution?: VideoResolution,
-): number {
-  const rule = VIDEO_MODEL_COSTS[modelId] ?? DEFAULT_VIDEO_COST;
-  const duration = durationSeconds ?? 5;
-  const selectedResolution = resolution ?? "720p";
-  if (!Number.isInteger(duration) || duration <= 0) {
-    throw new RangeError("Video duration must be a positive integer");
-  }
-
-  let total: number;
-  if (rule.calculation === "per_second") {
-    const rate = rule.rates[selectedResolution];
-    if (rate == null) {
-      throw new RangeError(
-        `No credit rate configured for ${modelId} at ${selectedResolution}`,
-      );
-    }
-    total = duration * rate;
-  } else {
-    const additionalSeconds = Math.max(0, duration - rule.includedSeconds);
-    total = rule.base + additionalSeconds * rule.perAdditionalSecond;
-    total *= rule.resolutionMultipliers[selectedResolution] ?? 1;
-  }
-
-  // Credit balances are integer-valued. Always round up so fractional
-  // provider rates never undercharge a generation.
-  return Math.ceil(total);
-}
-
-function basePlusDuration(
-  base: number,
-  perAdditionalSecond = 0,
-  multiplier1080p?: number,
-  multiplier4k?: number,
-): VideoModelCost {
-  return {
-    calculation: "base_plus_duration",
-    base,
-    includedSeconds: 5,
-    perAdditionalSecond,
-    resolutionMultipliers: {
-      ...(multiplier1080p != null ? { "1080p": multiplier1080p } : {}),
-      ...(multiplier4k != null ? { "4k": multiplier4k } : {}),
-    },
-  };
-}
 
 // ── Resolution guard ─────────────────────────────────────────
 
@@ -379,7 +265,6 @@ export const annotatedModelSchema = z.object({
   iconUrl: z.string().optional(),
   provider: z.string(),
   accessible: z.boolean(),
-  creditCost: z.number().int(),
   minTier: subscriptionPlanSchema,
   capabilities: z
     .object({

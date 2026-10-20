@@ -1,9 +1,8 @@
-// @credits-system — Image model list with tier annotations, credit costs, and accessibility flags
+// @credits-system — Image model list with tier annotations and accessibility flags
 import type { FastifyInstance } from "fastify";
 
 import {
   canAccessModel,
-  getImageCreditCost,
   MODEL_MIN_TIER,
   type SubscriptionPlan,
 } from "@loomic/shared";
@@ -46,7 +45,6 @@ export async function registerImageModelRoutes(
       iconUrl: m.iconUrl,
       provider: m.provider,
       accessible: userPlan !== null && canAccessModel(userPlan, m.id),
-      creditCost: getImageCreditCost(m.id, "hd"),
       minTier: MODEL_MIN_TIER[m.id] ?? "pro",
       // Exposed so the picker can gate the reference-image dropzone and the
       // aspect-ratio choices per model instead of duplicating those rules.

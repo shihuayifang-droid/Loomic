@@ -1,11 +1,10 @@
-// @credits-system — Video model list with tier annotations, credit costs, and accessibility flags
+// @credits-system — Video model list with tier annotations and accessibility flags
 import type { FastifyInstance } from "fastify";
 
 import {
   MODEL_MIN_TIER,
   type SubscriptionPlan,
   canAccessModel,
-  getVideoCreditCost,
 } from "@loomic/shared";
 
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
@@ -46,7 +45,6 @@ export async function registerVideoModelRoutes(
       iconUrl: m.iconUrl,
       provider: m.provider,
       accessible: userPlan !== null && canAccessModel(userPlan, m.id),
-      creditCost: getVideoCreditCost(m.id),
       minTier: MODEL_MIN_TIER[m.id] ?? "pro",
       capabilities: m.capabilities,
       limits: m.limits,
