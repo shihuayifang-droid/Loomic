@@ -7,6 +7,7 @@ import { createPortal } from "react-dom";
 import type { ImageModelInfo } from "../../lib/server-api";
 import { fetchImageModels, generateImageDirect } from "../../lib/server-api";
 import { visibleOn } from "../../lib/model-visibility";
+import { qualityOptionsFor } from "../../lib/image-quality-options";
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
 import { errorCodeOf, lookupError } from "../../lib/error-catalog";
 import {
@@ -30,11 +31,6 @@ type ImageGeneratorPanelProps = {
 };
 
 const ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4"] as const;
-const QUALITIES = [
-  { value: "standard", label: "1K" },
-  { value: "hd", label: "2K" },
-  { value: "ultra", label: "4K" },
-] as const;
 
 function generateId(): string {
   return (
@@ -138,6 +134,9 @@ export function ImageGeneratorPanel({
     (elementBounds.y + elementBounds.height + scrollY) * zoom + 8;
 
   const currentModel = models.find((m) => m.id === model);
+  // MD-03: null means this model has no resolution parameter at all — render no
+  // selector and send no quality.
+  const qualityOptions = qualityOptionsFor(currentModel);
 
   const handleAspectRatioChange = useCallback(
     (ratio: string) => {
@@ -191,7 +190,7 @@ export function ImageGeneratorPanel({
       const result = await generateImageDirect(
         accessTokenRef.current,
         prompt.trim(),
-        { model, aspectRatio, quality },
+        { model, aspectRatio, ...(qualityOptions ? { quality } : {}) },
       );
 
       // Check if this generation was cancelled while awaiting
@@ -256,6 +255,7 @@ export function ImageGeneratorPanel({
     model,
     aspectRatio,
     quality,
+    qualityOptions,
     excalidrawApi,
     elementId,
     elementBounds,
@@ -435,7 +435,8 @@ export function ImageGeneratorPanel({
 
         {/* Right: quality + ratio + generate */}
         <div className="flex items-center gap-1">
-          {/* Quality (1K/2K/4K) */}
+          {/* Quality (1K/2K/4K) — MD-03: not rendered when the model has no quality tiers */}
+          {qualityOptions && (
           <div className="relative">
             <button data-testid="canvas-image-generator-quality-trigger"
               type="button"
@@ -443,7 +444,8 @@ export function ImageGeneratorPanel({
               className="flex h-8 items-center gap-0.5 rounded-lg px-2 text-xs text-muted-foreground transition-colors hover:bg-muted"
             >
               <span className="text-foreground">
-                {QUALITIES.find((q) => q.value === quality)?.label ?? "2K"}
+                {qualityOptions.find((q) => q.value === quality)?.label ??
+                  qualityOptions[0]?.label}
               </span>
               <svg
                 className="h-3 w-3 text-muted-foreground"
@@ -455,7 +457,7 @@ export function ImageGeneratorPanel({
             </button>
             {showQualityDropdown && (
               <div data-testid="canvas-image-generator-quality-menu" className="absolute bottom-full right-0 z-50 mb-1 rounded-lg border-[0.5px] border-border bg-card py-1 shadow-card">
-                {QUALITIES.map((q) => (
+                {qualityOptions.map((q) => (
                   <button data-testid={`canvas-image-generator-quality-item-${q.value}`}
                     key={q.value}
                     type="button"
@@ -468,6 +470,7 @@ export function ImageGeneratorPanel({
               </div>
             )}
           </div>
+          )}
 
           {/* Aspect ratio */}
           <div className="relative">

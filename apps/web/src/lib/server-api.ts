@@ -636,6 +636,16 @@ export type ImageModelInfo = {
     allowedAspectRatios?: string[];
     supportsOutputFormat: boolean;
   };
+  /**
+   * MD-03: the quality tiers this model can actually produce, declared
+   * server-side. A model with no resolution parameter sends no `quality` key at
+   * all, so the panel renders no quality selector for it.
+   */
+  quality?: Array<{
+    key: "standard" | "hd" | "ultra";
+    output: string;
+    label: string;
+  }>;
 };
 
 export async function fetchImageModels(): Promise<{
