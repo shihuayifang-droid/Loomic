@@ -18,6 +18,7 @@ import {
   CanvasVersionConflict,
 } from "../lib/server-api";
 import { VideoCanvasElement } from "./canvas/video-canvas-element";
+import { FailedGenerationSlot } from "./media/failed-generation-slot";
 import { GenerationShimmer } from "./media/generation-shimmer";
 import {
   partitionCanvasFiles,
@@ -1105,6 +1106,29 @@ export function CanvasEditor({
   // and render an inline player, falling back to default for everything else.
   const renderEmbeddable = useCallback(
     (element: any, _appState: any) => {
+      // GN-19: the job died server-side (`failed: true` replaces a stale
+      // `generating: true`), so show the reason and offer to drop the slot.
+      // Sits BEFORE the generating branch so a failure can never be masked.
+      if (element?.customData?.failed === true) {
+        return (
+          <FailedGenerationSlot
+            kind={element.customData.kind === "video" ? "video" : "image"}
+            message={element.customData.failureMessage ?? "生成失败，请重试"}
+            width={element.width ?? 512}
+            height={element.height ?? 512}
+            onDelete={() => {
+              excalidrawApi?.updateScene({
+                elements: excalidrawApi
+                  .getSceneElements()
+                  .map((el: any) =>
+                    el.id === element.id ? { ...el, isDeleted: true } : el,
+                  ),
+              });
+            }}
+          />
+        );
+      }
+
       // A slot reserved by the backend while a generation runs. Rendered with the
       // same component the chat sidebar uses, so both views show one state for
       // one job — and, being a live component, it can actually animate.
@@ -1139,7 +1163,7 @@ export function CanvasEditor({
       // Return null to let Excalidraw handle non-video embeddables with default behavior
       return null;
     },
-    [handleVideoLoadError],
+    [handleVideoLoadError, excalidrawApi],
   );
 
   // Allow any URL as a valid embeddable so our video links are accepted
