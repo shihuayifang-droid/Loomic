@@ -8,6 +8,8 @@ import type {
   MessageCreateResponse,
   MessageListResponse,
   ModelListResponse,
+  PricingQuoteRequest,
+  PricingQuoteResponse,
   ProfileUpdateResponse,
   ProjectCreateRequest,
   ProjectCreateResponse,
@@ -881,6 +883,27 @@ export async function fetchToolDefinitions(
   if (!response.ok) return handleErrorResponse(response);
   const body: unknown = await response.json();
   return toolListResponseSchema.parse(body).tools;
+}
+
+// --- Pricing API ---
+
+/**
+ * `POST /api/pricing/quote` — ED-00f / GN-01 询价接口（工单31D 的后端）。
+ *
+ * 前端不算价（BL-14 验收 1）：菜单项与按钮上的 `⚡N` 只能来自这次询价的响应。
+ * 请求体原样交给服务端，客户端不拼价格、不带入口（入口由服务端按条目种类决定）。
+ */
+export async function fetchPriceQuote(
+  accessToken: string,
+  body: PricingQuoteRequest,
+): Promise<PricingQuoteResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/pricing/quote`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as PricingQuoteResponse;
 }
 
 // --- Skills API ---

@@ -1,3 +1,5 @@
+import type { PricingQuoteItemResponse } from "@loomic/shared";
+
 /**
  * BL-14 前端 · 价格展示五态（ED-00l 口径）
  *
@@ -69,6 +71,22 @@ export function formatPrice(state: PriceState, variant: PriceVariant): string {
     case "error":
       return RETRY_TEXT;
   }
+}
+
+/** ED-00f: one quote answer → what a price tag shows. */
+export function priceStateFromQuote(
+  item: PricingQuoteItemResponse | undefined,
+): PriceState {
+  // 没有这一条结果 = 询价还没回来（或这一项没进请求），只能显示「估算中」。
+  if (item === undefined) return { status: "estimating" };
+  // 这一条报错（模型未登记 / 工具不存在）：走 ED-00c 的「获取失败」文案。
+  if (item.status === "error") return { status: "error" };
+  // 命中规则的档位本身待定价（BL-14 §3）：即使合计是 0 也不是「免费」。
+  if (item.price_detail.price_status === "pending") return { status: "pending" };
+  // 规则已定价但合计 0 = 免费的直接执行项（ED-00f R9）。
+  if (item.price_detail.total_price === 0) return { status: "free" };
+  // 其余原样取询价的合计，不做任何换算或四舍五入。
+  return { status: "priced", amount: item.price_detail.total_price };
 }
 
 /**

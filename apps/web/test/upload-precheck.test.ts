@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ApiApplicationError,
   downloadAssetsZip,
+  fetchPriceQuote,
   fetchProjectUploads,
   getAssetDownloadUrl,
   uploadFile,
@@ -125,5 +126,34 @@ describe("ED-05: zip download (34W)", () => {
     expect(url.endsWith("/api/uploads/zip")).toBe(true);
     expect(init.method).toBe("POST");
     expect(String(init.body)).toContain("assetIds");
+  });
+});
+
+// 工单35K · ED-00f：菜单标价的来源是 `POST /api/pricing/quote`（GN-01）。
+// 替身只能证明「请求长什么样」，所以这里钉 URL、方法与请求体形状。
+describe("ED-00f: price quote (35K)", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    vi.stubEnv("NEXT_PUBLIC_SERVER_BASE_URL", "http://localhost:3001");
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ items: [], balance: {} }),
+    });
+  });
+
+  it("ED-00f: fetchPriceQuote posts the items to /api/pricing/quote", async () => {
+    const body = { items: [{ kind: "tool" as const, tool_id: "vectorize" }] };
+
+    await fetchPriceQuote("tok", body);
+
+    const [url, init] = mockFetch.mock.calls[0] as [
+      string,
+      { method?: string; body?: unknown; headers?: Record<string, string> },
+    ];
+    expect(url.endsWith("/api/pricing/quote")).toBe(true);
+    expect(init.method).toBe("POST");
+    expect(String(init.body)).toContain("items");
+    expect(String(init.body)).toContain("vectorize");
+    expect(init.headers?.Authorization).toBe("Bearer tok");
   });
 });

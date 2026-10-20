@@ -9,7 +9,9 @@ import {
   type PriceVariant,
   formatPrice,
   isPriceClickable,
+  priceStateFromQuote,
 } from "../src/lib/price-display";
+import type { PricingQuoteItemResponse } from "@loomic/shared";
 
 /**
  * BL-14 前端 · 价格展示五态（ED-00l 口径）
@@ -147,6 +149,67 @@ describe("ED-00l 验收：估算中不是空串", () => {
       expect(text.trim()).not.toBe("");
       expect(text).toContain("估算中");
     }
+  });
+});
+
+/**
+ * ED-00f：菜单项标价只来自询价 —— 这里验的是「一条询价结果映射成哪一种展示状态」，
+ * 五条规则各一例。`12` 是询价返回的合计占位（本仓不许写死真实价格）。
+ */
+function quoteItem(overrides: {
+  price_status?: "pending" | "active";
+  total_price?: number;
+}): PricingQuoteItemResponse {
+  const total = overrides.total_price ?? 12;
+  return {
+    status: "ok",
+    price_detail: {
+      base_price: total,
+      unit_name: "次",
+      unit_count: 1,
+      unit_price: total,
+      total_price: total,
+      search_key: "default",
+      search_key_matched: null,
+      time_variant_period: "normal",
+      disable_unlimited: false,
+      entry_point: "tool",
+      extras: [],
+      price_status: overrides.price_status ?? "active",
+    },
+  };
+}
+
+describe("ED-00f：priceStateFromQuote 五条规则", () => {
+  it("价格未返回（没有这一条结果）→ 估算中", () => {
+    expect(priceStateFromQuote(undefined)).toEqual({ status: "estimating" });
+  });
+
+  it("这一条 status=error → 获取失败", () => {
+    expect(
+      priceStateFromQuote({
+        status: "error",
+        code: "model_not_available",
+        message: "工具不存在",
+      }),
+    ).toEqual({ status: "error" });
+  });
+
+  it("price_status=pending → 待定价（合计 0 也不算免费）", () => {
+    expect(priceStateFromQuote(quoteItem({ price_status: "pending", total_price: 0 }))).toEqual({
+      status: "pending",
+    });
+  });
+
+  it("total_price=0 → 免费", () => {
+    expect(priceStateFromQuote(quoteItem({ total_price: 0 }))).toEqual({ status: "free" });
+  });
+
+  it("其余 → 数字，amount 原样取询价的合计（12）", () => {
+    expect(priceStateFromQuote(quoteItem({ total_price: 12 }))).toEqual({
+      status: "priced",
+      amount: 12,
+    });
   });
 });
 

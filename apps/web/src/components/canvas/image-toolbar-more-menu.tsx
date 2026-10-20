@@ -1,9 +1,13 @@
 "use client";
 
+import type { ReactNode } from "react";
+
 import type { ToolDefinition } from "@loomic/shared";
 
 import { AppDropdown } from "@/components/ui/app-dropdown";
 import type { AppDropdownItem } from "@/components/ui/app-dropdown";
+import { PriceTag } from "@/components/ui/price-tag";
+import type { PriceState } from "@/lib/price-display";
 
 /**
  * ED-00f · 工具条末端的「⋯ 更多」溢出菜单（工单 30F T3）
@@ -37,6 +41,12 @@ export type ImageToolbarMoreMenuProps = {
   /** 整份工具定义。本组件自己按 `default_slot === "more"` + `enabled` 过滤。 */
   tools: ToolDefinition[];
   onToolSelect: (toolId: string) => void;
+  /**
+   * ED-00f：直接执行类菜单项的标价，key = 工具 id（`toolDefinition.id`）。
+   * 值由询价结果映射（`priceStateFromQuote`）。不传 / 缺某个 id 时那一项显示
+   * 「估算中」—— 这正是规格允许的「价格未返回」态，不是占位假数据。
+   */
+  prices?: Readonly<Record<string, PriceState>> | undefined;
 };
 
 function noop() {
@@ -56,12 +66,38 @@ function menuItemId(tool: ToolDefinition): string {
   return tool.id.replace(/_/g, "-");
 }
 
-export function ImageToolbarMoreMenu({ tools, onToolSelect }: ImageToolbarMoreMenuProps) {
+/**
+ * ED-00f R9：直接执行类（`form === "direct"`）的菜单项在右侧标价，打开面板类的
+ * 菜单项不标价 —— 所以 label 的形状由 `form` 决定，不是由某个具体工具决定。
+ */
+function directItemLabel(
+  tool: ToolDefinition,
+  prices: Readonly<Record<string, PriceState>> | undefined,
+): ReactNode {
+  return (
+    <span className="flex w-full items-center justify-between gap-3">
+      <span>{tool.label}</span>
+      <PriceTag
+        state={prices?.[tool.id] ?? { status: "estimating" }}
+        variant="badge"
+      />
+    </span>
+  );
+}
+
+export function ImageToolbarMoreMenu({
+  tools,
+  onToolSelect,
+  prices,
+}: ImageToolbarMoreMenuProps) {
   const items: AppDropdownItem[] = tools
     .filter((tool) => tool.availability === "enabled" && tool.default_slot === "more")
     .map((tool) => ({
       id: menuItemId(tool),
-      label: tool.label,
+      label:
+        tool.form === "direct"
+          ? directItemLabel(tool, prices)
+          : tool.label,
       onSelect: () => onToolSelect(tool.id),
     }));
 

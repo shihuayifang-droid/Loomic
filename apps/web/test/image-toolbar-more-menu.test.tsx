@@ -11,6 +11,7 @@ import {
   ImageToolbarMoreMenu,
   MORE_MENU_TESTID,
 } from "../src/components/canvas/image-toolbar-more-menu";
+import { formatPrice, type PriceState } from "../src/lib/price-display";
 
 /**
  * 工单 30F T3 · ED-00f「更多」溢出菜单。
@@ -298,5 +299,74 @@ describe("ImageToolbarMoreMenu（ED-00f）", () => {
 
     expect(trigger).toHaveAttribute("aria-label", "更多");
     expect(trigger).toHaveAttribute("aria-haspopup", "menu");
+  });
+});
+
+/**
+ * ED-00f R9 · 菜单项标价。
+ *
+ * 夹具里没有「direct 且 default_slot=more」的项（download 在主槽位），
+ * 所以按工单在本文件内额外定义一个 `vectorize`（`form: "direct"` + `more`）。
+ * 价格一律由 `formatPrice` 算出的期望文案钉住，不在测试里另写一份文案。
+ */
+const VECTORIZE: ToolDefinition = {
+  id: "vectorize",
+  label: "矢量",
+  icon: "vectorize",
+  testid: "image-toolbar-vectorize",
+  form: "direct",
+  default_slot: "more",
+  removable: true,
+  consumes: true,
+  pricing: null,
+  output_kind: "none",
+  output_format: null,
+  file_prefix: null,
+  event_type: null,
+  disabled_rules: [],
+  eta_seconds: null,
+  agent_callable: true,
+  availability: "enabled",
+};
+
+function renderMenuWithPrices(prices?: Readonly<Record<string, PriceState>>) {
+  const onToolSelect = vi.fn();
+  render(
+    <ImageToolbarMoreMenu
+      tools={[...toolDefinitions(), VECTORIZE]}
+      onToolSelect={onToolSelect}
+      prices={prices}
+    />,
+  );
+  return { onToolSelect };
+}
+
+describe("ImageToolbarMoreMenu 标价（ED-00f R9）", () => {
+  it("ED-00f: a direct-execute item shows its quoted price", async () => {
+    const priced: PriceState = { status: "priced", amount: 12 };
+    renderMenuWithPrices({ vectorize: priced });
+    await openMenu();
+
+    const item = await screen.findByTestId(`${MORE_MENU_TESTID}-item-vectorize`);
+    expect(item).toHaveTextContent("矢量");
+    expect(item).toHaveTextContent(formatPrice(priced, "badge"));
+  });
+
+  it("ED-00f: without a price a direct item reads 估算中", async () => {
+    renderMenuWithPrices();
+    await openMenu();
+
+    const item = await screen.findByTestId(`${MORE_MENU_TESTID}-item-vectorize`);
+    expect(item).toHaveTextContent(formatPrice({ status: "estimating" }, "badge"));
+    expect(item).toHaveTextContent("估算中");
+  });
+
+  it("ED-00f: a panel item carries no price", async () => {
+    renderMenuWithPrices({ vectorize: { status: "priced", amount: 12 } });
+    await openMenu();
+
+    const panelItem = await screen.findByTestId(`${MORE_MENU_TESTID}-item-adjust`);
+    expect(panelItem).toHaveTextContent("调整");
+    expect(panelItem.textContent ?? "").not.toContain("估算中");
   });
 });
