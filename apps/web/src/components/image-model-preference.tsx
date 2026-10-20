@@ -7,6 +7,7 @@ import { Lock, Zap } from "lucide-react";
 import type { ImageModelInfo } from "../lib/server-api";
 import type { VideoModelInfo } from "../lib/server-api";
 import { fetchImageModels, fetchVideoModels } from "../lib/server-api";
+import { visibleOn } from "../lib/model-visibility";
 import { useImageModelPreference } from "../hooks/use-image-model-preference";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
 
@@ -30,10 +31,10 @@ export function ImageModelPreferencePopover({
   useEffect(() => {
     if (!open) return;
     fetchImageModels()
-      .then((data) => setModels(data.models))
+      .then((data) => setModels(visibleOn(data.models, "preference")))
       .catch(() => {});
     fetchVideoModels()
-      .then((data) => setVideoModels(data.models))
+      .then((data) => setVideoModels(visibleOn(data.models, "preference")))
       .catch(() => {});
   }, [open]);
 

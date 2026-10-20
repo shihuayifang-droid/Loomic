@@ -14,6 +14,7 @@ import {
 } from "../../lib/canvas-video-generator";
 import type { VideoModelInfo } from "../../lib/server-api";
 import { fetchVideoModels, submitVideoJob } from "../../lib/server-api";
+import { visibleOn } from "../../lib/model-visibility";
 import { awaitJobCompletion, type JobProgress } from "../../lib/await-job";
 import { errorCodeOf, lookupError } from "../../lib/error-catalog";
 import { formatRetryLabel } from "../../lib/job-status";
@@ -123,12 +124,13 @@ export function VideoGeneratorPanel({
     fetchVideoModels()
       .then((r) => {
         if (cancelled) return;
-        setModels(r.models);
+        const shown = visibleOn(r.models, "generator");
+        setModels(shown);
         setModel((current) => {
-          if (r.models.length === 0 || r.models.some((m) => m.id === current)) {
+          if (shown.length === 0 || shown.some((m) => m.id === current)) {
             return current;
           }
-          const fallback = r.models[0];
+          const fallback = shown[0];
           if (!fallback) return current;
           const fallbackId = fallback.id;
           updateVideoGeneratorElement(excalidrawApi, elementId, {

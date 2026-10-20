@@ -29,6 +29,7 @@ import type { WebSocketHandle } from "../hooks/use-websocket";
 import { fetchBrandKit } from "../lib/brand-kit-api";
 import { claimDailyCredits } from "../lib/credits-api";
 import { fetchImageModels, fetchWorkspaceSkills, saveMessage } from "../lib/server-api";
+import { visibleOn } from "../lib/model-visibility";
 import type { CanvasSelectedElement } from "./canvas-editor";
 import type { CanvasImageRef } from "./chat-input";
 import {
@@ -280,7 +281,7 @@ export function ChatSidebar({
       .then((data) => {
         if (cancelled) return;
         setImageModelMentionItems(
-          data.models.map((model) => ({
+          visibleOn(data.models, "agent").map((model) => ({
             kind: "image-model",
             id: model.id,
             label: model.displayName,

@@ -6,6 +6,7 @@ import { createPortal } from "react-dom";
 
 import type { ImageModelInfo } from "../../lib/server-api";
 import { fetchImageModels, generateImageDirect } from "../../lib/server-api";
+import { visibleOn } from "../../lib/model-visibility";
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
 import { errorCodeOf, lookupError } from "../../lib/error-catalog";
 import {
@@ -94,7 +95,7 @@ export function ImageGeneratorPanel({
     let cancelled = false;
     fetchImageModels()
       .then((r) => {
-        if (!cancelled) setModels(r.models);
+        if (!cancelled) setModels(visibleOn(r.models, "generator"));
       })
       .catch((err) => {
         console.warn("[image-gen] Failed to fetch models:", err);
