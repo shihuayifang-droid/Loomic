@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   IMAGE_MODEL_CATALOG,
+  IMAGE_QUALITY_NOMINAL_OUTPUT,
   isModelVisibleFor,
   modalityOfCatalogModel,
   MODEL_VISIBILITY_OVERRIDES,
   modelModalitySchema,
   modelVisibility,
+  qualityTierLabel,
   VIDEO_MODEL_CATALOG,
   type ModelSurface,
 } from "./model-catalog.js";
@@ -87,5 +89,29 @@ describe("MD-01 model visibility", () => {
 
   it("MD-01: the shipped override table is empty, so behaviour is unchanged", () => {
     expect(Object.keys(MODEL_VISIBILITY_OVERRIDES)).toEqual([]);
+  });
+});
+
+// MD-03: 档位文案写「实际产出」，不写档位名承诺的分辨率。
+describe("MD-03 quality tier labels", () => {
+  it("MD-03: a tier that delivers its nominal size is labelled with it", () => {
+    expect(qualityTierLabel("ultra", "4K")).toBe("超清 4K");
+    expect(qualityTierLabel("standard", "1K")).toBe("标准 1K");
+  });
+
+  it("MD-03: a capped tier says what it really produces", () => {
+    expect(qualityTierLabel("ultra", "2K")).toBe("超清（实际 2K）");
+  });
+
+  it("MD-03: an uplifted tier says so too", () => {
+    expect(qualityTierLabel("standard", "2K")).toBe("标准（实际 2K）");
+  });
+
+  it("MD-03: the nominal sizes are 1K / 2K / 4K", () => {
+    expect(IMAGE_QUALITY_NOMINAL_OUTPUT).toEqual({
+      standard: "1K",
+      hd: "2K",
+      ultra: "4K",
+    });
   });
 });

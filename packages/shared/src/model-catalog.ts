@@ -296,3 +296,48 @@ export function isModelVisibleFor(
   if (surface === "generator") return v.generator_visible;
   return v.in_preference;
 }
+
+/**
+ * MD-03: the quality levels a model may offer, and what each level's NAME
+ * promises. Kept here (not in a provider) because the panel labels the same
+ * three levels for every provider.
+ */
+export type ImageQualityName = "standard" | "hd" | "ultra";
+
+/** The provider-side resolution labels a tier can declare as its real output. */
+export type ImageQualityOutput = "1K" | "1.5K" | "2K" | "3K" | "4K";
+
+/**
+ * MD-03: the resolution implied by each tier name. A tier whose declared output
+ * differs from this is either capped (ultra → 2K) or uplifted (standard → 2K),
+ * and the label has to say the real number instead of the promised one.
+ */
+export const IMAGE_QUALITY_NOMINAL_OUTPUT = {
+  standard: "1K",
+  hd: "2K",
+  ultra: "4K",
+} as const satisfies Record<ImageQualityName, ImageQualityOutput>;
+
+const IMAGE_QUALITY_NAME_LABELS: Record<ImageQualityName, string> = {
+  standard: "标准",
+  hd: "高清",
+  ultra: "超清",
+};
+
+/**
+ * MD-03: the panel text for one tier of one model.
+ *
+ * `"超清 4K"` when the tier delivers what its name promises; `"超清（实际 2K）"`
+ * when the provider caps (or lifts) it. Advertising the nominal number for a
+ * model that never returns it is the bug this function exists to prevent
+ * (same wording as X-P12).
+ */
+export function qualityTierLabel(
+  quality: ImageQualityName,
+  output: ImageQualityOutput,
+): string {
+  const name = IMAGE_QUALITY_NAME_LABELS[quality];
+  return output === IMAGE_QUALITY_NOMINAL_OUTPUT[quality]
+    ? `${name} ${output}`
+    : `${name}（实际 ${output}）`;
+}
