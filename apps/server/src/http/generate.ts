@@ -19,7 +19,7 @@ import type { CreditService } from "../features/credits/credit-service.js";
 import { CreditServiceError } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
 import { TierGuardError } from "../features/credits/tier-guard.js";
-import { withBilling } from "../features/credits/with-billing.js";
+import { withBilling, type BillingRequest } from "../features/credits/with-billing.js";
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import type { JobService } from "../features/jobs/job-service.js";
@@ -59,6 +59,46 @@ export function generatorRelayProvenance(input: { modelId: string; prompt: strin
     modelId: input.modelId,
     prompt: input.prompt,
     creditsCharged: input.creditsCharged,
+  };
+}
+
+/**
+ * GN-37: the billing request of the asynchronous image route, as a pure function.
+ *
+ * Pulled out of the route so a test can compare the two halves that must agree
+ * without standing up a whole request: the tier guard decides what is ALLOWED at
+ * this quality, and the job payload decides what the executor RENDERS. Two
+ * separate `?? "hd"` expressions would be two copies that happen to look alike
+ * today and could drift tomorrow, so the quality is resolved once into a local
+ * and both halves read that local (the 35N rule, same as the video route does
+ * for its own fields).
+ */
+export function imageJobBillingRequest(
+  user: AuthenticatedUser,
+  workspaceId: string,
+  payload: GenerateImageRequest,
+): BillingRequest {
+  const model = payload.model ?? DEFAULT_IMAGE_MODEL_ID;
+  const quality = payload.quality ?? "hd";
+
+  return {
+    user,
+    workspaceId,
+    modelId: model,
+    entryPoint: "canvas_generator",
+    guard: {
+      jobType: "image_generation",
+      quality,
+    },
+    description: `Image generation: ${model}`,
+    job: {
+      payload: {
+        prompt: payload.prompt,
+        model,
+        aspect_ratio: payload.aspectRatio ?? "1:1",
+        quality,
+      },
+    },
   };
 }
 
@@ -302,6 +342,118 @@ export async function registerGenerateRoutes(
 
       // 202, not 200: the work is accepted and still running. The client watches
       // for job.progress (or queries GET /api/jobs/:id) instead of waiting here.
+      return reply.code(202).send({
+        jobId: result.id,
+        status: result.status,
+        prompt: payload.prompt,
+      });
+    } catch (error) {
+      if (error instanceof TierGuardError) {
+        return reply.code(error.statusCode).send(
+          applicationErrorResponseSchema.parse({
+            error: { code: error.code, message: error.message },
+          }),
+        );
+      }
+      if (error instanceof CreditServiceError) {
+        return reply.code(error.statusCode).send(
+          applicationErrorResponseSchema.parse({
+            error: { code: error.code, message: error.message },
+          }),
+        );
+      }
+      if (error instanceof JobServiceError) {
+        return reply.code(error.statusCode).send(
+          applicationErrorResponseSchema.parse({
+            error: { code: error.code, message: error.message },
+          }),
+        );
+      }
+
+      return reply.code(502).send(generationFailedBody(error));
+    }
+  });
+
+  // ── POST /api/agent/generate-image-job ──────────────────────
+  //
+  // GN-37: the image generator's asynchronous shape, written as the twin of
+  // POST /api/agent/generate-video above. Same three steps, same order:
+  //
+  //   job row (charged, carrying this job's id) -> detached watcher -> 202
+  //
+  // The synchronous /api/agent/generate-image route is deliberately left
+  // untouched: the frontend still calls it until it moves over, and retiring it
+  // is a separate ticket. That is why this is a NEW path instead of a flag on
+  // the old one.
+  app.post("/api/agent/generate-image-job", async (request, reply) => {
+    const user = await options.auth.authenticate(request);
+    if (!user) {
+      return reply.code(401).send(
+        unauthenticatedErrorResponseSchema.parse({
+          error: {
+            code: "unauthorized",
+            message: "Missing or invalid bearer token.",
+          },
+        }),
+      );
+    }
+
+    let payload: GenerateImageRequest;
+    try {
+      payload = generateImageRequestSchema.parse(request.body);
+    } catch {
+      return reply.code(400).send(
+        applicationErrorResponseSchema.parse({
+          error: {
+            code: "invalid_request",
+            message: "Invalid request body.",
+          },
+        }),
+      );
+    }
+
+    if (!options.jobService) {
+      return reply.code(503).send(
+        applicationErrorResponseSchema.parse({
+          error: {
+            code: "service_unavailable",
+            message:
+              "Image generation is not available (job service not configured).",
+          },
+        }),
+      );
+    }
+
+    try {
+      const viewer = await options.viewerService.ensureViewer(user);
+
+      const result = await withBilling(
+        options,
+        imageJobBillingRequest(user, viewer.workspace.id, payload),
+        // The worker owns the outcome from here on, including the dead-letter
+        // refund. Nothing below this line may hold the request open: the whole
+        // point of GN-37 is that the submit answers in about a second.
+        async ({ job }) => job!,
+      );
+
+      // Detached watcher: polls the job and pushes `job.progress` over the WS.
+      // Fire-and-forget on purpose — a failed push must not fail the submit.
+      watchJob(
+        {
+          jobService: options.jobService,
+          ...(options.connectionManager
+            ? { connectionManager: options.connectionManager }
+            : {}),
+        },
+        {
+          jobId: result.id,
+          userId: user.id,
+          jobType: "image_generation",
+        },
+      );
+
+      // 202, not 200: accepted and still running. The client follows
+      // job.progress (or GET /api/jobs/:id) instead of waiting here.
       return reply.code(202).send({
         jobId: result.id,
         status: result.status,
