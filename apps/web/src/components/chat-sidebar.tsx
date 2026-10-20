@@ -29,6 +29,7 @@ import type { WebSocketHandle } from "../hooks/use-websocket";
 import { billingErrorRoute } from "../lib/billing-error-route";
 import { fetchBrandKit } from "../lib/brand-kit-api";
 import { claimDailyCredits } from "../lib/credits-api";
+import { acceptedDropFiles, dragHasFiles } from "../lib/drop-files";
 import { fetchImageModels, fetchWorkspaceSkills, saveMessage } from "../lib/server-api";
 import { visibleOn } from "../lib/model-visibility";
 import { mentionFromPickerItem } from "../lib/mention-kinds";
@@ -930,6 +931,60 @@ export function ChatSidebar({
     initialPrompt,
   ]);
 
+  // ── Whole-panel drop target (AG-02) ──
+  // Dropping a file anywhere on the panel has to become a chat attachment and
+  // must NOT reach the canvas, so the root swallows the drag events itself.
+  // `dragEnterDepth` is a counter because dragenter/dragleave also fire for every
+  // child element the pointer crosses — leaving on child N would otherwise clear
+  // the overlay while the file is still over the panel.
+  const [dragActive, setDragActive] = useState(false);
+  const dragEnterDepth = useRef(0);
+
+  const handlePanelDragEnter = useCallback((e: React.DragEvent) => {
+    if (!dragHasFiles(e.dataTransfer.types)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragEnterDepth.current += 1;
+    setDragActive(true);
+  }, []);
+
+  const handlePanelDragOver = useCallback((e: React.DragEvent) => {
+    if (!dragHasFiles(e.dataTransfer.types)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(true);
+  }, []);
+
+  const handlePanelDragLeave = useCallback(() => {
+    dragEnterDepth.current = Math.max(0, dragEnterDepth.current - 1);
+    if (dragEnterDepth.current === 0) setDragActive(false);
+  }, []);
+
+  const handlePanelDrop = useCallback(
+    (e: React.DragEvent) => {
+      if (!dragHasFiles(e.dataTransfer.types)) return;
+      // Read the flag before our own preventDefault(): the composer's drop
+      // handler already claimed this drop, and re-adding the files here would
+      // upload every image twice.
+      const alreadyHandled = e.defaultPrevented;
+      e.preventDefault();
+      e.stopPropagation();
+      dragEnterDepth.current = 0;
+      setDragActive(false);
+      if (alreadyHandled) return;
+      const files = acceptedDropFiles(Array.from(e.dataTransfer.files));
+      if (files.length > 0) addFiles(files);
+    },
+    [addFiles],
+  );
+
+  const dropZoneProps = {
+    onDragEnter: handlePanelDragEnter,
+    onDragOver: handlePanelDragOver,
+    onDragLeave: handlePanelDragLeave,
+    onDrop: handlePanelDrop,
+  };
+
   // ── Collapsed state ──
   if (!open) {
     return (
@@ -1097,6 +1152,18 @@ export function ChatSidebar({
           {...(selectedCanvasElements ? { selectedCanvasElements } : {})}
         />
       </div>
+
+      {/* AG-02 drop hint — inert, so the pointer stays over the root drop target */}
+      {dragActive && (
+        <div
+          data-testid="agent-drop-overlay"
+          className="pointer-events-none absolute inset-0 z-[60] flex items-center justify-center rounded-lg border-2 border-dashed border-primary/60 bg-primary/10"
+        >
+          <span className="rounded-lg border border-border bg-card/95 px-3 py-1.5 text-sm font-medium text-foreground shadow-sm">
+            松开添加到对话
+          </span>
+        </div>
+      )}
     </>
   );
 
@@ -1133,6 +1200,7 @@ export function ChatSidebar({
           }
           {...eventIsolationProps}
           {...chatAttentionProps}
+          {...dropZoneProps}
         >
           {panelContent}
         </div>
@@ -1148,6 +1216,7 @@ export function ChatSidebar({
       style={{ width: sidebarWidth }}
       {...eventIsolationProps}
       {...chatAttentionProps}
+      {...dropZoneProps}
     >
       {/* Resize handle -- supports mouse, touch, and keyboard (ArrowLeft/ArrowRight) */}
       <div
@@ -1163,7 +1232,7 @@ export function ChatSidebar({
         onTouchStart={handleTouchStart}
         onKeyDown={handleResizeKeyDown}
       />
-      <div className="flex flex-1 flex-col bg-card min-w-0">
+      <div className="relative flex flex-1 flex-col bg-card min-w-0">
         {panelContent}
       </div>
       {creditDialogEl}
