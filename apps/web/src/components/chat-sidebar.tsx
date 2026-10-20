@@ -23,6 +23,7 @@ import {
 import type { ReadyAttachment } from "../hooks/use-image-attachments";
 import { toCanvasRefAttachments, useImageAttachments } from "../hooks/use-image-attachments";
 import { useImageModelPreference } from "../hooks/use-image-model-preference";
+import { usePersistFailedNotice } from "../hooks/use-persist-failed-notice";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
 import type { WebSocketHandle } from "../hooks/use-websocket";
 import { fetchBrandKit } from "../lib/brand-kit-api";
@@ -177,6 +178,7 @@ export function ChatSidebar({
 
   const { showTierLimit } = useTierLimitToast();
   const { toast: showToast } = useToast();
+  usePersistFailedNotice(ws, (message) => showToast(message, "error"));
 
   // ── Sidebar resize ──
   const SIDEBAR_MIN = 300;
