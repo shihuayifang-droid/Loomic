@@ -88,6 +88,14 @@ export type CreditService = {
   updatePlan(workspaceId: string, plan: SubscriptionPlan): Promise<void>;
 };
 
+// ── SQLSTATE ─────────────────────────────────────────────────
+
+/**
+ * X-40 §4: the SQLSTATE `deduct_credits` raises for an insufficient balance
+ * (migration 20261020000001). Matched by code, never by message text.
+ */
+export const INSUFFICIENT_CREDITS_SQLSTATE = "P0402";
+
 // ── Factory ──────────────────────────────────────────────────
 
 /**
@@ -149,7 +157,7 @@ export function createCreditService(options: {
       });
 
       if (error) {
-        if (error.message?.includes("INSUFFICIENT_CREDITS")) {
+        if (error.code === INSUFFICIENT_CREDITS_SQLSTATE) {
           throw new CreditServiceError(
             "insufficient_credits",
             "Not enough credits to perform this action.",

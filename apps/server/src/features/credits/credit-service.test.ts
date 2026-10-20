@@ -12,6 +12,7 @@ import {
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import {
   CreditServiceError,
+  INSUFFICIENT_CREDITS_SQLSTATE,
   createCreditService,
   type CreditService,
   type SubscriptionInfo,
@@ -1190,5 +1191,68 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
     )["from"];
     expect(admin.forbiddenReads).toEqual(["from"]);
     expect(() => forbidden?.()).toThrow(/reached the admin client's "from"/);
+  });
+});
+
+/**
+ * 工单33D · X-40 §4 —— 余额不足只按 SQLSTATE 识别。
+ *
+ * 这三个用例钉住的是「认码不认文案」：同一个 `deduct_credits` 调用，回答里
+ * 有 `P0402` 就是 402 insufficient_credits（文案随便改也一样），没有这个码
+ * 就绝不是余额不足 —— 哪怕 message 里还留着旧的那串 `INSUFFICIENT_CREDITS`。
+ * admin 桩只有一个 `rpc`，除这一条 RPC 之外的接触都不可能发生。
+ */
+describe("credit-service deductCredits: insufficient balance is recognised by SQLSTATE (X-40 §4)", () => {
+  const DEDUCT_USER_ID = "00000000-0000-0000-0000-0000000033d1";
+
+  /** 最小 admin 桩：只有 `deductCredits` 那一次 RPC，原样回答给定的结果。 */
+  function deductServiceWith(answer: {
+    data: unknown;
+    error: unknown;
+  }): CreditService {
+    const admin = {
+      rpc: async () => answer,
+    } as unknown as AdminSupabaseClient;
+
+    return createCreditService({ getAdminClient: () => admin });
+  }
+
+  it("X-40: code P0402 is a 402 insufficient_credits whatever the message says", async () => {
+    // 前提钉住：判据是这个常量，而不是任何一段文案。
+    expect(INSUFFICIENT_CREDITS_SQLSTATE).toBe("P0402");
+
+    const service = deductServiceWith({
+      data: null,
+      error: { code: "P0402", message: "余额不够了（文案随便改）" },
+    });
+
+    const error = await refusal(() =>
+      service.deductCredits(WORKSPACE_ID, DEDUCT_USER_ID, 5),
+    );
+
+    expect(error.code).toBe("insufficient_credits");
+    expect(error.statusCode).toBe(402);
+  });
+
+  it("X-40: the old message text without the code is NOT read as insufficient credits", async () => {
+    const service = deductServiceWith({
+      data: null,
+      error: { code: "P0001", message: "INSUFFICIENT_CREDITS: have 1, need 5" },
+    });
+
+    const error = await refusal(() =>
+      service.deductCredits(WORKSPACE_ID, DEDUCT_USER_ID, 5),
+    );
+
+    expect(error.code).toBe("credit_deduct_failed");
+    expect(error.statusCode).toBe(500);
+  });
+
+  it("X-40: a successful deduction returns the transaction id", async () => {
+    const service = deductServiceWith({ data: "tx-1", error: null });
+
+    await expect(
+      service.deductCredits(WORKSPACE_ID, DEDUCT_USER_ID, 5),
+    ).resolves.toBe("tx-1");
   });
 });
