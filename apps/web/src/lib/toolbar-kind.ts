@@ -111,34 +111,52 @@ export const TOOLBAR_ITEMS: Record<ToolbarKind, readonly string[]> = {
  */
 export type ElementKindInput = {
   readonly type?: string | undefined;
-  readonly customData?: { readonly generating?: unknown } | null | undefined;
+  readonly customData?:
+    | {
+        readonly generating?: unknown;
+        readonly failed?: unknown;
+        readonly isVideo?: unknown;
+      }
+    | null
+    | undefined;
 };
 
 /**
- * 元素 → kind（工单 30Q §3 裁决 2 的表格，**顺序即优先级**）。
+ * 元素 → kind（工单 30Q §3 裁决 2 的表格 + 工单 35A 的补两格，**顺序即优先级**）。
  *
  * | 元素 | kind |
  * |---|---|
+ * | `customData.failed === true` | `placeholder_failed` |
  * | `customData.generating === true` | `placeholder_generating` |
+ * | `customData.isVideo === true` | `video` |
  * | `type === "image"` | `image` |
  * | `text` | `text` |
  * | `rectangle` / `ellipse` / `diamond` | `shape` |
  * | `line` / `arrow` | `line` |
  * | `freedraw` | `freedraw` |
  * | `frame` / `magicframe` | `frame` |
- * | 其余（含 `embeddable`） | `null` |
+ * | 其余（含没有 `isVideo` 的 `embeddable`） | `null` |
  *
- * 三处口径：
+ * 四处口径：
  *
- * 1. **「正在生成」排在最前**。占位符在生成中会显示成一张图（`type` 也是 `image`），
- *    先判 `generating` 才不会把生成中的占位当成可编辑的图片、弹出一条对占位无意义的工具条。
- * 2. `placeholder_failed` 与 `vector` **本单不映射**（返回 `null`），接对应工具的那张单再补，
- *    见 T-78。`embeddable` 同理：视频走另一张单，`video` 的判定不在这里做。
- * 3. `null` 是「这个元素不在本模块的认知范围」，调用方拿到 `null` 就**不显示工具条**
+ * 1. **「生成失败」排在最前**（工单 35A）。失败占位的 `generating` 已经是 `false`，
+ *    这个顺序只是为了稳妥：一个既有 `failed` 又有 `generating` 的脏数据仍应按失败处理。
+ * 2. **「正在生成」排在 `isVideo` 与 `type` 之前**。占位符在生成中会显示成一张图
+ *    （`type` 也是 `image`），先判 `generating` 才不会把生成中的占位当成可编辑的图片、
+ *    弹出一条对占位无意义的工具条。视频也同理：生成中的视频占位该显示「取消」，不是视频面板。
+ * 3. **视频不看 `type`**：画布上的视频是 `type: "embeddable"` + `customData.isVideo === true`，
+ *    所以先判 `isVideo` 再按 `type` 走 switch，`embeddable` 里非视频的对象仍返回 `null`。
+ * 4. `vector` 仍返回 `null`：目前**没有矢量元素的来源**，接对应工具的那张单再补（见 T-78）。
+ *    `null` 是「这个元素不在本模块的认知范围」，调用方拿到 `null` 就**不显示工具条**
  *    （工单 §3 裁决 2 最后一句：任意一个选中元素映射成 null 就不显示）。
+ *
+ * 三个 `customData` 键（`generating` / `failed` / `isVideo`）都只在 `=== true` 时才认，
+ * 字符串 `"true"`、数字 `1` 一律不算（见 {@link ElementKindInput}）。
  */
 export function elementKind(el: ElementKindInput): SelectionItemKind | null {
+  if (el.customData?.failed === true) return "placeholder_failed";
   if (el.customData?.generating === true) return "placeholder_generating";
+  if (el.customData?.isVideo === true) return "video";
   switch (el.type) {
     case "image":
       return "image";

@@ -318,3 +318,56 @@ describe("elementKind：裁决 2 的表格逐行（工单 30Q）", () => {
     expect(kinds).not.toContain("vector");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 工单 35A：补齐 T-78 的两格（失败占位 / 视频）
+// ---------------------------------------------------------------------------
+
+describe("elementKind：工单 35A 补的两格（失败占位 / 视频）", () => {
+  it("ED-00e: a failed slot is placeholder_failed", () => {
+    // 失败占位由服务端 markGenerationSlotFailed 打上 failed: true，generating 同时被置为 false
+    expect(
+      elementKind({ type: "embeddable", customData: { failed: true, generating: false } }),
+    ).toBe("placeholder_failed");
+    // 即使脏数据里两个标记同时为 true，失败也要排在生成中之前
+    expect(
+      elementKind({ type: "image", customData: { failed: true, generating: true } }),
+    ).toBe("placeholder_failed");
+  });
+
+  it("ED-00e: a canvas video is video", () => {
+    // 画布视频是 type: "embeddable" + customData.isVideo === true（lib/canvas-elements.ts）
+    expect(elementKind({ type: "embeddable", customData: { isVideo: true } })).toBe("video");
+    // 不依赖 type：换成别的 type 也认 isVideo
+    expect(elementKind({ type: "rectangle", customData: { isVideo: true } })).toBe("video");
+    // 生成中的视频占位仍归 placeholder_generating（顺序：generating 在 isVideo 之前）
+    expect(
+      elementKind({ type: "embeddable", customData: { isVideo: true, generating: true } }),
+    ).toBe("placeholder_generating");
+  });
+
+  it('ED-00e: failed:"true" as a string is not recognised', () => {
+    // 只在 === true 时认，字符串 "true" 不算（此时 embeddable 没有 isVideo，落到 null）
+    expect(elementKind({ type: "embeddable", customData: { failed: "true" } })).toBeNull();
+    // 同一口径适用于 isVideo
+    expect(elementKind({ type: "embeddable", customData: { isVideo: "true" } })).toBeNull();
+  });
+
+  it("ED-00e: a single failed slot resolves to the retry/delete toolbar", () => {
+    const failedSlot = elementKind({
+      type: "embeddable",
+      customData: { failed: true, generating: false },
+    });
+    expect(resolveToolbar([{ kind: failedSlot! }])).toBe("placeholder_failed");
+    expect(TOOLBAR_ITEMS[resolveToolbar([{ kind: failedSlot! }])]).toEqual(["retry", "delete"]);
+  });
+
+  it("ED-00e: two images and a video resolve to download_all", () => {
+    const image = elementKind({ type: "image" });
+    const video = elementKind({ type: "embeddable", customData: { isVideo: true } });
+    expect(video).toBe("video");
+    const toolbar = resolveToolbar([{ kind: image! }, { kind: image! }, { kind: video! }]);
+    expect(toolbar).toBe("download_all");
+    expect(TOOLBAR_ITEMS[toolbar]).toEqual(["download_all"]);
+  });
+});
