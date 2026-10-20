@@ -2,6 +2,7 @@ import type {
   GeneratedImage,
   ImageGenerateParams,
   ImageModelInfo,
+  ImageQualityTier,
   ImageProvider,
 } from "../types.js";
 import { fetchAsBase64, GenerationError } from "../utils.js";
@@ -65,53 +66,6 @@ const KWJM_IMAGE_DEFAULTS = {
   },
 } as const;
 
-const OPENAI_IMAGE_MODELS: readonly ImageModelInfo[] = [
-  {
-    id: "kwjm/gpt-image-2",
-    displayName: "GPT Image 2",
-    description:
-      "OpenAI gpt-image-2 via the kwjm gateway. Text-to-image and multi-reference image editing. Up to 4K. Good prompt adherence and text rendering.",
-    iconUrl: ICON_OPENAI,
-    ...KWJM_IMAGE_DEFAULTS,
-  },
-  {
-    id: "kwjm/gpt-image-1.5",
-    displayName: "GPT Image 1.5",
-    description:
-      "Previous-generation OpenAI image model via the kwjm gateway. Cheaper and faster than gpt-image-2, lower fidelity.",
-    iconUrl: ICON_OPENAI,
-    ...KWJM_IMAGE_DEFAULTS,
-  },
-  {
-    // P1-e stage 2: the first non-generate operation to be wired end to end.
-    //
-    // Chosen over upscale because kwjm has NO upscaler and no background-removal
-    // model (checked its /v1/models: 121 models, zero matches), while
-    // /images/edits does document a `mask` parameter — the standard inpaint
-    // interface. It is also the stricter test of the abstraction: it needs a new
-    // parameter, not just a different model id.
-    id: "kwjm/gpt-image-2-inpaint",
-    displayName: "GPT Image 2 (Inpaint)",
-    description:
-      "Repaints only the masked region of an image, leaving the rest untouched. Needs a source image plus a PNG mask whose transparent area marks what to replace.",
-    iconUrl: ICON_OPENAI,
-    operation: "inpaint",
-    limits: {
-      // Exactly one source image: /images/edits pairs a single `image[]` with a
-      // single `mask`, and a mask has no meaning against several sources.
-      maxInputImages: 1,
-      supportsOutputFormat: false,
-    },
-  },
-];
-
-/** Semantic quality → gateway `quality` enum (low | medium | high | auto). */
-const QUALITY_MAP: Record<string, string> = {
-  standard: "low",
-  hd: "medium",
-  ultra: "high",
-};
-
 type Orientation = "square" | "landscape" | "portrait";
 
 /**
@@ -141,6 +95,86 @@ const SIZE_TABLE: Record<string, Record<Orientation, string>> = {
     landscape: "3840x2160",
     portrait: "2160x3840",
   },
+};
+
+/**
+ * MD-03: what each tier really produces, read off `SIZE_TABLE` itself instead of
+ * a second hand-kept list. A tier's `output` is the LONGEST edge of the sizes the
+ * table can pick for it — standard 1536 → "1.5K", hd 2048 → "2K",
+ * ultra 3840 → "4K" — so the label cannot claim a resolution the endpoint would
+ * never return for that tier.
+ */
+function kwjmQualityTiers(): { qualityTiers: readonly ImageQualityTier[] } {
+  // Ascending by edge; the table only yields 1024 / 1536 / 2048 / 3840 today.
+  const LABELS: readonly { edge: number; output: ImageQualityTier["output"] }[] = [
+    { edge: 1024, output: "1K" },
+    { edge: 1536, output: "1.5K" },
+    { edge: 2048, output: "2K" },
+    { edge: 3072, output: "3K" },
+    { edge: 3840, output: "4K" },
+  ];
+  return {
+    qualityTiers: (["standard", "hd", "ultra"] as const).map((quality) => {
+      const cells = Object.values(SIZE_TABLE[quality]!);
+      const longest = Math.max(
+        ...cells.map((size) => Math.max(...size.split("x").map(Number))),
+      );
+      const match =
+        LABELS.find((label) => label.edge >= longest) ??
+        LABELS[LABELS.length - 1]!;
+      return { quality, output: match.output };
+    }),
+  };
+}
+
+const OPENAI_IMAGE_MODELS: readonly ImageModelInfo[] = [
+  {
+    id: "kwjm/gpt-image-2",
+    displayName: "GPT Image 2",
+    description:
+      "OpenAI gpt-image-2 via the kwjm gateway. Text-to-image and multi-reference image editing. Up to 4K. Good prompt adherence and text rendering.",
+    iconUrl: ICON_OPENAI,
+    ...KWJM_IMAGE_DEFAULTS,
+    ...kwjmQualityTiers(),
+  },
+  {
+    id: "kwjm/gpt-image-1.5",
+    displayName: "GPT Image 1.5",
+    description:
+      "Previous-generation OpenAI image model via the kwjm gateway. Cheaper and faster than gpt-image-2, lower fidelity.",
+    iconUrl: ICON_OPENAI,
+    ...KWJM_IMAGE_DEFAULTS,
+    ...kwjmQualityTiers(),
+  },
+  {
+    // P1-e stage 2: the first non-generate operation to be wired end to end.
+    //
+    // Chosen over upscale because kwjm has NO upscaler and no background-removal
+    // model (checked its /v1/models: 121 models, zero matches), while
+    // /images/edits does document a `mask` parameter — the standard inpaint
+    // interface. It is also the stricter test of the abstraction: it needs a new
+    // parameter, not just a different model id.
+    id: "kwjm/gpt-image-2-inpaint",
+    displayName: "GPT Image 2 (Inpaint)",
+    description:
+      "Repaints only the masked region of an image, leaving the rest untouched. Needs a source image plus a PNG mask whose transparent area marks what to replace.",
+    iconUrl: ICON_OPENAI,
+    operation: "inpaint",
+    limits: {
+      // Exactly one source image: /images/edits pairs a single `image[]` with a
+      // single `mask`, and a mask has no meaning against several sources.
+      maxInputImages: 1,
+      supportsOutputFormat: false,
+    },
+    ...kwjmQualityTiers(),
+  },
+];
+
+/** Semantic quality → gateway `quality` enum (low | medium | high | auto). */
+const QUALITY_MAP: Record<string, string> = {
+  standard: "low",
+  hd: "medium",
+  ultra: "high",
 };
 
 function orientationOf(aspectRatio: string): Orientation {

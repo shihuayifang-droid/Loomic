@@ -63,6 +63,19 @@ export type ImageOperation =
  */
 export type ImageQuality = "standard" | "hd" | "ultra";
 
+/**
+ * MD-03: what one quality tier really produces on one model.
+ *
+ * `output` is the provider's own resolution label — the value actually put on
+ * the wire — not a promise the tier's name makes. A model that silently caps
+ * `ultra` at 2K declares "2K" here, which is what lets the UI say
+ * "超清（实际 2K）" instead of advertising a resolution the API never returns.
+ */
+export type ImageQualityTier = {
+  quality: ImageQuality;
+  output: "1K" | "1.5K" | "2K" | "3K" | "4K";
+};
+
 export type OutputFormat = "png" | "jpg" | "webp";
 
 export interface ImageGenerateParams {
@@ -154,6 +167,12 @@ export interface ImageModelInfo extends ModelInfo {
    */
   operation: ImageOperation;
   limits: ImageModelLimits;
+  /**
+   * MD-03: the quality tiers this model really honours and what each one
+   * actually produces. Absent = the model takes no resolution parameter, so no
+   * quality selector is shown. Derived from the same map the provider sends.
+   */
+  qualityTiers?: readonly ImageQualityTier[];
 }
 
 export interface ImageProvider {

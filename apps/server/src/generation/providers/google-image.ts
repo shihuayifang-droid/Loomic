@@ -4,6 +4,7 @@ import type {
   GeneratedImage,
   ImageGenerateParams,
   ImageModelInfo,
+  ImageQualityTier,
   ImageProvider,
 } from "../types.js";
 import { aspectRatioToDimensions, fetchAsBase64, GenerationError } from "../utils.js";
@@ -41,6 +42,27 @@ const GEMINI_IMAGE_DEFAULTS = {
   },
 } as const;
 
+/** Semantic quality → Gemini imageSize param. */
+const QUALITY_TO_IMAGE_SIZE: Record<string, string> = {
+  standard: "1K",
+  hd: "2K",
+  ultra: "4K",
+};
+
+/**
+ * MD-03: every Gemini image model is sent `imageSize` (see `generate`), so all
+ * of them declare the same three tiers. Derived from the map above so a label
+ * cannot drift from the value that is actually sent.
+ */
+function geminiQualityTiers(): { qualityTiers: readonly ImageQualityTier[] } {
+  return {
+    qualityTiers: (["standard", "hd", "ultra"] as const).map((quality) => ({
+      quality,
+      output: QUALITY_TO_IMAGE_SIZE[quality] as ImageQualityTier["output"],
+    })),
+  };
+}
+
 const GOOGLE_IMAGE_MODELS: readonly ImageModelInfo[] = [
   {
     id: "google-official/gemini-3-pro-image-preview",
@@ -49,6 +71,7 @@ const GOOGLE_IMAGE_MODELS: readonly ImageModelInfo[] = [
       "Google Gemini 3 Pro image generation & editing preview. Up to 4K resolution. Best quality with advanced reasoning.",
     iconUrl: ICON_GOOGLE,
     ...GEMINI_IMAGE_DEFAULTS,
+    ...geminiQualityTiers(),
   },
   {
     id: "google-official/gemini-3.1-flash-image-preview",
@@ -57,6 +80,7 @@ const GOOGLE_IMAGE_MODELS: readonly ImageModelInfo[] = [
       "Google Gemini 3.1 image generation & editing preview. Faster generation, newest capabilities.",
     iconUrl: ICON_GOOGLE,
     ...GEMINI_IMAGE_DEFAULTS,
+    ...geminiQualityTiers(),
   },
   {
     id: "google-official/gemini-2.5-flash-image",
@@ -65,15 +89,9 @@ const GOOGLE_IMAGE_MODELS: readonly ImageModelInfo[] = [
       "Google Gemini native image generation & editing via direct API. Stable. Best balance of speed and quality.",
     iconUrl: ICON_GOOGLE,
     ...GEMINI_IMAGE_DEFAULTS,
+    ...geminiQualityTiers(),
   },
 ];
-
-/** Semantic quality → Gemini imageSize param. */
-const QUALITY_TO_IMAGE_SIZE: Record<string, string> = {
-  standard: "1K",
-  hd: "2K",
-  ultra: "4K",
-};
 
 /** Gemini finish reasons that indicate content policy / safety blocks. */
 const SAFETY_FINISH_REASONS = new Set([

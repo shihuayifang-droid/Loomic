@@ -1,4 +1,10 @@
-import type { GeneratedImage, ImageGenerateParams, ImageModelInfo, ImageProvider } from "../types.js";
+import type {
+  GeneratedImage,
+  ImageGenerateParams,
+  ImageModelInfo,
+  ImageQualityTier,
+  ImageProvider,
+} from "../types.js";
 import { aspectRatioToDimensions, GenerationError } from "../utils.js";
 
 const REPLICATE_API_BASE = "https://api.replicate.com/v1";
@@ -51,112 +57,11 @@ const ICON_RECRAFT = "https://github.com/recraft-ai.png";
  * "multiple" had no number anywhere, so it is recorded as "unbounded" instead of
  * being guessed at.
  */
-const REPLICATE_IMAGE_MODELS: readonly ImageModelInfo[] = [
-  // Google
-  {
-    id: "google/nano-banana-pro",
-    displayName: "Nano Banana Pro",
-    description: "Google's SOTA image generation & editing model. Up to 4K resolution. Best for multi-reference editing.",
-    iconUrl: ICON_GOOGLE,
-    operation: "generate",
-    limits: { maxInputImages: 14, supportsOutputFormat: true },
-  },
-  {
-    id: "google/nano-banana-2",
-    displayName: "Nano Banana 2",
-    description: "Fast image generation with conversational editing and character consistency. Good for multi-image fusion.",
-    iconUrl: ICON_GOOGLE,
-    operation: "generate",
-    limits: { maxInputImages: 14, supportsOutputFormat: true },
-  },
-  {
-    id: "google/nano-banana",
-    displayName: "Nano Banana",
-    description: "Google's image editing model in Gemini 2.5. Best for editing & transformation tasks.",
-    iconUrl: ICON_GOOGLE,
-    operation: "generate",
-    limits: { maxInputImages: 14, supportsOutputFormat: true },
-  },
-  {
-    id: "google/imagen-4",
-    displayName: "Imagen 4",
-    description: "Google's Imagen 4 flagship text-to-image model. Best pure text-to-image quality.",
-    iconUrl: ICON_GOOGLE,
-    operation: "generate",
-    limits: { maxInputImages: 0, supportsOutputFormat: true },
-  },
-  // OpenAI
-  {
-    id: "openai/gpt-image-1.5",
-    displayName: "GPT Image 1.5",
-    description: "OpenAI's latest image model with better instruction following. Supports background transparency.",
-    iconUrl: ICON_OPENAI,
-    operation: "generate",
-    limits: {
-      maxInputImages: "unbounded",
-      allowedAspectRatios: ["1:1", "3:2", "2:3"],
-      supportsOutputFormat: true,
-    },
-  },
-  // Black Forest Labs
-  {
-    id: "black-forest-labs/flux-kontext-max",
-    displayName: "Flux Kontext Max",
-    description: "Premium text-based image editing with maximum performance and improved typography. Best for single-image editing.",
-    iconUrl: ICON_BFL,
-    operation: "generate",
-    limits: { maxInputImages: 1, supportsOutputFormat: true },
-  },
-  {
-    id: "black-forest-labs/flux-kontext-pro",
-    displayName: "Flux Kontext Pro",
-    description: "SOTA text-based image editing with excellent prompt following and consistent results. Best for single-image editing.",
-    iconUrl: ICON_BFL,
-    operation: "generate",
-    limits: { maxInputImages: 1, supportsOutputFormat: true },
-  },
-  // ByteDance
-  {
-    id: "bytedance/seedream-5-lite",
-    displayName: "Seedream 5.0 Lite",
-    description: "Image generation with built-in reasoning and example-based editing. Up to 3K resolution.",
-    iconUrl: ICON_BYTEDANCE,
-    operation: "generate",
-    limits: { maxInputImages: "unbounded", supportsOutputFormat: true },
-  },
-  {
-    id: "bytedance/seedream-4.5",
-    displayName: "Seedream 4.5",
-    description: "Upgraded ByteDance model with stronger spatial understanding. Up to 4K resolution.",
-    iconUrl: ICON_BYTEDANCE,
-    operation: "generate",
-    limits: { maxInputImages: "unbounded", supportsOutputFormat: false },
-  },
-  {
-    id: "bytedance/seedream-4",
-    displayName: "Seedream 4",
-    description: "Unified text-to-image generation and precise editing. Up to 4K resolution.",
-    iconUrl: ICON_BYTEDANCE,
-    operation: "generate",
-    limits: { maxInputImages: "unbounded", supportsOutputFormat: false },
-  },
-  // Recraft
-  {
-    id: "recraft-ai/recraft-v3",
-    displayName: "Recraft V3",
-    description: "SOTA text-to-image with long text rendering and wide style variety. #1 by Artificial Analysis benchmark.",
-    iconUrl: ICON_RECRAFT,
-    operation: "generate",
-    limits: { maxInputImages: 0, supportsOutputFormat: false },
-  },
-];
-
-/** Model id → its declared limits, for the parameter-building helpers below. */
-const LIMITS_BY_ID = new Map(
-  REPLICATE_IMAGE_MODELS.map((m) => [m.id as string, m.limits] as const),
-);
-
 // ── Quality → model-specific resolution translation ──────────────────────
+//
+// MD-03: declared ABOVE the model list because each entry derives its
+// `qualityTiers` from this table; a later declaration would be in the temporal
+// dead zone while the list initialises. Moved verbatim — the values are unchanged.
 
 type QualityMap = Record<string, Record<string, { param: string; value: string }>>;
 
@@ -201,6 +106,135 @@ const QUALITY_MAP: QualityMap = {
     ultra:    { param: "size", value: "4K" },
   },
 };
+
+/**
+ * MD-03: the tiers a Replicate model really honours, derived from `QUALITY_MAP`
+ * — the very table `applyQuality` sends from. A model with no entry there is sent
+ * no resolution parameter at all, so it declares no tiers and the UI shows no
+ * quality selector. Returns a spreadable fragment so entries stay literal.
+ */
+function tiersFromQualityMap(
+  modelId: string,
+): { qualityTiers?: readonly ImageQualityTier[] } {
+  const modelMap = QUALITY_MAP[modelId];
+  if (!modelMap) return {};
+  const tiers = (["standard", "hd", "ultra"] as const).map((quality) => ({
+    quality,
+    output: modelMap[quality]!.value as ImageQualityTier["output"],
+  }));
+  return tiers ? { qualityTiers: tiers } : {};
+}
+
+const REPLICATE_IMAGE_MODELS: readonly ImageModelInfo[] = [
+  // Google
+  {
+    id: "google/nano-banana-pro",
+    ...tiersFromQualityMap("google/nano-banana-pro"),
+    displayName: "Nano Banana Pro",
+    description: "Google's SOTA image generation & editing model. Up to 4K resolution. Best for multi-reference editing.",
+    iconUrl: ICON_GOOGLE,
+    operation: "generate",
+    limits: { maxInputImages: 14, supportsOutputFormat: true },
+  },
+  {
+    id: "google/nano-banana-2",
+    ...tiersFromQualityMap("google/nano-banana-2"),
+    displayName: "Nano Banana 2",
+    description: "Fast image generation with conversational editing and character consistency. Good for multi-image fusion.",
+    iconUrl: ICON_GOOGLE,
+    operation: "generate",
+    limits: { maxInputImages: 14, supportsOutputFormat: true },
+  },
+  {
+    id: "google/nano-banana",
+    displayName: "Nano Banana",
+    description: "Google's image editing model in Gemini 2.5. Best for editing & transformation tasks.",
+    iconUrl: ICON_GOOGLE,
+    operation: "generate",
+    limits: { maxInputImages: 14, supportsOutputFormat: true },
+  },
+  {
+    id: "google/imagen-4",
+    ...tiersFromQualityMap("google/imagen-4"),
+    displayName: "Imagen 4",
+    description: "Google's Imagen 4 flagship text-to-image model. Best pure text-to-image quality.",
+    iconUrl: ICON_GOOGLE,
+    operation: "generate",
+    limits: { maxInputImages: 0, supportsOutputFormat: true },
+  },
+  // OpenAI
+  {
+    id: "openai/gpt-image-1.5",
+    displayName: "GPT Image 1.5",
+    description: "OpenAI's latest image model with better instruction following. Supports background transparency.",
+    iconUrl: ICON_OPENAI,
+    operation: "generate",
+    limits: {
+      maxInputImages: "unbounded",
+      allowedAspectRatios: ["1:1", "3:2", "2:3"],
+      supportsOutputFormat: true,
+    },
+  },
+  // Black Forest Labs
+  {
+    id: "black-forest-labs/flux-kontext-max",
+    displayName: "Flux Kontext Max",
+    description: "Premium text-based image editing with maximum performance and improved typography. Best for single-image editing.",
+    iconUrl: ICON_BFL,
+    operation: "generate",
+    limits: { maxInputImages: 1, supportsOutputFormat: true },
+  },
+  {
+    id: "black-forest-labs/flux-kontext-pro",
+    displayName: "Flux Kontext Pro",
+    description: "SOTA text-based image editing with excellent prompt following and consistent results. Best for single-image editing.",
+    iconUrl: ICON_BFL,
+    operation: "generate",
+    limits: { maxInputImages: 1, supportsOutputFormat: true },
+  },
+  // ByteDance
+  {
+    id: "bytedance/seedream-5-lite",
+    ...tiersFromQualityMap("bytedance/seedream-5-lite"),
+    displayName: "Seedream 5.0 Lite",
+    description: "Image generation with built-in reasoning and example-based editing. Up to 3K resolution.",
+    iconUrl: ICON_BYTEDANCE,
+    operation: "generate",
+    limits: { maxInputImages: "unbounded", supportsOutputFormat: true },
+  },
+  {
+    id: "bytedance/seedream-4.5",
+    ...tiersFromQualityMap("bytedance/seedream-4.5"),
+    displayName: "Seedream 4.5",
+    description: "Upgraded ByteDance model with stronger spatial understanding. Up to 4K resolution.",
+    iconUrl: ICON_BYTEDANCE,
+    operation: "generate",
+    limits: { maxInputImages: "unbounded", supportsOutputFormat: false },
+  },
+  {
+    id: "bytedance/seedream-4",
+    ...tiersFromQualityMap("bytedance/seedream-4"),
+    displayName: "Seedream 4",
+    description: "Unified text-to-image generation and precise editing. Up to 4K resolution.",
+    iconUrl: ICON_BYTEDANCE,
+    operation: "generate",
+    limits: { maxInputImages: "unbounded", supportsOutputFormat: false },
+  },
+  // Recraft
+  {
+    id: "recraft-ai/recraft-v3",
+    displayName: "Recraft V3",
+    description: "SOTA text-to-image with long text rendering and wide style variety. #1 by Artificial Analysis benchmark.",
+    iconUrl: ICON_RECRAFT,
+    operation: "generate",
+    limits: { maxInputImages: 0, supportsOutputFormat: false },
+  },
+];
+
+/** Model id → its declared limits, for the parameter-building helpers below. */
+const LIMITS_BY_ID = new Map(
+  REPLICATE_IMAGE_MODELS.map((m) => [m.id as string, m.limits] as const),
+);
 
 /** GPT Image 1.5 quality mapping (native `quality` param) */
 const GPT_IMAGE_QUALITY: Record<string, string> = {
