@@ -125,6 +125,13 @@ export const pricingQuoteItemResponseSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("ok"),
     price_detail: priceDetailSchema,
+    /**
+     * GN-05: the model that will run this line, echoed from the tool definition's
+     * `execution_model`. Only tool items carry it (an image / video request names
+     * its own model), so it stays optional. It is not part of `price_detail`: the
+     * price detail describes the priced row, this describes who does the work.
+     */
+    model: z.string().min(1).optional(),
   }),
   z.object({
     status: z.literal("error"),

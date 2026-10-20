@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import Fastify from "fastify";
 import type { FastifyInstance } from "fastify";
 
 import {
@@ -8,9 +9,11 @@ import {
   type EntryPoint,
   type PriceDetail,
   type PricingQuoteItemResponse,
+  type ToolDefinition,
 } from "@loomic/shared";
 
 import { buildApp } from "../app.js";
+import { registerPricingRoutes } from "./pricing.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { CreditService } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
@@ -486,5 +489,93 @@ describe("POST /api/pricing/quote — 请求级错误", () => {
 
     expect(response.statusCode).toBe(401);
     expect(quote).toHaveBeenCalledTimes(0);
+  });
+});
+
+/**
+ * GN-05 —— 工具的「执行模型」写在工具定义里，询价把它带回。
+ *
+ * 本单**不给任何真实工具填 `execution_model`**（选哪个模型属采购 / 产品口径），
+ * 所以这三例用自造的工具表：`registerPricingRoutes` 收一个可选的 `tools`，把
+ * `model-a` 换成 `model-b` 只改这张表，响应里的 `model` 就跟着变 —— 前端一行
+ * 都没动。用独立的 Fastify 实例注册同一条路由，好让注入只影响这三个用例。
+ */
+describe("POST /api/pricing/quote — GN-05：工具的执行模型由配置决定", () => {
+  const EDIT_TEXT = "edit_text";
+
+  function editText(executionModel?: string): ToolDefinition {
+    return {
+      id: EDIT_TEXT,
+      label: "编辑文字",
+      icon: EDIT_TEXT,
+      testid: "image-toolbar-edit-text",
+      form: "panel",
+      default_slot: "main",
+      removable: true,
+      consumes: true,
+      pricing: { generator: EDIT_TEXT, tiers: [] },
+      output_kind: "image",
+      output_format: null,
+      file_prefix: null,
+      event_type: null,
+      disabled_rules: [],
+      eta_seconds: 20,
+      agent_callable: true,
+      availability: "enabled",
+      ...(executionModel === undefined
+        ? {}
+        : { execution_model: executionModel }),
+    };
+  }
+
+  /** 只带这一个工具的 app：工具表由用例注入，请求体与真实的工具询价同构。 */
+  async function quoteWithTool(tool: ToolDefinition) {
+    const instance = Fastify();
+    await registerPricingRoutes(instance, {
+      auth,
+      creditService,
+      priceQuoter,
+      viewerService,
+      tools: [tool],
+    });
+    await instance.ready();
+
+    try {
+      const response = await instance.inject({
+        method: "POST",
+        url: "/api/pricing/quote",
+        headers: { authorization: `Bearer ${TOKEN}` },
+        payload: { items: [{ kind: "tool", tool_id: EDIT_TEXT }] },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json() as { items: PricingQuoteItemResponse[] };
+      return onlyOk(body.items);
+    } finally {
+      await instance.close();
+    }
+  }
+
+  it("GN-05: a tool quote reports the model that runs the tool", async () => {
+    const [item] = await quoteWithTool(editText("model-a"));
+
+    expect(item?.model).toBe("model-a");
+  });
+
+  it("GN-05: switching the execution model is config only", async () => {
+    const [before] = await quoteWithTool(editText("model-a"));
+    const [after] = await quoteWithTool(editText("model-b"));
+
+    expect(before?.model).toBe("model-a");
+    expect(after?.model).toBe("model-b");
+    // 计价键没跟着模型走：`tool:<id>` 的 price_detail 两次逐字相等。
+    expect(after?.price_detail).toEqual(before?.price_detail);
+  });
+
+  it("GN-05: a tool without an execution model reports none", async () => {
+    const [item] = await quoteWithTool(editText());
+
+    expect(item).toBeDefined();
+    expect(item && "model" in item).toBe(false);
   });
 });

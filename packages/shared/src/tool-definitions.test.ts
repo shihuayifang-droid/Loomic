@@ -112,4 +112,18 @@ describe("MD-03 tool definitions: slider groups", () => {
     expect(parsed.id).toBe("adjust");
     expect(parsed.param_groups).toBeUndefined();
   });
+
+  it("GN-05: a tool may name the model that runs it", () => {
+    const parsed = toolDefinitionSchema.parse({
+      ...BASE_TOOL,
+      execution_model: "model-a",
+    });
+
+    expect(parsed.execution_model).toBe("model-a");
+    // Config, not a free-form field: an empty name would leave the tool with no
+    // model at all while still looking configured.
+    expect(() =>
+      toolDefinitionSchema.parse({ ...BASE_TOOL, execution_model: "" }),
+    ).toThrow();
+  });
 });

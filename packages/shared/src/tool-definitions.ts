@@ -144,6 +144,14 @@ export const toolDefinitionSchema = z
      * keeps parsing unchanged.
      */
     param_groups: z.array(toolParamGroupSchema).optional(),
+    /**
+     * GN-05: which model runs this tool; config only — changing it never touches
+     * the client. A tool and a model are not one-to-one: several tools may name
+     * the same model, and swapping the model behind a tool is an edit to this
+     * row, not to any front-end code. Optional, so every existing row (and every
+     * existing fixture) keeps parsing unchanged until purchasing decides.
+     */
+    execution_model: z.string().min(1).optional(),
   })
   /**
    * ED-00k: `consumes` and `pricing` may not disagree. A free tool must not

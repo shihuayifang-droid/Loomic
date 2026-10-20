@@ -57,6 +57,12 @@ export async function registerPricingRoutes(
     creditService: CreditService;
     priceQuoter: PriceQuoter;
     viewerService: ViewerService;
+    /**
+     * GN-05: the tool table a quote reads. The shipped table is the default, and a
+     * test may hand in its own so "swapping a tool's execution model is a config
+     * change" can be proved without editing the table the site ships.
+     */
+    tools?: typeof TOOL_DEFINITIONS;
   },
 ) {
   // POST /api/pricing/quote — quote a batch, no side effects
@@ -103,6 +109,7 @@ export async function registerPricingRoutes(
             plan: balanceInfo.plan,
             priceQuoter: options.priceQuoter,
             at,
+            ...(options.tools ? { tools: options.tools } : {}),
           }),
         );
       }
@@ -142,11 +149,13 @@ async function quoteItem(args: {
   plan: BalanceInfo["plan"];
   priceQuoter: PriceQuoter;
   at: Date;
+  /** GN-05: the tool table to read; defaults to the shipped one. */
+  tools?: typeof TOOL_DEFINITIONS;
 }): Promise<PricingQuoteItemResponse> {
-  const { item, plan, priceQuoter, at } = args;
+  const { item, plan, priceQuoter, at, tools = TOOL_DEFINITIONS } = args;
 
   if (item.kind === "tool") {
-    const tool = TOOL_DEFINITIONS.find((candidate) => candidate.id === item.tool_id);
+    const tool = tools.find((candidate) => candidate.id === item.tool_id);
 
     // Not a 400: the request is well-formed, this one line just cannot be priced.
     if (!tool) {
@@ -166,7 +175,7 @@ async function quoteItem(args: {
       );
     }
 
-    return await askPriceTable(
+    const quoted = await askPriceTable(
       priceQuoter,
       {
         modelId: `${TOOL_MODEL_ID_PREFIX}${tool.id}`,
@@ -175,6 +184,16 @@ async function quoteItem(args: {
       },
       at,
     );
+
+    // GN-05: a tool row may name the model that runs it; the quote echoes it back
+    // so the client keeps no tool -> model table of its own (swap the model =
+    // edit the definition). The priced key (`tool:<id>`) and `price_detail` are
+    // untouched: which model runs a tool does not move the price of the tool.
+    if (quoted.status === "ok" && tool.execution_model) {
+      return { ...quoted, model: tool.execution_model };
+    }
+
+    return quoted;
   }
 
   if (item.kind === "image_generation") {
