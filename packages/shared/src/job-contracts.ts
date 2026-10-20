@@ -119,3 +119,26 @@ export const jobListResponseSchema = z.object({
   jobs: z.array(backgroundJobSchema),
 });
 export type JobListResponse = z.infer<typeof jobListResponseSchema>;
+
+/**
+ * GN-35 / CV-02: the credits of ONE job, as the owner may see them.
+ *
+ * This is deliberately NOT a set of extra columns on `backgroundJobSchema`: the
+ * 22-column projection of a job is pinned by a long list of contract cases, and
+ * widening it to carry two money fields would change every one of them. The
+ * route that serves this shape is read-only and answers for the caller's OWN
+ * job only (workorder 36K).
+ *
+ * `credits_cost` is null for a job that was never charged (a free job, or a job
+ * created before a price was known): null means "not billed", it does NOT mean
+ * zero. `credits_refunded` is never null — a job with no refund row reports 0,
+ * which is what the "已退回 N 积分" line needs to render. `credits_transaction_id`
+ * is null exactly when the charge was never linked to a ledger row.
+ */
+export const jobCreditsResponseSchema = z.object({
+  job_id: z.string().uuid(),
+  credits_cost: z.number().int().nonnegative().nullable(),
+  credits_refunded: z.number().int().nonnegative(),
+  credits_transaction_id: z.string().uuid().nullable(),
+});
+export type JobCreditsResponse = z.infer<typeof jobCreditsResponseSchema>;

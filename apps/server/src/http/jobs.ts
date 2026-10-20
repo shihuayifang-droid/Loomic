@@ -11,6 +11,7 @@ import {
   applicationErrorResponseSchema,
   createImageJobRequestSchema,
   createVideoJobRequestSchema,
+  jobCreditsResponseSchema,
   jobListResponseSchema,
   jobResponseSchema,
   unauthenticatedErrorResponseSchema,
@@ -30,6 +31,7 @@ import {
 } from "../features/credits/tier-guard.js";
 import { withBilling } from "../features/credits/with-billing.js";
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
+import type { JobCreditsReadRepository } from "../db/job-credits-read-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
@@ -59,6 +61,15 @@ export async function registerJobRoutes(
      * money moving.
      */
     refundCanceledJob?: (jobId: string) => Promise<void>;
+    /**
+     * GN-35 / workorder 36K: the credits of ONE job, for its owner. Optional for
+     * the same reason the hook above is — the route still exists and still
+     * denies without one — but a MISSING repository is a failure and not an
+     * empty answer: it is reported as the same `job_query_failed` 500 the job
+     * read beside it reports, because a 200 with invented numbers would be a
+     * wrong line about somebody's money.
+     */
+    jobCreditsReadRepository?: JobCreditsReadRepository;
   },
 ) {
   // POST /api/jobs/image-generation — create image generation job
@@ -214,6 +225,52 @@ export async function registerJobRoutes(
       const job = await options.jobService.getJob(user, jobId);
 
       return reply.code(200).send(jobResponseSchema.parse({ job }));
+    } catch (error) {
+      return sendJobError(error, reply, "job_query_failed");
+    }
+  });
+
+  // GET /api/jobs/:jobId/credits — what one job cost and what came back
+  //
+  // GN-35 / workorder 36K, CV-02: the failed-job line says "已退回 N 积分" and N
+  // comes from here. The read is owner-scoped in its own statement, so a job
+  // that belongs to somebody else and a job that does not exist are the SAME
+  // answer below — one 404, no way to probe for other people's ids.
+  app.get("/api/jobs/:jobId/credits", async (request, reply) => {
+    try {
+      const user = await options.auth.authenticate(request);
+      if (!user) return sendUnauthenticated(reply);
+
+      const { jobId } = request.params as { jobId: string };
+      const repository = options.jobCreditsReadRepository;
+      if (!repository) {
+        // Not an empty answer: a deployment that wired no repository cannot
+        // know what this job cost, and inventing 0 would be a wrong line about
+        // money. The fallback below turns this into the `job_query_failed` 500.
+        throw new Error("job credits read repository is not wired");
+      }
+
+      const credits = await repository.readOwnJobCredits({
+        actorId: user.id,
+        jobId,
+      });
+
+      if (credits === null) {
+        return reply.code(404).send(
+          applicationErrorResponseSchema.parse({
+            error: { code: "job_not_found", message: "Job not found." },
+          }),
+        );
+      }
+
+      return reply.code(200).send(
+        jobCreditsResponseSchema.parse({
+          job_id: credits.jobId,
+          credits_cost: credits.creditsCost,
+          credits_refunded: credits.creditsRefunded,
+          credits_transaction_id: credits.creditsTransactionId,
+        }),
+      );
     } catch (error) {
       return sendJobError(error, reply, "job_query_failed");
     }

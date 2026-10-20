@@ -155,6 +155,11 @@ import {
 // which workspace and to whom is the same repository the worker already uses;
 // the decision (and its "never throws" contract) is `createRefundJob`.
 import { createJobRefundBasisRepository } from "./db/job-refund-basis-repository.js";
+// GN-35 / workorder 36K: the credits of one job, read by its OWNER, behind
+// `GET /api/jobs/:jobId/credits`. Built lazily against the same pool as its
+// neighbours, so `buildApp` still never connects and never needs
+// `DATABASE_URL`; with no pool the route fails closed as `job_query_failed`.
+import { createJobCreditsReadRepository } from "./db/job-credits-read-repository.js";
 import {
   CANCEL_REFUND_DESCRIPTION,
   createRefundJob,
@@ -925,6 +930,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       priceQuoter,
       creditLedgerWriteRepository,
       viewerService,
+      // GN-35 / workorder 36K: what one job cost, what came back, and which
+      // ledger row paid for it. The statement itself is owner-scoped
+      // (`created_by` is the acting user), so the route needs no extra rule.
+      jobCreditsReadRepository: createJobCreditsReadRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
       // The tag is the call site's, exactly as the worker passes its own: both
       // log lines of a cancel refund are attributable to this route.
       refundCanceledJob: (canceledJobId: string) =>
