@@ -571,8 +571,10 @@ export async function deleteAsset(
 export type ProjectUploadItem = {
   id: string;
   name: string;
-  mimeType: string;
-  byteSize: number;
+  /** T-92：服务端可能拿不到（返回 null），调用方不得当必有值用。 */
+  mimeType: string | null;
+  /** T-92：同上。 */
+  byteSize: number | null;
   createdAt: string;
   /** 签名 url；非图片资产可能拿不到（服务端返回 null）。 */
   url: string | null;

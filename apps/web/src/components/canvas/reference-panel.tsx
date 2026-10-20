@@ -3,9 +3,10 @@
 /**
  * 工单 34P · AS-06「参考」面板（需求：参考 tab = 本项目已上传文件列表）。
  *
- * 职责边界（工单目标 3）：本单只交付组件本身 —— **不挂到画布页**，也不做
- * 「拖到画布插入」/「点击插入对话」。列表项的 `onDragStart` 只负责把资产信息
- * 写进 dataTransfer（`application/x-hahart-asset`），接收端是另一张单。
+ * 职责边界：34P 交付组件本身；34Q 起本组件挂到画布页，图片项多一个「插入画布」
+ * 按钮（调 `onInsert`，由画布页的 `insertImageOnCanvas` 落地）。
+ * 「拖到画布插入」仍未做：列表项的 `onDragStart` 只负责把资产信息写进
+ * dataTransfer（`application/x-hahart-asset`），接收端是另一张单。
  *
  * 上传拦截不在这里重写：`uploadFile`（34B）发请求前已按 AS-02 的共享表拦一次，
  * 本项目拒绝时抛 `ApiApplicationError`，其 `message` 就是给用户看的中文原因，
@@ -14,6 +15,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { DragEvent, JSX } from "react";
+import type { ImageArtifact } from "@loomic/shared";
 
 import { useToast } from "@/components/toast";
 import { fetchProjectUploads, uploadFile } from "@/lib/server-api";
@@ -25,15 +27,44 @@ const ASSET_DRAG_MIME = "application/x-hahart-asset";
 type SortOrder = "newest" | "oldest";
 type FilterType = "" | "image" | "video" | "pdf";
 
-function typeLabel(mimeType: string): string {
+function typeLabel(mimeType: string | null): string {
+  if (!mimeType) return "文件";
   if (mimeType === "application/pdf") return "PDF";
   if (mimeType.startsWith("image/")) return "图片";
   if (mimeType.startsWith("video/")) return "视频";
   return "文件";
 }
 
-export function ReferencePanel(props: { accessToken: string; projectId: string }): JSX.Element {
-  const { accessToken, projectId } = props;
+/**
+ * AS-06：把一条上传项转成画布能插入的 `ImageArtifact`。
+ *
+ * 只有「有 url」且「mimeType 是 image/*」的项才转得出来，其余返回 `null`——
+ * 插入画布走 `insertImageOnCanvas`，它要求 url 非空。
+ *
+ * 宽高：上传项不带尺寸，这里统一给 1024×1024；真实比例由
+ * `insertImageOnCanvas` 内部的 `scaleToFit` 按图片实际尺寸缩放进画布，
+ * 所以这里只是占位，不是最终尺寸。
+ */
+export function toImageArtifact(item: ProjectUploadItem): ImageArtifact | null {
+  if (!item.url) return null;
+  if (!item.mimeType?.startsWith("image/")) return null;
+  return {
+    type: "image",
+    title: item.name,
+    url: item.url,
+    assetId: item.id,
+    mimeType: item.mimeType,
+    width: 1024,
+    height: 1024,
+  };
+}
+
+export function ReferencePanel(props: {
+  accessToken: string;
+  projectId: string;
+  onInsert?: (artifact: ImageArtifact) => void;
+}): JSX.Element {
+  const { accessToken, projectId, onInsert } = props;
   const { toast } = useToast();
 
   const [uploads, setUploads] = useState<ProjectUploadItem[]>([]);
@@ -151,7 +182,7 @@ export function ReferencePanel(props: { accessToken: string; projectId: string }
             }}
             className="flex cursor-grab items-center gap-2 rounded-md px-2 py-1 text-xs hover:bg-accent"
           >
-            {item.url && item.mimeType.startsWith("image/") ? (
+            {item.url && item.mimeType?.startsWith("image/") ? (
               <img src={item.url} alt={item.name} className="h-8 w-8 shrink-0 rounded object-cover" />
             ) : (
               <span
@@ -162,6 +193,20 @@ export function ReferencePanel(props: { accessToken: string; projectId: string }
               </span>
             )}
             <span className="truncate">{item.name}</span>
+            {item.url && item.mimeType?.startsWith("image/") ? (
+              <button
+                type="button"
+                data-testid="ref-item-insert"
+                aria-label="插入到画布"
+                onClick={() => {
+                  const artifact = toImageArtifact(item);
+                  if (artifact) onInsert?.(artifact);
+                }}
+                className="ml-auto shrink-0 rounded-md border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground"
+              >
+                插入画布
+              </button>
+            ) : null}
           </li>
         ))}
       </ul>

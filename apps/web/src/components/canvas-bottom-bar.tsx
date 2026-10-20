@@ -22,6 +22,9 @@ interface CanvasBottomBarProps {
   onToggleLayers: () => void;
   filesOpen: boolean;
   onToggleFiles: () => void;
+  /** 34Q: 参考面板开关（与 layers / files 互斥） */
+  referencesOpen: boolean;
+  onToggleReferences: () => void;
   /** Whether any left panel (layers/files) is open — shifts the bar right */
   leftPanelOpen: boolean;
 }
@@ -36,6 +39,8 @@ const PlusIcon = ({ className }: { className?: string }) => <Ico className={clas
 const LayersIcon = ({ className }: { className?: string }) => <Ico className={className} vb="0 0 20 20" fill="currentColor"><path d="M17.189 12.48a.65.65 0 0 1 .622 1.141l-7.5 4.1a.65.65 0 0 1-.623 0l-7.5-4.1a.65.65 0 0 1 .624-1.14L10 16.41zm0-3.036a.65.65 0 0 1 .622 1.14l-7.5 4.1a.65.65 0 0 1-.623 0l-7.5-4.1a.65.65 0 0 1 .624-1.14L10 13.374zm-7.426-7.2a.65.65 0 0 1 .549.035l7.5 4.1a.651.651 0 0 1 0 1.14l-7.5 4.101a.65.65 0 0 1-.624 0l-7.5-4.1a.651.651 0 0 1 0-1.14l7.5-4.101zM3.854 6.948 10 10.31l6.145-3.36L10 3.59z" /></Ico>;
 const FileIcon = ({ className }: { className?: string }) => <Ico className={className} vb="0 0 24 24"><path d="M9 17h6M9 13h6M13 3H8.2c-1.12 0-1.68 0-2.108.218a2 2 0 0 0-.874.874C5 4.52 5 5.08 5 6.2v11.6c0 1.12 0 1.68.218 2.108a2 2 0 0 0 .874.874C6.52 21 7.08 21 8.2 21h7.6c1.12 0 1.68 0 2.108-.218a2 2 0 0 0 .874-.874C19 19.48 19 18.92 19 17.8V9m-6-6 6 6m-6-6v4.4c0 .56 0 .84.109 1.054a1 1 0 0 0 .437.437C13.76 9 14.04 9 14.6 9H19" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></Ico>;
 const CloseIcon = ({ className }: { className?: string }) => <Ico className={className}><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></Ico>;
+/** 34Q：参考面板按钮图标（画框 + 地平线） */
+const ReferenceIcon = ({ className }: { className?: string }) => <Ico className={className} vb="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v13A2.5 2.5 0 0 1 17.5 21h-11A2.5 2.5 0 0 1 4 18.5zM4 16l4.5-4.5L12 15l3-3 5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></Ico>;
 
 /* checkerboard pattern for "transparent" swatch */
 const CheckerIcon = ({ className }: { className?: string }) => (
@@ -128,7 +133,7 @@ function ElementRow({ el, onSelect }: { el: ExcalidrawEl; onSelect: (id: string)
 /* ================================================================
    Main component
    ================================================================ */
-export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, filesOpen, onToggleFiles, leftPanelOpen }: CanvasBottomBarProps) {
+export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, filesOpen, onToggleFiles, referencesOpen, onToggleReferences, leftPanelOpen }: CanvasBottomBarProps) {
   /* ── Zoom state ── */
   const [zoom, setZoom] = useState(1);
 
@@ -207,6 +212,7 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
   const toggleBgPicker = useCallback(() => { const next = !bgPickerOpen; closeAllPopovers(); if (next) setBgPickerOpen(true); }, [bgPickerOpen, closeAllPopovers]);
   const handleToggleLayers = useCallback(() => { closeAllPopovers(); onToggleLayers(); }, [closeAllPopovers, onToggleLayers]);
   const handleToggleFiles = useCallback(() => { closeAllPopovers(); onToggleFiles(); }, [closeAllPopovers, onToggleFiles]);
+  const handleToggleReferences = useCallback(() => { closeAllPopovers(); onToggleReferences(); }, [closeAllPopovers, onToggleReferences]);
 
   return (
     <div
@@ -231,6 +237,11 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
         {/* ── Files button ── */}
         <button data-testid="canvas-files-trigger" type="button" className={`${btnClass} ${filesOpen ? "bg-muted text-foreground" : ""}`} onClick={handleToggleFiles} aria-label="Generated files">
           <FileIcon className="h-3.5 w-3.5" />
+        </button>
+
+        {/* ── References button (34Q) ── */}
+        <button data-testid="canvas-references-trigger" type="button" className={`${btnClass} ${referencesOpen ? "bg-muted text-foreground" : ""}`} onClick={handleToggleReferences} aria-label="References">
+          <ReferenceIcon className="h-4 w-4" />
         </button>
 
         {/* ── Divider ── */}

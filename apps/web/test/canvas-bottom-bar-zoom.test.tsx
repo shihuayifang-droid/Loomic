@@ -29,6 +29,8 @@ function renderBar() {
       onToggleLayers={() => {}}
       filesOpen={false}
       onToggleFiles={() => {}}
+      referencesOpen={false}
+      onToggleReferences={() => {}}
       leftPanelOpen={false}
     />,
   );

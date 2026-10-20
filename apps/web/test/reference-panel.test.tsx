@@ -7,7 +7,7 @@
 //    真实请求的 URL 拼装在 `upload-precheck.test.ts` 里用真身 + mockFetch 钉住（T4）。
 // 2. `@/components/toast` 换成可断言的 spy —— 要验的是「服务端的中文原因原样弹出来」，
 //    不是 toast 组件自己的动画。
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 
@@ -29,7 +29,7 @@ const toastMock = vi.hoisted(() => ({
 
 vi.mock("@/components/toast", () => ({ useToast: () => toastMock }));
 
-import { ReferencePanel } from "../src/components/canvas/reference-panel";
+import { ReferencePanel, toImageArtifact } from "../src/components/canvas/reference-panel";
 
 const firstItem = {
   id: "asset-1",
@@ -155,5 +155,61 @@ describe("ReferencePanel (AS-06)", () => {
       mimeType: "image/png",
       name: "草稿-第一张.png",
     });
+  });
+
+  // ── 34Q：点击插入画布 + T-92（mimeType 可空） ──
+
+  it("AS-06: 插入画布 hands the image to onInsert as an artifact", async () => {
+    const onInsert = vi.fn();
+    render(
+      <ReferencePanel accessToken="tok" projectId="project-1" onInsert={onInsert} />,
+    );
+    await waitFor(() => expect(screen.getAllByTestId("ref-item")).toHaveLength(2));
+
+    fireEvent.click(screen.getAllByTestId("ref-item-insert")[0] as HTMLElement);
+
+    expect(onInsert).toHaveBeenCalledTimes(1);
+    expect(onInsert).toHaveBeenCalledWith({
+      type: "image",
+      title: "草稿-第一张.png",
+      url: "https://example.invalid/signed/one",
+      assetId: "asset-1",
+      mimeType: "image/png",
+      width: 1024,
+      height: 1024,
+    });
+  });
+
+  it("AS-06: a PDF item has no 插入画布 button", async () => {
+    renderPanel();
+    await waitFor(() => expect(screen.getAllByTestId("ref-item")).toHaveLength(2));
+
+    const rows = screen.getAllByTestId("ref-item");
+    expect(within(rows[0] as HTMLElement).getAllByTestId("ref-item-insert")).toHaveLength(1);
+    expect(within(rows[1] as HTMLElement).queryAllByTestId("ref-item-insert")).toHaveLength(0);
+  });
+
+  it("AS-06: toImageArtifact refuses an item without a url", () => {
+    expect(toImageArtifact(secondItem)).toBeNull();
+  });
+
+  it("AS-06: an item without a mime type is listed as 文件", async () => {
+    apiMock.fetchProjectUploads.mockResolvedValue({
+      uploads: [
+        {
+          id: "asset-9",
+          name: "unknown-blob",
+          mimeType: null,
+          byteSize: null,
+          createdAt: "2026-10-11T00:00:00.000Z",
+          url: null,
+        },
+      ],
+    });
+    renderPanel();
+
+    await waitFor(() => expect(screen.getAllByTestId("ref-item")).toHaveLength(1));
+    expect(screen.getAllByTestId("ref-item")[0]).toHaveTextContent("文件");
+    expect(screen.getAllByTestId("ref-item")[0]).toHaveTextContent("unknown-blob");
   });
 });

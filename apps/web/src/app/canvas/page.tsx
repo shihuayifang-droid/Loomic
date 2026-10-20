@@ -36,6 +36,7 @@ import { BrandKitSelector } from "../../components/brand-kit-selector";
 import { CanvasBottomBar } from "../../components/canvas-bottom-bar";
 import { CanvasFilesPanel } from "../../components/canvas-files-panel";
 import { CanvasLayersPanel } from "../../components/canvas-layers-panel";
+import { ReferencePanel } from "../../components/canvas/reference-panel";
 import { CreditHeaderButton } from "../../components/credits/credit-header-button";
 
 function CanvasPageContent() {
@@ -78,6 +79,8 @@ function CanvasPageContent() {
   });
   const [layersOpen, setLayersOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
+  // 34Q：参考面板（AS-06 第 2 步）—— 与 layers / files 三选一
+  const [referencesOpen, setReferencesOpen] = useState(false);
   const [brandKitId, setBrandKitId] = useState<string | null>(null);
   const [projectName, setProjectName] = useState("Untitled");
   const [selectedCanvasElements, setSelectedCanvasElements] = useState<CanvasSelectedElement[]>([]);
@@ -115,8 +118,9 @@ function CanvasPageContent() {
   // Stable callbacks for panel toggles to prevent re-renders of child components
   const handleOpenChat = useCallback(() => setChatOpen(true), []);
   const handleToggleChat = useCallback(() => setChatOpen((v) => !v), []);
-  const handleToggleLayers = useCallback(() => { setLayersOpen((v) => !v); setFilesOpen(false); }, []);
-  const handleToggleFiles = useCallback(() => { setFilesOpen((v) => !v); setLayersOpen(false); }, []);
+  const handleToggleLayers = useCallback(() => { setLayersOpen((v) => !v); setFilesOpen(false); setReferencesOpen(false); }, []);
+  const handleToggleFiles = useCallback(() => { setFilesOpen((v) => !v); setLayersOpen(false); setReferencesOpen(false); }, []);
+  const handleToggleReferences = useCallback(() => { setReferencesOpen((v) => !v); setLayersOpen(false); setFilesOpen(false); }, []);
   const handleCloseLayers = useCallback(() => setLayersOpen(false), []);
   const handleCloseFiles = useCallback(() => setFilesOpen(false), []);
 
@@ -462,7 +466,7 @@ function CanvasPageContent() {
           onApiReady={handleApiReady}
           onStorageMediaError={handleStorageMediaError}
           ws={ws}
-          leftPanelOpen={layersOpen || filesOpen}
+          leftPanelOpen={layersOpen || filesOpen || referencesOpen}
           onSelectionChange={setSelectedCanvasElements}
         />
         <CanvasEmptyHint
@@ -475,7 +479,9 @@ function CanvasPageContent() {
           onToggleLayers={handleToggleLayers}
           filesOpen={filesOpen}
           onToggleFiles={handleToggleFiles}
-          leftPanelOpen={layersOpen || filesOpen}
+          referencesOpen={referencesOpen}
+          onToggleReferences={handleToggleReferences}
+          leftPanelOpen={layersOpen || filesOpen || referencesOpen}
         />
         <CanvasLayersPanel
           excalidrawApi={excalidrawApi}
@@ -487,6 +493,16 @@ function CanvasPageContent() {
           open={filesOpen}
           onClose={handleCloseFiles}
         />
+        {/* 34Q · AS-06：参考面板挂到画布页；「插入画布」复用 handleImageGenerated */}
+        {referencesOpen && accessToken && canvasData ? (
+          <div className="fixed left-0 top-0 z-30 h-full w-[280px] border-r border-border bg-card">
+            <ReferencePanel
+              accessToken={accessToken}
+              projectId={canvasData.projectId}
+              onInsert={handleImageGenerated}
+            />
+          </div>
+        ) : null}
       </div>
       <ChatSidebar
         accessToken={accessToken}
