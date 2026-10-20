@@ -11,9 +11,13 @@
 // bounded and labelled.
 import { describe, expect, it } from "vitest";
 
-import type { MessageMention } from "@loomic/shared";
+import type { ImageAttachment, MessageMention } from "@loomic/shared";
 
-import { MENTION_TEXT_MAX_CHARS, buildUserMessage } from "./runtime.js";
+import {
+  MENTION_TEXT_MAX_CHARS,
+  buildReferenceList,
+  buildUserMessage,
+} from "./runtime.js";
 
 /** A brand-kit mention carrying `textContent` (the @-injected body). */
 function textAssetMention(textContent: string | null): MessageMention {
@@ -86,5 +90,70 @@ describe("buildUserMessage", () => {
 
   it("AG-03: the cap is the spec's 4000 characters", () => {
     expect(MENTION_TEXT_MAX_CHARS).toBe(4000);
+  });
+});
+
+/** An image attachment as the runtime sees it — only the fields it reads. */
+function imageAttachment(assetId: string): ImageAttachment {
+  return { assetId, mimeType: "image/png" };
+}
+
+/** A skill mention: slug + label, and no version/source field yet. */
+function skillMention(slug: string, label: string): MessageMention {
+  return { mentionType: "skill", id: "skill-1", label, slug };
+}
+
+/** A model mention, whose `id` is the model key the agent is told to use. */
+function modelMention(id: string): MessageMention {
+  return { mentionType: "image-model", id, label: id };
+}
+
+describe("buildReferenceList (AG-05)", () => {
+  it("AG-05: a message with one image and one skill ends with their numbered references", () => {
+    const { text } = buildUserMessage(
+      "做一张海报",
+      [imageAttachment("a1")],
+      undefined,
+      [skillMention("poster", "海报")],
+    );
+
+    expect(
+      text.endsWith(
+        "<references>\nImage #1: asset:a1\nSkill #1: poster, 海报\n</references>",
+      ),
+    ).toBe(true);
+  });
+
+  it("AG-05: a mentioned model is listed as Model:", () => {
+    const { text } = buildUserMessage("hi", [], undefined, [
+      modelMention("google/nano-banana"),
+    ]);
+
+    expect(text).toContain("Model: google/nano-banana");
+  });
+
+  it("AG-05: no attachments and no mentions add no reference list", () => {
+    expect(buildReferenceList([], [])).toBeNull();
+    expect(buildUserMessage("hi", [])).toEqual({ text: "hi" });
+  });
+
+  it("AG-05: the existing blocks are kept", () => {
+    const { text } = buildUserMessage(
+      "做一张海报",
+      [imageAttachment("a1")],
+      undefined,
+      [skillMention("poster", "海报")],
+    );
+
+    expect(text).toContain("<input_images");
+    expect(text).toContain("<human_skill_mentions");
+  });
+
+  it("AG-05: reference values are escaped", () => {
+    const { text } = buildUserMessage("hi", [], undefined, [
+      skillMention("poster", 'a"<b>'),
+    ]);
+
+    expect(text).toContain("Skill #1: poster, a&quot;&lt;b&gt;");
   });
 });

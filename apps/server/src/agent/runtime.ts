@@ -115,8 +115,61 @@ export function buildUserMessage(
   const mentionXmlBlocks = buildMentionXmlBlocks(mentions);
   xmlBlocks.push(...mentionXmlBlocks);
 
+  // AG-05: the numbered reference tail goes after every block above it, so the
+  // numbers it shares with <input_images> / the mention blocks stay the last
+  // thing the model reads.
+  const referenceList = buildReferenceList(attachments, mentions);
+  if (referenceList) xmlBlocks.push(referenceList);
+
   if (!xmlBlocks.length) return { text: prompt };
   return { text: `${prompt}\n\n${xmlBlocks.join("\n\n")}` };
+}
+
+/**
+ * AG-05: the numbered reference list appended to the user message. Same numbering as the XML blocks above it.
+ *
+ * Images are listed by `assetId`, never by a URL: a URL in the request is the
+ * browser's own projection of a signature and the server re-signs from the
+ * assetId (X-52). Skills are listed by slug + label because a skill mention
+ * carries no source or version field yet (that arrives with SK-03 / AG-27).
+ * Every value is escaped the same way as the XML attributes above, so a label
+ * cannot close the <references> element from inside.
+ */
+export function buildReferenceList(
+  attachments: ImageAttachment[],
+  mentions: MessageMention[],
+): string | null {
+  const skillMentions = mentions.filter(
+    (mention): mention is Extract<MessageMention, { mentionType: "skill" }> =>
+      mention.mentionType === "skill",
+  );
+  const modelMentions = mentions.filter(
+    (
+      mention,
+    ): mention is Extract<MessageMention, { mentionType: "image-model" }> =>
+      mention.mentionType === "image-model",
+  );
+
+  const lines: string[] = [];
+
+  for (const [i, attachment] of attachments.entries()) {
+    lines.push(
+      `Image #${i + 1}: asset:${escapeXmlAttribute(attachment.assetId)}`,
+    );
+  }
+
+  for (const [i, mention] of skillMentions.entries()) {
+    lines.push(
+      `Skill #${i + 1}: ${escapeXmlAttribute(mention.slug)}, ${escapeXmlAttribute(mention.label)}`,
+    );
+  }
+
+  for (const mention of modelMentions) {
+    lines.push(`Model: ${escapeXmlAttribute(mention.id)}`);
+  }
+
+  if (lines.length === 0) return null;
+  return `<references>\n${lines.join("\n")}\n</references>`;
 }
 
 function buildInputImagesXml(attachments: ImageAttachment[]): string | null {
