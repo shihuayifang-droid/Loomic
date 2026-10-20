@@ -207,6 +207,47 @@ describe("awaitJobCompletion —— WebSocket 快路径", () => {
     expect(failed.code).toBe("failed");
     expect(failed.message).toBe('Job ended with status "failed".');
   });
+
+  it("GN-30: 事件自带 maxAttempts 时第一次回调就带分母，fetchJob 一次都不调", async () => {
+    const onProgress = vi.fn<(info: JobProgress) => void>();
+    const { ws, emit } = makeWs();
+    const { state } = track(
+      awaitJobCompletion("tok", "job-1", { ws, onProgress, pollIntervalMs: 1_000 }),
+    );
+
+    emit({ type: "job.progress", status: "retrying", attempt: 2, maxAttempts: 4 });
+    await flush();
+
+    expect(state.settled).toBe(false);
+    expect(onProgress).toHaveBeenCalledTimes(1);
+    expect(onProgress).toHaveBeenLastCalledWith({
+      status: "retrying",
+      attempt: 2,
+      maxAttempts: 4,
+    });
+    expect(fetchJobMock).toHaveBeenCalledTimes(0);
+  });
+
+  it("GN-30: 之后不带 maxAttempts 的事件沿用已知分母，仍不请求 REST", async () => {
+    const onProgress = vi.fn<(info: JobProgress) => void>();
+    const { ws, emit } = makeWs();
+    const { state } = track(
+      awaitJobCompletion("tok", "job-1", { ws, onProgress, pollIntervalMs: 1_000 }),
+    );
+
+    emit({ type: "job.progress", status: "retrying", attempt: 2, maxAttempts: 4 });
+    await flush();
+    emit({ type: "job.progress", status: "retrying", attempt: 3 });
+    await flush();
+
+    expect(state.settled).toBe(false);
+    expect(onProgress).toHaveBeenLastCalledWith({
+      status: "retrying",
+      attempt: 3,
+      maxAttempts: 4,
+    });
+    expect(fetchJobMock).toHaveBeenCalledTimes(0);
+  });
 });
 
 describe("awaitJobCompletion —— 轮询兜底", () => {

@@ -19,10 +19,12 @@
  * GN-30: `retrying` is NOT terminal. A retrying job is still coming, so the
  * wait continues and nothing is rejected — only `succeeded / failed / canceled`
  * end it (see `lib/job-status.ts`, the single definition). The socket event
- * carries `attempt` but not `max_attempts`, so the first `retrying` triggers one
- * REST read for the denominator and the answer is cached: the cap cannot change
- * under a running job, and asking again on every attempt would turn a status
- * stream into a poll.
+ * carries the denominator (`maxAttempts`) itself, so the cap is known from the
+ * very first callback and no REST read is needed for it. Only an older server,
+ * whose event has no `maxAttempts`, still costs one REST read: the first
+ * `retrying` asks once and the answer is cached — the cap cannot change under a
+ * running job, and asking again on every attempt would turn a status stream
+ * into a poll.
  */
 import type { WebSocketHandle } from "../hooks/use-websocket";
 import { isTerminalJobStatus, normalizeJobStatus } from "./job-status";
@@ -97,9 +99,11 @@ export async function awaitJobCompletion(
     let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 
     /**
-     * GN-30: `max_attempts` is not on the socket event, so a retrying job would
-     * read `重试中` with no fraction. We ask REST once, the first time we see
-     * `retrying`, and keep the answer for the rest of this wait.
+     * GN-30: the denominator now normally arrives on the socket event itself, so
+     * it is already known by the time we get here. An older server's event has
+     * no `maxAttempts`, and a retrying job would then read `重试中` with no
+     * fraction: we ask REST once, the first time we see `retrying`, and keep the
+     * answer for the rest of this wait.
      */
     let maxAttempts: number | undefined;
     let maxAttemptsAsked = false;
@@ -203,6 +207,13 @@ export async function awaitJobCompletion(
           typeof event.elapsedMs === "number" ? event.elapsedMs : undefined;
         const attempt =
           typeof event.attempt === "number" ? event.attempt : undefined;
+        // GN-30: the server now sends the cap on the event itself (33I). Take it
+        // and skip the REST read; an older server without it still gets the
+        // one-time fallback below.
+        if (typeof event.maxAttempts === "number") {
+          maxAttempts = event.maxAttempts;
+          maxAttemptsAsked = true;
+        }
         onProgress?.(progressOf(status, elapsedMs, attempt));
         if (status === "retrying") learnMaxAttempts(status, attempt, elapsedMs);
         if (isTerminalJobStatus(status)) {
