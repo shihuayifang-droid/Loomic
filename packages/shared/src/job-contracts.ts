@@ -65,6 +65,27 @@ export const createVideoJobRequestSchema = z.object({
 });
 export type CreateVideoJobRequest = z.infer<typeof createVideoJobRequestSchema>;
 
+// --- Job artifacts ---
+
+/**
+ * GN-02 (5): one produced file of a finished job, as the job result carries it.
+ *
+ * The job result used to name a single asset through loose keys; this is the
+ * array shape the client reads so that a multi-artifact job (GN-41) needs no new
+ * field. `index` is the position the client must use when it lays the artifacts
+ * out, so two artifacts can never collide on it. `format` is the MIME type, and
+ * `width` / `height` are the dimensions the provider actually reported — they are
+ * never filled in from the requested parameters.
+ */
+export const jobArtifactSchema = z.object({
+  artifact_id: z.string().min(1),
+  index: z.number().int().nonnegative(),
+  format: z.string().min(1),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+});
+export type JobArtifact = z.infer<typeof jobArtifactSchema>;
+
 // --- Job entity ---
 
 export const backgroundJobSchema = z.object({

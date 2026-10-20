@@ -47,6 +47,7 @@ vi.mock("../credits/watermark.js", () => ({
 }));
 
 import type { BackgroundJob, SubscriptionPlan } from "@loomic/shared";
+import { jobArtifactSchema } from "@loomic/shared";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { SubscriptionReadRow } from "../../db/credit-read-repository.js";
@@ -702,5 +703,59 @@ describe("generation executors record provenance on the asset (GN-11)", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+// GN-02 (5): a finished job result also lists its artifacts, so the client can
+// fill its placeholder from what was actually produced instead of from what it
+// asked for. The dimensions asserted below are the ones the mocked providers
+// report in `beforeEach` (1024x1024 image, 1280x720 video) — never the request's.
+describe("GN-02: a finished job result lists its artifacts", () => {
+  it("GN-02: an image job result lists its artifact with real dimensions", async () => {
+    const admin = makeAdmin();
+
+    const result = await getExecutor("image_generation")!(
+      "job-artifact-image",
+      {},
+      makeContext(admin.client, jobRow()),
+    );
+
+    expect(result.artifacts).toEqual([
+      { artifact_id: "asset-1", index: 0, format: "image/png", width: 1024, height: 1024 },
+    ]);
+    expect(() => jobArtifactSchema.array().parse(result.artifacts)).not.toThrow();
+  });
+
+  it("GN-02: a video job result lists its artifact", async () => {
+    const admin = makeAdmin();
+    const job = jobRow({ payload: { prompt: "a clip", model: "test/video" } });
+
+    const result = await getExecutor("video_generation")!(
+      "job-artifact-video",
+      {},
+      makeContext(admin.client, job),
+    );
+
+    expect(result.artifacts).toEqual([
+      { artifact_id: "asset-1", index: 0, format: "video/mp4", width: 1280, height: 720 },
+    ]);
+    expect(() => jobArtifactSchema.array().parse(result.artifacts)).not.toThrow();
+  });
+
+  it("GN-02: the old result fields are still there", async () => {
+    const admin = makeAdmin();
+
+    const result = await getExecutor("image_generation")!(
+      "job-artifact-old-fields",
+      {},
+      makeContext(admin.client, jobRow()),
+    );
+
+    expect(result.asset_id).toBe("asset-1");
+    expect(String(result.signed_url)).toContain("token=sig");
+    expect(result.object_path).toBe(admin.uploads[0]?.path);
+    expect(result.width).toBe(1024);
+    expect(result.height).toBe(1024);
+    expect(result.mime_type).toBe("image/png");
   });
 });

@@ -151,6 +151,14 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     const signedUrl = await signProjectAssetUrl(admin, objectPath);
 
     lap("total");
+    // GN-02 (5): see the image executor — the result lists its artifacts, and a
+    // provider that reports no usable dimensions gets no artifacts key at all.
+    const mimeType = generated.mimeType ?? "video/mp4";
+    const hasDimensions =
+      Number.isInteger(generated.width) &&
+      generated.width > 0 &&
+      Number.isInteger(generated.height) &&
+      generated.height > 0;
     return {
       asset_id: assetId,
       signed_url: signedUrl,
@@ -158,7 +166,20 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
       width: generated.width,
       height: generated.height,
       duration_seconds: generated.durationSeconds,
-      mime_type: generated.mimeType ?? "video/mp4",
+      mime_type: mimeType,
+      ...(hasDimensions
+        ? {
+            artifacts: [
+              {
+                artifact_id: assetId,
+                index: 0,
+                format: mimeType,
+                width: generated.width,
+                height: generated.height,
+              },
+            ],
+          }
+        : {}),
     };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);

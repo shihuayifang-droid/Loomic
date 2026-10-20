@@ -254,13 +254,36 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     const signedUrl = await signProjectAssetUrl(admin, objectPath);
 
     lap("total");
+    // GN-02 (5): the result also lists its artifacts. One job produces one
+    // artifact for now; the array is what lets GN-41 add more without a new
+    // field. The dimensions are the ones the provider reported — a provider that
+    // reports none gets NO artifacts key rather than a fabricated 0x0 entry.
+    const mimeType = generated.mimeType ?? "image/png";
+    const hasDimensions =
+      Number.isInteger(generated.width) &&
+      generated.width > 0 &&
+      Number.isInteger(generated.height) &&
+      generated.height > 0;
     return {
       asset_id: assetId,
       signed_url: signedUrl,
       object_path: objectPath,
       width: generated.width,
       height: generated.height,
-      mime_type: generated.mimeType ?? "image/png",
+      mime_type: mimeType,
+      ...(hasDimensions
+        ? {
+            artifacts: [
+              {
+                artifact_id: assetId,
+                index: 0,
+                format: mimeType,
+                width: generated.width,
+                height: generated.height,
+              },
+            ],
+          }
+        : {}),
     };
   } finally {
     clearInterval(heartbeatTimer);
