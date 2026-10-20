@@ -26,6 +26,7 @@ import { useImageModelPreference } from "../hooks/use-image-model-preference";
 import { usePersistFailedNotice } from "../hooks/use-persist-failed-notice";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
 import type { WebSocketHandle } from "../hooks/use-websocket";
+import { billingErrorRoute } from "../lib/billing-error-route";
 import { fetchBrandKit } from "../lib/brand-kit-api";
 import { claimDailyCredits } from "../lib/credits-api";
 import { fetchImageModels, fetchWorkspaceSkills, saveMessage } from "../lib/server-api";
@@ -551,7 +552,8 @@ export function ChatSidebar({
 
           // Billing error: route to appropriate UI, run.canceled will follow
           if (event.type === "billing.error") {
-            if (event.code === "insufficient_credits") {
+            const route = billingErrorRoute(event.code);
+            if (route.kind === "credit_dialog") {
               setCreditDialog({
                 open: true,
                 currentBalance: event.currentBalance ?? 0,
@@ -559,9 +561,14 @@ export function ChatSidebar({
                 plan: event.plan ?? "free",
                 dailyClaimed: event.dailyClaimed ?? false,
               });
-            } else {
-              // model_not_accessible, resolution_not_allowed, concurrency_limit
+            } else if (route.kind === "tier_toast") {
+              // concurrency_limit, model_not_accessible, resolution_not_allowed
               showTierLimit({ code: event.code, message: event.message });
+            } else {
+              // AG-10 fail closed: model_not_available (no price rule, the run
+              // was never created) and any other refusal the tier toast would
+              // drop. Never leave the user with a run that just stops.
+              showToast(route.text, "error");
             }
           }
 
