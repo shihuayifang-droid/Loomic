@@ -42,6 +42,49 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     eta_seconds: null,
     agent_callable: false,
     availability: "enabled",
+    /**
+     * ED-01 规格表, verbatim (MD-03 / X-P11, T-66): 17 sliders in three groups.
+     * The web panel renders from this, so the labels and the ranges live here
+     * only. Every slider defaults to 0 ("默认值全为 0"), which is also what makes
+     * 「完成」 disabled via `disabled_rules.no_adjustment`.
+     */
+    param_groups: [
+      {
+        id: "light",
+        label: "光",
+        params: [
+          { id: "light", label: "光线", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "exposure", label: "曝光", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "contrast", label: "对比度", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "highlights", label: "高光", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "shadows", label: "阴影", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "whites", label: "白色", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "blacks", label: "黑色", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+        ],
+      },
+      {
+        id: "color",
+        label: "色",
+        params: [
+          { id: "vibrance", label: "自然饱和度", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "saturation", label: "饱和度", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "temperature", label: "色温", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "tint", label: "色调", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+        ],
+      },
+      {
+        id: "effect",
+        label: "效果",
+        params: [
+          { id: "sharpen", label: "锐化", min: 0, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "clarity", label: "清晰度", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "grain", label: "颗粒", min: 0, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "vignette", label: "晕影", min: -100, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "glamour", label: "柔光", min: 0, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+          { id: "bloom", label: "辉光", min: 0, max: 100, defaultValue: 0, display: { kind: "linear", a: 0, k: 1, round: 0 } },
+        ],
+      },
+    ],
   },
   // ED-02 裁剪 — pure front-end, zero cost. The spec's messages carry the
   // source image's numbers ("不能超过原图宽度 1254"); the table holds the fixed

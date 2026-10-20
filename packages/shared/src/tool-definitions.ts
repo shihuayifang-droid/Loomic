@@ -47,6 +47,60 @@ export const toolDisabledRuleSchema = z.object({
 });
 export type ToolDisabledRule = z.infer<typeof toolDisabledRuleSchema>;
 
+/**
+ * MD-03 / ED-00h — how one slider's internal value is shown to the user.
+ *
+ * Same shape as the web's `ParamDisplay` (`apps/web/src/lib/param-slider.ts`):
+ * `linear` maps an internal value with `a + v * k` and rounds to `round`
+ * decimals, `steps` snaps to one of `labels`. The server ships it, so the web
+ * panel owns neither the labels nor the numbers.
+ */
+export const toolParamDisplaySchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("linear"),
+    a: z.number(),
+    k: z.number(),
+    round: z.number().int().nonnegative().optional(),
+    unit: z.string().optional(),
+  }),
+  z.object({
+    kind: z.literal("steps"),
+    labels: z.array(z.string().min(1)).min(1),
+  }),
+]);
+export type ToolParamDisplay = z.infer<typeof toolParamDisplaySchema>;
+
+/**
+ * MD-03 — one slider. `min` / `max` default to 0 / 100 (the web's
+ * `ParamSliderConfig` default), and the default value must lie inside the range:
+ * a slider whose default is unreachable would render a position the user cannot
+ * drag back to.
+ */
+export const toolParamSchema = z
+  .object({
+    id: z.string().min(1),
+    label: z.string().min(1),
+    min: z.number().optional(),
+    max: z.number().optional(),
+    defaultValue: z.number(),
+    display: toolParamDisplaySchema,
+  })
+  .refine(
+    (param) =>
+      (param.min ?? 0) <= param.defaultValue &&
+      param.defaultValue <= (param.max ?? 100),
+    { message: "defaultValue must lie within [min, max]" },
+  );
+export type ToolParam = z.infer<typeof toolParamSchema>;
+
+/** MD-03 — a titled group of sliders; order is render order. */
+export const toolParamGroupSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+  params: z.array(toolParamSchema).min(1),
+});
+export type ToolParamGroup = z.infer<typeof toolParamGroupSchema>;
+
 export const toolDefinitionSchema = z
   .object({
     /** Canonical name, unique across the site (ED-00k). */
@@ -83,6 +137,13 @@ export const toolDefinitionSchema = z
     /** Whether SK-13 registers it as an Agent-callable tool. */
     agent_callable: z.boolean(),
     availability: toolAvailabilitySchema,
+    /**
+     * MD-03 / X-P11 — the panel's sliders, shipped by the server instead of being
+     * hard-coded in the web app. Optional: only tools with a slider panel (now
+     * just ED-01 调整) carry it, so every other row and every existing fixture
+     * keeps parsing unchanged.
+     */
+    param_groups: z.array(toolParamGroupSchema).optional(),
   })
   /**
    * ED-00k: `consumes` and `pricing` may not disagree. A free tool must not

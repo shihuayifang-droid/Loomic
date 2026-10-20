@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { type ToolDefinition, toolListResponseSchema } from "@loomic/shared";
+import {
+  type ToolDefinition,
+  type ToolParamGroup,
+  toolListResponseSchema,
+} from "@loomic/shared";
 
 import {
   ED_00K_CLAIMED_TOOL_COUNT,
@@ -257,5 +261,81 @@ describe("ED-00k tool table: a broken table is rejected", () => {
     expect(() => toolListResponseSchema.parse({ tools: [mispriced] })).toThrow(
       /does not consume credits but carries pricing/,
     );
+  });
+});
+
+/**
+ * ED-01's slider table (workorder 35T, MD-03 / X-P11 / T-66).
+ *
+ * These numbers are the spec table, not a choice: the web panel stopped owning
+ * them, so if they drift the panel drifts with them. `adjust-slider-{param}`
+ * testids are derived from the ids pinned here.
+ */
+
+/** 光 7 → 色 4 → 效果 6, in spec order — the same order the panel renders. */
+const ED_01_PARAM_IDS = [
+  "light",
+  "exposure",
+  "contrast",
+  "highlights",
+  "shadows",
+  "whites",
+  "blacks",
+  "vibrance",
+  "saturation",
+  "temperature",
+  "tint",
+  "sharpen",
+  "clarity",
+  "grain",
+  "vignette",
+  "glamour",
+  "bloom",
+];
+
+/** The four sliders the spec gives as 0~100; every other one is −100~100. */
+const ED_01_ZERO_TO_HUNDRED = ["sharpen", "grain", "glamour", "bloom"];
+
+function adjustGroups(): ToolParamGroup[] {
+  const groups = byId("adjust").param_groups;
+
+  if (!groups) {
+    throw new Error("adjust carries no param_groups");
+  }
+
+  return groups;
+}
+
+describe("ED-01 调整: the slider table ships from the server", () => {
+  it("ED-01: adjust ships 17 sliders in three groups", () => {
+    const groups = adjustGroups();
+
+    expect(groups.map((group) => group.id)).toEqual(["light", "color", "effect"]);
+    expect(groups.map((group) => group.params.length)).toEqual([7, 4, 6]);
+    expect(groups.flatMap((group) => group.params.map((param) => param.id))).toEqual(
+      ED_01_PARAM_IDS,
+    );
+  });
+
+  it("ED-01: slider ranges follow the spec table", () => {
+    const params = adjustGroups().flatMap((group) => group.params);
+
+    for (const param of params) {
+      const expected = ED_01_ZERO_TO_HUNDRED.includes(param.id)
+        ? [0, 100]
+        : [-100, 100];
+
+      expect([param.id, param.min, param.max]).toEqual([param.id, ...expected]);
+      // 默认值全为 0 (ED-01), which is what makes 「完成」 start disabled.
+      expect([param.id, param.defaultValue]).toEqual([param.id, 0]);
+    }
+  });
+
+  it("ED-01: only adjust carries param groups for now", () => {
+    for (const tool of TOOL_DEFINITIONS) {
+      if (tool.id === "adjust") continue;
+
+      expect([tool.id, tool.param_groups]).toEqual([tool.id, undefined]);
+    }
   });
 });
