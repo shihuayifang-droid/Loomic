@@ -150,7 +150,10 @@ export async function registerViewerRoutes(
         profileUpdateResponseSchema.parse({
           profile: {
             id: profile.id,
-            email: profile.email ?? "",
+            // The row's email is nullable (historic data), so project the
+            // authenticated identity's email instead of "" — an empty string
+            // fails the response schema and 400s a committed write (T-37).
+            email: profile.email ?? user.email,
             displayName: profile.displayName,
             avatarUrl: profile.avatarUrl ?? null,
           },

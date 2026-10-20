@@ -298,10 +298,11 @@ describe("PATCH /api/viewer/profile: the successful write", () => {
     ]);
   });
 
-  it("case 10: an email the repository reports as NULL projects to '' exactly as before", async () => {
-    // Pre-existing projection, pinned rather than changed: the old PostgREST path
-    // read `data.email ?? ""` and the response schema then refuses an empty
-    // e-mail. The write really happened; the 400 is the RESPONSE contract's.
+  it("case 10: an email the repository reports as NULL projects the authenticated email (T-37)", async () => {
+    // T-37: the row's email is nullable, but the response contract still
+    // requires an address, so the projection falls back to the authenticated
+    // identity's email. Answering 400 here hid a write that had already
+    // succeeded; the caller now gets the 200 and the write's real result.
     writeRow = {
       id: USER_ID,
       email: null,
@@ -314,8 +315,15 @@ describe("PATCH /api/viewer/profile: the successful write", () => {
       payload: { displayName: "No Email On The Row" },
     });
 
-    expect(response.statusCode).toBe(400);
-    expect(response.json().message).toBe("Invalid request body");
+    expect(response.statusCode).toBe(200);
+    expect(profileUpdateResponseSchema.parse(response.json())).toEqual({
+      profile: {
+        id: USER_ID,
+        email: USER_EMAIL,
+        displayName: "No Email On The Row",
+        avatarUrl: null,
+      },
+    });
     expect(writeCalls).toHaveLength(1);
     expect(userFactoryCalls).toHaveLength(0);
   });
