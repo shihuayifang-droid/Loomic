@@ -10,6 +10,7 @@ import { visibleOn } from "../../lib/model-visibility";
 import { qualityOptionsFor } from "../../lib/image-quality-options";
 import { awaitJobCompletion } from "../../lib/await-job";
 import { imageResultFromJob } from "../../lib/image-job-result";
+import { fitResultIntoSlot } from "../../lib/fit-result";
 import { useCompletionTitle } from "../../hooks/use-completion-title";
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
 import type { WebSocketHandle } from "../../hooks/use-websocket";
@@ -270,12 +271,17 @@ export function ImageGeneratorPanel({
         },
       ]);
 
+      // GN-02 ⑤: the placeholder was drawn from the requested ratio; the picture
+      // that came back may be a different shape. Fit it into the slot instead of
+      // stretching it, and keep the slot untouched when the size is unknown.
+      const placed = fitResultIntoSlot(elementBounds, result);
+
       const imageElement = createExcalidrawImageElement({
         fileId,
-        x: elementBounds.x,
-        y: elementBounds.y,
-        width: elementBounds.width,
-        height: elementBounds.height,
+        x: placed.x,
+        y: placed.y,
+        width: placed.width,
+        height: placed.height,
         title: prompt.trim().slice(0, 60),
       });
 
