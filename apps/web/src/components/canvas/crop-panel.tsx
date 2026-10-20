@@ -43,6 +43,11 @@ export type CropPanelProps = {
   onRectChange: (rect: CropRect) => void;
   onCancel: () => void;
   onDone: (rect: CropRect) => void;
+  /**
+   * ED-02（工单 35W）：选预设时把该预设的比例报给调用方（叠层拖手柄要按同一个比例约束）。
+   * 可选：不传时面板行为与之前完全一致。
+   */
+  onRatioChange?: (ratio: [number, number] | null) => void;
 };
 
 const PRESET_CLASS =
@@ -52,7 +57,15 @@ const FIELD_CLASS =
 const BUTTON_CLASS =
   "rounded-md border border-border px-3 py-1 text-xs outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50";
 
-export function CropPanel({ source, presets, rect, onRectChange, onCancel, onDone }: CropPanelProps) {
+export function CropPanel({
+  source,
+  presets,
+  rect,
+  onRectChange,
+  onCancel,
+  onDone,
+  onRatioChange,
+}: CropPanelProps) {
   /** 默认选中第一个预设（调用方把「通用 / 不裁剪」排在第一，与整图的初始框一致）。 */
   const [selectedId, setSelectedId] = useState<string | null>(() => presets[0]?.id ?? null);
 
@@ -76,6 +89,7 @@ export function CropPanel({ source, presets, rect, onRectChange, onCancel, onDon
   /** 裁决 6：选预设 → 取原图内能放下的最大同比例矩形并居中。 */
   const selectPreset = (preset: SizePreset) => {
     setSelectedId(preset.id);
+    onRatioChange?.(preset.ratio);
     const next = fitRatioRect(source, preset.ratio);
     setWidthDraft(String(next.width));
     setHeightDraft(String(next.height));

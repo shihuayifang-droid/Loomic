@@ -1050,6 +1050,7 @@ export function ImageToolbarLayer({
       ) : mode.kind === "crop" ? (
         <CropToolSession
           source={mode.source}
+          sourceDataUrl={mode.sourceDataUrl}
           onCancel={exitCrop}
           onDone={(rect) => void handleCropDone(rect)}
         />
