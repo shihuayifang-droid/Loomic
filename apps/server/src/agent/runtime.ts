@@ -73,6 +73,7 @@ import {
   insertImageElement,
   insertImagePlaceholder,
   insertVideoElement,
+  markGenerationSlotFailed,
   removeCanvasElement,
 } from "../features/canvas/canvas-element-writer.js";
 import { aspectRatioToDimensions } from "../generation/utils.js";
@@ -1176,6 +1177,10 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           // anything was happening.
           let placeholderElementId: string | undefined;
           let placeholderFilled = false;
+          // GN-19: set only when the job itself failed (or the wait timed out).
+          // A canceled job, or an aborted run, leaves this null and keeps the old
+          // "remove the slot" behaviour.
+          let slotFailure: { message: string; jobId: string } | null = null;
           if (canvasId) {
             try {
               const { width: slotW, height: slotH } = aspectRatioToDimensions(
@@ -1285,6 +1290,17 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             // `retrying`), so there is nothing to wait for beyond these two.
             if (current.status === "failed" || current.status === "canceled") {
               jobLap("job_poll_done", { pollCount, status: current.status });
+              // GN-19: a failed job keeps its slot on the canvas, marked failed
+              // with a user-facing reason. `canceled` means the user actively
+              // stopped it, so that slot is still removed below.
+              if (current.status === "failed") {
+                slotFailure = {
+                  message: sanitizeErrorForClient(
+                    new Error(current.error_message ?? "Job failed"),
+                  ),
+                  jobId: job.id,
+                };
+              }
               return {
                 jobId: job.id,
                 error: current.error_message ?? `Job ${current.status}`,
@@ -1293,29 +1309,49 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           }
 
           jobLap("job_poll_done", { pollCount, status: "timeout" });
+          // GN-19: same treatment as `failed` — the user waited for a result and
+          // gets a slot that says why there is none.
+          slotFailure = { message: "生成超时，请重试", jobId: job.id };
           return {
             jobId: job.id,
             error: `Job timed out after ${MAX_WAIT / 1000}s`,
           };
           } finally {
-            // Covers every exit path — failure, timeout, and the abort throw —
-            // so a slot that will never be filled does not stay on the canvas as
-            // a permanently empty frame.
+            // Covers every exit path — failure, timeout, the abort throw, and
+            // success.
             if (canvasId && placeholderElementId && !placeholderFilled) {
               try {
-                await removeCanvasElement(
-                  createClient(accessToken) as UserSupabaseClient,
-                  canvasId,
-                  placeholderElementId,
-                );
-                options.connectionManager?.pushToCanvas(canvasId, {
-                  type: "canvas.sync" as const,
-                  runId,
-                  timestamp: new Date().toISOString(),
-                });
-                jobLap("canvas_placeholder_removed", {
-                  elementId: placeholderElementId,
-                });
+                if (slotFailure) {
+                  await markGenerationSlotFailed(
+                    createClient(accessToken) as UserSupabaseClient,
+                    canvasId,
+                    placeholderElementId,
+                    slotFailure,
+                  );
+                  options.connectionManager?.pushToCanvas(canvasId, {
+                    type: "canvas.sync" as const,
+                    runId,
+                    timestamp: new Date().toISOString(),
+                  });
+                  jobLap("canvas_placeholder_failed", {
+                    elementId: placeholderElementId,
+                    jobId: slotFailure.jobId,
+                  });
+                } else {
+                  await removeCanvasElement(
+                    createClient(accessToken) as UserSupabaseClient,
+                    canvasId,
+                    placeholderElementId,
+                  );
+                  options.connectionManager?.pushToCanvas(canvasId, {
+                    type: "canvas.sync" as const,
+                    runId,
+                    timestamp: new Date().toISOString(),
+                  });
+                  jobLap("canvas_placeholder_removed", {
+                    elementId: placeholderElementId,
+                  });
+                }
               } catch (cleanupErr) {
                 console.error(
                   "[submitImageJob] placeholder cleanup failed:",

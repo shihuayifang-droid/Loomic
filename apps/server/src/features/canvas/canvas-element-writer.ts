@@ -416,6 +416,68 @@ export async function removeCanvasElement(
   }
 }
 
+/**
+ * GN-19: a generation slot whose job failed stays on the canvas as a failed
+ * slot (reason + job id), so the user sees what happened and can retry or
+ * delete it. Same best-effort contract as removeCanvasElement: never throws.
+ */
+export async function markGenerationSlotFailed(
+  client: { from: (table: string) => any },
+  canvasId: string,
+  elementId: string,
+  failure: { message: string; jobId: string },
+): Promise<void> {
+  try {
+    await mutateCanvasContent(
+      client,
+      canvasId,
+      (content) => {
+        const elements: CanvasElement[] = (content.elements as CanvasElement[]) ?? [];
+        const target = elements.find(
+          (el) =>
+            el.id === elementId &&
+            ((el.customData as Record<string, unknown> | undefined)?.generating) === true,
+        );
+        // Already gone, or already filled with a real image — write nothing.
+        if (!target) return null;
+
+        const failedAt = Date.now();
+        const updatedElements = elements.map((el) =>
+          el === target
+            ? {
+                ...el,
+                // Position, size, title, kind and modelName are deliberately
+                // carried over: the failed slot must stay exactly where the user
+                // watched it being generated.
+                customData: {
+                  ...((el.customData as Record<string, unknown>) ?? {}),
+                  generating: false,
+                  failed: true,
+                  failureMessage: failure.message,
+                  jobId: failure.jobId,
+                  failedAt,
+                },
+                version: (Number(el.version) || 1) + 1,
+                versionNonce: Math.floor(Math.random() * 2_000_000_000),
+                updated: failedAt,
+              }
+            : el,
+        );
+        return { ...content, elements: updatedElements } as CanvasContent;
+      },
+      { label: "markGenerationSlotFailed" },
+    );
+  } catch {
+    // Non-throwing on purpose: the caller is already in an error path, and a
+    // failed mark must not replace the real generation error. Log a line so a
+    // stuck slot still has an explanation.
+    console.log(
+      `[canvas-element-writer] markGenerationSlotFailed gave up ` +
+        `canvasId=${canvasId} elementId=${elementId}`,
+    );
+  }
+}
+
 export async function insertImageElement(
   client: { from: (table: string) => any; storage: { from: (bucket: string) => any } },
   opts: ImageInsertOpts,
