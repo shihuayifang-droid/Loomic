@@ -96,6 +96,14 @@ export async function registerJobRoutes(
                 ? { threadId: payload.thread_id }
                 : {}),
             },
+            // ED-00m: a field of the JOB, not of the generation payload — it
+            // identifies the submission, and `withBilling` uses it before any
+            // price, balance or insert to answer a repeated submit with the job
+            // it already created. Spread conditionally because
+            // `exactOptionalPropertyTypes` does not accept an explicit undefined.
+            ...(payload.client_request_id !== undefined
+              ? { clientRequestId: payload.client_request_id }
+              : {}),
           },
         },
         // Nothing to do here: the worker picks the job up off the queue. The
@@ -169,6 +177,10 @@ export async function registerJobRoutes(
                 ? { threadId: payload.thread_id }
                 : {}),
             },
+            // ED-00m: same field, same meaning as on the image route above.
+            ...(payload.client_request_id !== undefined
+              ? { clientRequestId: payload.client_request_id }
+              : {}),
           },
         },
         async (outcome) => outcome,

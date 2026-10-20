@@ -58,6 +58,10 @@ export const createVideoJobRequestSchema = z.object({
   input_images: z.array(z.string()).optional(),
   input_video: z.string().optional(),
   enable_audio: z.boolean().optional(),
+  // ED-00m: the browser-chosen submission id. The length bounds are the same
+  // ones the `client_request_id` CHECK constraint uses (workorder 34T), so a
+  // request the route accepts can never fail the insert on length alone.
+  client_request_id: z.string().min(8).max(128).optional(),
 });
 export type CreateVideoJobRequest = z.infer<typeof createVideoJobRequestSchema>;
 
@@ -99,6 +103,8 @@ export const createImageJobRequestSchema = z.object({
   prompt: z.string().min(1),
   model: z.string().optional(),
   aspect_ratio: z.string().optional(),
+  // ED-00m: see the video schema above — same field, same bounds.
+  client_request_id: z.string().min(8).max(128).optional(),
 });
 export type CreateImageJobRequest = z.infer<typeof createImageJobRequestSchema>;
 
