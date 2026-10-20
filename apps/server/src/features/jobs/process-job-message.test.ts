@@ -79,8 +79,12 @@ function makeHarness(scenario: Scenario = {}) {
     },
   };
 
-  const executor: JobExecutor = async () => {
+  /** The context the executor was handed (GN-11 reads `creditsCharged` from it). */
+  let executorCtx: ExecutorContext | undefined;
+
+  const executor: JobExecutor = async (_jobId, _payload, ctx) => {
     calls.push("executor");
+    executorCtx = ctx;
     if (scenario.executorThrows) throw Object.assign(new Error(scenario.executorThrows.message), {
       ...(scenario.executorThrows.code ? { code: scenario.executorThrows.code } : {}),
     });
@@ -163,6 +167,7 @@ function makeHarness(scenario: Scenario = {}) {
     gateReads,
     gateClaims,
     refunds: () => refunds,
+    executorCtx: () => executorCtx,
     run: () => processJobMessage(deps, args),
   };
 }
@@ -595,5 +600,21 @@ describe("processJobMessage: the billing gate (工单21H1)", () => {
     const overdue = makeHarness({ gate: OVERDUE_UNBILLED, gateClaim: true });
     await overdue.run();
     expect(overdue.gateReads).toEqual(overdue.gateClaims);
+  });
+
+  it("GN-11: the executor receives the charged amount the billing gate read", async () => {
+    const h = makeHarness({ gate: { status: "queued", creditsCost: 12, overdue: false } });
+
+    await h.run();
+
+    expect(h.executorCtx()?.creditsCharged).toBe(12);
+  });
+
+  it("GN-11: a free job hands the executor 0, not undefined", async () => {
+    const h = makeHarness();
+
+    await h.run();
+
+    expect(h.executorCtx()?.creditsCharged).toBe(0);
   });
 });

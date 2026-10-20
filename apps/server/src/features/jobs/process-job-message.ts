@@ -312,7 +312,9 @@ export async function processJobMessage(
   }
 
   try {
-    const result = await executor(jobId, msg.message as Record<string, unknown>, ctx);
+    const executorCtx: ExecutorContext =
+      typeof gate?.creditsCost === "number" ? { ...ctx, creditsCharged: gate.creditsCost } : ctx;
+    const result = await executor(jobId, msg.message as Record<string, unknown>, executorCtx);
     const marked = await deps.jobService.markSucceeded(jobId, result);
 
     if (!marked) {

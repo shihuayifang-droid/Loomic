@@ -31,6 +31,12 @@ export type ExecutorContext = {
    * executor simply skips provenance.
    */
   assetProvenanceRepository?: Pick<AssetProvenanceRepository, "recordProvenance">;
+  /**
+   * GN-11: the amount this job was charged, as the worker read it from the
+   * billing gate (`credits_cost`). The executors copy it into provenance.
+   * Optional: absent means "unknown", and the executors then record null.
+   */
+  creditsCharged?: number;
   /** PGMQ queue name for the current job (set per-message by the worker). */
   queue: string;
   /** PGMQ message id for the current job (set per-message by the worker). */

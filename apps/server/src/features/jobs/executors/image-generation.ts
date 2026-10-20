@@ -195,7 +195,7 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
             operation: "image_generation",
             modelId: model,
             prompt: payload.prompt,
-            creditsCharged: null,
+            creditsCharged: ctx.creditsCharged ?? null,
             actionId: null,
             sourceJobId: jobId,
             parentArtifactId: null,

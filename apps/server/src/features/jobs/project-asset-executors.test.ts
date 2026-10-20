@@ -640,6 +640,17 @@ describe("generation executors record provenance on the asset (GN-11)", () => {
     });
   });
 
+  it("GN-11: the image executor records the charged amount from the context", async () => {
+    const admin = makeAdmin();
+    const provenance = makeProvenance();
+    const ctx = makeContext(admin.client, jobRow(), makeCreditRead(), provenance);
+
+    await getExecutor("image_generation")!("job-1", {}, { ...ctx, creditsCharged: 7 });
+
+    expect(provenance.calls).toHaveLength(1);
+    expect(provenance.calls[0]?.provenance.creditsCharged).toBe(7);
+  });
+
   it("GN-11: a job without a session is recorded as generator", async () => {
     const admin = makeAdmin();
     const provenance = makeProvenance();
