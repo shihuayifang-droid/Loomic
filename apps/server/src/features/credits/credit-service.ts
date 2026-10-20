@@ -91,12 +91,16 @@ export type CreditService = {
 // ── Factory ──────────────────────────────────────────────────
 
 /**
- * `creditReadRepository` is OPTIONAL on purpose (workorders 21K and 21P): the
- * three reads it serves — the transaction list, the subscription row and the
- * balance snapshot — are the only ones that moved, and the remaining methods
- * still work through the admin client. When it is absent those three reads fail
- * closed as their existing `credit_query_failed` 500 — there is no PostgREST
- * fallback and the admin client is no longer reachable from them at all.
+ * `creditReadRepository` is OPTIONAL on purpose (workorders 21K, 21P and 21Q):
+ * it serves FOUR methods through FIVE reads — `getBalance` (balance snapshot),
+ * `claimDailyCredits` (subscription row plus the post-claim balance snapshot),
+ * `getTransactions` (transaction list) and `getSubscription` (subscription
+ * row). Everything else still goes through the admin client: deduct, refund,
+ * updatePlan and the claim RPC itself. With the repository absent there is no
+ * PostgREST fallback: `getBalance`, `getTransactions` and `getSubscription`
+ * fail closed as their existing `credit_query_failed` 500, while
+ * `claimDailyCredits` keeps its own refusal for the subscription read and its
+ * post-claim balance read is best effort — fixed log text, balance reported 0.
  */
 export function createCreditService(options: {
   getAdminClient: () => AdminSupabaseClient;
