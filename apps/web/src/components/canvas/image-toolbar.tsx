@@ -5,6 +5,7 @@ import * as React from "react";
 import type { ToolDefinition } from "@loomic/shared";
 
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import type { PriceState } from "@/lib/price-display";
 
 import { ImageToolbarMoreMenu } from "./image-toolbar-more-menu";
 
@@ -172,6 +173,11 @@ export type ImageToolbarProps = {
    * 默认 `false`，保持 30F 的纯图标形态 —— 不传这个 prop 时现有测试一字不改地通过。
    */
   showLabels?: boolean;
+  /**
+   * ED-00f：「更多」菜单里直接执行类菜单项的标价，key = 工具 id。
+   * 由 `useToolPrices` 询价得到（本组件自己不算价）；不传时菜单项沿用「估算中」。
+   */
+  prices?: Readonly<Record<string, PriceState>>;
 };
 
 type ToolbarGroup = {
@@ -179,7 +185,12 @@ type ToolbarGroup = {
   children: React.ReactNode;
 };
 
-export function ImageToolbar({ tools, onToolSelect, showLabels = false }: ImageToolbarProps) {
+export function ImageToolbar({
+  tools,
+  onToolSelect,
+  showLabels = false,
+  prices,
+}: ImageToolbarProps) {
   const enabledMainTools = tools.filter(
     (tool) => tool.availability === "enabled" && tool.default_slot === "main",
   );
@@ -220,7 +231,11 @@ export function ImageToolbar({ tools, onToolSelect, showLabels = false }: ImageT
           className="flex items-center justify-center"
           style={{ width: TOOLBAR_BUTTON, height: TOOLBAR_BUTTON }}
         >
-          <ImageToolbarMoreMenu tools={tools} onToolSelect={onToolSelect} />
+          <ImageToolbarMoreMenu
+            tools={tools}
+            onToolSelect={onToolSelect}
+            {...(prices ? { prices } : {})}
+          />
         </span>
       </>
     ),

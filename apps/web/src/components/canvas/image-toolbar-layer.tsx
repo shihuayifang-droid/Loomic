@@ -10,6 +10,7 @@ import { imageToolbarPosition } from "@/lib/toolbar-position";
 
 import { useToast } from "@/components/toast";
 import { useToolDefinitions } from "@/hooks/use-tool-definitions";
+import { useToolPrices } from "@/hooks/use-tool-prices";
 import { downloadAssetsZip, getAssetDownloadUrl } from "@/lib/server-api";
 
 import { DownloadAllBar } from "./download-all-bar";
@@ -339,6 +340,8 @@ export function ImageToolbarLayer({
 }: ImageToolbarLayerProps) {
   const { toast } = useToast();
   const definitions = useToolDefinitions(accessToken);
+  // ED-00f：「更多」菜单里直接执行类菜单项的标价，一次询价覆盖全部可询价工具。
+  const prices = useToolPrices(accessToken, definitions.tools);
 
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [mode, setMode] = useState<Mode>({ kind: "toolbar" });
@@ -731,7 +734,7 @@ export function ImageToolbarLayer({
           onExit={exitFlipRotate}
         />
       ) : (
-        <ImageToolbar tools={definitions.tools} onToolSelect={handleToolSelect} />
+        <ImageToolbar tools={definitions.tools} onToolSelect={handleToolSelect} prices={prices} />
       )}
     </div>
   );
