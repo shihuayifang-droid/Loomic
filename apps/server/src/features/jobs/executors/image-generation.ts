@@ -182,6 +182,30 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
     lap("asset_record_done");
 
+    // GN-11: provenance on the asset row. Best effort — the asset is already
+    // recorded and the generation already succeeded, so a failure here is
+    // logged and never fails the job (same reasoning as T-15).
+    if (ctx.assetProvenanceRepository) {
+      try {
+        await ctx.assetProvenanceRepository.recordProvenance({
+          actorId: createdBy,
+          assetId,
+          provenance: {
+            source: jobRow.session_id ? "agent" : "generator",
+            operation: "image_generation",
+            modelId: model,
+            prompt: payload.prompt,
+            creditsCharged: null,
+            actionId: null,
+            sourceJobId: jobId,
+            parentArtifactId: null,
+          },
+        });
+      } catch {
+        console.warn(`[asset-provenance] job ${jobId}: provenance was not recorded`);
+      }
+    }
+
     // A short-lived signature, not a permanent public URL (X-52). The worker uses
     // its admin client: it just recorded ownership of this object itself, and the
     // URL is a convenience for the job's consumer — `object_path` and `asset_id`

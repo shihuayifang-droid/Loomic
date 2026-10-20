@@ -169,6 +169,28 @@ function makeCreditRead(
   return { repository, calls };
 }
 
+/**
+ * GN-11: the substitute for the provenance write the executors perform after
+ * `record_project_asset`, plus every argument it was handed. Never injected by
+ * default, so every case above runs exactly as it did before provenance existed.
+ */
+type ProvenanceRepository = NonNullable<ExecutorContext["assetProvenanceRepository"]>;
+type ProvenanceInput = Parameters<ProvenanceRepository["recordProvenance"]>[0];
+
+function makeProvenance(options: { failWith?: Error } = {}) {
+  const calls: ProvenanceInput[] = [];
+  const repository: ProvenanceRepository = {
+    async recordProvenance(input) {
+      calls.push(input);
+      if (options.failWith) throw options.failWith;
+      return undefined as unknown as Awaited<
+        ReturnType<ProvenanceRepository["recordProvenance"]>
+      >;
+    },
+  };
+  return { repository, calls };
+}
+
 /** The context plus the job ids its service substitute was asked for. */
 type TestExecutorContext = ExecutorContext & { jobReads: string[] };
 
@@ -187,6 +209,7 @@ function makeContext(
   client: AdminSupabaseClient,
   job: ExecutorJobFixture,
   creditRead: ReturnType<typeof makeCreditRead> | null = makeCreditRead(),
+  provenance: ReturnType<typeof makeProvenance> | null = null,
 ): TestExecutorContext {
   const jobReads: string[] = [];
 
@@ -225,6 +248,8 @@ function makeContext(
     // present-and-undefined is a different shape under
     // `exactOptionalPropertyTypes`, and the executor's check does not care.
     ...(creditRead ? { creditReadRepository: creditRead.repository } : {}),
+    // GN-11: same conditional-spread rule; absent unless a case asks for it.
+    ...(provenance ? { assetProvenanceRepository: provenance.repository } : {}),
     jobReads,
   };
 }
@@ -586,5 +611,85 @@ describe("the watermark decision reads the plan through the credit repository", 
     // The JOB still ran: this is a skipped watermark, not a skipped job.
     expect(admin.uploads).toHaveLength(1);
     expect(result.asset_id).toBe("asset-1");
+  });
+});
+
+describe("generation executors record provenance on the asset (GN-11)", () => {
+  it("GN-11: the image executor records provenance on the asset it just registered", async () => {
+    const admin = makeAdmin();
+    const provenance = makeProvenance();
+
+    const result = await getExecutor("image_generation")!(
+      "job-1",
+      {},
+      makeContext(admin.client, jobRow(), makeCreditRead(), provenance),
+    );
+
+    expect(provenance.calls).toHaveLength(1);
+    expect(provenance.calls[0]?.assetId).toBe(result.asset_id);
+    expect(provenance.calls[0]?.actorId).toBe(CREATED_BY);
+    expect(provenance.calls[0]?.provenance).toEqual({
+      source: "agent",
+      operation: "image_generation",
+      modelId: "test/model",
+      prompt: "a cat",
+      creditsCharged: null,
+      actionId: null,
+      sourceJobId: "job-1",
+      parentArtifactId: null,
+    });
+  });
+
+  it("GN-11: a job without a session is recorded as generator", async () => {
+    const admin = makeAdmin();
+    const provenance = makeProvenance();
+
+    await getExecutor("image_generation")!(
+      "job-1",
+      {},
+      makeContext(admin.client, jobRow({ session_id: null }), makeCreditRead(), provenance),
+    );
+
+    expect(provenance.calls).toHaveLength(1);
+    expect(provenance.calls[0]?.provenance.source).toBe("generator");
+  });
+
+  it("GN-11: the video executor records video_generation provenance", async () => {
+    const admin = makeAdmin();
+    const provenance = makeProvenance();
+    const job = jobRow({ payload: { prompt: "a clip", model: "test/video" } });
+
+    const result = await getExecutor("video_generation")!(
+      "job-video-1",
+      {},
+      makeContext(admin.client, job, makeCreditRead(), provenance),
+    );
+
+    expect(provenance.calls).toHaveLength(1);
+    expect(provenance.calls[0]?.assetId).toBe(result.asset_id);
+    expect(provenance.calls[0]?.provenance.operation).toBe("video_generation");
+    expect(provenance.calls[0]?.provenance.sourceJobId).toBe("job-video-1");
+  });
+
+  it("GN-11: a provenance failure warns once and the job still succeeds", async () => {
+    const admin = makeAdmin();
+    const provenance = makeProvenance({ failWith: new Error("db down") });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const result = await getExecutor("image_generation")!(
+        "job-1",
+        {},
+        makeContext(admin.client, jobRow(), makeCreditRead(), provenance),
+      );
+
+      expect(result.asset_id).toBe("asset-1");
+      expect(warn).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]?.[0]);
+      expect(message).toContain("provenance was not recorded");
+      expect(message).not.toContain("db down");
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

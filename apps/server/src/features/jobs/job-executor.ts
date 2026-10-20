@@ -5,6 +5,7 @@ import type { PgmqClient } from "../../queue/pgmq-client.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { ServerEnv } from "../../config/env.js";
 import type { CreditReadRepository } from "../../db/credit-read-repository.js";
+import type { AssetProvenanceRepository } from "../../db/asset-provenance-repository.js";
 
 export type ExecutorContext = {
   jobService: JobService;
@@ -22,6 +23,14 @@ export type ExecutorContext = {
    * why that direction is the safe one.
    */
   creditReadRepository?: Pick<CreditReadRepository, "readSubscription">;
+  /**
+   * GN-11: writes provenance (source, operation, model, prompt, job id) onto the
+   * asset row the image / video executors just registered. The worker wires the
+   * real repository in; every other construction site (and every test
+   * substitute) may leave it out. An absent repository is NOT an error — the
+   * executor simply skips provenance.
+   */
+  assetProvenanceRepository?: Pick<AssetProvenanceRepository, "recordProvenance">;
   /** PGMQ queue name for the current job (set per-message by the worker). */
   queue: string;
   /** PGMQ message id for the current job (set per-message by the worker). */

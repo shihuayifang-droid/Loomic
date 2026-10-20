@@ -43,6 +43,10 @@ import {
   createCreditReadRepository,
   type CreditReadRepository,
 } from "./db/credit-read-repository.js";
+import {
+  createAssetProvenanceRepository,
+  type AssetProvenanceRepository,
+} from "./db/asset-provenance-repository.js";
 import { createRefundJob, type RefundJob } from "./features/jobs/refund-job.js";
 import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
 import type { ServerEnv } from "./config/env.js";
@@ -82,6 +86,7 @@ export type WorkerBaseContext = {
   getAdminClient: () => AdminSupabaseClient;
   env: ServerEnv;
   creditReadRepository: CreditReadRepository;
+  assetProvenanceRepository: AssetProvenanceRepository;
 };
 
 export type WorkerComposition = {
@@ -154,6 +159,13 @@ export function buildWorkerComposition(
     getTransactionPool,
   });
 
+  // GN-11: the image / video executors write provenance onto the asset row they
+  // just registered. Built lazily against the same `DATABASE_URL` as the
+  // repositories above, so construction connects to nothing.
+  const assetProvenanceRepository = createAssetProvenanceRepository({
+    getTransactionPool,
+  });
+
   // ADR-0001 / workorder 21H1: the billing gate the worker runs before it
   // consumes an attempt or calls a model. Built here, lazily, exactly like the
   // attempt repository above and against the same `DATABASE_URL`. With no
@@ -194,6 +206,8 @@ export function buildWorkerComposition(
     // Workorder 21W: the image executor's watermark decision reads the plan
     // through this. Optional on `ExecutorContext`, wired here for real.
     creditReadRepository,
+    // GN-11: provenance written onto the asset row by the image / video executors.
+    assetProvenanceRepository,
   };
 
   return {
