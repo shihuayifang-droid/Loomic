@@ -14,6 +14,56 @@
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 
+/**
+ * Whether Supabase's display projection may be routed through storage's on-the-fly
+ * image renderer (`/storage/v1/render/image/sign/...`).
+ *
+ * That route is a Supabase feature an individual project may not have enabled. On
+ * a project without it EVERY such URL answers
+ * `403 {"error":"FeatureNotEnabled","message":"feature not enabled for this tenant"}`
+ * — verified against this deployment for the same object that `/object/sign/`
+ * serves with a 200. The client treats the failure as recoverable (it retries the
+ * undownscaled original), but the retry is not guaranteed to run on every path: an
+ * image pushed in by `canvas.sync` was observed staying a grey placeholder box while
+ * the same object loaded fine on the next full page load.
+ *
+ * So the renderer is opt-OUT rather than assumed: default on (unchanged behaviour
+ * where the feature exists), and a deployment whose project lacks it sets
+ * `LOOMIC_CANVAS_DISPLAY_TRANSFORM=0` to make the plain object URL the primary one.
+ * Downscaling is an optimisation; it must never be the only way to see a picture.
+ */
+export function storageRenderTransformEnabled(): boolean {
+  const raw = process.env.LOOMIC_CANVAS_DISPLAY_TRANSFORM?.trim().toLowerCase();
+  return raw !== "0" && raw !== "false" && raw !== "off";
+}
+
+/**
+ * Ask the image renderer for WebP, on a signed display URL.
+ *
+ * The old public-URL path appended `&format=webp` by string concatenation, which
+ * only works because a public URL always has a query-free tail. A signed URL
+ * always carries `?token=...`, so the parameter is set through `URL` instead of
+ * being concatenated — and a URL that cannot be parsed is returned untouched
+ * rather than mangled.
+ *
+ * Why the format is pinned in the URL instead of left to content negotiation:
+ * Supabase's transformer will return WebP on its own if the request's Accept
+ * header asks for it — but its responses carry NO `Vary: Accept`. Any cache in
+ * the path (the browser's included) therefore keys purely on the URL and hands
+ * every later requester whichever format happened to be fetched first. Naming the
+ * format in the URL makes the cache key describe the bytes, so the saving cannot
+ * silently evaporate depending on who warmed the cache.
+ */
+export function withWebpFormat(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.set("format", "webp");
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
 /** The bucket every project asset lives in. */
 export const PROJECT_ASSET_BUCKET = "project-assets";
 

@@ -131,6 +131,39 @@ function makeSigningClient() {
   return { client: client as unknown as UserSupabaseClient, signed };
 }
 
+/**
+ * GN-14: same shape as `makeSigningClient`, but also records the THIRD argument
+ * (`createSignedUrl(path, ttl, options)`), which is how the list thumbnail's
+ * storage-side transform is observed from the service boundary.
+ */
+function makeTransformSigningClient() {
+  const calls: Array<{ bucket: string; path: string; options: unknown }> = [];
+
+  const client = {
+    storage: {
+      from(bucket: string) {
+        return {
+          createSignedUrl: async (
+            path: string,
+            _expiresIn: number,
+            options?: unknown,
+          ) => {
+            calls.push({ bucket, path, options });
+            return {
+              data: {
+                signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+              },
+              error: null,
+            };
+          },
+        };
+      },
+    },
+  };
+
+  return { client: client as unknown as UserSupabaseClient, calls };
+}
+
 type RepositoryCall = { method: string; input: Record<string, unknown> };
 
 /**
@@ -1340,6 +1373,68 @@ describe("saveThumbnail lookup retry", () => {
       expect(harness.writeCalls).toEqual([]);
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+// GN-14: a list card shows a 400px cover thumbnail rendered by storage — never the
+// stored original — unless the deployment has switched the renderer off, in which
+// case the list keeps the plain stored-object signature (same switch as the canvas).
+describe("GN-14 list thumbnails go through the storage renderer", () => {
+  it("GN-14: list thumbnails are signed as a 400px cover transform in webp", async () => {
+    const withThumbnail = {
+      ...PROJECT_ROW,
+      thumbnail_path: `${TEAM_ID}/project-1/thumbnail.webp`,
+    };
+    const { client, calls } = makeTransformSigningClient();
+    const { repository } = makeRepositoryStub({
+      projects: [withThumbnail],
+      canvases: [CANVAS_ROW],
+    });
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      getAdminClient: () => client as unknown as never,
+      projectReadRepository: repository,
+      projectWriteRepository: makeWriteRepositoryStub().repository,
+    });
+
+    const projects = await service.listProjects(USER);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.options).toEqual({
+      transform: { width: 400, height: 400, resize: "cover" },
+    });
+    expect(projects[0]?.thumbnailUrl).toContain("format=webp");
+  });
+
+  it("GN-14: with the renderer switched off the list falls back to the plain signature", async () => {
+    vi.stubEnv("LOOMIC_CANVAS_DISPLAY_TRANSFORM", "0");
+    try {
+      const withThumbnail = {
+        ...PROJECT_ROW,
+        thumbnail_path: `${TEAM_ID}/project-1/thumbnail.webp`,
+      };
+      const { client, calls } = makeTransformSigningClient();
+      const { repository } = makeRepositoryStub({
+        projects: [withThumbnail],
+        canvases: [CANVAS_ROW],
+      });
+      const service = createProjectService({
+        createUserClient: () => client,
+        viewerService: makeViewerStub(TEAM_WORKSPACE),
+        getAdminClient: () => client as unknown as never,
+        projectReadRepository: repository,
+        projectWriteRepository: makeWriteRepositoryStub().repository,
+      });
+
+      const projects = await service.listProjects(USER);
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.options).toBeUndefined();
+      expect(projects[0]?.thumbnailUrl).not.toContain("format=webp");
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 });

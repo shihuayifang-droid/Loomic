@@ -8,7 +8,11 @@ import {
   CanvasReadError,
   type CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
-import { signProjectAssetUrl } from "../storage/project-asset-urls.js";
+import {
+  signProjectAssetUrl,
+  storageRenderTransformEnabled,
+  withWebpFormat,
+} from "../storage/project-asset-urls.js";
 import {
   listRecoverableArtifacts as listRecoverable,
   recoverArtifacts as restoreArtifacts,
@@ -532,40 +536,6 @@ async function extractFilesToStorage(
 const CANVAS_DISPLAY_MAX_PX = 1024;
 
 /**
- * Why `format=webp` is pinned in the URL instead of left to content negotiation.
- *
- * Supabase's transformer will return WebP on its own if the request's Accept
- * header asks for it — but its responses carry NO `Vary: Accept`. Any cache in
- * the path (the browser's included) therefore keys purely on the URL and hands
- * every later requester whichever format happened to be fetched first. Measured
- * on one object: the same URL returned a 1228 KB PNG from cache while a
- * cache-bypassing request for it produced 54 KB of WebP.
- *
- * Naming the format in the URL makes the cache key describe the bytes, so the
- * saving cannot silently evaporate depending on who warmed the cache.
- */
-const CANVAS_DISPLAY_FORMAT_QUERY = "format=webp";
-
-/**
- * Ask the image renderer for WebP, on a signed display URL.
- *
- * The old public-URL path appended `&format=webp` by string concatenation, which
- * only works because a public URL always has a query-free tail. A signed URL
- * always carries `?token=...`, so the parameter is set through `URL` instead of
- * being concatenated — and a URL that cannot be parsed is returned untouched
- * rather than mangled.
- */
-function withDisplayFormat(url: string): string {
-  try {
-    const parsed = new URL(url);
-    parsed.searchParams.set("format", "webp");
-    return parsed.toString();
-  } catch {
-    return url;
-  }
-}
-
-/**
  * Whether Supabase's image transformer can safely resize this mime type.
  *
  * Deliberately an allowlist. SVG has no raster size to resize and comes back
@@ -581,29 +551,6 @@ function canTransformOnTheFly(mimeType: string): boolean {
     mimeType === "image/jpg" ||
     mimeType === "image/webp"
   );
-}
-
-/**
- * Whether the display projection may be routed through storage's on-the-fly image
- * renderer (`/storage/v1/render/image/sign/...`).
- *
- * That route is a Supabase feature an individual project may not have enabled. On
- * a project without it EVERY such URL answers
- * `403 {"error":"FeatureNotEnabled","message":"feature not enabled for this tenant"}`
- * — verified against this deployment for the same object that `/object/sign/`
- * serves with a 200. The client treats the failure as recoverable (it retries the
- * undownscaled original), but the retry is not guaranteed to run on every path: an
- * image pushed in by `canvas.sync` was observed staying a grey placeholder box while
- * the same object loaded fine on the next full page load.
- *
- * So the renderer is opt-OUT rather than assumed: default on (unchanged behaviour
- * where the feature exists), and a deployment whose project lacks it sets
- * `LOOMIC_CANVAS_DISPLAY_TRANSFORM=0` to make the plain object URL the primary one.
- * Downscaling is an optimisation; it must never be the only way to see a picture.
- */
-function canvasDisplayTransformEnabled(): boolean {
-  const raw = process.env.LOOMIC_CANVAS_DISPLAY_TRANSFORM?.trim().toLowerCase();
-  return raw !== "0" && raw !== "false" && raw !== "off";
 }
 
 async function resolveFilesFromStorage(
@@ -684,7 +631,7 @@ async function resolveFilesFromStorage(
           ? entry.fileData.mimeType
           : "";
       const transformable =
-        canTransformOnTheFly(mimeType) && canvasDisplayTransformEnabled();
+        canTransformOnTheFly(mimeType) && storageRenderTransformEnabled();
 
       // SIGNED, not public (X-52): the caller's JWT decides whether this object
       // may be read at all. The 1024px display projection is signed as a
@@ -697,7 +644,7 @@ async function resolveFilesFromStorage(
       try {
         original = await signProjectAssetUrl(client, entry.objectPath, { bucket });
         storageUrl = transformable
-          ? withDisplayFormat(
+          ? withWebpFormat(
               await signProjectAssetUrl(client, entry.objectPath, {
                 bucket,
                 transform: {

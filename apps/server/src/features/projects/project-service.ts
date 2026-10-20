@@ -28,6 +28,8 @@ import {
   ProjectAssetUrlError,
   signProjectAssetUrl,
   signProjectAssetUrls,
+  storageRenderTransformEnabled,
+  withWebpFormat,
 } from "../storage/project-asset-urls.js";
 import type {
   AuthenticatedUser,
@@ -35,6 +37,8 @@ import type {
 } from "../../supabase/user.js";
 
 const THUMBNAIL_BUCKET = "project-assets";
+/** GN-14: a list card shows a thumbnail, never the stored original. */
+const PROJECT_LIST_THUMBNAIL_PX = 400;
 const PROJECT_QUERY_FAILED_MESSAGE = "Unable to load projects.";
 const PROJECT_LOOKUP_FAILED_MESSAGE = "Unable to look up project.";
 const PROJECT_CREATE_FAILED_MESSAGE = "Unable to create project.";
@@ -712,15 +716,30 @@ async function generateThumbnailUrls(
   );
   if (withThumbnail.length === 0) return urlMap;
 
+  // GN-14: the renderer switch is the same one the canvas uses, with the same
+  // meaning. Off, a deployment keeps the plain stored-object signature.
+  const transformEnabled = storageRenderTransformEnabled();
+
   const signed = await signProjectAssetUrls(
     client,
     withThumbnail.map((project) => project.thumbnail_path),
-    { bucket: THUMBNAIL_BUCKET },
+    transformEnabled
+      ? {
+          bucket: THUMBNAIL_BUCKET,
+          transform: {
+            width: PROJECT_LIST_THUMBNAIL_PX,
+            height: PROJECT_LIST_THUMBNAIL_PX,
+            resize: "cover",
+          },
+        }
+      : { bucket: THUMBNAIL_BUCKET },
   );
 
   for (const project of withThumbnail) {
     const url = signed.get(project.thumbnail_path);
-    if (url) urlMap.set(project.id, url);
+    if (url) {
+      urlMap.set(project.id, transformEnabled ? withWebpFormat(url) : url);
+    }
   }
 
   return urlMap;

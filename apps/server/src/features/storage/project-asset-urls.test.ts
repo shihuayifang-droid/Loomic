@@ -1,7 +1,7 @@
 // X-52: the signing service is the only source of a project asset URL, and it
 // NEVER falls back to a public one. These cases pin the two halves of that:
 // what it signs, and what it refuses to do when signing fails.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   PROJECT_ASSET_BUCKET,
@@ -9,6 +9,8 @@ import {
   ProjectAssetUrlError,
   signProjectAssetUrl,
   signProjectAssetUrls,
+  storageRenderTransformEnabled,
+  withWebpFormat,
   type ProjectAssetSigningClient,
 } from "./project-asset-urls.js";
 
@@ -177,5 +179,43 @@ describe("project asset signed URLs", () => {
     await signProjectAssetUrl(stub.client, "ws/p/a.png");
 
     expect(stub.calls[0]?.options).toBeUndefined();
+  });
+});
+
+// GN-14: list cards and canvas tiles show a storage-side projection, never the
+// stored original. The two pieces that make that possible — pinning `format=webp`
+// on a signed URL and reading the renderer switch — used to be private to
+// canvas-service; they now live here so the list path can use them too.
+describe("GN-14 storage-side display projection", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("GN-14: withWebpFormat sets format=webp on a signed URL and keeps the token", () => {
+    const signed =
+      "https://proj.test/storage/v1/object/sign/project-assets/ws/p/a.png?token=sig";
+
+    const url = withWebpFormat(signed);
+
+    expect(url).toContain("token=sig");
+    expect(url).toContain("format=webp");
+    const parsed = new URL(url);
+    expect(parsed.searchParams.get("format")).toBe("webp");
+    expect(parsed.searchParams.get("token")).toBe("sig");
+  });
+
+  it("GN-14: an unparsable URL is returned untouched", () => {
+    expect(withWebpFormat("not a url at all")).toBe("not a url at all");
+  });
+
+  it("GN-14: the renderer switch reads LOOMIC_CANVAS_DISPLAY_TRANSFORM", () => {
+    vi.stubEnv("LOOMIC_CANVAS_DISPLAY_TRANSFORM", "0");
+    expect(storageRenderTransformEnabled()).toBe(false);
+
+    vi.stubEnv("LOOMIC_CANVAS_DISPLAY_TRANSFORM", "off");
+    expect(storageRenderTransformEnabled()).toBe(false);
+
+    vi.unstubAllEnvs();
+    expect(storageRenderTransformEnabled()).toBe(true);
   });
 });
