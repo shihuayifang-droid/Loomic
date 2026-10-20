@@ -164,6 +164,15 @@ type HarnessConfig = {
   /** Build the service with NO owner read repository at all (fail-closed). */
   withoutJobOwnerReadRepository?: boolean;
   /**
+   * ED-00m: what `findOwnJobByClientRequestId` answers. `recentJobRow` is the row
+   * (`null` — or omitting it — is "no job under that id"), `recentJobError` is
+   * the rejected-promise channel, and `withoutRecentJobLookup` builds the double
+   * WITHOUT the method, i.e. a repository wired before this ticket.
+   */
+  recentJobRow?: Record<string, unknown> | null;
+  recentJobError?: Error;
+  withoutRecentJobLookup?: boolean;
+  /**
    * ADR-0001 / workorder 21M: build the service with NO transition repository at
    * all (the fail-closed path of the four `mark*` methods).
    */
@@ -521,7 +530,26 @@ function makeHarness(config: HarnessConfig = {}) {
       if (config.ownJobListError) throw config.ownJobListError;
       return (config.ownJobRows ?? []) as JobOwnerReadRow[];
     },
+    // ED-00m: the "is this the same submission?" read. Recorded by name and by
+    // its whole argument object, because the WINDOW (`withinHours: 24`) is part
+    // of the question: an id older than that is a new submission, not this job.
+    async findOwnJobByClientRequestId(input) {
+      jobOwnerReadCalls.push({
+        operation: "findOwnJobByClientRequestId",
+        input: { ...input },
+      });
+      if (config.recentJobError) throw config.recentJobError;
+      return (config.recentJobRow ?? null) as JobOwnerReadRow | null;
+    },
   };
+
+  // ED-00m: the method is optional on the repository port, and a wiring that
+  // predates it must simply not deduplicate. Removing it (rather than answering
+  // `null` from it) is what makes that distinguishable from "asked, found
+  // nothing".
+  if (config.withoutRecentJobLookup) {
+    delete jobOwnerReadRepository.findOwnJobByClientRequestId;
+  }
 
   // ADR-0001 / workorder 21M: the four guarded status transitions. The double
   // keeps the SAME outward shape the old client update had — it records the
@@ -3501,5 +3529,85 @@ describe("processJobMessage with the real JobService: single-ownership boundarie
     expect(harness.calls).toEqual(["executor", "refundJob", "archive"]);
     expect(harness.calls).not.toContain("deleteMsg");
     expect(harness.refunds()).toBe(1);
+  });
+});
+
+// Workorder 34U / ED-00m: the same submission id is the same job. The write half
+// is `createJob` recording the id; the read half is
+// `findRecentJobByClientRequestId`, which the callers (withBilling) ask BEFORE
+// they create or charge anything.
+describe("ED-00m: the same submission id is the same job (工单34U)", () => {
+  it("ED-00m: createJob stores the client request id", async () => {
+    const harness = makeHarness({ insertedJob: ownerJobFixture() });
+
+    await harness.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      jobType: "image_generation",
+      payload: { prompt: "a red fox" },
+      clientRequestId: "req-12345678",
+    });
+
+    // The id reaches the INSERT itself, not the enqueue message: it is a fact
+    // about the row, which is what a later lookup can find.
+    expect(harness.insertOp()?.row.client_request_id).toBe("req-12345678");
+
+    // And it is NOT written when the caller sent none. The key is absent rather
+    // than `null`, so "no submission id" cannot be mistaken for a stored one.
+    const anonymous = makeHarness({ insertedJob: ownerJobFixture() });
+    await anonymous.service.createJob(WRITE_USER, {
+      workspaceId: "ws-1",
+      jobType: "image_generation",
+      payload: { prompt: "a red fox" },
+    });
+    expect(anonymous.insertOp()?.row).not.toHaveProperty("client_request_id");
+  });
+
+  it("ED-00m: a recent job is found by its client request id within 24 hours", async () => {
+    const harness = makeHarness({
+      recentJobRow: ownerJobFixture({
+        id: "job-recent",
+        client_request_id: "req-12345678",
+      }),
+    });
+
+    const found = await harness.service.findRecentJobByClientRequestId(
+      caller("user-21h0"),
+      "req-12345678",
+    );
+
+    // The question is exactly three values: WHO is asking (the repository's ACL
+    // is `created_by = actor`), WHICH id, and HOW FAR BACK. The window is part of
+    // the question — an id older than the window is not this job any more.
+    expect(harness.jobOwnerReadCalls).toEqual([
+      {
+        operation: "findOwnJobByClientRequestId",
+        input: {
+          actorId: "user-21h0",
+          clientRequestId: "req-12345678",
+          withinHours: 24,
+        },
+      },
+    ]);
+    // The row comes back through the same `mapJobRow` every other read uses.
+    expect(found?.id).toBe("job-recent");
+    expect(found?.job_type).toBe("image_generation");
+  });
+
+  it("ED-00m: without the repository method nothing is deduplicated", async () => {
+    // A repository wired before this ticket has no lookup at all. That is NOT an
+    // error and NOT a hit: the answer is `null`, so the caller creates the job
+    // exactly as it always did.
+    const harness = makeHarness({
+      withoutRecentJobLookup: true,
+      recentJobRow: ownerJobFixture({ id: "job-recent" }),
+    });
+
+    const found = await harness.service.findRecentJobByClientRequestId(
+      caller("user-21h0"),
+      "req-12345678",
+    );
+
+    expect(found).toBeNull();
+    expect(harness.jobOwnerReadCalls).toEqual([]);
   });
 });

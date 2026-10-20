@@ -55,11 +55,31 @@ export type CreateJobInput = {
   threadId?: string;
   jobType: BackgroundJobType;
   payload: Record<string, unknown>;
+  /**
+   * ED-00m: the browser-chosen submission id this job belongs to, when the
+   * caller supplied one. It is written to `background_jobs.client_request_id`
+   * only when present — an empty/absent id is "no opinion", not a NULL-valued
+   * opinion, which is why the insert spreads the column conditionally
+   * (`exactOptionalPropertyTypes`).
+   */
+  clientRequestId?: string;
 };
 
 export type JobService = {
   createJob(user: AuthenticatedUser, input: CreateJobInput): Promise<BackgroundJob>;
   getJob(user: AuthenticatedUser, jobId: string): Promise<BackgroundJob>;
+  /**
+   * ED-00m: the job this caller already submitted under `clientRequestId` within
+   * the last 24 hours, or `null` when there is none — and `null` as well when no
+   * repository (or no such repository method) is wired, because "cannot ask" is
+   * the answer that leaves the caller's path exactly as it was before this
+   * ticket. A repository that THREW is not that answer: it is
+   * `job_query_failed` 500, so a broken read can never look like "no duplicate".
+   */
+  findRecentJobByClientRequestId(
+    user: AuthenticatedUser,
+    clientRequestId: string,
+  ): Promise<BackgroundJob | null>;
   listJobs(
     user: AuthenticatedUser,
     filters?: { status?: BackgroundJobStatus; jobType?: BackgroundJobType },
@@ -400,6 +420,13 @@ export function createJobService(options: {
           job_type: input.jobType,
           payload: input.payload as Json,
           created_by: user.id,
+          // ED-00m: absent means "no submission id" — the column stays NULL and
+          // two anonymous submissions stay two jobs. Spread conditionally so an
+          // empty id cannot become a stored `null` that some other id-less
+          // submission would then have to be told apart from.
+          ...(input.clientRequestId
+            ? { client_request_id: input.clientRequestId }
+            : {}),
         })
         .select(SELECT_COLS)
         .single();
@@ -467,6 +494,39 @@ export function createJobService(options: {
       }
 
       return mapJobRow(row);
+    },
+
+    async findRecentJobByClientRequestId(user, clientRequestId) {
+      // ED-00m: "the same submission id is the same job" — the read half. The
+      // age bound is part of the question (the repository's statement carries
+      // `created_at >= now() - make_interval(hours => 24)`), because a name the
+      // browser reuses a day later is a NEW submission.
+      //
+      // Two answers are deliberately NOT errors here:
+      //   - no repository, or a repository from before this method existed:
+      //     `null`, so deduplication is simply off and the caller inserts as it
+      //     always did. Deduplication is new behaviour, and a missing dependency
+      //     must not turn into a new failure for every submission.
+      //   - no row: `null`, the ordinary "nothing to reuse" answer.
+      // A repository that THREW is a different answer — `job_query_failed` 500,
+      // the same shape `getJob` publishes — because "we could not ask" must never
+      // be reused as "there is no duplicate" and quietly create a second job.
+      const repository = options.jobOwnerReadRepository;
+      const lookup = repository?.findOwnJobByClientRequestId;
+      if (!repository || typeof lookup !== "function") return null;
+
+      let row: Record<string, unknown> | null;
+      try {
+        row = await lookup.call(repository, {
+          actorId: user.id,
+          clientRequestId,
+          withinHours: 24,
+        });
+      } catch {
+        throw new JobServiceError("job_query_failed", "Failed to query job.", 500);
+      }
+
+      return row === null ? null : mapJobRow(row);
     },
 
     async listJobs(user, filters) {

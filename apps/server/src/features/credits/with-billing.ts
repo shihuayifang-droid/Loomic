@@ -174,6 +174,16 @@ export interface BillingRequest {
       CreateJobInput,
       "projectId" | "canvasId" | "sessionId" | "threadId"
     >;
+    /**
+     * ED-00m: the browser-chosen submission id, when the caller sent one.
+     *
+     * With it set, this function first asks whether the SAME user already has a
+     * job under it within 24 hours, and if so it reuses that job, charges
+     * nothing and creates nothing — the double-click of a submit button is one
+     * submission. Without it, nothing is looked up and the request is exactly
+     * what it was before this ticket.
+     */
+    clientRequestId?: string;
   };
   /**
    * Called before the rejection is thrown. The agent runtime uses it to push a
@@ -233,6 +243,44 @@ export async function withBilling<T>(
       "withBilling: deps.creditService and deps.tierGuard are set but " +
         "deps.priceQuoter is missing. Wire a price quoter (or turn billing off).",
     );
+  }
+
+  // ED-00m — "the same submission id is the same job", before ANY money or job:
+  //
+  //   submitted again with `clientRequestId` -> look it up -> found -> hand the
+  //   EXISTING job to `run` and return.
+  //
+  // This sits after the two wiring checks above (a request that cannot be served
+  // must fail for that reason, not because a lookup found nothing) and BEFORE
+  // the quote, the balance read, the job insert, the pending ledger row, the
+  // deduction and `setCreditsInfo`. A hit therefore performs none of them: no
+  // price is quoted, no credit moves, no second job is created and no
+  // confirmation is written — the original call already did all of that.
+  //
+  // `creditsCost: 0` in the outcome means "THIS call charged nothing". It is not
+  // a discount and not a free generation: the charge for this job happened in the
+  // call that created it, and `priceStatus: null` says so — no quote was made
+  // here, so there is no price status to report.
+  //
+  // A lookup that FAILS propagates (the job service answers `job_query_failed`):
+  // "we could not tell whether this is a duplicate" must not be answered with a
+  // second job and a second charge. Nothing has been charged at this point, so
+  // there is nothing to refund either.
+  if (request.job?.clientRequestId) {
+    const lookup = jobService?.findRecentJobByClientRequestId;
+    // A job service from before this method existed (or a test double without
+    // it) means deduplication is off; the request then runs exactly as it did
+    // before this ticket rather than failing.
+    if (typeof lookup === "function") {
+      const existing = await lookup.call(
+        jobService,
+        user,
+        request.job.clientRequestId,
+      );
+      if (existing) {
+        return await run({ job: existing, creditsCost: 0, priceStatus: null });
+      }
+    }
   }
 
   let creditsCost = 0;
@@ -347,6 +395,12 @@ export async function withBilling<T>(
       ...(request.job.refs ?? {}),
       jobType: guard.jobType,
       payload: request.job.payload,
+      // ED-00m: a lookup that found nothing (or was never wired) still records
+      // the submission id on the row it creates, so the NEXT submission of the
+      // same id is answered with this job.
+      ...(request.job.clientRequestId
+        ? { clientRequestId: request.job.clientRequestId }
+        : {}),
     });
   }
 

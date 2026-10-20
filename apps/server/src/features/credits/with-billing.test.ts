@@ -22,7 +22,7 @@ import { JobServiceError } from "../jobs/job-service.js";
 import type { PriceQuoter } from "../pricing/price-quoter.js";
 import { CreditServiceError, type CreditService } from "./credit-service.js";
 import { TierGuardError, type TierGuard } from "./tier-guard.js";
-import { withBilling, type BillingRejection } from "./with-billing.js";
+import { withBilling, type BillingOutcome, type BillingRejection } from "./with-billing.js";
 
 const USER: AuthenticatedUser = {
   id: "user-1",
@@ -1175,6 +1175,127 @@ describe("withBilling", () => {
       expect(creditService.deductCredits).toHaveBeenCalledTimes(1);
       expect(jobService.setCreditsInfo).not.toHaveBeenCalled();
       expect(jobService.claimUnlinkedCharge).not.toHaveBeenCalled();
+      expect(creditService.refundCredits).not.toHaveBeenCalled();
+    });
+  });
+
+  // Workorder 34U / ED-00m: "the same submission id is the same job". The
+  // submission id arrives with the request and is looked up BEFORE any quote,
+  // balance read, insert or deduction — so a double-clicked submit button is one
+  // job and one charge, not two.
+  //
+  // The lookup is added to the `makeJobService` double per case (the double keeps
+  // its old behaviour by default: no method, so no deduplication), which is also
+  // what proves the "nothing is looked up" case.
+  describe("the same submission id is the same job (工单34U / ED-00m)", () => {
+    it("ED-00m: a repeated client request id returns the existing job and charges nothing", async () => {
+      const existing = { id: "job-existing" } as BackgroundJob;
+      jobService.findRecentJobByClientRequestId = vi.fn(async () => existing);
+      const seen: BillingOutcome[] = [];
+
+      const result = await withBilling(
+        { creditService, tierGuard, jobService, priceQuoter, creditLedgerWriteRepository: ledger },
+        {
+          ...IMAGE_REQUEST,
+          job: { payload: { prompt: "x" }, clientRequestId: "req-12345678" },
+        },
+        async (outcome) => {
+          seen.push(outcome);
+          return "ok";
+        },
+      );
+
+      expect(result).toBe("ok");
+      // The id asked for is the one the caller sent, for the caller themself: the
+      // repository's ACL is `created_by = actor`, so this is the only pair the
+      // service may ask with.
+      expect(jobService.findRecentJobByClientRequestId).toHaveBeenCalledWith(
+        USER,
+        "req-12345678",
+      );
+      // `run` receives the job that already exists — not a new one — and 0,
+      // because THIS call took no money; the original call already did.
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.job).toBe(existing);
+      expect(seen[0]?.creditsCost).toBe(0);
+      // Nothing downstream of the lookup ran: no second job, no second quote, no
+      // second charge, no second confirmation, no second pending ledger row.
+      expect(jobService.createJob).not.toHaveBeenCalled();
+      expect(priceQuoter.quote).not.toHaveBeenCalled();
+      expect(creditService.deductCredits).not.toHaveBeenCalled();
+      expect(jobService.setCreditsInfo).not.toHaveBeenCalled();
+      expect(ledger.recordPendingConsume).not.toHaveBeenCalled();
+      expect(creditService.refundCredits).not.toHaveBeenCalled();
+    });
+
+    it("ED-00m: a new client request id creates the job with that id", async () => {
+      jobService.findRecentJobByClientRequestId = vi.fn(async () => null);
+
+      const result = await withBilling(
+        { creditService, tierGuard, jobService, priceQuoter, creditLedgerWriteRepository: ledger },
+        {
+          ...IMAGE_REQUEST,
+          job: { payload: { prompt: "x" }, clientRequestId: "req-12345678" },
+        },
+        async () => "ok",
+      );
+
+      expect(result).toBe("ok");
+      // No row for this id, so the request runs as any first submission does —
+      // and the id travels WITH the insert, so the next submission finds it.
+      expect(jobService.createJob).toHaveBeenCalledTimes(1);
+      expect(jobService.createJob).toHaveBeenCalledWith(
+        USER,
+        expect.objectContaining({ clientRequestId: "req-12345678" }),
+      );
+      expect(creditService.deductCredits).toHaveBeenCalledTimes(1);
+    });
+
+    it("ED-00m: without a client request id nothing is looked up", async () => {
+      // Deliberately answers a job: if the lookup ran at all, `run` would get
+      // this row instead of a freshly created one.
+      const existing = { id: "job-existing" } as BackgroundJob;
+      jobService.findRecentJobByClientRequestId = vi.fn(async () => existing);
+
+      const result = await withBilling(
+        { creditService, tierGuard, jobService, priceQuoter, creditLedgerWriteRepository: ledger },
+        { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } } },
+        async () => "ok",
+      );
+
+      expect(result).toBe("ok");
+      expect(jobService.findRecentJobByClientRequestId).not.toHaveBeenCalled();
+      expect(jobService.createJob).toHaveBeenCalledTimes(1);
+      expect(jobService.createJob).toHaveBeenCalledWith(
+        USER,
+        expect.not.objectContaining({ clientRequestId: expect.anything() }),
+      );
+    });
+
+    it("ED-00m: a failing lookup fails the request before any charge", async () => {
+      const failure = new JobServiceError("job_query_failed", "Failed to query job.", 500);
+      jobService.findRecentJobByClientRequestId = vi.fn(async () => {
+        throw failure;
+      });
+
+      const error = await withBilling(
+        { creditService, tierGuard, jobService, priceQuoter, creditLedgerWriteRepository: ledger },
+        {
+          ...IMAGE_REQUEST,
+          job: { payload: { prompt: "x" }, clientRequestId: "req-12345678" },
+        },
+        async () => "ok",
+      )
+        .then(() => null)
+        .catch((thrown: unknown) => thrown);
+
+      // "We could not ask whether this is a duplicate" is never answered with a
+      // second job and a second charge: the lookup error is the request's error.
+      expect(error).toBe(failure);
+      expect(jobService.createJob).not.toHaveBeenCalled();
+      expect(priceQuoter.quote).not.toHaveBeenCalled();
+      expect(creditService.deductCredits).not.toHaveBeenCalled();
+      expect(jobService.setCreditsInfo).not.toHaveBeenCalled();
       expect(creditService.refundCredits).not.toHaveBeenCalled();
     });
   });
