@@ -122,6 +122,7 @@ type CanvasEditorProps = {
   onStorageMediaError?: (url: string) => void;
   ws?: WebSocketHandle;
   leftPanelOpen?: boolean;
+  projectName?: string;
   onSelectionChange?: (elements: CanvasSelectedElement[]) => void;
 };
 
@@ -159,6 +160,7 @@ export function CanvasEditor({
   onStorageMediaError,
   ws,
   leftPanelOpen,
+  projectName,
   onSelectionChange,
 }: CanvasEditorProps) {
   const { resolvedTheme } = useTheme();
@@ -1194,7 +1196,7 @@ export function CanvasEditor({
             {...(ws ? { ws } : {})}
           />
         )}
-        {excalidrawApi && <ImageToolbarLayer accessToken={accessToken} excalidrawApi={excalidrawApi} />}
+        {excalidrawApi && <ImageToolbarLayer accessToken={accessToken} excalidrawApi={excalidrawApi} {...(projectName ? { projectName } : {})} />}
 
         {/*
           Save state has to be visible. A save that exhausted its retries used to

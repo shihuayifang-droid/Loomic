@@ -467,6 +467,7 @@ function CanvasPageContent() {
           onStorageMediaError={handleStorageMediaError}
           ws={ws}
           leftPanelOpen={layersOpen || filesOpen || referencesOpen}
+          projectName={projectName}
           onSelectionChange={setSelectedCanvasElements}
         />
         <CanvasEmptyHint
