@@ -50,3 +50,18 @@ export const MENTION_KIND_LABEL: Record<MentionKind, string> = {
   model: "模型",
   skill: "技能",
 };
+
+/** AG-03: the server injects at most this many characters of a text asset (runtime.ts MENTION_TEXT_MAX_CHARS). */
+export const MENTION_TEXT_MAX_CHARS = 4000;
+
+/**
+ * AG-03: whether a text asset's body is long enough for the server to cut it.
+ *
+ * The server compares `text.length` (UTF-16 code units), so the count here is
+ * deliberately the same — not code points, not grapheme clusters.  Empty or
+ * missing text is never truncated.
+ */
+export function isMentionTextTruncated(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return text.length > MENTION_TEXT_MAX_CHARS;
+}

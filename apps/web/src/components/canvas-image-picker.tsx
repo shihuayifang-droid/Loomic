@@ -2,6 +2,8 @@
 
 import { useEffect, useRef } from "react";
 
+import { isMentionTextTruncated } from "@/lib/mention-kinds";
+
 export type CanvasImageItem = {
   kind: "canvas-image";
   id: string;
@@ -173,6 +175,11 @@ export function MessageMentionPicker({
                       <div className="truncate text-[11px] text-muted-foreground">
                         {item.assetType}
                         {item.textContent ? ` · ${item.textContent}` : ""}
+                        {isMentionTextTruncated(item.textContent) && (
+                          <span data-testid="agent-mention-truncated-hint">
+                            {" · 将截断至 4000 字"}
+                          </span>
+                        )}
                       </div>
                     )}
                     {item.kind === "image-model" && item.description && (

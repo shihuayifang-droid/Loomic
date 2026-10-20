@@ -2,7 +2,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { MentionPill } from "../src/components/chat/mention-pill";
-import { MENTION_PREFIX, mentionKindOf } from "../src/lib/mention-kinds";
+import { MENTION_PREFIX, MENTION_TEXT_MAX_CHARS, isMentionTextTruncated, mentionKindOf } from "../src/lib/mention-kinds";
 
 afterEach(cleanup);
 
@@ -56,5 +56,31 @@ describe("mention kinds (AG-03)", () => {
 
     expect(capsule.getAttribute("data-kind")).toBe("unknown");
     expect(capsule.textContent).toContain("引用");
+  });
+
+  it("AG-03: the injection cap is 4000 characters", () => {
+    expect(MENTION_TEXT_MAX_CHARS).toBe(4000);
+    expect(isMentionTextTruncated("字".repeat(4000))).toBe(false);
+    expect(isMentionTextTruncated("字".repeat(4001))).toBe(true);
+  });
+
+  it("AG-03: empty or missing text is never truncated", () => {
+    expect(isMentionTextTruncated("")).toBe(false);
+    expect(isMentionTextTruncated(null)).toBe(false);
+    expect(isMentionTextTruncated(undefined)).toBe(false);
+  });
+
+  it("AG-03: a truncated capsule says 已截断", () => {
+    render(<MentionPill label="设计指南" kind="brand-kit-asset" truncated />);
+
+    const badge = screen.getByTestId("agent-mention-capsule-truncated");
+
+    expect(badge.textContent).toBe("已截断");
+  });
+
+  it("AG-03: a capsule within the cap shows no truncation", () => {
+    render(<MentionPill label="设计指南" kind="brand-kit-asset" />);
+
+    expect(screen.queryByTestId("agent-mention-capsule-truncated")).toBeNull();
   });
 });
