@@ -21,8 +21,45 @@ import { useToast } from "@/components/toast";
 import { fetchProjectUploads, uploadFile } from "@/lib/server-api";
 import type { ProjectUploadItem } from "@/lib/server-api";
 
-/** 落到画布上的接收端（另单）读这个类型。 */
-const ASSET_DRAG_MIME = "application/x-hahart-asset";
+/** 落到画布上的接收端（35G：画布容器）读这个类型。 */
+export const ASSET_DRAG_MIME = "application/x-hahart-asset";
+
+/**
+ * 35G · AS-06：读回列表项 `dragstart` 写进 dataTransfer 的那份载荷。
+ *
+ * 不认的一律返回 `null`，调用方据此「不处理这次拖入」——画布要把非本应用的
+ * 拖入（本地文件、外部图片）原样留给 Excalidraw，所以判空必须宽进严出：
+ * - JSON 解析失败 → null；
+ * - `assetId` 不是非空字符串 → null；
+ * - `mimeType` 不是 `image/*` → null（视频 / PDF 目前不插画布）；
+ * - `name` 不是字符串时给空串，名字只用于图层标题，缺了不算失败。
+ */
+export function parseAssetDrag(
+  raw: string | null | undefined,
+): { assetId: string; mimeType: string; name: string } | null {
+  if (typeof raw !== "string" || raw === "") return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const record = parsed as Record<string, unknown>;
+
+  const assetId = record.assetId;
+  const mimeType = record.mimeType;
+  if (typeof assetId !== "string" || assetId === "") return null;
+  if (typeof mimeType !== "string" || !mimeType.startsWith("image/")) return null;
+
+  return {
+    assetId,
+    mimeType,
+    name: typeof record.name === "string" ? record.name : "",
+  };
+}
 
 type SortOrder = "newest" | "oldest";
 type FilterType = "" | "image" | "video" | "pdf";

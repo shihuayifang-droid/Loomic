@@ -29,7 +29,12 @@ const toastMock = vi.hoisted(() => ({
 
 vi.mock("@/components/toast", () => ({ useToast: () => toastMock }));
 
-import { ReferencePanel, toImageArtifact } from "../src/components/canvas/reference-panel";
+import {
+  ASSET_DRAG_MIME,
+  ReferencePanel,
+  parseAssetDrag,
+  toImageArtifact,
+} from "../src/components/canvas/reference-panel";
 
 const firstItem = {
   id: "asset-1",
@@ -211,5 +216,40 @@ describe("ReferencePanel (AS-06)", () => {
     await waitFor(() => expect(screen.getAllByTestId("ref-item")).toHaveLength(1));
     expect(screen.getAllByTestId("ref-item")[0]).toHaveTextContent("文件");
     expect(screen.getAllByTestId("ref-item")[0]).toHaveTextContent("unknown-blob");
+  });
+
+  // ── 35G：拖到画布（接收端读回 34P 写下的载荷） ──
+
+  it("AS-06: a dragged image reference is read back", () => {
+    expect(
+      parseAssetDrag(
+        JSON.stringify({ assetId: "a1", mimeType: "image/png", name: "猫.png" }),
+      ),
+    ).toEqual({ assetId: "a1", mimeType: "image/png", name: "猫.png" });
+  });
+
+  it("AS-06: a dragged PDF is not dropped onto the canvas", () => {
+    expect(
+      parseAssetDrag(
+        JSON.stringify({ assetId: "a2", mimeType: "application/pdf", name: "分镜.pdf" }),
+      ),
+    ).toBeNull();
+  });
+
+  it("AS-06: a foreign drag payload is ignored", () => {
+    expect(parseAssetDrag("not json")).toBeNull();
+    expect(parseAssetDrag(null)).toBeNull();
+  });
+
+  it("AS-06: what the panel writes on dragstart is what the canvas reads", async () => {
+    renderPanel();
+    await waitFor(() => expect(screen.getAllByTestId("ref-item")).toHaveLength(2));
+
+    const dataTransfer = { setData: vi.fn() };
+    fireEvent.dragStart(screen.getAllByTestId("ref-item")[0] as HTMLElement, { dataTransfer });
+
+    const [mime, data] = dataTransfer.setData.mock.calls[0] as [string, string];
+    expect(mime).toBe(ASSET_DRAG_MIME);
+    expect(parseAssetDrag(data)?.assetId).toBe("asset-1");
   });
 });

@@ -2,6 +2,7 @@
 
 import { useSearchParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, Suspense } from "react";
+import type { DragEvent } from "react";
 
 import type { ImageArtifact, VideoArtifact } from "@loomic/shared";
 import type { CanvasImageItem } from "../../components/canvas-image-picker";
@@ -29,6 +30,7 @@ import {
 import {
   fetchCanvas,
   fetchProject,
+  getAssetUrl,
   ApiAuthError,
   ApiApplicationError,
 } from "../../lib/server-api";
@@ -36,7 +38,11 @@ import { BrandKitSelector } from "../../components/brand-kit-selector";
 import { CanvasBottomBar } from "../../components/canvas-bottom-bar";
 import { CanvasFilesPanel } from "../../components/canvas-files-panel";
 import { CanvasLayersPanel } from "../../components/canvas-layers-panel";
-import { ReferencePanel } from "../../components/canvas/reference-panel";
+import {
+  ASSET_DRAG_MIME,
+  ReferencePanel,
+  parseAssetDrag,
+} from "../../components/canvas/reference-panel";
 import { CreditHeaderButton } from "../../components/credits/credit-header-button";
 
 function CanvasPageContent() {
@@ -143,6 +149,46 @@ function CanvasPageContent() {
       console.warn("Failed to insert image on canvas:", err);
     });
   }, []);
+
+  // 35G · AS-06：参考列表项拖到画布 → 插入为图片对象。
+  // 只拦本应用自己写的 `application/x-hahart-asset`：别的拖入（本地文件、外部
+  // 图片、网页链接）一律不 preventDefault，交给 Excalidraw 自己处理。
+  const handleAssetDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
+    const types = Array.from(event.dataTransfer.types);
+    if (types.includes(ASSET_DRAG_MIME)) event.preventDefault();
+  }, []);
+
+  const handleAssetDrop = useCallback(
+    (event: DragEvent<HTMLDivElement>) => {
+      const payload = parseAssetDrag(event.dataTransfer.getData(ASSET_DRAG_MIME));
+      // 不是我们的载荷：不 preventDefault、不 stopPropagation，让 Excalidraw 接手。
+      if (!payload) return;
+      event.preventDefault();
+      event.stopPropagation();
+
+      const token = accessTokenRef.current;
+      if (!token) return;
+
+      // 拖过来的只有 assetId，画布要能真画出图就得先换签名地址。
+      // 页面上没有 toast 钩子（原话：以源码为准），失败只 console.warn。
+      void getAssetUrl(token, payload.assetId)
+        .then(({ url }) => {
+          handleImageGenerated({
+            type: "image",
+            ...(payload.name ? { title: payload.name } : {}),
+            url,
+            assetId: payload.assetId,
+            mimeType: payload.mimeType,
+            width: 1024,
+            height: 1024,
+          });
+        })
+        .catch((err: unknown) => {
+          console.warn("Failed to resolve reference asset url:", err);
+        });
+    },
+    [handleImageGenerated],
+  );
 
   const handleVideoGenerated = useCallback((artifact: VideoArtifact) => {
     const api = excalidrawApiRef.current;
@@ -450,7 +496,12 @@ function CanvasPageContent() {
         />
       </div>
       {/* Canvas always takes full width; on mobile/tablet, ChatSidebar overlays instead of side-by-side */}
-      <div className="flex-1 relative min-w-0 overflow-hidden">
+      {/* 35G · AS-06：参考列表项拖进来的落点（只看本应用的 MIME，其余交给 Excalidraw） */}
+      <div
+        className="flex-1 relative min-w-0 overflow-hidden"
+        onDragOver={handleAssetDragOver}
+        onDrop={handleAssetDrop}
+      >
         {/* Credits button — canvas area top-right, NOT chatbar */}
         <div className="absolute top-3 right-3 z-20">
           <CreditHeaderButton />
