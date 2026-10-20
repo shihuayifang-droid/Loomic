@@ -250,3 +250,17 @@ describe("serializeNode", () => {
     expect(serializeNode(editor)).toBe("a\nb");
   });
 });
+
+describe("createChipElement", () => {
+  it("AG-03: a canvas chip is an agent-mention-capsule of kind shape", () => {
+    insertChipAt(editor, chip("a"), null);
+
+    const el = findChip("a");
+
+    expect(el.getAttribute("data-testid")).toBe("agent-mention-capsule");
+    expect(el.getAttribute("data-kind")).toBe("shape");
+    // The chip contract itself is unchanged: chips are still keyed by CHIP_ATTR.
+    expect(el.getAttribute(CHIP_ATTR)).toBe("a");
+    expect(el.getAttribute("contenteditable")).toBe("false");
+  });
+});

@@ -242,6 +242,9 @@ export function createChipElement(chip: ComposerChip): HTMLElement {
   const span = document.createElement("span");
   span.setAttribute(CHIP_ATTR, chip.refId);
   span.setAttribute("contenteditable", "false");
+  // AG-03: composer chips are always canvas objects, so they are shape capsules.
+  span.setAttribute("data-testid", "agent-mention-capsule");
+  span.setAttribute("data-kind", "shape");
   span.className =
     "mx-0.5 inline-flex max-w-[160px] translate-y-[2px] items-center gap-1 rounded-md border border-border bg-muted px-1 py-0.5 align-middle text-[12px] leading-none text-foreground";
 
