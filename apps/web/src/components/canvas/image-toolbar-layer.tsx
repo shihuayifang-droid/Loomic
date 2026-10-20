@@ -10,8 +10,9 @@ import { imageToolbarPosition } from "@/lib/toolbar-position";
 
 import { useToast } from "@/components/toast";
 import { useToolDefinitions } from "@/hooks/use-tool-definitions";
-import { getAssetDownloadUrl } from "@/lib/server-api";
+import { downloadAssetsZip, getAssetDownloadUrl } from "@/lib/server-api";
 
+import { DownloadAllBar } from "./download-all-bar";
 import { FlipRotateBar } from "./flip-rotate-bar";
 import { ImageToolbar } from "./image-toolbar";
 
@@ -54,6 +55,12 @@ export const TOOL_PENDING_MESSAGE = "该工具即将接入";
 
 /** 拿不到原图时的提示（工单 §3 裁决 5：不抛错，给提示）。 */
 export const DOWNLOAD_FAILED_MESSAGE = "原图还没准备好，暂时无法下载";
+
+/** ED-05：多选里一个带 `assetId` 的图片都没有时给的提示（原话见工单 34W 任务 T3）。 */
+export const NO_DOWNLOADABLE_MESSAGE = "没有可下载的对象";
+
+/** ED-05：zip 包名里的项目名缺省值（服务端按它拼包名）。 */
+const DEFAULT_PROJECT_NAME = "画布";
 
 /** 二级条的入口工具 id（工单 §3 裁决 5）。 */
 const FLIP_ROTATE_TOOL_ID = "flip_rotate";
@@ -103,6 +110,13 @@ export type ImageToolbarLayerProps = {
    * 同样只给测试注入：jsdom 里 `anchor.click()` 没有可断言的行为。
    */
   openDownload?: ((url: string) => void) | undefined;
+  /** ED-05：zip 包名里的项目名，缺省 `"画布"`（服务端按它拼包名）。 */
+  projectName?: string | undefined;
+  /**
+   * ED-05：把 zip 交给浏览器保存，默认 {@link defaultSaveBlob}。
+   * 只有测试会传：jsdom 里没有 `URL.createObjectURL`，走默认实现会抛。
+   */
+  saveBlob?: ((blob: Blob, fileName: string) => void) | undefined;
 };
 
 /** ED-05 的默认「打开下载地址」：造一个带 `download` 的 anchor 直接点。 */
@@ -112,6 +126,17 @@ function defaultOpenDownload(url: string): void {
   anchor.download = "";
   anchor.rel = "noopener";
   anchor.click();
+}
+
+/** ED-05 的默认「保存 zip」：objectURL + 带 `download` 的 anchor，点完立刻回收。 */
+function defaultSaveBlob(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.rel = "noopener";
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 /** 最近一帧里与渲染有关的全部信息。 */
@@ -126,6 +151,21 @@ type Snapshot = {
   zoom: number;
   viewportWidth: number;
   busy: boolean;
+  /**
+   * ED-05：多选「下载全部」时选中元素的**合并外接框**（场景坐标，`angle: 0` ——
+   * 各元素可能各自带角度，并起来以后没有单一角度可言）。其他形态一律 `null`。
+   */
+  downloadAllBox: SelectionBox | null;
+};
+
+/** 一组选中元素并起来的外接框（场景坐标）。 */
+type SelectionBox = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** 恒为 0：见 `Snapshot.downloadAllBox` 的注释。 */
+  angle: number;
 };
 
 /** 「主工具条」或「翻转与旋转的二级条」。二级条记住自己是在改哪个元素。 */
@@ -155,6 +195,37 @@ function elementScale(el: ElementLike): [number, number] {
   return [scale[0], scale[1]];
 }
 
+/**
+ * 把选中的一组元素并成一个外接框；一个都没有（或坐标不是有限数）就是 `null`。
+ *
+ * 不参与旋转：`imageToolbarPosition` 的入参本来是「一张图 + 它的角度」，多选没有那个角度，
+ * 所以并框时按未旋转的 `x` / `y` / `width` / `height` 算，`angle` 给 0。
+ */
+function selectionBoxOf(selected: readonly ElementLike[]): SelectionBox | null {
+  if (selected.length === 0) return null;
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const el of selected) {
+    const x = el.x ?? 0;
+    const y = el.y ?? 0;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x + (el.width ?? 0));
+    maxY = Math.max(maxY, y + (el.height ?? 0));
+  }
+  if (
+    !Number.isFinite(minX) ||
+    !Number.isFinite(minY) ||
+    !Number.isFinite(maxX) ||
+    !Number.isFinite(maxY)
+  ) {
+    return null;
+  }
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY, angle: 0 };
+}
+
 /** 选中元素 → 工具条形态。任何一个选中元素映射成 `null` 就不显示（工单 §3 裁决 2）。 */
 function toolbarKindOf(selected: readonly ElementLike[]): ToolbarKind {
   const kinds = selected.map((el) => elementKind(el));
@@ -182,9 +253,13 @@ function snapshotKey(snapshot: Snapshot): string {
           elementScale(el)[1],
           String(el.fileId ?? ""),
         ].join(":");
+  // ED-05：多选「下载全部」的位置只取决于合并外接框，选中集合换了框就得重算。
+  const box = snapshot.downloadAllBox;
+  const boxPart = box === null ? "-" : [box.x, box.y, box.width, box.height].join(":");
   return [
     snapshot.toolbarKind,
     elementPart,
+    boxPart,
     snapshot.scrollX,
     snapshot.scrollY,
     snapshot.zoom,
@@ -259,6 +334,8 @@ export function ImageToolbarLayer({
   accessToken,
   download,
   openDownload,
+  projectName = DEFAULT_PROJECT_NAME,
+  saveBlob,
 }: ImageToolbarLayerProps) {
   const { toast } = useToast();
   const definitions = useToolDefinitions(accessToken);
@@ -268,9 +345,13 @@ export function ImageToolbarLayer({
   /** 最近 150ms 内滚 / 缩过没有。`true` = 已经停下来，可以显示。 */
   const [scrollZoomSettled, setScrollZoomSettled] = useState(true);
   const [toolbarWidth, setToolbarWidth] = useState(0);
+  /** ED-05：zip 请求进行中（按钮 disabled + 文案「打包中…」）。 */
+  const [downloadAllBusy, setDownloadAllBusy] = useState(false);
 
   /** 最近一帧的完整元素数组：写回 `angle` / `scale` 时要拿到**全场景**（不只是选中那个）。 */
   const elementsRef = useRef<unknown[]>([]);
+  /** ED-05：最近一帧 `toolbarKind === "download_all"` 时的选中元素（只读快照）。 */
+  const downloadAllSelectionRef = useRef<readonly ElementLike[]>([]);
   /** 上一帧的滚动 / 缩放值，用来判断「这一帧是不是刚滚过」。 */
   const motionRef = useRef({ initialized: false, scrollX: 0, scrollY: 0, zoom: 1 });
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -292,6 +373,11 @@ export function ImageToolbarLayer({
       toolbarKind === "image" && selected.length === 1 ? (selected[0] ?? null) : null;
     const elementId =
       element !== null && typeof element.id === "string" ? element.id : null;
+
+    // ED-05：多选「下载全部」时要留住「当时那批选中元素」—— 点击发生在之后某一帧，
+    // 而 `snapshot` 只装渲染摘要、不装选择集本身。
+    const downloadAllBox = toolbarKind === "download_all" ? selectionBoxOf(selected) : null;
+    downloadAllSelectionRef.current = toolbarKind === "download_all" ? selected : [];
 
     const scrollX = typeof state["scrollX"] === "number" ? state["scrollX"] : 0;
     const scrollY = typeof state["scrollY"] === "number" ? state["scrollY"] : 0;
@@ -324,6 +410,7 @@ export function ImageToolbarLayer({
       scrollY,
       zoom,
       viewportWidth: typeof state["width"] === "number" ? state["width"] : 0,
+      downloadAllBox,
       // 拖动 / 拉伸 / 旋转 / 裁剪进行中都不显示（工单 §3 裁决 4）。
       busy: Boolean(
         state["selectedElementsAreBeingDragged"] ||
@@ -364,12 +451,22 @@ export function ImageToolbarLayer({
     if (selectedElementId !== mode.elementId) setMode({ kind: "toolbar" });
   }, [mode, selectedElementId]);
 
-  const visible =
+  const visibleImage =
     snapshot !== null &&
     !snapshot.busy &&
     scrollZoomSettled &&
     snapshot.toolbarKind === "image" &&
     snapshot.element !== null;
+
+  // ED-05：多选（≥2）时同一位置只放「下载全部」，与单图工具条互斥 —— 两者不会同时可见。
+  const visibleDownloadAll =
+    snapshot !== null &&
+    !snapshot.busy &&
+    scrollZoomSettled &&
+    snapshot.toolbarKind === "download_all" &&
+    snapshot.downloadAllBox !== null;
+
+  const visible = visibleImage || visibleDownloadAll;
 
   // 测量工具条宽度（`toolbarWidth` 是定位的入参）。jsdom 里恒为 0，组件必须能处理 0。
   useEffect(() => {
@@ -517,22 +614,78 @@ export function ImageToolbarLayer({
     [enterFlipRotate, handleDownloadOriginal, toast],
   );
 
-  if (
-    !visible ||
-    snapshot === null ||
-    snapshot.element === null
-  ) {
+  /**
+   * ED-05：多选「下载全部」→ 服务端打包 zip（34G `POST /api/uploads/zip`）。
+   *
+   * 只有「`type === "image"` 且 `files[fileId].assetId` 是非空字符串」的才进 `assetIds`；
+   * 生成中 / 失败占位、没有 `assetId` 的老图、其他类型的选中项一律**本地跳过**并计数，
+   * 完成后把「本地跳过 + 服务端 skipped」一起报给用户（ED-05 原话「已跳过 N 个未完成对象」）。
+   *
+   * 服务端拒绝时 `message` 就是规格文案（如「选中过多，请分批下载」），原样显示，不改写。
+   *
+   * 已知口径（工单 34W 明确接受）：`elementKind` 把**失败占位**映射成 `null`，所以多选里
+   * 混进失败占位时整条形态变成 `none`、这个按钮根本不出现；生成中占位能参与并会被跳过。
+   */
+  const handleDownloadAll = useCallback(async () => {
+    const files = excalidrawApi.getFiles?.() ?? {};
+    const assetIds: string[] = [];
+    let localSkipped = 0;
+
+    for (const el of downloadAllSelectionRef.current) {
+      const fileId = typeof el.fileId === "string" ? el.fileId : "";
+      const file = fileId === "" ? undefined : files[fileId];
+      const assetId = file?.assetId;
+      if (el.type === "image" && typeof assetId === "string" && assetId !== "") {
+        assetIds.push(assetId);
+      } else {
+        localSkipped += 1;
+      }
+    }
+
+    if (assetIds.length === 0) {
+      toast(NO_DOWNLOADABLE_MESSAGE);
+      return;
+    }
+    // 没有 token 就没有 zip 请求可发：与单图下载同一条提示，不弹服务端文案。
+    if (accessToken === null || accessToken === "") {
+      toast(DOWNLOAD_FAILED_MESSAGE);
+      return;
+    }
+
+    setDownloadAllBusy(true);
+    try {
+      const { blob, fileName, skipped } = await downloadAssetsZip(accessToken, {
+        assetIds,
+        projectName,
+      });
+      (saveBlob ?? defaultSaveBlob)(blob, fileName);
+
+      const skippedTotal = localSkipped + skipped;
+      if (skippedTotal > 0) toast(`已跳过 ${skippedTotal} 个未完成对象`);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : DOWNLOAD_FAILED_MESSAGE);
+    } finally {
+      setDownloadAllBusy(false);
+    }
+  }, [excalidrawApi, toast, accessToken, projectName, saveBlob]);
+
+  // 「下载全部」用合并外接框，单图工具条用那张图自己的框（含旋转）；两者互斥，同时只一个非空。
+  const anchor: ElementLike | SelectionBox | null =
+    (snapshot?.element as ElementLike | null | undefined) ??
+    snapshot?.downloadAllBox ??
+    null;
+
+  if (!visible || snapshot === null || anchor === null) {
     return null;
   }
 
-  const el = snapshot.element as ElementLike;
   const position = imageToolbarPosition({
     el: {
-      x: el.x ?? 0,
-      y: el.y ?? 0,
-      width: el.width ?? 0,
-      height: el.height ?? 0,
-      angle: el.angle ?? 0,
+      x: anchor.x ?? 0,
+      y: anchor.y ?? 0,
+      width: anchor.width ?? 0,
+      height: anchor.height ?? 0,
+      angle: anchor.angle ?? 0,
     },
     scrollX: snapshot.scrollX,
     scrollY: snapshot.scrollY,
@@ -540,6 +693,26 @@ export function ImageToolbarLayer({
     viewportWidth: snapshot.viewportWidth,
     toolbarWidth,
   });
+
+  /**
+   * ED-05：多选「下载全部」**用自己的容器**，不复用 `image-toolbar-layer`。
+   *
+   * 已有契约 `image-toolbar-layer` 只在「恰好选中 1 张图」时出现（`test/image-toolbar-layer.test.tsx`
+   * 「选中 2 张图 → 不出现」），多选条的容器混进去就会破掉它 —— 两者是两张不同的浮层。
+   */
+  if (visibleDownloadAll) {
+    return (
+      <div
+        ref={containerRef}
+        data-testid="image-toolbar-download-all-layer"
+        data-placement={position.placement}
+        className="absolute z-20"
+        style={{ left: position.x, top: position.y }}
+      >
+        <DownloadAllBar onDownload={() => void handleDownloadAll()} busy={downloadAllBusy} />
+      </div>
+    );
+  }
 
   return (
     <div

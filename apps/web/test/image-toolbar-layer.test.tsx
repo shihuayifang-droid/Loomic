@@ -91,9 +91,12 @@ vi.mock("@/hooks/use-tool-definitions", () => ({
  * 其余导出用 `importOriginal` 保留原样 —— 被测组件与这个文件都还需要 server-api 的其他成员。
  */
 const getAssetDownloadUrlMock = vi.hoisted(() => vi.fn());
+// 工单 34W（ED-05 多选「下载全部」）：zip 走服务端，替身只证明「组件问没问、带了什么参数」。
+const downloadAssetsZipMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/server-api", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   getAssetDownloadUrl: getAssetDownloadUrlMock,
+  downloadAssetsZip: downloadAssetsZipMock,
 }));
 
 vi.mock("@excalidraw/excalidraw", () => ({
@@ -197,6 +200,8 @@ type HarnessOptions = {
   openDownload?: ReturnType<typeof vi.fn>;
   /** ED-05：有的用例要换 token（默认 `"test-token"`）。 */
   accessToken?: string | null;
+  /** 工单 34W：注入「保存 zip」的 spy（jsdom 里没有 `URL.createObjectURL`）。 */
+  saveBlob?: ReturnType<typeof vi.fn>;
 };
 
 function setup(options: HarnessOptions = {}) {
@@ -222,6 +227,7 @@ function setup(options: HarnessOptions = {}) {
   };
   if (options.download !== undefined) props.download = options.download;
   if (options.openDownload !== undefined) props.openDownload = options.openDownload;
+  if (options.saveBlob !== undefined) props.saveBlob = options.saveBlob;
 
   render(<ImageToolbarLayer {...props} />);
 
@@ -592,5 +598,105 @@ describe("ED-05：工具条下载走服务端原图", () => {
       expect(toastMock.toast).toHaveBeenCalledWith(DOWNLOAD_FAILED_MESSAGE),
     );
     expect(openDownload).toHaveBeenCalledTimes(0);
+  });
+});
+
+describe("ED-05：多选「下载全部」（工单 34W）", () => {
+  /** `assetId` 就是服务端文件记录 id：有它才下得了，测试里直接摆在 `files` 上。 */
+  const twoAssetFiles = {
+    "file-1": { dataURL: "data:image/png;base64,AAAA", mimeType: "image/png", assetId: "a1" },
+    "file-2": { dataURL: "data:image/png;base64,BBBB", mimeType: "image/png", assetId: "a2" },
+  };
+
+  const twoImages = () => [imageElement(), imageElement({ id: "img-2", fileId: "file-2" })];
+  const bothSelected = () =>
+    makeAppState({ selectedElementIds: { "img-1": true, "img-2": true } });
+
+  beforeEach(() => {
+    downloadAssetsZipMock.mockReset();
+  });
+
+  it("ED-05: two selected images show 下载全部 instead of the image toolbar", () => {
+    const { push } = setup({ files: twoAssetFiles });
+    push(twoImages(), bothSelected());
+
+    expect(screen.getByTestId("image-toolbar-download-all")).toBeInTheDocument();
+    // 单图工具条整条不出现（不是叠在同一条位置上）
+    expect(screen.queryByTestId("image-toolbar")).toBeNull();
+    expect(screen.queryByTestId("image-toolbar-download")).toBeNull();
+    // 多选条用自己的容器，`image-toolbar-layer` 仍然只在恰好选中 1 张图时出现。
+    expect(screen.getByTestId("image-toolbar-download-all-layer")).toBeInTheDocument();
+    expect(screen.queryByTestId("image-toolbar-layer")).toBeNull();
+  });
+
+  it("ED-05: 下载全部 zips the selected originals and saves the file", async () => {
+    const blob = new Blob(["zip"]);
+    downloadAssetsZipMock.mockResolvedValue({
+      blob,
+      fileName: "画布_20261021-0005.zip",
+      skipped: 0,
+    });
+    const saveBlob = vi.fn();
+    const { push } = setup({ files: twoAssetFiles, saveBlob });
+    push(twoImages(), bothSelected());
+
+    fireEvent.click(screen.getByTestId("image-toolbar-download-all"));
+
+    await waitFor(() => expect(saveBlob).toHaveBeenCalledWith(blob, "画布_20261021-0005.zip"));
+    expect(downloadAssetsZipMock).toHaveBeenCalledTimes(1);
+    expect(downloadAssetsZipMock).toHaveBeenCalledWith("test-token", {
+      assetIds: ["a1", "a2"],
+      projectName: "画布",
+    });
+    expect(toastMock.toast).not.toHaveBeenCalled();
+  });
+
+  it("ED-05: images without an asset id are skipped and reported", async () => {
+    downloadAssetsZipMock.mockResolvedValue({
+      blob: new Blob(["zip"]),
+      fileName: "画布_20261021-0005.zip",
+      skipped: 0,
+    });
+    const saveBlob = vi.fn();
+    const { push } = setup({
+      files: {
+        "file-1": { dataURL: "data:image/png;base64,AAAA", mimeType: "image/png", assetId: "a1" },
+        // 生成中：文件记录已经在了，但还没有 assetId
+        "file-2": { dataURL: "data:image/png;base64,BBBB", mimeType: "image/png" },
+        "file-3": { dataURL: "data:image/png;base64,CCCC", mimeType: "image/png", assetId: "a3" },
+      },
+      saveBlob,
+    });
+    push(
+      [
+        imageElement(),
+        imageElement({ id: "img-2", fileId: "file-2" }),
+        imageElement({ id: "img-3", fileId: "file-3" }),
+      ],
+      makeAppState({ selectedElementIds: { "img-1": true, "img-2": true, "img-3": true } }),
+    );
+
+    fireEvent.click(screen.getByTestId("image-toolbar-download-all"));
+
+    await waitFor(() =>
+      expect(downloadAssetsZipMock).toHaveBeenCalledWith("test-token", {
+        assetIds: ["a1", "a3"],
+        projectName: "画布",
+      }),
+    );
+    await waitFor(() => expect(saveBlob).toHaveBeenCalledTimes(1));
+    expect(toastMock.toast).toHaveBeenCalledWith("已跳过 1 个未完成对象");
+  });
+
+  it("ED-05: a refusal from the server is shown as is", async () => {
+    downloadAssetsZipMock.mockRejectedValue(new Error("选中过多，请分批下载"));
+    const saveBlob = vi.fn();
+    const { push } = setup({ files: twoAssetFiles, saveBlob });
+    push(twoImages(), bothSelected());
+
+    fireEvent.click(screen.getByTestId("image-toolbar-download-all"));
+
+    await waitFor(() => expect(toastMock.toast).toHaveBeenCalledWith("选中过多，请分批下载"));
+    expect(saveBlob).toHaveBeenCalledTimes(0);
   });
 });

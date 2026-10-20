@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApiApplicationError,
+  downloadAssetsZip,
   fetchProjectUploads,
   getAssetDownloadUrl,
   uploadFile,
@@ -90,5 +91,39 @@ describe("server-api URL shapes (ED-05 / AS-06)", () => {
 
     const [url] = mockFetch.mock.calls[0] as [string, ...unknown[]];
     expect(url.endsWith("/api/projects/p-1/uploads?order=oldest&type=pdf")).toBe(true);
+  });
+});
+
+// 工单 34W：`POST /api/uploads/zip` 回的是 zip 流，包名与跳过数都在响应头上 —— 替身证明不了
+// 头部怎么解析，所以这里走真身 + 一个能读头部的假响应。
+describe("ED-05: zip download (34W)", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    vi.stubEnv("NEXT_PUBLIC_SERVER_BASE_URL", "http://localhost:3001");
+  });
+
+  it("ED-05: downloadAssetsZip posts the ids and reads the file name and skip count", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      headers: new Headers({
+        "content-disposition":
+          "attachment; filename*=UTF-8''%E7%94%BB%E5%B8%83_20261021-0005.zip",
+        "x-skipped-count": "2",
+      }),
+      blob: async () => new Blob(["x"]),
+    });
+
+    const result = await downloadAssetsZip("tok", {
+      assetIds: ["a1", "a2"],
+      projectName: "画布",
+    });
+
+    expect(result.fileName).toBe("画布_20261021-0005.zip");
+    expect(result.skipped).toBe(2);
+
+    const [url, init] = mockFetch.mock.calls[0] as [string, { method?: string; body?: unknown }];
+    expect(url.endsWith("/api/uploads/zip")).toBe(true);
+    expect(init.method).toBe("POST");
+    expect(String(init.body)).toContain("assetIds");
   });
 });

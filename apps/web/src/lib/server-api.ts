@@ -556,6 +556,49 @@ export async function getAssetDownloadUrl(
   return (await response.json()) as AssetSignedUrlResponse;
 }
 
+/**
+ * ED-05: ask the server to zip these originals; resolves with the file and how
+ * many it skipped.
+ *
+ * `POST /api/uploads/zip`（34G）回的是 zip 流而不是 JSON：包名在 `Content-Disposition`
+ * 的 `filename*=UTF-8''…` 里，被跳过的未完成对象数在 `X-Skipped-Count` 里。
+ * 包名取不到时退回一个固定名，调用方不必再判空。
+ */
+export async function downloadAssetsZip(
+  accessToken: string,
+  input: { assetIds: string[]; projectName: string },
+): Promise<{ blob: Blob; fileName: string; skipped: number }> {
+  const response = await fetch(`${getServerBaseUrl()}/api/uploads/zip`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({
+      assetIds: input.assetIds,
+      projectName: input.projectName,
+    }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+
+  const disposition = response.headers.get("content-disposition") ?? "";
+  return {
+    blob: await response.blob(),
+    fileName: fileNameFromContentDisposition(disposition) ?? "download.zip",
+    skipped: Number(response.headers.get("x-skipped-count")) || 0,
+  };
+}
+
+/** `attachment; filename*=UTF-8''<percent-encoded>` → 解码后的文件名；没有就是 null。 */
+function fileNameFromContentDisposition(header: string): string | null {
+  const match = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  const raw = match?.[1];
+  if (raw === undefined || raw === "") return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    // 不合法百分号编码时原样给出去，不为一个文件名让整次下载失败。
+    return raw;
+  }
+}
+
 export async function deleteAsset(
   accessToken: string,
   assetId: string,
