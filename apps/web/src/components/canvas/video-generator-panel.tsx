@@ -17,6 +17,7 @@ import { cancelJob, fetchVideoModels, submitVideoJob } from "../../lib/server-ap
 import { visibleOn } from "../../lib/model-visibility";
 import { awaitJobCompletion, type JobProgress } from "../../lib/await-job";
 import { errorCodeOf, lookupError } from "../../lib/error-catalog";
+import { fitResultIntoSlot } from "../../lib/fit-result";
 import { formatRetryLabel } from "../../lib/job-status";
 import type { WebSocketHandle } from "../../hooks/use-websocket";
 // No longer needs poster frame extraction -- videos use embeddable elements
@@ -372,6 +373,8 @@ export function VideoGeneratorPanel({
         signed_url?: string;
         mime_type?: string;
         duration_seconds?: number;
+        width?: number;
+        height?: number;
       };
       if (!jobResult.signed_url) {
         throw new Error("Job succeeded but carried no video URL");
@@ -392,14 +395,22 @@ export function VideoGeneratorPanel({
         return;
       }
 
+      // GN-02 (5): the slot was drawn from the ratio the request asked for and
+      // the video that comes back can be another shape. Fit it inside the slot
+      // instead of stretching it -- same rule as the image panel.
+      const placed = fitResultIntoSlot(elementBounds, {
+        ...(jobResult.width !== undefined ? { width: jobResult.width } : {}),
+        ...(jobResult.height !== undefined ? { height: jobResult.height } : {}),
+      });
+
       const newElements = convertToExcalidrawElements([
         {
           type: "embeddable",
           link: result.url,
-          x: elementBounds.x,
-          y: elementBounds.y,
-          width: elementBounds.width,
-          height: elementBounds.height,
+          x: placed.x,
+          y: placed.y,
+          width: placed.width,
+          height: placed.height,
           customData: {
             isVideo: true,
             mimeType: result.mimeType,
