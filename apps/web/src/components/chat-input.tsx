@@ -330,7 +330,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
         {mentions && mentions.length > 0 && onRemoveMention && (
           <div className="flex flex-wrap items-center gap-1 px-2 py-1">
             {mentions.map((mention) => (
-              <button
+              <button data-testid="chat-input-mention-remove"
                 key={`${mention.mentionType}:${mention.id}`}
                 type="button"
                 onClick={() => onRemoveMention(mention)}
@@ -367,7 +367,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
           <div className="flex items-center gap-1">
             {onAddFiles && (
               <>
-                <input
+                <input data-testid="chat-input-file-input"
                   ref={fileInputRef}
                   type="file"
                   accept="image/png,image/jpeg,image/webp,image/gif"
@@ -375,7 +375,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
                   className="hidden"
                   onChange={handleFileChange}
                 />
-                <button
+                <button data-testid="chat-input-attach"
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   className="flex h-8 w-8 items-center justify-center rounded-full border-[0.5px] border-border text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
@@ -395,7 +395,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
             <AgentModelSelector compact />
             {/* Model preference button */}
             <div className="relative">
-              <button
+              <button data-testid="chat-input-model-trigger"
                 ref={modelBtnRef}
                 type="button"
                 onClick={() => setModelPopoverOpen((prev) => !prev)}
@@ -417,7 +417,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
               />
             </div>
           </div>
-          <button
+          <button data-testid="chat-input-send"
             onClick={handleSubmit}
             disabled={disabled || !hasContent || isUploading}
             className="flex h-8 min-w-8 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/80 active:bg-primary/90 disabled:opacity-20 disabled:cursor-not-allowed"

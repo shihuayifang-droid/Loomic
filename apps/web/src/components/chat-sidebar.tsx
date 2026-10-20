@@ -939,7 +939,7 @@ export function ChatSidebar({
   if (!open) {
     return (
       <div className="absolute right-3 top-3 z-20">
-        <button
+        <button data-testid="chat-sidebar-expand"
           onClick={onToggle}
           type="button"
           className="group inline-flex items-center gap-1 rounded-xl bg-card/80 backdrop-blur-sm border border-border px-2.5 py-1.5 text-xs text-foreground/60 shadow-sm hover:bg-card hover:text-foreground transition-colors cursor-pointer md:px-2.5 md:py-1.5 min-h-[36px] md:min-h-0"
@@ -1002,7 +1002,7 @@ export function ChatSidebar({
             />
           )}
         </div>
-        <button
+        <button data-testid="chat-sidebar-collapse"
           type="button"
           onClick={onToggle}
           className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors shrink-0"

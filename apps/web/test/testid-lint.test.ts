@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
  * 三条断言：
  *   1) `src/**\/*.tsx` 里所有 `data-testid` 字面量都匹配 `^[a-z0-9]+(-[a-z0-9]+)*-([a-z0-9]+|[0-9]+\.[0-9]+)$`；
  *   2) 第一段前缀都在 `CONVENTIONS.md` §6 的「已落地的区域前缀表」里（表在测试里解析）；
- *   3) 非脏文件里可交互元素的 testid 覆盖率 = 100%。
+ *   3) `src/**\/*.tsx` 里可交互元素的 testid 覆盖率 = 100%（30P 起无豁免）。
  *
  * 扫描是文本级而不是 AST 级：本仓 web 侧没有装 ESLint/Babel 解析器，
  * 引 parser 就等于给这张单加依赖。文本级扫描的两个坑都在下面处理：
@@ -33,12 +33,6 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.resolve(HERE, "..");
 const SRC_ROOT = path.join(WEB_ROOT, "src");
 const CONVENTIONS_PATH = path.join(WEB_ROOT, "CONVENTIONS.md");
-
-/**
- * 脏文件：用户正在改，本单一行都不许碰（工单 §1 的脏文件清单里的 .tsx）。
- * **等这些文件提交后移出清单。**
- */
-const DIRTY_TSX = new Set(["canvas-editor.tsx", "chat-input.tsx", "chat-sidebar.tsx"]);
 
 /** 可交互元素：工单 30C T4 的范围（`<Button>` 是渲染成本 `<button>` 的组件，同样要能定位）。 */
 const INTERACTIVE_TAG_RE = /<(button|input|textarea|select|Button)\b/g;
@@ -316,7 +310,6 @@ function scanInteractive(source: string): Array<{ line: number; tag: string; has
 
 const prefixes = parsePrefixTable(fs.readFileSync(CONVENTIONS_PATH, "utf8"));
 const allTsx = collectTsxFiles(SRC_ROOT);
-const liveTsx = allTsx.filter((full) => !DIRTY_TSX.has(path.basename(full)));
 
 const testidReport = allTsx.flatMap((full) =>
   collectTestidValues(fs.readFileSync(full, "utf8")).map((entry) => ({
@@ -325,7 +318,7 @@ const testidReport = allTsx.flatMap((full) =>
   })),
 );
 
-const coverageReport = liveTsx.map((full) => ({
+const coverageReport = allTsx.map((full) => ({
   file: relPath(full),
   elements: scanInteractive(fs.readFileSync(full, "utf8")),
 }));
@@ -339,8 +332,6 @@ describe("X-05 testid lint", () => {
 
   it("src 下的 tsx 都被扫到了（约 132 个），脏文件确实在清单里", () => {
     expect(allTsx.length).toBeGreaterThan(100);
-    const dirtyPresent = allTsx.filter((full) => DIRTY_TSX.has(path.basename(full))).length;
-    expect(dirtyPresent, "脏文件清单里的文件一个都没扫到，清单写错了").toBe(DIRTY_TSX.size);
   });
 
   it("断言1：所有 testid 字面量匹配 ^[a-z0-9]+(-[a-z0-9]+)*-([a-z0-9]+|[0-9]+\\.[0-9]+)$", () => {

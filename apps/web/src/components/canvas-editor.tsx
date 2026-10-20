@@ -1185,7 +1185,7 @@ export function CanvasEditor({
           </div>
         )}
         {restoredDraft !== null && (
-          <button
+          <button data-testid="canvas-editor-restored-draft-dismiss"
             type="button"
             onClick={() => setRestoredDraft(null)}
             className="absolute left-1/2 top-3 z-10 -translate-x-1/2 cursor-pointer rounded-full border border-sky-500/40 bg-sky-500/15 px-3 py-1.5 text-xs text-sky-700 backdrop-blur dark:text-sky-300"
@@ -1202,7 +1202,7 @@ export function CanvasEditor({
           unsaved — and says why, rather than looking broken.
         */}
         {recoverable.length > 0 && (
-          <button
+          <button data-testid="canvas-editor-recover-images"
             type="button"
             disabled={recovering || unsavedSince !== null}
             onClick={handleRecover}
