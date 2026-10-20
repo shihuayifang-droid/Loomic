@@ -115,9 +115,14 @@ export async function registerUploadRoutes(
         const user = await options.auth.authenticate(request);
         if (!user) return sendUnauthorized(reply);
 
+        // ED-05: `?download=1` asks for the signed URL that makes the browser save
+        // the object under the name the user gave the file. Anything else is the
+        // plain view signature this route always answered with.
+        const query = request.query as { download?: string } | undefined;
         const url = await options.uploadService.getAssetUrl(
           user,
           request.params.assetId,
+          query?.download === "1" ? { download: true } : undefined,
         );
 
         // PJ-07 验收 4 — see projects.ts for the ordering rationale.

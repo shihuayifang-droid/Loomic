@@ -16,7 +16,7 @@ type Call = {
   bucket: string;
   path: string;
   expiresIn: number;
-  options: { transform?: unknown } | undefined;
+  options: { transform?: unknown; download?: unknown } | undefined;
 };
 
 function makeClient(options: {
@@ -33,7 +33,7 @@ function makeClient(options: {
           createSignedUrl: async (
             path: string,
             expiresIn: number,
-            callOptions?: { transform?: unknown },
+            callOptions?: { transform?: unknown; download?: unknown },
           ) => {
             calls.push({ bucket, path, expiresIn, options: callOptions });
             if (options.error) return { data: null, error: options.error };
@@ -156,5 +156,26 @@ describe("project asset signed URLs", () => {
       },
     ]);
     expect(url).toContain("/canvases/canvases/team/p/legacy.png?token=sig");
+  });
+
+  // ED-05: the object key is ASCII-mangled, so the name a person gave the file has
+  // to travel beside it. `download` is how the storage service is told to answer the
+  // signature with `Content-Disposition: attachment; filename*=UTF-8''…`.
+  it("ED-05: a download name reaches the signing SDK as download", async () => {
+    const stub = makeClient({});
+
+    await signProjectAssetUrl(stub.client, "ws/p/a.png", {
+      download: "角色-小橘.png",
+    });
+
+    expect(stub.calls[0]?.options).toEqual({ download: "角色-小橘.png" });
+  });
+
+  it("ED-05: no transform and no download still passes nothing", async () => {
+    const stub = makeClient({});
+
+    await signProjectAssetUrl(stub.client, "ws/p/a.png");
+
+    expect(stub.calls[0]?.options).toBeUndefined();
   });
 });

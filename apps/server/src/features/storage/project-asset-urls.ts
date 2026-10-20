@@ -52,7 +52,10 @@ export type ProjectAssetSigningClient = {
       createSignedUrl(
         path: string,
         expiresIn: number,
-        options?: { transform?: ProjectAssetTransform },
+        options?: {
+          transform?: ProjectAssetTransform;
+          download?: string | boolean;
+        },
       ): PromiseLike<{
         data: { signedUrl: string } | null;
         error: { message: string } | null;
@@ -65,6 +68,12 @@ export type SignProjectAssetOptions = {
   ttlSeconds?: number;
   transform?: ProjectAssetTransform;
   bucket?: string;
+  /**
+   * ED-05: the name a download should carry. The storage service turns this into
+   * `Content-Disposition: attachment; filename*=UTF-8''…`, which is the only way
+   * the name a person gave the file survives an ASCII object key.
+   */
+  download?: string;
 };
 
 /**
@@ -80,6 +89,10 @@ export async function signProjectAssetUrl(
   const bucket = options.bucket ?? PROJECT_ASSET_BUCKET;
   const ttl = options.ttlSeconds ?? PROJECT_ASSET_URL_TTL_SECONDS;
 
+  // Only send a third argument when there is something to say in it: a plain
+  // signature must keep reaching the SDK with no options at all.
+  const hasSignOptions = Boolean(options.transform || options.download);
+
   const { data, error } = await (
     client as ProjectAssetSigningClient
   ).storage
@@ -87,7 +100,12 @@ export async function signProjectAssetUrl(
     .createSignedUrl(
       objectPath,
       ttl,
-      options.transform ? { transform: options.transform } : undefined,
+      hasSignOptions
+        ? {
+            ...(options.transform ? { transform: options.transform } : {}),
+            ...(options.download ? { download: options.download } : {}),
+          }
+        : undefined,
     );
 
   if (error || !data?.signedUrl) {

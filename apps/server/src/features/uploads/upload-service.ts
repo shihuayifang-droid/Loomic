@@ -61,6 +61,7 @@ export type UploadService = {
   getAssetUrl(
     user: AuthenticatedUser,
     assetId: string,
+    options?: { download?: boolean },
   ): Promise<string>;
 
   deleteAsset(
@@ -97,12 +98,13 @@ export function createUploadService(options: {
   assetWriteRepository: AssetWriteRepository;
   /**
    * GN-11: writes where the artifact came from onto the row it just created.
+   * ED-05: and the name the user gave the file, so a download can carry it back.
    * Optional: absent simply means provenance is skipped, which is not an error —
    * a caller that relays an artifact it produced itself passes one.
    */
   assetProvenanceRepository?: Pick<
     AssetProvenanceRepository,
-    "recordProvenance"
+    "recordProvenance" | "recordDisplayName" | "readDisplayName"
   >;
 }): UploadService {
   return {
@@ -269,6 +271,24 @@ export function createUploadService(options: {
         } catch {
           console.warn(`[asset-provenance] upload ${assetId}: provenance was not recorded`);
         }
+
+        // ED-05: keep the name the user gave the file beside the ASCII object key,
+        // under the same best-effort rule as the provenance above — the object and
+        // its row already exist, so a failure here is a warning, not the upload's
+        // answer. A name that is only whitespace is not a name.
+        if (input.fileName.trim() !== "") {
+          try {
+            await options.assetProvenanceRepository.recordDisplayName({
+              actorId: user.id,
+              assetId,
+              displayName: input.fileName,
+            });
+          } catch {
+            console.warn(
+              `[asset-display-name] upload ${assetId}: display name was not recorded`,
+            );
+          }
+        }
       }
 
       const url = await getAssetUrl(client, input.bucket, objectPath);
@@ -288,7 +308,7 @@ export function createUploadService(options: {
       };
     },
 
-    async getAssetUrl(user, assetId) {
+    async getAssetUrl(user, assetId, signOptions) {
       const repository = options.assetReadRepository;
 
       // ADR-0001 / workorder 21AA: the row that names the bucket and the object is
@@ -324,7 +344,33 @@ export function createUploadService(options: {
 
       const client = options.createUserClient(user.accessToken);
 
-      return getAssetUrl(client, assetRow.bucket, assetRow.object_path);
+      if (!signOptions?.download) {
+        return getAssetUrl(client, assetRow.bucket, assetRow.object_path);
+      }
+
+      // ED-05: a download is named after what the user called the file, not after
+      // the object key the storage service had to ASCII-mangle. The stored name is
+      // that; the key's last segment is only the fallback for rows that predate it.
+      // A failed read is the same answer as a missing one: fall back, do not fail —
+      // a nameless-but-working download beats no download.
+      let storedName: string | null = null;
+
+      if (options.assetProvenanceRepository) {
+        try {
+          storedName = await options.assetProvenanceRepository.readDisplayName({
+            assetId,
+          });
+        } catch {
+          storedName = null;
+        }
+      }
+
+      return getAssetUrl(
+        client,
+        assetRow.bucket,
+        assetRow.object_path,
+        storedName ?? lastPathSegment(assetRow.object_path),
+      );
     },
 
     async deleteAsset(user, assetId) {
@@ -395,20 +441,36 @@ function buildObjectPath(
 }
 
 /**
+ * ED-05: what is left of an object key once the folders are gone — the closest
+ * thing to a file name a stored object has on its own.
+ */
+function lastPathSegment(objectPath: string): string {
+  const cut = objectPath.lastIndexOf("/");
+  return cut === -1 ? objectPath : objectPath.slice(cut + 1);
+}
+
+/**
  * Every asset URL this service hands out is signed (X-52).
  *
  * `project-assets` used to be on a public allowlist, so an upload answered with a
  * permanent, unauthenticated URL. That is exactly what the ticket removes: reads
  * now go through the signing service, which authorises against the caller's JWT
  * and refuses rather than degrading to a public URL.
+ *
+ * ED-05: `download` is the name a download should carry; absent it, the signature
+ * is the plain one this always produced.
  */
 async function getAssetUrl(
   client: UserSupabaseClient,
   bucket: string,
   objectPath: string,
+  download?: string,
 ): Promise<string> {
   try {
-    return await signProjectAssetUrl(client, objectPath, { bucket });
+    return await signProjectAssetUrl(client, objectPath, {
+      bucket,
+      ...(download ? { download } : {}),
+    });
   } catch (error) {
     throw new UploadServiceError(
       "upload_failed",

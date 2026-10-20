@@ -33,6 +33,9 @@ const PROJECT = "project-1";
 
 type RpcCall = { name: string; params: Record<string, unknown> };
 
+/** ED-05: what the signing SDK was told about a download, kept beside `signedCalls`. */
+type SignedOptions = { transform?: unknown; download?: unknown } | undefined;
+
 function makeStubs(options: {
   project?: { workspace_id: string } | null;
   projectError?: { code?: string; message: string } | null;
@@ -42,11 +45,16 @@ function makeStubs(options: {
   assetReadError?: { message: string } | null;
   assetDeleteError?: { message: string } | null;
   provenance?: { failWith?: Error };
+  /** ED-05: a display-name write that fails, and the name a read answers. */
+  displayNameError?: Error;
+  storedDisplayName?: string | null;
 }) {
   const rpcs: RpcCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
   const removals: string[] = [];
   const signedCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
+  /** ED-05: the third argument of every signing call, in order. */
+  const signedOptions: SignedOptions[] = [];
   /** GN-11: what `uploadFile` asked the provenance repository to record. */
   const provenanceCalls: Array<{
     actorId: string | null;
@@ -111,6 +119,14 @@ function makeStubs(options: {
   };
 
   // GN-11: the provenance write the upload service performs once the row exists.
+  // ED-05 adds the two display-name methods to the same repository.
+  const displayNameCalls: Array<{
+    actorId: string | null;
+    assetId: string;
+    displayName: string;
+  }> = [];
+  const displayNameReads: Array<{ assetId: string }> = [];
+
   const provenanceRepository = {
     async recordProvenance(input: {
       actorId: string | null;
@@ -120,6 +136,19 @@ function makeStubs(options: {
       provenanceCalls.push(input);
       if (options.provenance?.failWith) throw options.provenance.failWith;
       return { updated: 1 };
+    },
+    async recordDisplayName(input: {
+      actorId: string | null;
+      assetId: string;
+      displayName: string;
+    }) {
+      displayNameCalls.push(input);
+      if (options.displayNameError) throw options.displayNameError;
+      return { updated: 1 };
+    },
+    async readDisplayName(input: { assetId: string }) {
+      displayNameReads.push(input);
+      return options.storedDisplayName ?? null;
     },
   };
 
@@ -143,8 +172,15 @@ function makeStubs(options: {
           },
           // X-52: asset URLs are signed through this call. `getPublicUrl` is kept
           // only so the stub would visibly explode if production code used it.
-          createSignedUrl: async (path: string, expiresIn: number) => {
+          createSignedUrl: async (
+            path: string,
+            expiresIn: number,
+            callOptions?: SignedOptions,
+          ) => {
             signedCalls.push({ bucket, path, expiresIn });
+            // ED-05: recorded separately so the 25 cases above keep asserting on
+            // `signedCalls` exactly as they did.
+            signedOptions.push(callOptions);
             events.push(`sign:${path}`);
             return {
               data: {
@@ -190,7 +226,7 @@ function makeStubs(options: {
           assetProvenanceRepository:
             provenanceRepository as unknown as Pick<
               AssetProvenanceRepository,
-              "recordProvenance"
+              "recordProvenance" | "recordDisplayName" | "readDisplayName"
             >,
         }
       : {}),
@@ -202,11 +238,14 @@ function makeStubs(options: {
     uploads,
     removals,
     signedCalls,
+    signedOptions,
     events,
     projectLookups,
     assetLookups,
     assetDeletes,
     provenanceCalls,
+    displayNameCalls,
+    displayNameReads,
     userClient,
   };
 }
@@ -825,5 +864,94 @@ describe("uploadFile records provenance (GN-11)", () => {
 
     expect(error?.statusCode).toBe(500);
     expect(stub.provenanceCalls).toEqual([]);
+  });
+});
+
+// ED-05: the object key is ASCII-mangled, so the name the user gave the file has to
+// be stored beside it and handed back to the signing SDK on download. Both halves
+// are best effort in one direction only: the upload never fails because the name
+// could not be kept, and a download without a stored name still works.
+describe("ED-05: the original file name is kept and used for downloads", () => {
+  const NAMED_FILE = { ...FILE, fileName: "角色-小橘.png" };
+
+  const NAMED_ASSET_ROW = {
+    id: "asset-1",
+    bucket: "project-assets",
+    object_path: "ws/123-photo.png",
+    mime_type: "image/png",
+    byte_size: 3,
+    workspace_id: TEAM_WORKSPACE,
+    project_id: PROJECT,
+    created_at: "2026-10-13T00:00:00.000Z",
+  };
+
+  it("ED-05: an upload records the original file name", async () => {
+    const stub = makeStubs({ provenance: {} });
+
+    await stub.service.uploadFile(USER, {
+      ...NAMED_FILE,
+      workspaceId: TEAM_WORKSPACE,
+    });
+
+    expect(stub.displayNameCalls).toEqual([
+      { actorId: "user-1", assetId: "asset-1", displayName: "角色-小橘.png" },
+    ]);
+  });
+
+  it("ED-05: a failing display-name write does not fail the upload", async () => {
+    const stub = makeStubs({
+      provenance: {},
+      displayNameError: new Error("db down"),
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const result = await stub.service.uploadFile(USER, {
+        ...NAMED_FILE,
+        workspaceId: TEAM_WORKSPACE,
+      });
+
+      expect(result.asset.id).toBe("asset-1");
+      expect(warn).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]?.[0]);
+      expect(message).toContain("display name was not recorded");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("ED-05: a download URL is signed with the stored display name", async () => {
+    const stub = makeStubs({
+      provenance: {},
+      storedDisplayName: "角色-小橘.png",
+      assetRow: NAMED_ASSET_ROW,
+    });
+
+    const url = await stub.service.getAssetUrl(USER, "asset-1", {
+      download: true,
+    });
+
+    expect(stub.displayNameReads).toEqual([{ assetId: "asset-1" }]);
+    expect(stub.signedOptions[stub.signedOptions.length - 1]).toEqual({
+      download: "角色-小橘.png",
+    });
+    expect(url).toContain("token=sig");
+  });
+
+  it("ED-05: without a stored name the download falls back to the object key's last segment", async () => {
+    const stub = makeStubs({
+      provenance: {},
+      storedDisplayName: null,
+      assetRow: NAMED_ASSET_ROW,
+    });
+
+    await stub.service.getAssetUrl(USER, "asset-1", { download: true });
+
+    expect(stub.signedOptions[0]).toEqual({ download: "123-photo.png" });
+
+    // A plain view is still signed with no options at all.
+    await stub.service.getAssetUrl(USER, "asset-1");
+
+    expect(stub.signedOptions[1]).toBeUndefined();
   });
 });
