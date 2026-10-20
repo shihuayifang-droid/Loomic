@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { TOOLBAR_HEIGHT } from "../src/components/canvas/image-toolbar";
-import { TOOLBAR_MARGIN, imageToolbarPosition } from "../src/lib/toolbar-position";
+import { TOOLBAR_MARGIN, elementScreenRect, imageToolbarPosition } from "../src/lib/toolbar-position";
 
 /**
  * 工单 30Q §5 · `imageToolbarPosition`。
@@ -180,5 +180,50 @@ describe("imageToolbarPosition（ED-00a 跟随定位）", () => {
     });
 
     expect(position.x).toBe(TOOLBAR_MARGIN);
+  });
+});
+
+/**
+ * 工单 35Y（ED-00d）：面板定位的锚点矩形。
+ *
+ * 期望值手算：`el = {x:10, y:20, w:100, h:50}`、`scroll (5,5)`、`zoom 2`
+ * - 中心 = `((10 + 50 + 5) * 2, (20 + 25 + 5) * 2)` = `(130, 100)`；
+ * - 未旋转半宽/半高 = `50 / 25` → 屏幕半宽/半高 = `100 / 50`；
+ * - 所以左上角 = `(130 − 100, 100 − 50)` = `(30, 50)`，尺寸 = `(200, 100)`。
+ */
+describe("elementScreenRect（ED-00d 面板锚点）", () => {
+  const BASE = { x: 10, y: 20, width: 100, height: 50 };
+
+  it("ED-00d: the screen rect of an unrotated image", () => {
+    const rect = elementScreenRect({
+      el: { ...BASE, angle: 0 },
+      scrollX: 5,
+      scrollY: 5,
+      zoom: 2,
+    });
+
+    expect(rect).toEqual({ x: 30, y: 50, width: 200, height: 100 });
+  });
+
+  it("ED-00d: a 90° image swaps its screen width and height", () => {
+    const unrotated = elementScreenRect({
+      el: { ...BASE, angle: 0 },
+      scrollX: 5,
+      scrollY: 5,
+      zoom: 2,
+    });
+    const rotated = elementScreenRect({
+      el: { ...BASE, angle: Math.PI / 2 },
+      scrollX: 5,
+      scrollY: 5,
+      zoom: 2,
+    });
+
+    // 宽高互换（cos(π/2) 不是精确 0，所以用 toBeCloseTo）
+    expect(rotated.width).toBeCloseTo(100);
+    expect(rotated.height).toBeCloseTo(200);
+    // 旋转绕元素中心进行，所以中心不变
+    expect(rotated.x + rotated.width / 2).toBeCloseTo(unrotated.x + unrotated.width / 2);
+    expect(rotated.y + rotated.height / 2).toBeCloseTo(unrotated.y + unrotated.height / 2);
   });
 });

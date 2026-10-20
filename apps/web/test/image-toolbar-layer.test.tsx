@@ -181,6 +181,8 @@ import {
 } from "../src/components/canvas/image-toolbar-layer";
 // 工单 35X（ED-00d）：源图被删时的提示文案从这个常量取，不在本文件写第二份。
 import { SOURCE_DELETED_MESSAGE } from "../src/components/canvas/tool-panel-host";
+// 工单 35Y（ED-00d）：面板位置的期望值用同一个纯函数算，不在测试里抄一份坐标换算。
+import { elementScreenRect } from "../src/lib/toolbar-position";
 
 // 本仓 vitest 没开 globals，RTL 不会自动 cleanup，每个文件自己收。
 afterEach(() => {
@@ -278,6 +280,8 @@ type HarnessOptions = {
   /** 工单 35U：调整的解码 / 编码注入。 */
   decodePixels?: ReturnType<typeof vi.fn>;
   encodePixels?: ReturnType<typeof vi.fn>;
+  /** 工单 35Y（ED-00d）：注入面板尺寸（jsdom 里 `getBoundingClientRect` 恒为 0）。 */
+  measurePanel?: ReturnType<typeof vi.fn>;
 };
 
 function setup(options: HarnessOptions = {}) {
@@ -310,6 +314,7 @@ function setup(options: HarnessOptions = {}) {
   if (options.loadOriginal !== undefined) props.loadOriginal = options.loadOriginal;
   if (options.decodePixels !== undefined) props.decodePixels = options.decodePixels;
   if (options.encodePixels !== undefined) props.encodePixels = options.encodePixels;
+  if (options.measurePanel !== undefined) props.measurePanel = options.measurePanel;
 
   render(<ImageToolbarLayer {...props} />);
 
@@ -1050,5 +1055,72 @@ describe("ED-00d：面板绑定打开时的源对象（工单 35X）", () => {
     // 源图恢复且又被选中 → layer 回来，说明 mode 已退回主工具条
     push([imageElement(), rectangleElement()], makeAppState());
     expect(layerState()).toBe("toolbar");
+  });
+});
+
+describe("ED-00d：面板按「右 → 左 → 下」定位（工单 35Y）", () => {
+  const panelFiles = {
+    "file-1": {
+      dataURL: "data:image/png;base64,AAAA",
+      mimeType: "image/png",
+      assetId: "a-orig",
+    },
+  };
+
+  /** 面板尺寸替身（jsdom 里 `getBoundingClientRect` 恒为 0，只能注入）。 */
+  function panelSizeSpy(): ReturnType<typeof vi.fn> {
+    return vi.fn(() => ({ width: 300, height: 400 }));
+  }
+
+  /** 推一帧再点「裁剪」，等到 root 变成 crop 面板。 */
+  async function openCropPanel(
+    options: HarnessOptions,
+    elements: Element[],
+    appState: AppState,
+  ) {
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/original.png" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    const readImageSize = vi.fn(async () => ({ width: 1254, height: 1254 }));
+    const harness = setup({ files: panelFiles, loadOriginal, readImageSize, ...options });
+    harness.push(elements, appState);
+    fireEvent.click(screen.getByTestId("image-toolbar-crop"));
+    await waitFor(() => expect(layerState()).toBe("crop"));
+    return harness;
+  }
+
+  it("ED-00d: a panel opens to the right of the image", async () => {
+    await openCropPanel(
+      { measurePanel: panelSizeSpy() },
+      [imageElement(), rectangleElement()],
+      makeAppState({ width: 1280, height: 800 }),
+    );
+
+    const layer = screen.getByTestId("image-toolbar-layer");
+    await waitFor(() => expect(layer.getAttribute("data-placement")).toBe("right"));
+
+    // 期望值用同一个纯函数算：锚点（图片外接框）右边缘 + 面板间距 8
+    const rect = elementScreenRect({
+      el: { x: 100, y: 200, width: 80, height: 60, angle: 0 },
+      scrollX: 0,
+      scrollY: 0,
+      zoom: 1,
+    });
+    expect(layer.style.left).toBe(`${rect.x + rect.width + 8}px`);
+  });
+
+  it("ED-00d: an image at the right edge gets its panel on the left, inside the viewport", async () => {
+    await openCropPanel(
+      { measurePanel: panelSizeSpy() },
+      [imageElement({ x: 1150, y: 300 }), rectangleElement()],
+      makeAppState({ width: 1280, height: 800 }),
+    );
+
+    const layer = screen.getByTestId("image-toolbar-layer");
+    await waitFor(() => expect(layer.getAttribute("data-placement")).toBe("left"));
+
+    const left = Number.parseFloat(layer.style.left);
+    expect(left).toBeGreaterThanOrEqual(0);
+    expect(left + 300).toBeLessThanOrEqual(1280);
   });
 });

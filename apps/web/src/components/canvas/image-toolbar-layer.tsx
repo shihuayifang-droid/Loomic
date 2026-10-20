@@ -7,7 +7,8 @@ import type { FlipRotateState } from "@/lib/flip-rotate";
 import { drawTransformed, fromElementTransform, toElementTransform, transformedFileName, transformedSize } from "@/lib/flip-rotate";
 import type { SelectionItemKind, ToolbarKind } from "@/lib/toolbar-kind";
 import { elementKind, resolveToolbar } from "@/lib/toolbar-kind";
-import { imageToolbarPosition } from "@/lib/toolbar-position";
+import { placePanel } from "@/lib/panel-placement";
+import { elementScreenRect, imageToolbarPosition } from "@/lib/toolbar-position";
 import { fetchAsDataURL } from "@/lib/canvas-elements";
 import { browserRenderCrop, commitCropOutput } from "@/lib/crop-commit";
 import { replaceImageInPlace } from "@/lib/tool-output-replace";
@@ -156,6 +157,12 @@ export type ImageToolbarLayerProps = {
   decodePixels?: ((dataUrl: string) => Promise<PixelBuffer>) | undefined;
   /** ED-01: encode pixels to a PNG Blob. Test-injectable; default is {@link browserEncode}. */
   encodePixels?: ((pixels: PixelBuffer) => Promise<Blob>) | undefined;
+  /**
+   * ED-00d：测量面板容器的宽高（`placePanel` 的 `panel` 入参）。
+   * 默认 {@link defaultMeasurePanel}（`getBoundingClientRect`）；只有测试会传，
+   * 因为 jsdom 里量出来恒为 0。
+   */
+  measurePanel?: ((el: HTMLElement) => { width: number; height: number }) | undefined;
 };
 
 /** ED-02 default size reader: load the data URL into an Image and read naturalWidth/Height. */
@@ -196,6 +203,12 @@ function defaultSaveBlob(blob: Blob, fileName: string): void {
   URL.revokeObjectURL(url);
 }
 
+/** ED-00d：默认的面板量法 —— 真实 DOM 里就是 `getBoundingClientRect`（jsdom 量出来是 0）。 */
+function defaultMeasurePanel(el: HTMLElement): { width: number; height: number } {
+  const rect = el.getBoundingClientRect();
+  return { width: rect.width, height: rect.height };
+}
+
 /** 最近一帧里与渲染有关的全部信息。 */
 type Snapshot = {
   /** 恰好选中 1 张图时的那个元素；其他情况一律 `null`（不显示工具条）。 */
@@ -207,6 +220,8 @@ type Snapshot = {
   scrollY: number;
   zoom: number;
   viewportWidth: number;
+  /** ED-00d：视口高度（`appState.height`，与 `viewportWidth` 同一写法）—— 面板夹边要用。 */
+  viewportHeight: number;
   busy: boolean;
   /**
    * ED-05：多选「下载全部」时选中元素的**合并外接框**（场景坐标，`angle: 0` ——
@@ -336,6 +351,7 @@ function snapshotKey(snapshot: Snapshot): string {
     snapshot.scrollY,
     snapshot.zoom,
     snapshot.viewportWidth,
+    snapshot.viewportHeight,
     snapshot.busy ? 1 : 0,
   ].join("|");
 }
@@ -413,6 +429,7 @@ export function ImageToolbarLayer({
   loadOriginal,
   decodePixels,
   encodePixels,
+  measurePanel,
 }: ImageToolbarLayerProps) {
   const { toast } = useToast();
   const definitions = useToolDefinitions(accessToken);
@@ -424,6 +441,14 @@ export function ImageToolbarLayer({
   /** 最近 150ms 内滚 / 缩过没有。`true` = 已经停下来，可以显示。 */
   const [scrollZoomSettled, setScrollZoomSettled] = useState(true);
   const [toolbarWidth, setToolbarWidth] = useState(0);
+  /**
+   * ED-00d：裁剪 / 调整面板的实测尺寸（`placePanel` 的 `panel` 入参）。
+   * jsdom 里量出来是 `{0, 0}`，组件必须能处理 —— 那时面板按「零尺寸」定位。
+   */
+  const [panelSize, setPanelSize] = useState<{ width: number; height: number }>({
+    width: 0,
+    height: 0,
+  });
   /** ED-05：zip 请求进行中（按钮 disabled + 文案「打包中…」）。 */
   const [downloadAllBusy, setDownloadAllBusy] = useState(false);
   /**
@@ -524,6 +549,7 @@ export function ImageToolbarLayer({
       scrollY,
       zoom,
       viewportWidth: typeof state["width"] === "number" ? state["width"] : 0,
+      viewportHeight: typeof state["height"] === "number" ? state["height"] : 0,
       downloadAllBox,
       // 拖动 / 拉伸 / 旋转 / 裁剪进行中都不显示（工单 §3 裁决 4）。
       busy: Boolean(
@@ -585,6 +611,9 @@ export function ImageToolbarLayer({
 
   const visible = visibleImage || visibleDownloadAll;
 
+  /** ED-00d：裁剪 / 调整是「面板」，位置按「右 → 左 → 下」算；其余形态仍是工具条。 */
+  const panelMode = mode.kind === "crop" || mode.kind === "adjust";
+
   // 测量工具条宽度（`toolbarWidth` 是定位的入参）。jsdom 里恒为 0，组件必须能处理 0。
   useEffect(() => {
     const node = containerRef.current;
@@ -599,6 +628,25 @@ export function ImageToolbarLayer({
     observer.observe(node);
     return () => observer.disconnect();
   }, [visible, mode.kind]);
+
+  // ED-00d：量面板容器尺寸（`placePanel` 的 `panel`），与上面量工具条宽度同一套办法：先量一次，
+  // 有 `ResizeObserver` 就跟。jsdom 里量出来是 0（真实尺寸只能浏览器里看）。
+  useEffect(() => {
+    if (!panelMode) return;
+    const node = containerRef.current;
+    if (node === null) return;
+    const measure = () => {
+      const next = (measurePanel ?? defaultMeasurePanel)(node);
+      setPanelSize((previous) =>
+        previous.width === next.width && previous.height === next.height ? previous : next,
+      );
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [panelMode, visible, measurePanel]);
 
   /** 进入二级条：把元素当前的 `angle` / `scale` 翻成 `FlipRotateState` 当初始状态。 */
   const enterFlipRotate = useCallback(() => {
@@ -1017,7 +1065,20 @@ export function ImageToolbarLayer({
 
   const adjustTool = definitions.tools.find((tool) => tool.id === ADJUST_TOOL_ID);
 
-  const position = imageToolbarPosition({
+  const anchorRect = elementScreenRect({
+    el: {
+      x: anchor.x ?? 0,
+      y: anchor.y ?? 0,
+      width: anchor.width ?? 0,
+      height: anchor.height ?? 0,
+      angle: anchor.angle ?? 0,
+    },
+    scrollX: snapshot.scrollX,
+    scrollY: snapshot.scrollY,
+    zoom: snapshot.zoom,
+  });
+
+  const toolbarPosition = imageToolbarPosition({
     el: {
       x: anchor.x ?? 0,
       y: anchor.y ?? 0,
@@ -1031,6 +1092,28 @@ export function ImageToolbarLayer({
     viewportWidth: snapshot.viewportWidth,
     toolbarWidth,
   });
+
+  /**
+   * ED-00d：面板按「右 → 左 → 下」定位，并夹进视口（规格原文：面板不得超出视口）。
+   * 坐标系与 `elementScreenRect` 一致（画布容器坐标），视口从 `(0, 0)` 起算 —— 本组件
+   * 挂在画布容器里，容器的左上角就是视口的左上角。
+   */
+  const panelPlacement = panelMode
+    ? placePanel({
+        anchor: anchorRect,
+        panel: panelSize,
+        viewport: { x: 0, y: 0, width: snapshot.viewportWidth, height: snapshot.viewportHeight },
+      })
+    : null;
+
+  const position: { x: number; y: number; placement: "above" | "below" | "right" | "left" } =
+    panelPlacement !== null
+      ? { x: panelPlacement.x, y: panelPlacement.y, placement: panelPlacement.side }
+      : {
+          x: toolbarPosition.x,
+          y: toolbarPosition.y,
+          placement: toolbarPosition.placement,
+        };
 
   /**
    * ED-05：多选「下载全部」**用自己的容器**，不复用 `image-toolbar-layer`。

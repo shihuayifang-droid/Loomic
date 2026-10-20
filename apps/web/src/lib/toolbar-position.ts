@@ -67,20 +67,12 @@ export type ImageToolbarPosition = {
  */
 export function imageToolbarPosition(input: ImageToolbarPositionInput): ImageToolbarPosition {
   const { el, scrollX, scrollY, zoom, viewportWidth, toolbarWidth } = input;
-  const angle = el.angle ?? 0;
-  const cos = Math.cos(angle);
-  const sin = Math.sin(angle);
 
-  // 旋转后的轴对齐外接框：半宽 / 半高。
-  const halfWidth = (Math.abs(el.width * cos) + Math.abs(el.height * sin)) / 2;
-  const halfHeight = (Math.abs(el.width * sin) + Math.abs(el.height * cos)) / 2;
-
-  // 外接框中心（场景坐标）→ 容器坐标。
-  const centerX = (el.x + el.width / 2 + scrollX) * zoom;
-  const centerY = (el.y + el.height / 2 + scrollY) * zoom;
-
-  const top = centerY - halfHeight * zoom;
-  const bottom = centerY + halfHeight * zoom;
+  // 外接框与中心都从 `elementScreenRect` 来：ED-00d 的面板定位也用同一个矩形当锚点。
+  const rect = elementScreenRect({ el, scrollX, scrollY, zoom });
+  const centerX = rect.x + rect.width / 2;
+  const top = rect.y;
+  const bottom = rect.y + rect.height;
 
   // 上沿 → 工具条上沿。放不下就翻到下方（下方不再判是否放得下：翻下去也放不下时
   // 只能让工具条贴住底边，而 `y` 不参与夹边，所以不再做第二次翻转）。
@@ -96,4 +88,37 @@ export function imageToolbarPosition(input: ImageToolbarPositionInput): ImageToo
   const x = Math.min(Math.max(centeredX, TOOLBAR_MARGIN), maxX);
 
   return { x, y, placement };
+}
+
+/**
+ * ED-00d：元素在**容器坐标**里的旋转后轴对齐外接框 —— 面板定位的锚点。
+ *
+ * 与 `imageToolbarPosition` 内部同一套换算（外接框半宽 / 半高、中心 `(el.x + w/2 + scrollX) * zoom`），
+ * 只是把它单独暴露出来：面板要的是「矩形」而不是「工具条中心对齐矩形上沿」。
+ */
+export function elementScreenRect(input: {
+  el: ImageToolbarElement;
+  scrollX: number;
+  scrollY: number;
+  zoom: number;
+}): { x: number; y: number; width: number; height: number } {
+  const { el, scrollX, scrollY, zoom } = input;
+  const angle = el.angle ?? 0;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+
+  // 旋转后的轴对齐外接框：半宽 / 半高。
+  const halfWidth = (Math.abs(el.width * cos) + Math.abs(el.height * sin)) / 2;
+  const halfHeight = (Math.abs(el.width * sin) + Math.abs(el.height * cos)) / 2;
+
+  // 外接框中心（场景坐标）→ 容器坐标。
+  const centerX = (el.x + el.width / 2 + scrollX) * zoom;
+  const centerY = (el.y + el.height / 2 + scrollY) * zoom;
+
+  return {
+    x: centerX - halfWidth * zoom,
+    y: centerY - halfHeight * zoom,
+    width: halfWidth * 2 * zoom,
+    height: halfHeight * 2 * zoom,
+  };
 }
