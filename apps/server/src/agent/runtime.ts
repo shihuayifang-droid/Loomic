@@ -1195,6 +1195,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   width: slotW,
                   height: slotH,
                   ...(input.title ? { title: input.title } : {}),
+                  jobId: job.id,
                 },
                 explicitPlacement,
               );
@@ -1509,6 +1510,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   ...(placementInput.title
                     ? { title: placementInput.title }
                     : {}),
+                  jobId: job.id,
                 },
                 explicitPlacement,
               );

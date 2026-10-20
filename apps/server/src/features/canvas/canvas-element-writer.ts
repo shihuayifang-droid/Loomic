@@ -39,6 +39,11 @@ type PlaceholderInsertOpts = {
   kind?: "image" | "video";
   /** Shown under the label, matching the chat sidebar's card. */
   modelName?: string;
+  /**
+   * GN-30: the job this slot is waiting for. Stored on the slot so a client
+   * that reconnects can tell which `job.progress` events belong to it.
+   */
+  jobId?: string;
 };
 
 type VideoInsertOpts = {
@@ -195,7 +200,13 @@ export const GENERATING_SLOT_LINK = "loomic://generating";
  */
 function buildGeneratingSlotElement(
   placement: Placement,
-  opts: { title?: string; kind?: "image" | "video"; modelName?: string },
+  opts: {
+    title?: string;
+    kind?: "image" | "video";
+    modelName?: string;
+    /** GN-30: which job this slot waits for, so retries can be attributed. */
+    jobId?: string;
+  },
 ): CanvasElement {
   return {
     type: "embeddable",
@@ -236,6 +247,7 @@ function buildGeneratingSlotElement(
       startedAt: Date.now(),
       ...(opts.modelName ? { modelName: opts.modelName } : {}),
       ...(opts.title ? { title: opts.title } : {}),
+      ...(opts.jobId ? { jobId: opts.jobId } : {}),
       source: "generated" as const,
     },
   };
@@ -358,6 +370,7 @@ export async function insertImagePlaceholder(
         ...(opts.title ? { title: opts.title } : {}),
         ...(opts.kind ? { kind: opts.kind } : {}),
         ...(opts.modelName ? { modelName: opts.modelName } : {}),
+        ...(opts.jobId ? { jobId: opts.jobId } : {}),
       });
       element = element
         ? { ...built, id: element.id }

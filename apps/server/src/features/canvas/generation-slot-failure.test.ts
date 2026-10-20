@@ -308,3 +308,37 @@ describe("GN-19 failed generation slots", () => {
     });
   });
 });
+
+// GN-30: the retrying slot has to name the job it is waiting for, otherwise the
+// client cannot tell which `job.progress` / `job.retrying` events belong to it.
+describe("GN-30 generating slots carry their job", () => {
+  it("GN-30: a generating slot carries the job it is waiting for", async () => {
+    const fake = createFakeCanvasClient(emptyCanvas());
+
+    const { elementId } = await insertImagePlaceholder(fake.client, {
+      canvasId: CANVAS_ID,
+      width: 512,
+      height: 512,
+      jobId: "job-7",
+    });
+
+    const element = findElement(fake, elementId);
+    expect(element).toBeDefined();
+    expect(element?.customData.generating).toBe(true);
+    expect(element?.customData.jobId).toBe("job-7");
+  });
+
+  it("GN-30: without a job id the slot has no jobId key", async () => {
+    const fake = createFakeCanvasClient(emptyCanvas());
+
+    const { elementId } = await insertImagePlaceholder(fake.client, {
+      canvasId: CANVAS_ID,
+      width: 512,
+      height: 512,
+    });
+
+    const element = findElement(fake, elementId);
+    expect(element).toBeDefined();
+    expect("jobId" in (element?.customData as Record<string, unknown>)).toBe(false);
+  });
+});
