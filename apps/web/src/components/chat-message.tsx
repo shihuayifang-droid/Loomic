@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import React, { useMemo } from "react";
 
 import type { ContentBlock, ToolArtifact, ToolBlock } from "@loomic/shared";
+import { isMentionTextTruncated } from "@/lib/mention-kinds";
 import { ImagePill } from "./chat/image-lightbox";
 import { MarkdownRenderer } from "./chat/markdown-renderer";
 import { MentionPill } from "./chat/mention-pill";
@@ -199,6 +200,7 @@ const UserMessage = React.memo(function UserMessage({
                       }
                     ).mentionType
                   }
+                  truncated={isMentionTextTruncated((block as { textContent?: string | null }).textContent)}
                 />
               ))}
             </span>
@@ -232,6 +234,7 @@ const UserMessage = React.memo(function UserMessage({
                   }
                 ).mentionType
               }
+              truncated={isMentionTextTruncated((block as { textContent?: string | null }).textContent)}
             />
           ))}
           {imageBlocks.map((block, idx) => (
