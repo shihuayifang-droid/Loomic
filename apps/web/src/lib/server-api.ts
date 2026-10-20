@@ -533,6 +533,42 @@ export async function uploadFile(
   return (await response.json()) as UploadResponse;
 }
 
+/** ED-00i: upload a browser-rendered tool result as a child of `parentArtifactId`. */
+export async function uploadToolOutput(
+  accessToken: string,
+  input: {
+    file: File;
+    source: "tool:adjust" | "tool:crop";
+    parentArtifactId: string;
+  },
+): Promise<UploadResponse> {
+  // AS-02 / ED-00i: the shared table still decides before a byte leaves the
+  // browser — a tool output is just another upload, only its provenance differs.
+  const constraint = checkUploadConstraint({
+    mimeType: input.file.type,
+    byteSize: input.file.size,
+  });
+  if (!constraint.ok) {
+    throw new ApiApplicationError("upload_failed", constraint.message, 400);
+  }
+
+  const formData = new FormData();
+  formData.append("file", input.file);
+  formData.append("source", input.source);
+  formData.append("parentArtifactId", input.parentArtifactId);
+
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/uploads/tool-output`,
+    {
+      method: "POST",
+      headers: authHeaders(accessToken),
+      body: formData,
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as UploadResponse;
+}
+
 export async function getAssetUrl(
   accessToken: string,
   assetId: string,

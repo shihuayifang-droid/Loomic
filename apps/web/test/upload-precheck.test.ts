@@ -15,6 +15,7 @@ import {
   getAssetDownloadUrl,
   submitImageJob,
   uploadFile,
+  uploadToolOutput,
 } from "../src/lib/server-api";
 
 const mockFetch = vi.fn();
@@ -159,6 +160,63 @@ describe("ED-00f: price quote (35K)", () => {
   });
 });
 
+// 工单35R · ED-00i：像素类工具（调整 / 裁剪）的产物走独立的工具产物上传端点 ——
+// 来源与父产物是这次请求的全部意义（出处链 + 花费 0 靠它们在服务端落地），
+// 所以这里钉字段取值本身，不只是「发了个请求」。
+describe("ED-00i: tool output upload (35R)", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    vi.stubEnv("NEXT_PUBLIC_SERVER_BASE_URL", "http://localhost:3001");
+  });
+
+  it("ED-00i: uploadToolOutput posts the file with its tool source and parent", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ asset: { id: "a-child" }, url: "u" }),
+    });
+
+    const file = new File(["bytes"], "cropped.png", { type: "image/png" });
+    const result = await uploadToolOutput("tok", {
+      file,
+      source: "tool:crop",
+      parentArtifactId: "p-1",
+    });
+
+    expect(result).toMatchObject({ asset: { id: "a-child" }, url: "u" });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    const [url, init] = mockFetch.mock.calls[0] as [
+      string,
+      { method?: string; body?: unknown; headers?: Record<string, string> },
+    ];
+    expect(url.endsWith("/api/uploads/tool-output")).toBe(true);
+    expect(init.method).toBe("POST");
+    expect(init.headers?.Authorization).toBe("Bearer tok");
+
+    const body = init.body as FormData;
+    expect(body.get("source")).toBe("tool:crop");
+    expect(body.get("parentArtifactId")).toBe("p-1");
+    expect(body.get("file")).toBeInstanceOf(File);
+  });
+
+  it("ED-00i: an oversized tool output is refused before any request", async () => {
+    const file = new File(["x"], "huge.png", { type: "image/png" });
+    Object.defineProperty(file, "size", { value: 21 * 1024 * 1024 });
+
+    const error = await uploadToolOutput("tok", {
+      file,
+      source: "tool:adjust",
+      parentArtifactId: "p-1",
+    }).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiApplicationError);
+    expect((error as ApiApplicationError).code).toBe("upload_failed");
+    expect((error as ApiApplicationError).message).toBe("图片最大 20MB");
+    expect(mockFetch).toHaveBeenCalledTimes(0);
+  });
+});
+
+// 替身钉 URL、方法与请求体（quality 只在模型有档位时才带上，见 image-quality-options）。
 // 工单35P · GN-37：图像生成器改走任务链路 —— 提交这一步回到 202，不再是「等图生成完」。
 // 替身钉 URL、方法与请求体（quality 只在模型有档位时才带上，见 image-quality-options）。
 describe("GN-37: image generation submits a job (35P)", () => {
