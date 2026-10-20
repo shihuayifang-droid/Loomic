@@ -75,6 +75,7 @@ import type { ServerEnv } from "../config/env.js";
 import type { UserSupabaseClient } from "../supabase/user.js";
 import { createLoomicDeepAgent } from "./deep-agent.js";
 import {
+  eventAfterPersistFailure,
   readCanvasProjectLinkForRun,
   readCanvasSummaryForRun,
   resolveAttachmentContent,
@@ -1172,5 +1173,94 @@ describe("工单21AC: the Agent-side repositories are wired to the tools", () =>
     expect(assetAsks).toEqual([{ actorId: ACTOR, kitId: WIRING_KIT_ID }]);
     // And the client it signs URLs with was never asked for a table.
     expect(tableReads).toBe(0);
+  });
+});
+
+/**
+ * AG-35 §3: the run's terminal state must not be a lie about the artifacts.
+ *
+ * When `run.completed` arrives the image is already on the canvas, so a status
+ * row that could not be written is a persistence problem, not a failed run. The
+ * cases below drive the decision function directly, because the point of the
+ * extraction is that this rule is a value, not a control-flow accident buried in
+ * the streaming loop.
+ */
+describe("eventAfterPersistFailure (AG-35 §3)", () => {
+  /** The error a transport retry gives up on: a driver error with a socket code. */
+  const writeError = Object.assign(new Error("read ECONNRESET"), {
+    code: "ECONNRESET",
+  });
+
+  function silenceConsoleError() {
+    return vi.spyOn(console, "error").mockImplementation(() => {});
+  }
+
+  it("AG-35: a completed run whose status write failed is still completed", () => {
+    const spy = silenceConsoleError();
+    try {
+      const completed = {
+        runId: "run-1",
+        timestamp: "t0",
+        type: "run.completed",
+      } as const;
+
+      const next = eventAfterPersistFailure("run-1", () => "t0", completed, writeError);
+
+      // IDENTITY: the caller re-emits the very event it was about to emit, so no
+      // field can drift and the run does not turn into a failure.
+      expect(next).toBe(completed);
+      expect(next.type).toBe("run.completed");
+      expect(spy).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("AG-35: a failed run whose failure write failed is still a run.failed", () => {
+    const spy = silenceConsoleError();
+    try {
+      const failed = {
+        error: { code: "run_failed", message: "the run itself failed" },
+        runId: "run-1",
+        timestamp: "t0",
+        type: "run.failed",
+      } as const;
+
+      const next = eventAfterPersistFailure("run-1", () => "t1", failed, writeError);
+
+      expect(next.type).toBe("run.failed");
+      if (next.type !== "run.failed") {
+        throw new Error("unreachable: narrowed above");
+      }
+      expect(next.error.code).toBe("run_failed");
+      expect(next.runId).toBe("run-1");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("AG-35: any other event whose write failed becomes run.failed, as before", () => {
+    const spy = silenceConsoleError();
+    try {
+      const delta = {
+        delta: "a token",
+        messageId: "message-1",
+        runId: "run-1",
+        timestamp: "t0",
+        type: "message.delta",
+      } as const;
+
+      const next = eventAfterPersistFailure("run-1", () => "t2", delta, writeError);
+
+      expect(next.type).toBe("run.failed");
+      if (next.type !== "run.failed") {
+        throw new Error("unreachable: narrowed above");
+      }
+      expect(next.error.code).toBe("run_failed");
+      expect(next.runId).toBe("run-1");
+      expect(next.timestamp).toBe("t2");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

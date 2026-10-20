@@ -1858,9 +1858,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             now,
           );
         } catch (error) {
-          const failedEvent = toFailedEvent(runId, now, error);
-          run.status = "failed";
-          yield failedEvent;
+          const next = eventAfterPersistFailure(runId, now, event, error);
+          run.status = mapEventToStatus(next);
+          yield next;
           return;
         }
         yield event;
@@ -1944,6 +1944,25 @@ function toFailedEvent(
     timestamp: now(),
     type: "run.failed",
   };
+}
+
+/**
+ * AG-35 §3: what to emit after persisting `event` failed. A completed run stays
+ * completed — the artifacts already landed, so the run must not be shown as
+ * failed because its status row could not be written; the failure is logged.
+ * Every other event keeps the existing answer: a run.failed in its place.
+ */
+export function eventAfterPersistFailure(
+  runId: string,
+  now: () => string,
+  event: StreamEvent,
+  error: unknown,
+): StreamEvent {
+  if (event.type === "run.completed") {
+    console.error(`[runtime] run ${runId} completed but its status could not be saved:`, error);
+    return event;
+  }
+  return toFailedEvent(runId, now, error);
 }
 
 async function updatePersistedRunStatus(
