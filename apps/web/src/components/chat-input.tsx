@@ -12,6 +12,7 @@ import {
 import type { MessageMention } from "@loomic/shared";
 import type { ImageAttachmentState } from "../hooks/use-image-attachments";
 import { AGENT_INPUT_PLACEHOLDER } from "../lib/composer-copy";
+import { triggerBeforeCaret } from "../lib/composer-trigger";
 import type { CanvasSelectedElement } from "./canvas-editor";
 import { useImageModelPreference } from "../hooks/use-image-model-preference";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
@@ -70,6 +71,7 @@ type ChatInputProps = {
   onRetryAttachment?: (id: string) => void;
   isUploading?: boolean;
   onAtQuery?: (query: string | null) => void;
+  onSlashQuery?: (query: string | null) => void;
   mentions?: MessageMention[];
   onRemoveMention?: (mention: MessageMention) => void;
   selectedCanvasElements?: CanvasSelectedElement[];
@@ -78,6 +80,8 @@ type ChatInputProps = {
 export type ChatInputHandle = {
   /** Remove the @query text from input after picker selection */
   clearAtQuery: () => void;
+  /** Remove the /query text from input after skill picker selection */
+  clearSlashQuery: () => void;
   /** Drop an inline image reference at the caret. */
   insertImageChip: (chip: ComposerChip) => void;
   /**
@@ -99,6 +103,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
   onRetryAttachment,
   isUploading,
   onAtQuery,
+  onSlashQuery,
   mentions,
   onRemoveMention,
   selectedCanvasElements,
@@ -127,6 +132,9 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
   useImperativeHandle(ref, () => ({
     clearAtQuery() {
       composerRef.current?.clearAtQuery();
+    },
+    clearSlashQuery() {
+      composerRef.current?.clearTriggerQuery("/");
     },
     insertImageChip(chip: ComposerChip) {
       composerRef.current?.insertChip(chip);
@@ -182,36 +190,21 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
    */
   const handleTextBeforeCaret = useCallback(
     (textBeforeCaret: string) => {
-      if (!onAtQuery) return;
+      if (!onAtQuery && !onSlashQuery) return;
 
-      const lastAtIdx = textBeforeCaret.lastIndexOf("@");
-      if (lastAtIdx === -1) {
-        onAtQuery(null);
-        return;
+      const trigger = triggerBeforeCaret(textBeforeCaret);
+      if (trigger?.char === "@") {
+        onAtQuery?.(trigger.query);
+        onSlashQuery?.(null);
+      } else if (trigger?.char === "/") {
+        onSlashQuery?.(trigger.query);
+        onAtQuery?.(null);
+      } else {
+        onAtQuery?.(null);
+        onSlashQuery?.(null);
       }
-
-      // Only trigger if @ is at start or preceded by whitespace
-      const charBefore = lastAtIdx > 0 ? textBeforeCaret[lastAtIdx - 1] : " ";
-      if (
-        charBefore !== " " &&
-        charBefore !== "\n" &&
-        charBefore !== "\u00A0" &&
-        lastAtIdx !== 0
-      ) {
-        onAtQuery(null);
-        return;
-      }
-
-      const query = textBeforeCaret.slice(lastAtIdx + 1);
-      // Close once the mention run is finished
-      if (/[\s\u00A0]/.test(query)) {
-        onAtQuery(null);
-        return;
-      }
-
-      onAtQuery(query);
     },
-    [onAtQuery],
+    [onAtQuery, onSlashQuery],
   );
 
   const handleFileChange = useCallback(

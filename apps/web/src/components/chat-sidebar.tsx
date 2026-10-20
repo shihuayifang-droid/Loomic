@@ -124,6 +124,7 @@ export function ChatSidebar({
 
   // ── Mention & attachment state ──
   const [atQuery, setAtQuery] = useState<string | null>(null);
+  const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [messageMentions, setMessageMentions] = useState<MessageMention[]>([]);
   const [brandKitMentionItems, setBrandKitMentionItems] = useState<
     BrandKitMentionItem[]
@@ -1066,6 +1067,18 @@ export function ChatSidebar({
             onClose={() => setAtQuery(null)}
           />
         )}
+        {slashQuery !== null && skillMentionItems.length > 0 && (
+          <MessageMentionPicker
+            items={skillMentionItems}
+            query={slashQuery}
+            onSelect={(item) => {
+              handleMentionSelect(item);
+              chatInputRef.current?.clearSlashQuery();
+              setSlashQuery(null);
+            }}
+            onClose={() => setSlashQuery(null)}
+          />
+        )}
         <ChatInput
           ref={chatInputRef}
           onSend={(text, canvasRefs) =>
@@ -1078,6 +1091,7 @@ export function ChatSidebar({
           onRetryAttachment={retryUpload}
           isUploading={isUploading}
           onAtQuery={setAtQuery}
+          onSlashQuery={setSlashQuery}
           mentions={messageMentions}
           onRemoveMention={handleRemoveMention}
           {...(selectedCanvasElements ? { selectedCanvasElements } : {})}

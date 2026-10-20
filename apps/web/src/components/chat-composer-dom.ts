@@ -373,13 +373,16 @@ export function insertPlainText(text: string): void {
  * Remove the "@query" run immediately before the caret. Used after the mention
  * picker consumes it, so the typed "@app" does not linger next to the chip.
  */
-export function deleteAtQueryBeforeCaret(root: HTMLElement): void {
+export function deleteAtQueryBeforeCaret(
+  root: HTMLElement,
+  char: "@" | "/" = "@",
+): void {
   const range = currentRangeWithin(root);
   if (!range || range.endContainer.nodeType !== Node.TEXT_NODE) return;
 
   const textNode = range.endContainer as Text;
   const upToCaret = (textNode.textContent ?? "").slice(0, range.endOffset);
-  const atIdx = upToCaret.lastIndexOf("@");
+  const atIdx = upToCaret.lastIndexOf(char);
   if (atIdx === -1) return;
 
   const del = document.createRange();

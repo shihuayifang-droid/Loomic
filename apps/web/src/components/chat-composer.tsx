@@ -69,6 +69,8 @@ export type ChatComposerHandle = {
   removeChip: (refId: string) => void;
   /** Drop the trailing "@query" the mention picker consumed. */
   clearAtQuery: () => void;
+  /** Drop the trailing "<char>query" (char = "@" or "/") the picker consumed. */
+  clearTriggerQuery: (char: "@" | "/") => void;
 };
 
 type ChatComposerProps = {
@@ -203,6 +205,12 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
         const el = editorRef.current;
         if (!el) return;
         deleteAtQueryBeforeCaret(el);
+        notifyState();
+      },
+      clearTriggerQuery: (char) => {
+        const el = editorRef.current;
+        if (!el) return;
+        deleteAtQueryBeforeCaret(el, char);
         notifyState();
       },
     }));
