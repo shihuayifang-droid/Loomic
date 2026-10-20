@@ -20,6 +20,7 @@ import type {
 } from "../db/skill-repository.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
+import { sendValidationError } from "./validation-error.js";
 
 type SkillErrorCode =
   | "feature_disabled"
@@ -196,10 +197,7 @@ export async function registerSkillRoutes(
       return reply.code(201).send(skillDetailResponseSchema.parse({ skill }));
     } catch (error) {
       if (isZodError(error)) {
-        return reply.code(400).send({
-          issues: error.issues,
-          message: "Invalid request body",
-        });
+        return sendValidationError(reply, error.issues);
       }
 
       request.log.error({ err: error }, "skill create error");
@@ -289,10 +287,7 @@ export async function registerSkillRoutes(
       return reply.code(200).send(skillDetailResponseSchema.parse({ skill }));
     } catch (error) {
       if (isZodError(error)) {
-        return reply.code(400).send({
-          issues: error.issues,
-          message: "Invalid request body",
-        });
+        return sendValidationError(reply, error.issues);
       }
 
       request.log.error({ err: error }, "skill update error");
@@ -521,10 +516,7 @@ export async function registerSkillRoutes(
       return reply.code(204).send();
     } catch (error) {
       if (isZodError(error)) {
-        return reply.code(400).send({
-          issues: error.issues,
-          message: "Invalid request body",
-        });
+        return sendValidationError(reply, error.issues);
       }
 
       request.log.error({ err: error }, "skill toggle error");

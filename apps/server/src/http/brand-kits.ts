@@ -17,6 +17,7 @@ import {
   type BrandKitService,
 } from "../features/brand-kit/brand-kit-service.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
+import { sendValidationError } from "./validation-error.js";
 
 const ALLOWED_UPLOAD_MIME_TYPES = new Set([
   "image/png",
@@ -75,10 +76,7 @@ export async function registerBrandKitRoutes(
       return reply.code(201).send(brandKitDetailResponseSchema.parse(kit));
     } catch (error) {
       if (isZodError(error)) {
-        return reply.code(400).send({
-          issues: error.issues,
-          message: "Invalid request body",
-        });
+        return sendValidationError(reply, error.issues);
       }
 
       return sendBrandKitError(error, reply, "brand_kit_create_failed");
@@ -119,10 +117,7 @@ export async function registerBrandKitRoutes(
       return reply.code(200).send(brandKitDetailResponseSchema.parse(kit));
     } catch (error) {
       if (isZodError(error)) {
-        return reply.code(400).send({
-          issues: error.issues,
-          message: "Invalid request body",
-        });
+        return sendValidationError(reply, error.issues);
       }
 
       return sendBrandKitError(error, reply, "brand_kit_update_failed");
@@ -256,10 +251,7 @@ export async function registerBrandKitRoutes(
       return reply.code(201).send(brandKitAssetResponseSchema.parse(asset));
     } catch (error) {
       if (isZodError(error)) {
-        return reply.code(400).send({
-          issues: error.issues,
-          message: "Invalid request body",
-        });
+        return sendValidationError(reply, error.issues);
       }
 
       return sendBrandKitError(error, reply, "brand_kit_asset_create_failed");
@@ -292,10 +284,7 @@ export async function registerBrandKitRoutes(
         return reply.code(200).send(brandKitAssetResponseSchema.parse(asset));
       } catch (error) {
         if (isZodError(error)) {
-          return reply.code(400).send({
-            issues: error.issues,
-            message: "Invalid request body",
-          });
+          return sendValidationError(reply, error.issues);
         }
 
         return sendBrandKitError(error, reply, "brand_kit_update_failed");

@@ -15,6 +15,7 @@ import {
 } from "../features/projects/project-service.js";
 import type { TeamAdminService } from "../features/team/team-admin.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
+import { sendValidationError } from "./validation-error.js";
 
 export async function registerProjectRoutes(
   app: FastifyInstance,
@@ -138,10 +139,7 @@ export async function registerProjectRoutes(
       );
     } catch (error) {
       if (isZodError(error)) {
-        return reply.code(400).send({
-          issues: error.issues,
-          message: "Invalid request body",
-        });
+        return sendValidationError(reply, error.issues);
       }
 
       return sendProjectError(error, reply, "project_create_failed");
@@ -170,10 +168,7 @@ export async function registerProjectRoutes(
       return reply.code(204).send();
     } catch (error) {
       if (isZodError(error)) {
-        return reply.code(400).send({
-          issues: error.issues,
-          message: "Invalid request body",
-        });
+        return sendValidationError(reply, error.issues);
       }
 
       return sendProjectError(error, reply, "project_update_failed");

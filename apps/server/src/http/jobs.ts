@@ -33,6 +33,7 @@ import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repo
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
+import { sendValidationError } from "./validation-error.js";
 
 export async function registerJobRoutes(
   app: FastifyInstance,
@@ -105,9 +106,7 @@ export async function registerJobRoutes(
       return reply.code(201).send(jobResponseSchema.parse({ job }));
     } catch (error) {
       if (isZodError(error)) {
-        return reply
-          .code(400)
-          .send({ issues: error.issues, message: "Invalid request body" });
+        return sendValidationError(reply, error.issues);
       }
       return sendJobError(error, reply, "job_create_failed");
     }
@@ -178,9 +177,7 @@ export async function registerJobRoutes(
       return reply.code(201).send(jobResponseSchema.parse({ job }));
     } catch (error) {
       if (isZodError(error)) {
-        return reply
-          .code(400)
-          .send({ issues: error.issues, message: "Invalid request body" });
+        return sendValidationError(reply, error.issues);
       }
       return sendJobError(error, reply, "job_create_failed");
     }
