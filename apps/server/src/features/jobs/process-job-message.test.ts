@@ -6,8 +6,10 @@ import type { JobService } from "./job-service.js";
 import {
   BILLING_CONFIRM_TIMEOUT_SECONDS,
   BILLING_DEFER_VT_SECONDS,
+  executorTimeoutMs,
   processJobMessage,
 } from "./process-job-message.js";
+import type { ProcessJobMessageDeps } from "./process-job-message.js";
 
 /** A gate row, spelled out per case so the matrix below reads like the ticket. */
 type GateRow = { status: string; creditsCost: number | null; overdue: boolean };
@@ -36,6 +38,12 @@ type Scenario = {
   gateClaimThrows?: boolean;
   /** `renewVt` settles on the next macrotask instead of synchronously (T-43). */
   renewVtAsync?: boolean;
+  /** GN-31: the executor never settles — an upstream that hangs. */
+  executorHangs?: boolean;
+  /** GN-31: the executor settles this many ms after it was started. */
+  executorDelayMs?: number;
+  /** GN-31: shortens the execution budget, in ms. Omitted = the real default. */
+  executorTimeoutMs?: number;
 };
 
 function makeHarness(scenario: Scenario = {}) {
@@ -85,6 +93,18 @@ function makeHarness(scenario: Scenario = {}) {
   const executor: JobExecutor = async (_jobId, _payload, ctx) => {
     calls.push("executor");
     executorCtx = ctx;
+    if (scenario.executorHangs) {
+      // Never settles: the shape of an upstream call that hangs while the
+      // executor keeps renewing its visibility timeout, which is exactly what
+      // GN-31's budget exists to end.
+      return new Promise<Record<string, unknown>>(() => {});
+    }
+    const delayMs = scenario.executorDelayMs;
+    if (delayMs !== undefined) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, delayMs);
+      });
+    }
     if (scenario.executorThrows) throw Object.assign(new Error(scenario.executorThrows.message), {
       ...(scenario.executorThrows.code ? { code: scenario.executorThrows.code } : {}),
     });
@@ -133,7 +153,7 @@ function makeHarness(scenario: Scenario = {}) {
     },
   } as unknown as ExecutorContext;
 
-  const deps = {
+  const deps: ProcessJobMessageDeps = {
     jobService,
     billingGate,
     pgmq: pgmq as never,
@@ -148,6 +168,16 @@ function makeHarness(scenario: Scenario = {}) {
       logs.push(message);
     },
   };
+
+  // GN-31: only the cases that measure the budget shorten it — every case
+  // written before this ticket keeps the real default, so its budget never
+  // enters what it was written to measure.
+  const injectedTimeoutMs = scenario.executorTimeoutMs;
+
+  if (injectedTimeoutMs !== undefined) {
+    const fixedBudgetMs = injectedTimeoutMs;
+    deps.executorTimeoutMs = () => fixedBudgetMs;
+  }
 
   const args = {
     queue: "image_generation",
@@ -616,5 +646,75 @@ describe("processJobMessage: the billing gate (工单21H1)", () => {
     await h.run();
 
     expect(h.executorCtx()?.creditsCharged).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workorder 36H — the executor's overall execution budget (GN-31).
+//
+// Until this ticket an attempt was unbounded: the executor renews its own
+// visibility timeout while it works, so an upstream that never answers kept the
+// message invisible forever and the job stayed `running`. These four cases pin
+// the budget, the terminal `timeout` outcome, and the fact that a late success
+// after the timeout writes nothing at all.
+// ---------------------------------------------------------------------------
+
+describe("processJobMessage: the execution budget (工单36H / GN-31)", () => {
+  it("GN-31: an executor that never answers fails the job as timeout and refunds it", async () => {
+    const h = makeHarness({ executorHangs: true, executorTimeoutMs: 20 });
+
+    await h.run();
+
+    expect(h.failures).toEqual([
+      {
+        code: "timeout",
+        message: expect.stringContaining("exceeded its 20ms execution budget"),
+      },
+    ]);
+    expect(h.refunds()).toBe(1);
+    expect(h.calls).toContain("archive");
+    expect(h.calls).not.toContain("markRetrying");
+  });
+
+  it("GN-31: a timeout is not retried even with attempts left", async () => {
+    const h = makeHarness({
+      executorHangs: true,
+      executorTimeoutMs: 20,
+      increment: async () => ({ attempt_count: 1, max_attempts: 3 }),
+    });
+
+    await h.run();
+
+    // Attempt 1 of 3: a retryable failure would have written `retrying` here.
+    expect(h.failures.map((failure) => failure.code)).toEqual(["timeout"]);
+    expect(h.calls).not.toContain("markRetrying");
+  });
+
+  it("GN-31: a late success after the timeout does not turn the job into succeeded", async () => {
+    // The executor needs 40ms, the budget is 10ms: the timeout is answered
+    // first, and the executor's own resolution arrives 30ms later.
+    const h = makeHarness({ executorDelayMs: 40, executorTimeoutMs: 10 });
+
+    await h.run();
+
+    expect(h.failures.map((failure) => failure.code)).toEqual(["timeout"]);
+
+    // Wait past the executor's own resolution, then check that losing the race
+    // really did drop the result instead of letting it through a little later.
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 60);
+    });
+
+    expect(h.calls).not.toContain("markSucceeded");
+    expect(h.calls).not.toContain("deleteMsg");
+    expect(h.refunds()).toBe(1);
+  });
+
+  it("GN-31: the default budget is the visibility timeout times the attempts", () => {
+    // The registry's visibility timeouts (image 120s, video 300s) times the
+    // attempt budget, in ms. `0` attempts means "not counted yet" and must not
+    // collapse the budget to nothing.
+    expect(executorTimeoutMs("image_generation", 3)).toBe(120 * 3 * 1000);
+    expect(executorTimeoutMs("video_generation", 0)).toBe(300 * 1000);
   });
 });

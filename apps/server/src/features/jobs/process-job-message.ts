@@ -63,6 +63,7 @@ import type {
 } from "../../db/job-billing-gate-repository.js";
 import type { PgmqClient, PgmqMessage } from "../../queue/pgmq-client.js";
 import type { ExecutorContext, JobExecutor } from "./job-executor.js";
+import { JOB_TYPE_REGISTRY } from "./job-registry.js";
 import type { JobService } from "./job-service.js";
 
 /** Retrying these can only fail again the same way. */
@@ -71,6 +72,11 @@ const NON_RETRYABLE_CODES = new Set([
   "model_not_found",
   "provider_not_found",
   "safety_filter",
+  // GN-31. The whole execution budget for this job is already spent, so a retry
+  // would spend another full budget on work that has just proved it cannot
+  // finish in time. The job goes terminal (`failed` + `timeout`) and is
+  // refunded exactly once, like every other non-retryable failure.
+  "timeout",
 ]);
 
 /**
@@ -95,6 +101,69 @@ export const BILLING_CONFIRM_TIMEOUT_SECONDS = 600;
  */
 export const BILLING_DEFER_VT_SECONDS = 10;
 
+/**
+ * GN-31: how long one attempt of a job may run before it is failed as `timeout`.
+ *
+ * The requirement's shape is "the model's estimated duration (MD-07) times 3".
+ * MD-07 carries no per-model estimate yet, so the specified fallback is used
+ * instead: the queue's visibility timeout times the attempt budget. That is
+ * the right order of magnitude on purpose — an executor that is healthy renews
+ * its visibility timeout while it works, so the VT is the only existing
+ * statement of "how long this kind of job is expected to take".
+ *
+ * `maxAttempts` bounds the JOB, not one attempt: a job that still has attempts
+ * left must not be killed by a budget it never got to use. `Math.max(1, ...)`
+ * keeps a nonsensical budget (0, on a row that has not been counted) from
+ * collapsing the limit to zero milliseconds.
+ *
+ * Once MD-07 has an estimate, the body becomes `estimateMs * 3` and this
+ * registry lookup stays only as its fallback.
+ */
+export function executorTimeoutMs(jobType: BackgroundJobType, maxAttempts: number): number {
+  return JOB_TYPE_REGISTRY[jobType].visibilityTimeoutSeconds * Math.max(1, maxAttempts) * 1000;
+}
+
+/**
+ * Races one executor call against its execution budget (GN-31).
+ *
+ * The executor is started BEFORE the race and handed in as a promise, so the
+ * timer measures the work rather than the scheduling. Three properties matter:
+ *
+ *   - the executor's OWN failure wins the race unchanged: only the timer builds
+ *     the `timeout` error, so a provider error keeps its original code and the
+ *     retry / non-retryable branches below still see what they always saw;
+ *   - the timer is cleared on both settle paths, so a job that finishes in a
+ *     millisecond does not leave a timer holding the worker (or the test
+ *     process) open for the rest of its budget;
+ *   - a work promise that settles AFTER the timer loses the race and its value
+ *     is dropped: `resolve` on an already-rejected promise does nothing, so a
+ *     late success never reaches the success branch from this delivery. Even if
+ *     it could, the success branch only writes a row that is still `running`,
+ *     and the terminal failure has already moved this one to `failed`.
+ */
+function withExecutionBudget<T>(
+  work: Promise<T>,
+  budgetMs: number,
+  budgetExceeded: () => Error,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(budgetExceeded());
+    }, budgetMs);
+
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 export type ProcessJobMessageDeps = {
   jobService: JobService;
   /**
@@ -107,6 +176,13 @@ export type ProcessJobMessageDeps = {
   /** Only the two message-lifecycle calls are needed here. */
   pgmq: Pick<PgmqClient, "archive" | "deleteMsg">;
   getExecutor: (jobType: BackgroundJobType) => JobExecutor | undefined;
+  /**
+   * GN-31: the execution budget for one attempt, in milliseconds. Optional so a
+   * test can inject a very short budget; absent means `executorTimeoutMs` above,
+   * the VT-based default. It is a function rather than a constant because the
+   * budget depends on the job type and on the attempts this job was granted.
+   */
+  executorTimeoutMs?: (jobType: BackgroundJobType, maxAttempts: number) => number;
   /** Refund for a terminally failed job. The worker's implementation logs instead of throwing. */
   refundJob: (jobId: string) => Promise<void>;
   log: (message: string) => void;
@@ -314,7 +390,26 @@ export async function processJobMessage(
   try {
     const executorCtx: ExecutorContext =
       typeof gate?.creditsCost === "number" ? { ...ctx, creditsCharged: gate.creditsCost } : ctx;
-    const result = await executor(jobId, msg.message as Record<string, unknown>, executorCtx);
+
+    // GN-31. The executor renews the visibility timeout from the inside while it
+    // works, so an upstream that hangs keeps its own message invisible forever
+    // and the job stays `running` with no way out. The budget is that way out;
+    // it is the only limit the executor cannot push back.
+    const budgetMs = (deps.executorTimeoutMs ?? executorTimeoutMs)(jobType, maxAttempts);
+
+    const result = await withExecutionBudget(
+      executor(jobId, msg.message as Record<string, unknown>, executorCtx),
+      budgetMs,
+      () =>
+        Object.assign(new Error(`Job ${jobId} exceeded its ${budgetMs}ms execution budget`), {
+          code: "timeout",
+        }),
+    );
+
+    // A job whose status is no longer `running` is not overwritten here — that
+    // is what makes a late completion of a timed-out attempt harmless: the
+    // timeout branch below has already written `failed`, and this guard refuses
+    // to turn it back into `succeeded`.
     const marked = await deps.jobService.markSucceeded(jobId, result);
 
     if (!marked) {
