@@ -705,25 +705,6 @@ export function ImageToolbarLayer({
     [snapshot, excalidrawApi],
   );
 
-  const handleDownload = useCallback(
-    (state: FlipRotateState) => {
-      const el = snapshot?.element as ElementLike | null | undefined;
-      if (!el) return;
-      const files = excalidrawApi.getFiles?.() ?? {};
-      const fileId = typeof el.fileId === "string" ? el.fileId : "";
-      const file = fileId === "" ? undefined : files[fileId];
-      const dataUrl = file?.dataURL;
-
-      // 拿不到原图就只提示，不抛错（工单 §5 用例 9）。
-      if (typeof dataUrl !== "string" || dataUrl === "") {
-        toast(DOWNLOAD_FAILED_MESSAGE);
-        return;
-      }
-      (download ?? downloadTransformed)(dataUrl, downloadBaseName(el, file), state);
-    },
-    [snapshot, excalidrawApi, toast, download],
-  );
-
   const exitFlipRotate = useCallback(() => setMode({ kind: "toolbar" }), []);
 
   /**
@@ -797,6 +778,48 @@ export function ImageToolbarLayer({
       }
     },
     [excalidrawApi, toast, loadOriginal, accessToken],
+  );
+
+  /**
+   * 二级条（翻转 / 旋转）的「下载」—— ED-00j：**必须用原图**。
+   *
+   * 画布里的 `files[fileId].dataURL` 是**显示版**（服务端 `storageUrl` 的 1024 webp 变换，GN-14），
+   * 拿它下载等于把翻转后的图再缩一遍，违反「翻转 = 原图」。所以：
+   *
+   * - 有 `assetId`（服务端产物）→ 先 `loadOriginalOf` 取原图字节（assetId → 签名 URL → 原图），
+   *   成功才用 `loaded.original` + `loaded.fileName` 下载；拿不到时它自己已 toast，这里直接返回。
+   * - 没有 `assetId`（本地尚未上传的图）→ 只有 `dataURL` 这一份，**它就是原图**，保持原行为；
+   *   连 `dataURL` 都没有才 toast（工单 §5 用例 9）。
+   *
+   * 依赖里放 `loadOriginalOf`，所以这个回调必须声明在它之后（否则求值依赖数组时进 TDZ）。
+   */
+  const handleDownload = useCallback(
+    async (state: FlipRotateState) => {
+      const el = snapshot?.element as ElementLike | null | undefined;
+      if (!el) return;
+      const files = excalidrawApi.getFiles?.() ?? {};
+      const fileId = typeof el.fileId === "string" ? el.fileId : "";
+      const file = fileId === "" ? undefined : files[fileId];
+
+      const assetId = file?.assetId;
+      if (typeof assetId === "string" && assetId !== "") {
+        const loaded = await loadOriginalOf(el);
+        // 拿不到原图就不下载显示版（loadOriginalOf 已经提示过）。
+        if (loaded === null) return;
+        (download ?? downloadTransformed)(loaded.original, loaded.fileName, state);
+        return;
+      }
+
+      const dataUrl = file?.dataURL;
+
+      // 本地图只有 dataURL 这一份（它就是原图）；拿不到就只提示，不抛错（工单 §5 用例 9）。
+      if (typeof dataUrl !== "string" || dataUrl === "") {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return;
+      }
+      (download ?? downloadTransformed)(dataUrl, downloadBaseName(el, file), state);
+    },
+    [snapshot, excalidrawApi, toast, download, loadOriginalOf],
   );
 
   /** ED-02: enter the crop panel for the selected image (needs dataURL, assetId and a known size). */
@@ -1171,7 +1194,7 @@ export function ImageToolbarLayer({
         <FlipRotateBar
           state={mode.state}
           onChange={handleFlipChange}
-          onDownload={handleDownload}
+          onDownload={(s) => void handleDownload(s)}
           onExit={exitFlipRotate}
         />
       ) : (

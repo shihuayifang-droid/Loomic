@@ -619,6 +619,67 @@ describe("ImageToolbarLayer：二级条的下载", () => {
     expect(lastCall?.[2]).toEqual({ angle: 0, flipH: true, flipV: false });
     expect(lastCall?.[1]).toBe("cat.png");
   });
+
+  // ED-00j: 画布里的 dataURL 是显示版（1024 webp 变换），翻转后的下载必须取服务端原图。
+  const displayFiles = {
+    "file-1": {
+      dataURL: "data:image/webp;base64,DISPLAY",
+      mimeType: "image/webp",
+      assetId: "a1",
+    },
+  };
+
+  it("ED-00j: a server image is flipped from its original, not the canvas copy", async () => {
+    const download = vi.fn();
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/orig" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    setupSelectedImage({ files: displayFiles, download, loadOriginal });
+    enterFlipRotate();
+
+    fireEvent.click(screen.getByTestId("image-toolbar-flip-rotate-download"));
+
+    await waitFor(() => expect(download).toHaveBeenCalledTimes(1));
+    expect(getAssetUrlMock).toHaveBeenCalledWith("test-token", "a1");
+    expect(loadOriginal).toHaveBeenCalledWith("https://x/orig");
+    expect(download.mock.calls[0]?.[0]).toBe("data:image/png;base64,ORIG");
+    expect(download.mock.calls[0]?.[1]).toBe("cat.png");
+    expect(toastMock.toast).not.toHaveBeenCalled();
+  });
+
+  it("ED-00j: the flip state rides along with the original", async () => {
+    const download = vi.fn();
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/orig" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    const { api } = setupSelectedImage({ files: displayFiles, download, loadOriginal });
+    enterFlipRotate();
+
+    fireEvent.click(screen.getByTestId("image-toolbar-flip-rotate-flip-h"));
+    await waitFor(() => expect(api.updateScene).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByTestId("image-toolbar-flip-rotate-download"));
+    await waitFor(() => expect(download).toHaveBeenCalledTimes(1));
+
+    const lastCall = download.mock.calls[download.mock.calls.length - 1];
+    expect(lastCall?.[2]).toEqual({ angle: 0, flipH: true, flipV: false });
+    expect(lastCall?.[0]).toBe("data:image/png;base64,ORIG");
+  });
+
+  it("ED-00j: when the original cannot be had, nothing is downloaded", async () => {
+    const download = vi.fn();
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockRejectedValue(new Error("403"));
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    setupSelectedImage({ files: displayFiles, download, loadOriginal });
+    enterFlipRotate();
+
+    fireEvent.click(screen.getByTestId("image-toolbar-flip-rotate-download"));
+
+    await waitFor(() => expect(toastMock.toast).toHaveBeenCalledWith(DOWNLOAD_FAILED_MESSAGE));
+    expect(download).toHaveBeenCalledTimes(0);
+    expect(loadOriginal).toHaveBeenCalledTimes(0);
+  });
 });
 
 describe("ED-05：工具条下载走服务端原图", () => {
