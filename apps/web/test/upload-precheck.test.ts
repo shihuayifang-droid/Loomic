@@ -7,7 +7,12 @@
 // still have spent the user's bandwidth (and earned a 413 from the server).
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiApplicationError, uploadFile } from "../src/lib/server-api";
+import {
+  ApiApplicationError,
+  fetchProjectUploads,
+  getAssetDownloadUrl,
+  uploadFile,
+} from "../src/lib/server-api";
 
 const mockFetch = vi.fn();
 globalThis.fetch = mockFetch;
@@ -58,5 +63,32 @@ describe("uploadFile refuses locally from the shared constraint table (AS-02)", 
     expect(mockFetch).toHaveBeenCalledTimes(1);
     const [url] = mockFetch.mock.calls[0] as [string, ...unknown[]];
     expect(url.endsWith("/api/uploads")).toBe(true);
+  });
+});
+
+// T-91 + 工单 34P T4：URL 拼装用真身钉住 —— 替身只能证明「组件用了哪些参数」，
+// 钉不住真正发出去的请求长什么样（ED-05 的 `?download=1` 之前就是这样漏掉的）。
+describe("server-api URL shapes (ED-05 / AS-06)", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    vi.stubEnv("NEXT_PUBLIC_SERVER_BASE_URL", "http://localhost:3001");
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ url: "https://example.invalid/signed", uploads: [] }),
+    });
+  });
+
+  it("ED-05: getAssetDownloadUrl asks for the download signature", async () => {
+    await getAssetDownloadUrl("tok", "asset-9");
+
+    const [url] = mockFetch.mock.calls[0] as [string, ...unknown[]];
+    expect(url.endsWith("/api/uploads/asset-9/url?download=1")).toBe(true);
+  });
+
+  it("AS-06: fetchProjectUploads puts order and type on the query", async () => {
+    await fetchProjectUploads("tok", "p-1", { order: "oldest", type: "pdf" });
+
+    const [url] = mockFetch.mock.calls[0] as [string, ...unknown[]];
+    expect(url.endsWith("/api/projects/p-1/uploads?order=oldest&type=pdf")).toBe(true);
   });
 });

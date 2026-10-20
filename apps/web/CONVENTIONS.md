@@ -243,6 +243,7 @@ import { AppDropdown } from "@/components/ui/app-dropdown";
 | `landing-` | 落地页（浮动导航、价格预览） |
 | `price-` | 价格展示（PriceTag 五态文案与获取失败重试） |
 | `pricing-` | 价格页（套餐卡片、对比表、常见问题、月付与年付切换） |
+| `ref-` | 参考面板（AS-06：上传卡片、排序与筛选、参考文件项、空态） |
 | `project-` | 单个项目的详情控件（项目名编辑） |
 | `projects-` | 项目列表与项目弹窗（新建、删除、重试） |
 | `settings-` | 设置页（分区导航、返回、各分区表单） |

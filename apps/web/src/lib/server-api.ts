@@ -567,6 +567,41 @@ export async function deleteAsset(
   if (!response.ok) return handleErrorResponse(response);
 }
 
+/** AS-06: one row of the project's own uploaded references (34O 列表接口). */
+export type ProjectUploadItem = {
+  id: string;
+  name: string;
+  mimeType: string;
+  byteSize: number;
+  createdAt: string;
+  /** 签名 url；非图片资产可能拿不到（服务端返回 null）。 */
+  url: string | null;
+};
+
+/**
+ * AS-06: the project's own uploads, newest first by default.
+ *
+ * 查询串只在调用方给了参数时才加 —— 缺省排序由服务端定，前端不重复一份默认值，
+ * 免得两边口径漂移。
+ */
+export async function fetchProjectUploads(
+  accessToken: string,
+  projectId: string,
+  opts?: { order?: "newest" | "oldest"; type?: "image" | "video" | "pdf" },
+): Promise<{ uploads: ProjectUploadItem[] }> {
+  const query = new URLSearchParams();
+  if (opts?.order) query.set("order", opts.order);
+  if (opts?.type) query.set("type", opts.type);
+  const search = query.toString();
+
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/projects/${projectId}/uploads${search ? `?${search}` : ""}`,
+    { headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as { uploads: ProjectUploadItem[] };
+}
+
 // --- Canvas-Native Generation API ---
 
 export type GenerateImageResponse = {
