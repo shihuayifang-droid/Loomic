@@ -6,6 +6,7 @@ import type { ToolDefinition } from "@loomic/shared";
 
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { PriceState } from "@/lib/price-display";
+import { toolPriceTooltip } from "@/lib/tool-price-tooltip";
 
 import { ImageToolbarMoreMenu } from "./image-toolbar-more-menu";
 
@@ -17,8 +18,8 @@ import { ImageToolbarMoreMenu } from "./image-toolbar-more-menu";
  * - 三组、两条分隔线：入口（快捷编辑）｜编辑动作（若干工具 + 「更多」）｜导出（下载）。
  * - 尺寸照 ED-00a 的 Lovart 实测：容器高 44、按钮 32×32、间距 4、左右内边距 6、圆角 14。
  * - 每个按钮都有 tooltip（含「更多」「下载」），键盘聚焦时同样出；图标按钮必须有 aria-label。
- * - tooltip 内容 = 工具名 + 快捷键（有则显示）+ 价格 —— **价格本单不显示也不留占位**
- *   （ED-00c 询价未做，写了占位以后会被当成真价格）。
+ * - tooltip 内容 = 工具名 + 快捷键（有则显示），**另有价格行时另起一行显示**（工单 36M /
+ *   ED-00c）：价格行由 `toolPriceTooltip` 生成，数字只来自询价，本组件不算价。
  *
  * ## 不许写死工具清单（X-P11）
  *
@@ -111,10 +112,13 @@ function ToolButton({
   tool,
   onSelect,
   showLabels,
+  prices,
 }: {
   tool: ToolDefinition;
   onSelect: (toolId: string) => void;
   showLabels: boolean;
+  /** 询价结果（key 见 `toolPriceKey`）。不传 = 不显示价格行（30F 的旧调用方式）。 */
+  prices?: Readonly<Record<string, PriceState>>;
 }) {
   /**
    * 显示工具名时按钮不能还是 32×32（一行中文塞不进去），所以按内容撑开、高度不变；
@@ -123,6 +127,14 @@ function ToolButton({
   const buttonStyle: React.CSSProperties = showLabels
     ? { height: TOOLBAR_BUTTON }
     : { width: TOOLBAR_BUTTON, height: TOOLBAR_BUTTON };
+
+  /**
+   * 工单 36M（ED-00c）：tooltip 的第二行是价格。
+   *
+   * 只在调用方**传了** `prices` 时出这一行：没传说明这一条工具条没有询价结果可用，
+   * 此时把所有工具都写成「估算中」反而是在编一个状态出来（30F 的用例也是这种调用方式）。
+   */
+  const priceLine = prices === undefined ? null : toolPriceTooltip(tool, prices);
 
   return (
     <Tooltip>
@@ -148,7 +160,14 @@ function ToolButton({
         ) : null}
       </TooltipTrigger>
       {/* Tooltip 在 focus 上同样展开，所以 Tab 到按钮也会出 tooltip（ED-00a 验收 2）。 */}
-      <TooltipContent data-testid="image-toolbar-tooltip">{tooltipLabel(tool)}</TooltipContent>
+      <TooltipContent data-testid="image-toolbar-tooltip">
+        {tooltipLabel(tool)}
+        {priceLine === null ? null : (
+          <span data-testid="image-toolbar-tooltip-price" className="block">
+            {priceLine}
+          </span>
+        )}
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -215,7 +234,14 @@ export function ImageToolbar({
   if (entryTool !== undefined) {
     groups.push({
       key: "entry",
-      children: <ToolButton tool={entryTool} onSelect={onToolSelect} showLabels={showLabels} />,
+      children: (
+        <ToolButton
+          tool={entryTool}
+          onSelect={onToolSelect}
+          showLabels={showLabels}
+          {...(prices === undefined ? {} : { prices })}
+        />
+      ),
     });
   }
 
@@ -224,7 +250,13 @@ export function ImageToolbar({
     children: (
       <>
         {actionTools.map((tool) => (
-          <ToolButton key={tool.id} tool={tool} onSelect={onToolSelect} showLabels={showLabels} />
+          <ToolButton
+            key={tool.id}
+            tool={tool}
+            onSelect={onToolSelect}
+            showLabels={showLabels}
+            {...(prices === undefined ? {} : { prices })}
+          />
         ))}
         {/* ED-00f：编辑按钮的最后一个是「⋯ 更多」，它的 testid 是 `image-toolbar-more`。 */}
         <span
@@ -244,7 +276,14 @@ export function ImageToolbar({
   if (exportTool !== undefined) {
     groups.push({
       key: "export",
-      children: <ToolButton tool={exportTool} onSelect={onToolSelect} showLabels={showLabels} />,
+      children: (
+        <ToolButton
+          tool={exportTool}
+          onSelect={onToolSelect}
+          showLabels={showLabels}
+          {...(prices === undefined ? {} : { prices })}
+        />
+      ),
     });
   }
 

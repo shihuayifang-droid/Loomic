@@ -151,3 +151,95 @@ describe("useToolPrices（ED-00f 询价）", () => {
     await waitFor(() => expect(result.current).toEqual({ vectorize: { status: "error" } }));
   });
 });
+
+/**
+ * 工单 36M T5 · ED-00c「工具条渲染时并发询价所有付费工具的全部档位」。
+ *
+ * 上面 35L 的四例一个字都没改：它们的夹具（ADJUST / DOWNLOAD / UNPRICED）都是
+ * `consumes: false`，换判据之后仍然不询价；VECTORIZE 的 `tiers` 只有 `"*"`，
+ * 所以询价项照旧不带 `search_key`。
+ */
+
+/** 付费 + 三档：每档一项询价，结果按 `toolId:tier` 落。 */
+const UPSCALE = makeTool({
+  id: "upscale",
+  label: "放大",
+  consumes: true,
+  default_slot: "main",
+  pricing: { generator: "upscale", tiers: ["2k", "4k", "8k"] },
+});
+
+/** 付费 + 无档位（`tiers: ["*"]`）：一项询价，key 就是 toolId。 */
+const PAID_DIRECT = makeTool({
+  id: "vectorize",
+  label: "矢量",
+  consumes: true,
+  pricing: { generator: "vectorize", tiers: ["*"] },
+});
+
+/** 付费但不可用：不询价（`availability` 是另一条挡板）。 */
+const MOTION = makeTool({
+  id: "motion",
+  label: "动态图片",
+  consumes: true,
+  availability: "unavailable",
+  pricing: { generator: "motion", tiers: [] },
+});
+
+describe("useToolPrices（ED-00c 全档询价）", () => {
+  it("ED-00c: every tier of every enabled paid tool is quoted in one request", async () => {
+    fetchPriceQuoteMock.mockResolvedValue({ items: [], balance: BALANCE });
+
+    renderHook(() => useToolPrices(TOKEN, [UPSCALE, PAID_DIRECT]));
+
+    await waitFor(() => expect(fetchPriceQuoteMock).toHaveBeenCalledTimes(1));
+    // 一次请求带两工具的全部槽位：放大三档 + 矢量一项 = 4 项，三档都带 `search_key`。
+    expect(fetchPriceQuoteMock).toHaveBeenCalledWith(TOKEN, {
+      items: [
+        { kind: "tool", tool_id: "upscale", search_key: "2k" },
+        { kind: "tool", tool_id: "upscale", search_key: "4k" },
+        { kind: "tool", tool_id: "upscale", search_key: "8k" },
+        { kind: "tool", tool_id: "vectorize" },
+      ],
+    });
+    expect(fetchPriceQuoteMock.mock.calls[0]?.[1]?.items).toHaveLength(4);
+  });
+
+  it("ED-00c: unavailable and free tools are not quoted", async () => {
+    fetchPriceQuoteMock.mockResolvedValue({ items: [], balance: BALANCE });
+
+    // 只有 PAID_DIRECT 该被问价：MOTION 不可用，ADJUST 面板类、UNPRICED 无计价规则都不花钱。
+    renderHook(() => useToolPrices(TOKEN, [MOTION, ADJUST, UNPRICED, PAID_DIRECT]));
+
+    await waitFor(() => expect(fetchPriceQuoteMock).toHaveBeenCalledTimes(1));
+    expect(fetchPriceQuoteMock).toHaveBeenCalledWith(TOKEN, {
+      items: [{ kind: "tool", tool_id: "vectorize" }],
+    });
+  });
+
+  it("ED-00c: results are keyed by tool and tier", async () => {
+    fetchPriceQuoteMock.mockResolvedValue({
+      items: [
+        { status: "ok", price_detail: { ...PRICE_DETAIL, search_key: "2k", search_key_matched: "2k" } },
+        { status: "ok", price_detail: { ...PRICE_DETAIL, search_key: "4k", search_key_matched: "4k" } },
+        { status: "ok", price_detail: { ...PRICE_DETAIL, search_key: "8k", search_key_matched: "8k" } },
+        { status: "ok", price_detail: PRICE_DETAIL },
+      ],
+      balance: BALANCE,
+    });
+
+    const { result } = renderHook(() => useToolPrices(TOKEN, [UPSCALE, PAID_DIRECT]));
+
+    await waitFor(() =>
+      expect(result.current).toEqual({
+        "upscale:2k": { status: "priced", amount: 12 },
+        "upscale:4k": { status: "priced", amount: 12 },
+        "upscale:8k": { status: "priced", amount: 12 },
+        // 无档位工具的 key 仍是 toolId（35K / 35L 的菜单读法靠这条不变）。
+        vectorize: { status: "priced", amount: 12 },
+      }),
+    );
+    expect(Object.keys(result.current)).toContain("upscale:2k");
+    expect(Object.keys(result.current)).toContain("vectorize");
+  });
+});
