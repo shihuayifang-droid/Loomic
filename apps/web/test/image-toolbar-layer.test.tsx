@@ -179,6 +179,8 @@ import {
   SCROLL_ZOOM_SETTLE_MS,
   TOOL_PENDING_MESSAGE,
 } from "../src/components/canvas/image-toolbar-layer";
+// 工单 35X（ED-00d）：源图被删时的提示文案从这个常量取，不在本文件写第二份。
+import { SOURCE_DELETED_MESSAGE } from "../src/components/canvas/tool-panel-host";
 
 // 本仓 vitest 没开 globals，RTL 不会自动 cleanup，每个文件自己收。
 afterEach(() => {
@@ -975,5 +977,78 @@ describe("ImageToolbarLayer：调整（ED-01 / ED-00i，工单 35U）", () => {
       source: "tool:adjust",
       parentArtifactId: "a-orig",
     });
+  });
+});
+
+describe("ED-00d：面板绑定打开时的源对象（工单 35X）", () => {
+  const panelFiles = {
+    "file-1": {
+      dataURL: "data:image/png;base64,AAAA",
+      mimeType: "image/png",
+      assetId: "a-orig",
+    },
+    "file-2": {
+      dataURL: "data:image/png;base64,BBBB",
+      mimeType: "image/png",
+      assetId: "a-other",
+    },
+  };
+
+  /** 进裁剪面板（复用 35S 用例的写法）。 */
+  async function enterCropPanel() {
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/original.png" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    const readImageSize = vi.fn(async () => ({ width: 1254, height: 1254 }));
+    const harness = setupSelectedImage({ files: panelFiles, loadOriginal, readImageSize });
+    fireEvent.click(screen.getByTestId("image-toolbar-crop"));
+    await waitFor(() => expect(layerState()).toBe("crop"));
+    return harness;
+  }
+
+  /** 进调整面板（复用 35U 用例的写法）。 */
+  async function enterAdjustPanel() {
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/original.png" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    const harness = setupSelectedImage({ files: panelFiles, loadOriginal });
+    fireEvent.click(screen.getByTestId("image-toolbar-adjust"));
+    await waitFor(() => expect(layerState()).toBe("adjust"));
+    return harness;
+  }
+
+  it("ED-00d: the crop panel stays open when the selection changes", async () => {
+    const { push } = await enterCropPanel();
+
+    // 选中换成另一张图（源图 img-1 仍在场景里，只是不再被选中）
+    push(
+      [
+        imageElement(),
+        rectangleElement(),
+        imageElement({ id: "img-2", fileId: "file-2", x: 400 }),
+      ],
+      makeAppState({ selectedElementIds: { "img-2": true } }),
+    );
+
+    expect(layerState()).toBe("crop");
+    expect(screen.getByTestId("crop-panel")).toBeInTheDocument();
+  });
+
+  it("ED-00d: deleting the source closes the panel with a notice", async () => {
+    const { push } = await enterAdjustPanel();
+    const deleted = [imageElement({ isDeleted: true }), rectangleElement()];
+    const noSelection = makeAppState({ selectedElementIds: {} });
+
+    push(deleted, noSelection);
+    // 同一帧再推一次：提示只发一次
+    push(deleted, noSelection);
+
+    expect(toastMock.toast).toHaveBeenCalledTimes(1);
+    expect(toastMock.toast).toHaveBeenCalledWith(SOURCE_DELETED_MESSAGE);
+    expect(screen.queryByTestId("adjust-panel")).toBeNull();
+
+    // 源图恢复且又被选中 → layer 回来，说明 mode 已退回主工具条
+    push([imageElement(), rectangleElement()], makeAppState());
+    expect(layerState()).toBe("toolbar");
   });
 });

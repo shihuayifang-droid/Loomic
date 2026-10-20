@@ -32,6 +32,7 @@ import { CropToolSession } from "./crop-tool-session";
 import { DownloadAllBar } from "./download-all-bar";
 import { FlipRotateBar } from "./flip-rotate-bar";
 import { ImageToolbar } from "./image-toolbar";
+import { SOURCE_DELETED_MESSAGE } from "./tool-panel-host";
 
 /**
  * ED-00 / ED-00a / ED-03 · 逐图工具条接到画布上（工单 30Q）
@@ -435,6 +436,15 @@ export function ImageToolbarLayer({
     pixels: PixelBuffer;
   } | null>(null);
 
+  /**
+   * ED-00d：`handleChange` 是 `[]` 依赖的订阅回调（每帧都要跑，不能因为 `mode` 变了就重订阅），
+   * 所以要判断「开着的面板绑的是哪张源图」只能从这里读最新值。
+   */
+  const modeRef = useRef<Mode>(mode);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
   /** 最近一帧的完整元素数组：写回 `angle` / `scale` 时要拿到**全场景**（不只是选中那个）。 */
   const elementsRef = useRef<unknown[]>([]);
   /** ED-05：最近一帧 `toolbarKind === "download_all"` 时的选中元素（只读快照）。 */
@@ -447,6 +457,23 @@ export function ImageToolbarLayer({
 
   const handleChange = useCallback((elements: unknown[], appState: unknown) => {
     elementsRef.current = Array.isArray(elements) ? elements : [];
+
+    /**
+     * ED-00d：面板绑的是**打开时那张源图的 id**，所以选中集合怎么变都不收面板；
+     * 只有那张源图自己没了（不在场景里 / `isDeleted === true`）才收，并且只提示一次。
+     * 先改 `modeRef` 再 `setMode`：同一批里接着来的那一帧就不会重复 toast。
+     */
+    const opened = modeRef.current;
+    if (opened.kind === "crop" || opened.kind === "adjust") {
+      const source = (elementsRef.current as ElementLike[]).find(
+        (element) => element?.id === opened.elementId,
+      );
+      if (source === undefined || source.isDeleted === true) {
+        modeRef.current = { kind: "toolbar" };
+        setMode({ kind: "toolbar" });
+        toast(SOURCE_DELETED_MESSAGE);
+      }
+    }
 
     const state = (appState ?? {}) as Record<string, any>;
     const selectedIds = (state["selectedElementIds"] ?? {}) as Record<string, unknown>;
@@ -511,7 +538,7 @@ export function ImageToolbarLayer({
     if (key === snapshotKeyRef.current) return;
     snapshotKeyRef.current = key;
     setSnapshot(next);
-  }, []);
+  }, [toast]);
 
   useEffect(() => {
     const unsubscribe = excalidrawApi.onChange?.(handleChange);
@@ -532,9 +559,12 @@ export function ImageToolbarLayer({
   );
 
   // 二级条只在「选中的还是那一张图」时成立：选中集合一变就退回主工具条（工单 §3 裁决 5）。
+  // ED-00d：这一条**只留给 flip-rotate**（它是二级工具条，点画布空白就该退出）；
+  // crop / adjust 是**面板**，绑定打开时的源对象，不随选中变化关闭 —— 源图被删的处理在
+  // `handleChange` 里，见那里的注释。
   const selectedElementId = snapshot?.elementId ?? null;
   useEffect(() => {
-    if (mode.kind !== "flip-rotate" && mode.kind !== "crop" && mode.kind !== "adjust") return;
+    if (mode.kind !== "flip-rotate") return;
     if (selectedElementId !== mode.elementId) setMode({ kind: "toolbar" });
   }, [mode, selectedElementId]);
 
