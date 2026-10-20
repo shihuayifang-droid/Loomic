@@ -139,6 +139,8 @@ export const jobProgressEventSchema = z.object({
   /** Milliseconds since the job started running. Absent while still queued. */
   elapsedMs: z.number().int().nonnegative().optional(),
   attempt: z.number().int().nonnegative().optional(),
+  /** GN-30: the job's attempt cap, so a retrying job can show "2/3" without a REST read. */
+  maxAttempts: z.number().int().positive().optional(),
   /** Present on success, so the client does not need a follow-up request. */
   result: z.record(z.string(), z.unknown()).optional(),
   error: z

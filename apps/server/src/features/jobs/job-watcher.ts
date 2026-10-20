@@ -93,6 +93,7 @@ export function watchJob(
           ? { elapsedMs: Math.max(0, endedAt - jobStartedAt) }
           : {}),
         ...(job?.attempt_count != null ? { attempt: job.attempt_count } : {}),
+        ...(job?.max_attempts != null ? { maxAttempts: job.max_attempts } : {}),
         ...(status === "succeeded" && job?.result
           ? { result: job.result as Record<string, unknown> }
           : {}),
