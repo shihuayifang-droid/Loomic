@@ -10,6 +10,7 @@ import { visibleOn } from "../../lib/model-visibility";
 import { qualityOptionsFor } from "../../lib/image-quality-options";
 import { awaitJobCompletion } from "../../lib/await-job";
 import { imageResultFromJob } from "../../lib/image-job-result";
+import { useCompletionTitle } from "../../hooks/use-completion-title";
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
 import type { WebSocketHandle } from "../../hooks/use-websocket";
 import { errorCodeOf, lookupError } from "../../lib/error-catalog";
@@ -92,6 +93,9 @@ export function ImageGeneratorPanel({
     [],
   );
   const { handleGenerationError } = useGenerationErrorHandler(errorActions);
+  // CV-10：本轮完成提醒，与视频面板同一写法。`begin` / `end` 回调身份稳定
+  // （模块级单例），面板只报告「提交成功 / 到达终态」，改不改标题由 hook 决定。
+  const { begin, end } = useCompletionTitle();
   // AbortController for in-flight generation requests so we can cancel on unmount
   const abortRef = useRef<AbortController | null>(null);
 
@@ -195,6 +199,13 @@ export function ImageGeneratorPanel({
       quality,
     });
 
+    // CV-10：提交成功之后才登记本轮（jobId 在下面拿到）。成功、失败、取消都走同一个
+    // 结算口；同一个 id 重复结算由 endTask 幂等挡掉（工单 30H T2「重复 end 只算一次」）。
+    let jobId: string | null = null;
+    const settleJob = (ok: boolean): void => {
+      if (jobId !== null) end(jobId, ok);
+    };
+
     try {
       // GN-37: two steps now, same shape as the video panel — submit answers 202
       // with a jobId (the ledger entry is billed against that job), then we wait
@@ -206,6 +217,14 @@ export function ImageGeneratorPanel({
         { model, aspectRatio, ...(qualityOptions ? { quality } : {}) },
       );
 
+      // CV-10：job 提交成功即进入本轮，与该 job 最终成功与否无关。
+      jobId = submitted.jobId;
+      begin(jobId);
+      if (controller.signal.aborted) {
+        settleJob(false);
+        return;
+      }
+
       const job = await awaitJobCompletion(
         accessTokenRef.current,
         submitted.jobId,
@@ -213,13 +232,19 @@ export function ImageGeneratorPanel({
       );
 
       // Check if this generation was cancelled while awaiting
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) {
+        settleJob(false);
+        return;
+      }
 
       const result = imageResultFromJob(job);
 
       // Download and insert as real image element at same position
       const dataURL = await fetchAsDataURL(result.url);
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) {
+        settleJob(false);
+        return;
+      }
 
       const fileId = generateId();
       excalidrawApi.addFiles([
@@ -252,8 +277,14 @@ export function ImageGeneratorPanel({
         captureUpdate: "IMMEDIATELY",
       });
 
+      // CV-10：图片已经落到画布上 —— 这个任务成功结束。必须在 `onClose()` 之前，
+      // 否则面板卸载就再也没有机会结算，这条任务会永远留在 pending 里。
+      settleJob(true);
       onClose();
     } catch (err) {
+      // CV-10：失败与取消都算「失败」。中止也要结算，否则这条任务永远留在
+      // pending 里，下一轮的「全部任务结束」再也不会触发。
+      settleJob(false);
       // Ignore aborted requests (user cancelled or component unmounted)
       if (controller.signal.aborted) return;
 
@@ -282,6 +313,8 @@ export function ImageGeneratorPanel({
     elementBounds,
     onClose,
     handleGenerationError,
+    begin,
+    end,
     ws,
   ]);
 
