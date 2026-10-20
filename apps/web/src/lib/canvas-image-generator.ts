@@ -61,39 +61,21 @@ export function getGenerationDimensions(
 }
 
 /**
- * Create an Excalidraw rectangle element that serves as an image generator placeholder.
+ * Build the Excalidraw rectangle skeleton for an image generator placeholder at a
+ * given position. Exported so callers that already know where the element belongs
+ * (GN-19 retry reuses the failed slot's own x/y/width/height) do not have to copy
+ * the shape; `createImageGeneratorElement` is the viewport-centred wrapper.
  */
-export function createImageGeneratorElement(
-  api: {
-    getAppState: () => any;
-    getSceneElements: () => readonly any[];
-    updateScene: (scene: { elements: any[]; captureUpdate?: string }) => void;
-  },
-  options?: {
-    aspectRatio?: string;
-    model?: string;
-    quality?: string;
-  },
-): string {
-  const aspectRatio = options?.aspectRatio ?? "1:1";
-  const { width, height } = getDisplayDimensions(aspectRatio);
-  const center = getViewportCenter(api.getAppState());
-
-  const customData: ImageGeneratorData = {
-    type: "image-generator",
-    status: "idle",
-    prompt: "",
-    model: options?.model ?? "google/nano-banana-2",
-    aspectRatio,
-    quality: options?.quality ?? "hd",
-  };
-
-  const id = generateId();
-  const element: Record<string, unknown> = {
+export function buildImageGeneratorElement(
+  position: { x: number; y: number; width: number; height: number },
+  data: ImageGeneratorData,
+): Record<string, unknown> {
+  const { x, y, width, height } = position;
+  return {
     type: "rectangle",
-    id,
-    x: center.x - width / 2,
-    y: center.y - height / 2,
+    id: generateId(),
+    x,
+    y,
     width,
     height,
     angle: 0,
@@ -116,8 +98,49 @@ export function createImageGeneratorElement(
     updated: Date.now(),
     link: null,
     locked: false,
-    customData,
+    customData: data,
   };
+}
+
+/**
+ * Create an Excalidraw rectangle element that serves as an image generator placeholder.
+ */
+export function createImageGeneratorElement(
+  api: {
+    getAppState: () => any;
+    getSceneElements: () => readonly any[];
+    updateScene: (scene: { elements: any[]; captureUpdate?: string }) => void;
+  },
+  options?: {
+    aspectRatio?: string;
+    model?: string;
+    quality?: string;
+    prompt?: string;
+  },
+): string {
+  const aspectRatio = options?.aspectRatio ?? "1:1";
+  const { width, height } = getDisplayDimensions(aspectRatio);
+  const center = getViewportCenter(api.getAppState());
+
+  const customData: ImageGeneratorData = {
+    type: "image-generator",
+    status: "idle",
+    prompt: options?.prompt ?? "",
+    model: options?.model ?? "google/nano-banana-2",
+    aspectRatio,
+    quality: options?.quality ?? "hd",
+  };
+
+  const element = buildImageGeneratorElement(
+    {
+      x: center.x - width / 2,
+      y: center.y - height / 2,
+      width,
+      height,
+    },
+    customData,
+  );
+  const id = element.id as string;
 
   api.updateScene({
     elements: [...api.getSceneElements(), element],
@@ -125,6 +148,48 @@ export function createImageGeneratorElement(
   });
 
   return id;
+}
+
+/**
+ * GN-19: the image generator that replaces a failed slot on "retry". Null when the slot cannot be retried.
+ */
+export function retryGeneratorFromFailedSlot(slot: {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  customData?: unknown;
+}): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  data: ImageGeneratorData;
+} | null {
+  const customData = slot?.customData as Record<string, any> | undefined;
+  if (customData?.failed !== true) return null;
+
+  const retry = customData.retryRequest as Record<string, any> | undefined;
+  if (retry?.kind !== "image") return null;
+
+  const prompt = typeof retry.prompt === "string" ? retry.prompt : "";
+  const model = typeof retry.model === "string" ? retry.model : "";
+  if (prompt.trim() === "" || model.trim() === "") return null;
+
+  return {
+    x: slot.x ?? 0,
+    y: slot.y ?? 0,
+    width: slot.width ?? 0,
+    height: slot.height ?? 0,
+    data: {
+      type: "image-generator",
+      status: "idle",
+      prompt,
+      model,
+      aspectRatio: retry.aspectRatio ?? "1:1",
+      quality: retry.quality ?? "hd",
+    },
+  };
 }
 
 /**

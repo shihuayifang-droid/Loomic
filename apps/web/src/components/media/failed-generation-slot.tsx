@@ -16,8 +16,13 @@ import type { JSX } from "react";
  *
  * Sizing follows GenerationShimmer's canvas mode: explicit `width`/`height` in
  * element units, and `pointerEvents: "none"` on the outer box so the slot can
- * still be selected and dragged like any other element. Only the delete button
- * opts back in to pointer events — it is the one thing that can be clicked.
+ * still be selected and dragged like any other element. Only the buttons opt back
+ * in to pointer events — they are the only clickable things.
+ *
+ * GN-19: when the slot carries a usable `retryRequest` the caller passes
+ * `onRetry`, and a "重试" button appears next to "删除". Retrying does NOT resubmit
+ * the dead job: the caller swaps this placeholder for a fresh generator prefilled
+ * with the original parameters, so the user re-quotes and confirms first.
  */
 export function FailedGenerationSlot(props: {
   kind: "image" | "video";
@@ -26,8 +31,10 @@ export function FailedGenerationSlot(props: {
   width: number;
   height: number;
   onDelete: () => void;
+  /** GN-19: present only when the slot can be retried with its original request. */
+  onRetry?: () => void;
 }): JSX.Element {
-  const { kind, message, width, height, onDelete } = props;
+  const { kind, message, width, height, onDelete, onRetry } = props;
 
   return (
     <div
@@ -57,18 +64,32 @@ export function FailedGenerationSlot(props: {
           >
             {message}
           </div>
-          <button
-            type="button"
-            data-testid="canvas-failed-slot-delete"
-            aria-label="删除失败的占位"
-            onClick={onDelete}
-            className="shrink-0 rounded-md border-[0.5px] border-border px-2 py-0.5 text-[11px] font-medium text-foreground hover:bg-muted"
-            // The outer box is pointer-transparent so the canvas keeps receiving
-            // events; the button is the sole exception.
-            style={{ pointerEvents: "auto" }}
-          >
-            删除
-          </button>
+          <div className="flex shrink-0 items-center gap-2">
+            {onRetry ? (
+              <button
+                type="button"
+                data-testid="canvas-failed-slot-retry"
+                aria-label="用原参数重试"
+                onClick={onRetry}
+                className="shrink-0 rounded-md border-[0.5px] border-border px-2 py-0.5 text-[11px] font-medium text-foreground hover:bg-muted"
+                style={{ pointerEvents: "auto" }}
+              >
+                重试
+              </button>
+            ) : null}
+            <button
+              type="button"
+              data-testid="canvas-failed-slot-delete"
+              aria-label="删除失败的占位"
+              onClick={onDelete}
+              className="shrink-0 rounded-md border-[0.5px] border-border px-2 py-0.5 text-[11px] font-medium text-foreground hover:bg-muted"
+              // The outer box is pointer-transparent so the canvas keeps receiving
+              // events; the buttons are the sole exception.
+              style={{ pointerEvents: "auto" }}
+            >
+              删除
+            </button>
+          </div>
         </div>
       </div>
     </div>

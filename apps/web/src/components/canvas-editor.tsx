@@ -42,6 +42,10 @@ import {
   mergeElementsById,
   type MergeableContent,
 } from "../lib/canvas-merge";
+import {
+  buildImageGeneratorElement,
+  retryGeneratorFromFailedSlot,
+} from "../lib/canvas-image-generator";
 import { CanvasToolMenu } from "./canvas-tool-menu";
 import { ImageToolbarLayer } from "./canvas/image-toolbar-layer";
 import { normalizeCanvasElements } from "../lib/canvas-normalize";
@@ -1112,6 +1116,11 @@ export function CanvasEditor({
       // `generating: true`), so show the reason and offer to drop the slot.
       // Sits BEFORE the generating branch so a failure can never be masked.
       if (element?.customData?.failed === true) {
+        // GN-19: an image slot that still knows what was asked for can be retried.
+        // "重试" never resubmits the dead job — it swaps this placeholder for a
+        // fresh generator prefilled with the original prompt/settings, so the user
+        // re-quotes and confirms in the generator panel (video has no prefill yet).
+        const retry = retryGeneratorFromFailedSlot(element);
         return (
           <FailedGenerationSlot
             kind={element.customData.kind === "video" ? "video" : "image"}
@@ -1127,6 +1136,36 @@ export function CanvasEditor({
                   ),
               });
             }}
+            {...(retry
+              ? {
+                  onRetry: () => {
+                    const api = excalidrawApi;
+                    if (!api) return;
+                    const replacement = buildImageGeneratorElement(
+                      {
+                        x: retry.x,
+                        y: retry.y,
+                        width: retry.width || element.width || 512,
+                        height: retry.height || element.height || 512,
+                      },
+                      retry.data,
+                    );
+                    // One updateScene: the failed slot goes away and the prefilled
+                    // generator arrives in the same commit, so the canvas never
+                    // shows both (or neither) in between.
+                    api.updateScene({
+                      elements: [
+                        ...api
+                          .getSceneElements()
+                          .map((el: any) =>
+                            el.id === element.id ? { ...el, isDeleted: true } : el,
+                          ),
+                        replacement,
+                      ],
+                    });
+                  },
+                }
+              : {})}
           />
         );
       }

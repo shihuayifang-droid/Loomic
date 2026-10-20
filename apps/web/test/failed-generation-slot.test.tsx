@@ -81,4 +81,36 @@ describe("GN-19 failed generation slot", () => {
       height: "360px",
     });
   });
+
+  it("GN-19: 重试 calls onRetry once", () => {
+    const onRetry = vi.fn();
+    render(
+      <FailedGenerationSlot
+        kind="image"
+        message="图片生成失败，请重试"
+        width={512}
+        height={512}
+        onDelete={() => {}}
+        onRetry={onRetry}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("canvas-failed-slot-retry"));
+
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it("GN-19: without onRetry there is no 重试 button", () => {
+    render(
+      <FailedGenerationSlot
+        kind="image"
+        message="图片生成失败，请重试"
+        width={512}
+        height={512}
+        onDelete={() => {}}
+      />,
+    );
+
+    expect(screen.queryByTestId("canvas-failed-slot-retry")).toBeNull();
+  });
 });
