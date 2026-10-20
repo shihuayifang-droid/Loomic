@@ -38,7 +38,6 @@ vi.mock("@/components/credits/tier-limit-toast", () => ({
 // --- server-api：保留真类（instanceof 要用），只把网络函数换成 spy -----------
 const apiMock = vi.hoisted(() => ({
   fetchImageModels: vi.fn(),
-  generateImageDirect: vi.fn(),
   submitImageJob: vi.fn(),
   fetchVideoModels: vi.fn(),
   submitVideoJob: vi.fn(),

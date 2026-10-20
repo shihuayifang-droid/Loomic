@@ -651,13 +651,9 @@ export async function fetchProjectUploads(
 
 // --- Canvas-Native Generation API ---
 
-export type GenerateImageResponse = {
-  url: string;
-  prompt: string;
-  mimeType: string;
-  width: number;
-  height: number;
-};
+// GN-37 removed the old synchronous image call and the response type that was
+// its only reader: POST /api/agent/generate-image now answers 410, and the
+// canvas submits through `submitImageJob` below instead.
 
 export type ImageModelInfo = {
   id: string;
@@ -748,28 +744,6 @@ export async function fetchVideoModels(): Promise<{
   return (await response.json()) as { models: VideoModelInfo[] };
 }
 
-export async function generateImageDirect(
-  accessToken: string,
-  prompt: string,
-  options?: { model?: string; aspectRatio?: string; quality?: string },
-): Promise<GenerateImageResponse> {
-  const response = await fetch(
-    `${getServerBaseUrl()}/api/agent/generate-image`,
-    {
-      method: "POST",
-      headers: authJsonHeaders(accessToken),
-      body: JSON.stringify({
-        prompt,
-        ...(options?.model ? { model: options.model } : {}),
-        ...(options?.aspectRatio ? { aspectRatio: options.aspectRatio } : {}),
-        ...(options?.quality ? { quality: options.quality } : {}),
-      }),
-    },
-  );
-  if (!response.ok) return handleErrorResponse(response);
-  return (await response.json()) as GenerateImageResponse;
-}
-
 /** 202 body of POST /api/agent/generate-image-job — the work is accepted, not done. */
 export type SubmitImageResponse = {
   jobId: string;
@@ -780,11 +754,11 @@ export type SubmitImageResponse = {
 /**
  * Submits an image generation job and returns immediately (HTTP 202).
  *
- * GN-37: the canvas toolbar image generator used `generateImageDirect`, which
- * held the request open for the whole generation. The route now takes a job and
- * bills it (with `job_id` on the ledger entry), so the waiting belongs to
- * `awaitJobCompletion`, exactly like the video panel. `generateImageDirect` is
- * kept for now — retiring it is a separate change.
+ * GN-37: the canvas toolbar image generator used to hold the request open for
+ * the whole generation through the old synchronous path, which billed without a
+ * `job_id`. That path is retired (it answers 410 now), so the route takes a job
+ * and bills it with `job_id` on the ledger entry, and the waiting belongs to
+ * `awaitJobCompletion`, exactly like the video panel.
  */
 export async function submitImageJob(
   accessToken: string,

@@ -13,8 +13,6 @@ import {
   type VideoResolution,
 } from "@loomic/shared";
 
-import { generateImage } from "../generation/image-generation.js";
-import { resolveImageProviderName } from "../generation/providers/registry.js";
 import type { CreditService } from "../features/credits/credit-service.js";
 import { CreditServiceError } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
@@ -122,6 +120,17 @@ export async function registerGenerateRoutes(
     connectionManager?: ConnectionManager;
   },
 ) {
+  // ── POST /api/agent/generate-image (RETIRED, GN-37) ─────────
+  //
+  // The synchronous shape is gone: it held the HTTP request open for the whole
+  // generation and billed without a job_id. Every caller moved to
+  // POST /api/agent/generate-image-job below, so this path now only answers 410
+  // and names its replacement. Authentication still runs first, so an
+  // unauthenticated caller gets 401 and learns nothing about the retirement.
+  //
+  // Nothing is generated and nothing is charged here — deliberately not a call
+  // to `withBilling` with an early return, because that would still open a
+  // billing round-trip for a request that is guaranteed to fail.
   app.post("/api/agent/generate-image", async (request, reply) => {
     const user = await options.auth.authenticate(request);
     if (!user) {
@@ -135,107 +144,14 @@ export async function registerGenerateRoutes(
       );
     }
 
-    let payload: GenerateImageRequest;
-    try {
-      payload = generateImageRequestSchema.parse(request.body);
-    } catch {
-      return reply.code(400).send(
-        applicationErrorResponseSchema.parse({
-          error: {
-            code: "invalid_request",
-            message: "Invalid request body.",
-          },
-        }),
-      );
-    }
-
-    const model = payload.model ?? DEFAULT_IMAGE_MODEL_ID;
-
-    try {
-      const viewer = await options.viewerService.ensureViewer(user);
-
-      // No `job` in the request: this route generates synchronously and never
-      // creates one, so withBilling owns the refund if anything below fails --
-      // the provider call, the download, or the Storage upload. The upload case
-      // is deliberately covered: the provider has already charged us by then,
-      // but the user got no image, so eating their credits too is the wrong
-      // trade. Making this route asynchronous so the transaction carries a
-      // job_id is tracked as B-3.
-      const { signedUrl, assetId, result } = await withBilling(
-        options,
-        {
-          user,
-          workspaceId: viewer.workspace.id,
-          modelId: model,
-          entryPoint: "canvas_generator",
-          guard: {
-            jobType: "image_generation",
-            quality: payload.quality ?? "hd",
-          },
-          description: `Direct image generation: ${model}`,
+    return reply.code(410).send(
+      applicationErrorResponseSchema.parse({
+        error: {
+          code: "service_unavailable",
+          message: "该接口已下线，请改用 POST /api/agent/generate-image-job",
         },
-        async (outcome) => {
-          const providerName = resolveImageProviderName(model, "generate");
-          const generated = await generateImage(providerName, {
-            prompt: payload.prompt,
-            model,
-            aspectRatio: payload.aspectRatio ?? "1:1",
-            ...(payload.quality ? { quality: payload.quality } : {}),
-          });
-
-          const uploaded = await downloadAndUpload(
-            generated.url,
-            generated.mimeType,
-            payload.prompt,
-            user,
-            options,
-            { modelId: model, creditsCharged: outcome.creditsCost },
-          );
-          return { ...uploaded, result: generated };
-        },
-      );
-
-      return reply.code(200).send({
-        url: signedUrl,
-        assetId,
-        prompt: payload.prompt,
-        mimeType: result.mimeType,
-        width: result.width,
-        height: result.height,
-      });
-    } catch (error) {
-      // Handle tier/credit errors
-      if (error instanceof TierGuardError) {
-        return reply.code(error.statusCode).send(
-          applicationErrorResponseSchema.parse({
-            error: { code: error.code, message: error.message },
-          }),
-        );
-      }
-      if (error instanceof CreditServiceError) {
-        return reply.code(error.statusCode).send(
-          applicationErrorResponseSchema.parse({
-            error: { code: error.code, message: error.message },
-          }),
-        );
-      }
-
-      const message =
-        error instanceof Error ? error.message : "Image generation failed.";
-
-      if (message.includes("No provider registered")) {
-        return reply.code(400).send(
-          applicationErrorResponseSchema.parse({
-            error: {
-              code: "provider_not_configured",
-              message: "Image generation is not available.",
-            },
-          }),
-        );
-      }
-
-      return reply.code(502).send(generationFailedBody(error));
-    }
+      }),
+    );
   });
 
   // ── POST /api/agent/generate-video ──────────────────────────
@@ -508,41 +424,9 @@ function delay(ms: number): Promise<void> {
 }
 
 // ── Image download + upload helper ──────────────────────────
+//
+// GN-37 removed `downloadAndUpload` from here together with the synchronous
+// route that was its only caller. The generator relay it used to record is now
+// done by the image job worker, which still imports `generatorRelayProvenance`
+// from this module — that export stays.
 
-async function downloadAndUpload(
-  sourceUrl: string,
-  mimeType: string,
-  prompt: string,
-  user: AuthenticatedUser,
-  deps: { uploadService: UploadService; viewerService: ViewerService },
-  relay: { modelId: string; creditsCharged: number },
-): Promise<{ signedUrl: string; assetId: string }> {
-  const response = await fetch(sourceUrl);
-  if (!response.ok) {
-    throw new Error(`Failed to download generated image: ${response.status}`);
-  }
-  const buffer = Buffer.from(await response.arrayBuffer());
-
-  const ext = mimeType === "image/webp" ? "webp" : "png";
-  const slug = prompt.slice(0, 40).replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "");
-  const fileName = `gen-${slug}-${Date.now()}.${ext}`;
-
-  const viewer = await deps.viewerService.ensureViewer(user);
-
-  const result = await deps.uploadService.uploadFile(user, {
-    bucket: "project-assets",
-    fileName,
-    fileBuffer: buffer,
-    mimeType,
-    workspaceId: viewer.workspace.id,
-    // GN-11 / X-P7: this route produced the image, so relaying it into Storage
-    // records where it really came from instead of calling it a user upload.
-    provenance: generatorRelayProvenance({
-      modelId: relay.modelId,
-      prompt,
-      creditsCharged: relay.creditsCharged,
-    }),
-  });
-
-  return { signedUrl: result.url, assetId: result.asset.id };
-}
