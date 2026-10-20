@@ -1,3 +1,7 @@
+import type { Readable } from "node:stream";
+
+import { ZipFile } from "yazl";
+
 import type { AssetBucket, AssetObject } from "@loomic/shared";
 
 import type {
@@ -15,6 +19,7 @@ import type {
   AuthenticatedUser,
   UserSupabaseClient,
 } from "../../supabase/user.js";
+import { planZipDownload } from "../downloads/zip-download-plan.js";
 import {
   ProjectAssetUrlError,
   signProjectAssetUrl,
@@ -68,6 +73,27 @@ export type UploadService = {
     user: AuthenticatedUser,
     assetId: string,
   ): Promise<void>;
+
+  /**
+   * ED-05: bundle several readable artifacts into one zip stream.
+   *
+   * The plan (names, limits, skipped count) comes from `planZipDownload`. Objects
+   * are read one at a time into memory and then written into the zip, so the peak
+   * memory is about the largest single object; the total is bounded by the plan's
+   * 500MB limit.
+   *
+   * The stream is returned immediately and filled in the background. `skipped`
+   * only counts objects skipped at plan time (unreadable / not ready): an object
+   * that fails to download once the stream has started is left out of the zip, but
+   * the response headers are already sent, so it is not reflected in `skipped`.
+   */
+  prepareZipDownload(
+    user: AuthenticatedUser,
+    input: { assetIds: readonly string[]; projectName: string; now?: Date },
+  ): Promise<
+    | { ok: true; fileName: string; skipped: number; stream: NodeJS.ReadableStream }
+    | { ok: false; message: string }
+  >;
 };
 
 
@@ -371,6 +397,110 @@ export function createUploadService(options: {
         assetRow.object_path,
         storedName ?? lastPathSegment(assetRow.object_path),
       );
+    },
+
+    async prepareZipDownload(user, input) {
+      const client = options.createUserClient(user.accessToken);
+      const repository = options.assetReadRepository;
+      const uniqueIds = [...new Set(input.assetIds)];
+
+      const rows = new Map<string, AssetReadRow>();
+      const items: Array<{
+        id: string;
+        name: string;
+        byteSize: number | null;
+        status: "ready" | "failed";
+      }> = [];
+
+      for (const assetId of uniqueIds) {
+        let row: AssetReadRow | null = null;
+
+        if (repository) {
+          try {
+            row = await repository.findReadableAsset({
+              actorId: user.id,
+              assetId,
+            });
+          } catch {
+            row = null;
+          }
+        }
+
+        if (!row) {
+          items.push({ id: assetId, name: assetId, byteSize: null, status: "failed" });
+          continue;
+        }
+
+        let storedName: string | null = null;
+        if (options.assetProvenanceRepository) {
+          try {
+            storedName = await options.assetProvenanceRepository.readDisplayName({
+              assetId,
+            });
+          } catch {
+            storedName = null;
+          }
+        }
+
+        const name =
+          storedName && storedName.trim() !== ""
+            ? storedName
+            : lastPathSegment(row.object_path);
+
+        rows.set(assetId, row);
+        items.push({ id: assetId, name, byteSize: row.byte_size, status: "ready" });
+      }
+
+      const plan = planZipDownload({
+        projectName: input.projectName,
+        now: input.now ?? new Date(),
+        items,
+      });
+
+      if (!plan.ok) {
+        return { ok: false, message: plan.message };
+      }
+
+      const zip = new ZipFile();
+
+      // Fill the zip in the background so the caller can start streaming at once.
+      void (async () => {
+        try {
+          for (const entry of plan.entries) {
+            const row = rows.get(entry.id);
+            if (!row) continue;
+
+            try {
+              const url = await signProjectAssetUrl(client, row.object_path, {
+                bucket: row.bucket,
+              });
+              const res = await fetch(url);
+
+              if (!res.ok) {
+                console.warn("[zip-download] an object could not be read; skipped");
+                continue;
+              }
+
+              zip.addBuffer(Buffer.from(await res.arrayBuffer()), entry.entryName);
+            } catch {
+              console.warn("[zip-download] an object could not be read; skipped");
+            }
+          }
+
+          zip.end();
+        } catch (error) {
+          (zip.outputStream as Readable).destroy(
+            error instanceof Error ? error : new Error("zip download failed"),
+          );
+        }
+      })();
+
+      return {
+        ok: true,
+        fileName: plan.fileName,
+        skipped: plan.skipped,
+        stream: zip.outputStream,
+      };
     },
 
     async deleteAsset(user, assetId) {

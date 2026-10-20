@@ -8,7 +8,7 @@
 //
 // Every metadata write in this file goes through the service_role-only RPC, so the
 // stub asserts on the RPC call rather than on an insert.
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import { createProjectService } from "../projects/project-service.js";
@@ -953,5 +953,177 @@ describe("ED-05: the original file name is kept and used for downloads", () => {
     await stub.service.getAssetUrl(USER, "asset-1");
 
     expect(stub.signedOptions[1]).toBeUndefined();
+  });
+});
+
+/**
+ * ED-05: the zip download. These cases build their own small fixture instead of
+ * widening `makeStubs`: every asset id needs its own row and its own bytes.
+ */
+function makeZipStubs(options: {
+  rows: Record<string, { object_path: string; byte_size: number | null } | null>;
+  names?: Record<string, string>;
+}) {
+  const fetched: string[] = [];
+  const fetchStub = vi.fn(async (url: string | URL | Request) => {
+    const text = String(url);
+    fetched.push(text);
+    return new Response(Buffer.from(`bytes-of-${text}`));
+  });
+  vi.stubGlobal("fetch", fetchStub);
+
+  const userClient = {
+    storage: {
+      from(bucket: string) {
+        return {
+          createSignedUrl: async (path: string) => ({
+            data: { signedUrl: `https://storage.test/${bucket}/${path}?token=t` },
+            error: null,
+          }),
+        };
+      },
+    },
+  };
+
+  const service = createUploadService({
+    createUserClient: () => userClient as unknown as UserSupabaseClient,
+    getAdminClient: () => ({}) as unknown as AdminSupabaseClient,
+    assetReadRepository: {
+      async findReadableAsset(input: { actorId: string; assetId: string }) {
+        const row = options.rows[input.assetId];
+        if (!row) return null;
+        return {
+          id: input.assetId,
+          bucket: "project-assets",
+          object_path: row.object_path,
+          mime_type: "image/png",
+          byte_size: row.byte_size,
+          workspace_id: TEAM_WORKSPACE,
+          project_id: PROJECT,
+          created_at: "2026-10-02T00:00:00.000Z",
+        };
+      },
+    } as unknown as AssetReadRepository,
+    assetWriteRepository: {} as unknown as AssetWriteRepository,
+    assetProvenanceRepository: {
+      async recordProvenance() {
+        return { updated: 1 };
+      },
+      async recordDisplayName() {
+        return { updated: 1 };
+      },
+      async readDisplayName(input: { assetId: string }) {
+        return options.names?.[input.assetId] ?? null;
+      },
+    } as unknown as Pick<
+      AssetProvenanceRepository,
+      "recordProvenance" | "recordDisplayName" | "readDisplayName"
+    >,
+  });
+
+  return { service, fetched, fetchStub };
+}
+
+async function readAll(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+  }
+  return Buffer.concat(chunks);
+}
+
+describe("prepareZipDownload (ED-05)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("ED-05: three readable assets become a zip with three entries named after their display names", async () => {
+    const stub = makeZipStubs({
+      rows: {
+        a1: { object_path: "ws/1-a.png", byte_size: 10 },
+        a2: { object_path: "ws/2-b.png", byte_size: 10 },
+        a3: { object_path: "ws/3-c.png", byte_size: 10 },
+      },
+      names: { a1: "one.png", a2: "two.png", a3: "three.png" },
+    });
+
+    const result = await stub.service.prepareZipDownload(USER, {
+      assetIds: ["a1", "a2", "a3"],
+      projectName: "角色设定",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const bytes = await readAll(result.stream);
+
+    expect(bytes.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))).toBe(true);
+    expect(bytes.includes(Buffer.from("one.png"))).toBe(true);
+    expect(bytes.includes(Buffer.from("two.png"))).toBe(true);
+    expect(bytes.includes(Buffer.from("three.png"))).toBe(true);
+    expect(stub.fetchStub).toHaveBeenCalledTimes(3);
+  });
+
+  it("ED-05: an unreadable asset is skipped and counted", async () => {
+    const stub = makeZipStubs({
+      rows: {
+        a1: { object_path: "ws/1-a.png", byte_size: 10 },
+        a2: null,
+        a3: { object_path: "ws/3-c.png", byte_size: 10 },
+      },
+      names: { a1: "one.png", a3: "three.png" },
+    });
+
+    const result = await stub.service.prepareZipDownload(USER, {
+      assetIds: ["a1", "a2", "a3"],
+      projectName: "角色设定",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.skipped).toBe(1);
+
+    const bytes = await readAll(result.stream);
+
+    expect(bytes.includes(Buffer.from("one.png"))).toBe(true);
+    expect(bytes.includes(Buffer.from("three.png"))).toBe(true);
+    expect(stub.fetchStub).toHaveBeenCalledTimes(2);
+  });
+
+  it("ED-05: 51 readable assets are refused before any download", async () => {
+    const rows: Record<string, { object_path: string; byte_size: number | null }> = {};
+    const assetIds: string[] = [];
+    for (let index = 0; index < 51; index += 1) {
+      rows[`a${index}`] = { object_path: `ws/${index}-x.png`, byte_size: 1 };
+      assetIds.push(`a${index}`);
+    }
+    const stub = makeZipStubs({ rows });
+
+    const result = await stub.service.prepareZipDownload(USER, {
+      assetIds,
+      projectName: "角色设定",
+    });
+
+    expect(result).toEqual({ ok: false, message: "选中过多，请分批下载" });
+    expect(stub.fetchStub).toHaveBeenCalledTimes(0);
+  });
+
+  it("ED-05: the zip is named after the project in Shanghai time", async () => {
+    const stub = makeZipStubs({
+      rows: { a1: { object_path: "ws/1-a.png", byte_size: 10 } },
+    });
+
+    const result = await stub.service.prepareZipDownload(USER, {
+      assetIds: ["a1"],
+      projectName: "角色设定",
+      now: new Date("2026-10-20T16:05:00Z"),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.fileName).toBe("角色设定_20261021-0005.zip");
+    await readAll(result.stream);
   });
 });

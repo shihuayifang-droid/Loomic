@@ -147,6 +147,61 @@ export async function registerUploadRoutes(
     },
   );
 
+  // ED-05: bundle several artifacts into one zip stream.
+  app.post<{ Body: { assetIds?: unknown; projectName?: unknown } }>(
+    "/api/uploads/zip",
+    async (request, reply) => {
+      try {
+        const user = await options.auth.authenticate(request);
+        if (!user) return sendUnauthorized(reply);
+
+        const body = request.body ?? {};
+        const { assetIds, projectName } = body;
+        const idsValid =
+          Array.isArray(assetIds) &&
+          assetIds.length >= 1 &&
+          assetIds.length <= 100 &&
+          assetIds.every((id) => typeof id === "string" && id !== "");
+        const nameValid =
+          typeof projectName === "string" &&
+          projectName.length >= 1 &&
+          projectName.length <= 100;
+
+        if (!idsValid || !nameValid) {
+          return reply.code(400).send(
+            applicationErrorResponseSchema.parse({
+              error: { code: "upload_failed", message: "请求参数无效" },
+            }),
+          );
+        }
+
+        const result = await options.uploadService.prepareZipDownload(user, {
+          assetIds: assetIds as string[],
+          projectName: projectName as string,
+        });
+
+        if (!result.ok) {
+          return reply.code(400).send(
+            applicationErrorResponseSchema.parse({
+              error: { code: "upload_failed", message: result.message },
+            }),
+          );
+        }
+
+        return reply
+          .header("content-type", "application/zip")
+          .header(
+            "content-disposition",
+            `attachment; filename*=UTF-8''${encodeURIComponent(result.fileName)}`,
+          )
+          .header("x-skipped-count", String(result.skipped))
+          .send(result.stream);
+      } catch (error) {
+        return sendUploadError(error, reply);
+      }
+    },
+  );
+
   // Delete an asset
   app.delete<{ Params: { assetId: string } }>(
     "/api/uploads/:assetId",
