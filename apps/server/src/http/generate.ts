@@ -48,6 +48,20 @@ export function generationFailedBody(error: unknown) {
   });
 }
 
+/**
+ * GN-11 / X-P7: what a generator relay upload records about the image it is
+ * relaying — the real source, the model, the prompt and what it cost.
+ */
+export function generatorRelayProvenance(input: { modelId: string; prompt: string; creditsCharged: number }) {
+  return {
+    source: "generator" as const,
+    operation: "image_generation",
+    modelId: input.modelId,
+    prompt: input.prompt,
+    creditsCharged: input.creditsCharged,
+  };
+}
+
 export async function registerGenerateRoutes(
   app: FastifyInstance,
   options: {
@@ -120,7 +134,7 @@ export async function registerGenerateRoutes(
           },
           description: `Direct image generation: ${model}`,
         },
-        async () => {
+        async (outcome) => {
           const providerName = resolveImageProviderName(model, "generate");
           const generated = await generateImage(providerName, {
             prompt: payload.prompt,
@@ -135,7 +149,7 @@ export async function registerGenerateRoutes(
             payload.prompt,
             user,
             options,
-            { modelId: model },
+            { modelId: model, creditsCharged: outcome.creditsCost },
           );
           return { ...uploaded, result: generated };
         },
@@ -349,7 +363,7 @@ async function downloadAndUpload(
   prompt: string,
   user: AuthenticatedUser,
   deps: { uploadService: UploadService; viewerService: ViewerService },
-  provenance: { modelId: string },
+  relay: { modelId: string; creditsCharged: number },
 ): Promise<{ signedUrl: string; assetId: string }> {
   const response = await fetch(sourceUrl);
   if (!response.ok) {
@@ -371,11 +385,11 @@ async function downloadAndUpload(
     workspaceId: viewer.workspace.id,
     // GN-11 / X-P7: this route produced the image, so relaying it into Storage
     // records where it really came from instead of calling it a user upload.
-    provenance: {
-      source: "generator", operation: "image_generation",
-      modelId: provenance.modelId,
+    provenance: generatorRelayProvenance({
+      modelId: relay.modelId,
       prompt,
-    },
+      creditsCharged: relay.creditsCharged,
+    }),
   });
 
   return { signedUrl: result.url, assetId: result.asset.id };

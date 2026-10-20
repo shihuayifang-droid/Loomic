@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { applicationErrorResponseSchema } from "@loomic/shared";
 
-import { generationFailedBody } from "./generate.js";
+import { generationFailedBody, generatorRelayProvenance } from "./generate.js";
 
 describe("generationFailedBody (X-40 §3)", () => {
   afterEach(() => {
@@ -44,5 +44,31 @@ describe("generationFailedBody (X-40 §3)", () => {
     const body = generationFailedBody(new Error("x"));
 
     expect(() => applicationErrorResponseSchema.parse(body)).not.toThrow();
+  });
+});
+
+// GN-11 / T-84: the relay upload used to record where the image came from but
+// not what it cost. These pin the provenance the relay now writes.
+describe("generatorRelayProvenance (GN-11)", () => {
+  it("GN-11: the relay provenance carries the charged amount", () => {
+    expect(
+      generatorRelayProvenance({ modelId: "m", prompt: "p", creditsCharged: 9 }),
+    ).toEqual({
+      source: "generator",
+      operation: "image_generation",
+      modelId: "m",
+      prompt: "p",
+      creditsCharged: 9,
+    });
+  });
+
+  it("GN-11: a free generation records 0, not null", () => {
+    const provenance = generatorRelayProvenance({
+      modelId: "m",
+      prompt: "p",
+      creditsCharged: 0,
+    });
+
+    expect(provenance.creditsCharged).toBe(0);
   });
 });
