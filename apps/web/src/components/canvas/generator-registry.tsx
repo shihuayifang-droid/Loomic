@@ -103,6 +103,7 @@ export const GENERATOR_SPECS: GeneratorSpec[] = [
         accessToken={ctx.accessToken}
         canvasScrollZoom={ctx.canvasScrollZoom}
         onClose={ctx.onClose}
+        {...(ctx.ws ? { ws: ctx.ws } : {})}
       />
     ),
     toolbar: {

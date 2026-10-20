@@ -5,10 +5,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import type { ImageModelInfo } from "../../lib/server-api";
-import { fetchImageModels, generateImageDirect } from "../../lib/server-api";
+import { fetchImageModels, submitImageJob } from "../../lib/server-api";
 import { visibleOn } from "../../lib/model-visibility";
 import { qualityOptionsFor } from "../../lib/image-quality-options";
+import { awaitJobCompletion } from "../../lib/await-job";
+import { imageResultFromJob } from "../../lib/image-job-result";
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
+import type { WebSocketHandle } from "../../hooks/use-websocket";
 import { errorCodeOf, lookupError } from "../../lib/error-catalog";
 import {
   updateImageGeneratorElement,
@@ -28,6 +31,11 @@ type ImageGeneratorPanelProps = {
   accessToken: string;
   canvasScrollZoom: { scrollX: number; scrollY: number; zoom: number };
   onClose: () => void;
+  /**
+   * GN-37: used to receive `job.progress`. Optional: without it the slow poll in
+   * awaitJobCompletion still delivers the result, just a few seconds later.
+   */
+  ws?: WebSocketHandle;
 };
 
 const ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4"] as const;
@@ -46,6 +54,7 @@ export function ImageGeneratorPanel({
   accessToken,
   canvasScrollZoom,
   onClose,
+  ws,
 }: ImageGeneratorPanelProps) {
   const [prompt, setPrompt] = useState(data.prompt);
   const [model, setModel] = useState(data.model);
@@ -187,14 +196,26 @@ export function ImageGeneratorPanel({
     });
 
     try {
-      const result = await generateImageDirect(
+      // GN-37: two steps now, same shape as the video panel — submit answers 202
+      // with a jobId (the ledger entry is billed against that job), then we wait
+      // for job.progress over the WebSocket with a slow poll as the safety net.
+      // Previously this was one request held open for the whole generation.
+      const submitted = await submitImageJob(
         accessTokenRef.current,
         prompt.trim(),
         { model, aspectRatio, ...(qualityOptions ? { quality } : {}) },
       );
 
+      const job = await awaitJobCompletion(
+        accessTokenRef.current,
+        submitted.jobId,
+        { ...(ws ? { ws } : {}), signal: controller.signal },
+      );
+
       // Check if this generation was cancelled while awaiting
       if (controller.signal.aborted) return;
+
+      const result = imageResultFromJob(job);
 
       // Download and insert as real image element at same position
       const dataURL = await fetchAsDataURL(result.url);
@@ -261,6 +282,7 @@ export function ImageGeneratorPanel({
     elementBounds,
     onClose,
     handleGenerationError,
+    ws,
   ]);
 
   // X-40 二期: 「稍后重试」重新提交一次，走的还是上面那一条提交路径。

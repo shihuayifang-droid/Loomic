@@ -13,6 +13,7 @@ import {
   fetchPriceQuote,
   fetchProjectUploads,
   getAssetDownloadUrl,
+  submitImageJob,
   uploadFile,
 } from "../src/lib/server-api";
 
@@ -155,5 +156,37 @@ describe("ED-00f: price quote (35K)", () => {
     expect(String(init.body)).toContain("items");
     expect(String(init.body)).toContain("vectorize");
     expect(init.headers?.Authorization).toBe("Bearer tok");
+  });
+});
+
+// 工单35P · GN-37：图像生成器改走任务链路 —— 提交这一步回到 202，不再是「等图生成完」。
+// 替身钉 URL、方法与请求体（quality 只在模型有档位时才带上，见 image-quality-options）。
+describe("GN-37: image generation submits a job (35P)", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    vi.stubEnv("NEXT_PUBLIC_SERVER_BASE_URL", "http://localhost:3001");
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ jobId: "job-1", status: "queued", prompt: "a cat" }),
+    });
+  });
+
+  it("GN-37: submitImageJob posts prompt and quality to /api/agent/generate-image-job", async () => {
+    const result = await submitImageJob("tok", "a cat", {
+      model: "openai/gpt-image-1",
+      aspectRatio: "1:1",
+      quality: "2K",
+    });
+
+    expect(result).toMatchObject({ jobId: "job-1", status: "queued" });
+
+    const [url, init] = mockFetch.mock.calls[0] as [
+      string,
+      { method?: string; body?: unknown },
+    ];
+    expect(url.endsWith("/api/agent/generate-image-job")).toBe(true);
+    expect(init.method).toBe("POST");
+    expect(String(init.body)).toContain("a cat");
+    expect(String(init.body)).toContain("quality");
   });
 });

@@ -770,6 +770,44 @@ export async function generateImageDirect(
   return (await response.json()) as GenerateImageResponse;
 }
 
+/** 202 body of POST /api/agent/generate-image-job — the work is accepted, not done. */
+export type SubmitImageResponse = {
+  jobId: string;
+  status: string;
+  prompt: string;
+};
+
+/**
+ * Submits an image generation job and returns immediately (HTTP 202).
+ *
+ * GN-37: the canvas toolbar image generator used `generateImageDirect`, which
+ * held the request open for the whole generation. The route now takes a job and
+ * bills it (with `job_id` on the ledger entry), so the waiting belongs to
+ * `awaitJobCompletion`, exactly like the video panel. `generateImageDirect` is
+ * kept for now — retiring it is a separate change.
+ */
+export async function submitImageJob(
+  accessToken: string,
+  prompt: string,
+  options?: { model?: string; aspectRatio?: string; quality?: string },
+): Promise<SubmitImageResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/agent/generate-image-job`,
+    {
+      method: "POST",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify({
+        prompt,
+        ...(options?.model ? { model: options.model } : {}),
+        ...(options?.aspectRatio ? { aspectRatio: options.aspectRatio } : {}),
+        ...(options?.quality ? { quality: options.quality } : {}),
+      }),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as SubmitImageResponse;
+}
+
 /**
  * The fields a finished job is guaranteed to expose to a waiter, whichever way
  * it learned the job finished. Deliberately narrower than shared's

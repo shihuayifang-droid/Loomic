@@ -39,6 +39,7 @@ vi.mock("@/components/credits/tier-limit-toast", () => ({
 const apiMock = vi.hoisted(() => ({
   fetchImageModels: vi.fn(),
   generateImageDirect: vi.fn(),
+  submitImageJob: vi.fn(),
   fetchVideoModels: vi.fn(),
   submitVideoJob: vi.fn(),
 }));
@@ -278,7 +279,7 @@ describe("X-05 验收：图像/视频的 prompt 输入框 testid 相同、data-m
 
 describe("T3 面板接线：图像面板的两个入口", () => {
   it("user_fixable 错误显示「修改参数」，点它把焦点送回 prompt 输入框", async () => {
-    apiMock.generateImageDirect.mockRejectedValue(
+    apiMock.submitImageJob.mockRejectedValue(
       new ApiApplicationError("invalid_request", "bad params", 400),
     );
     renderImagePanel();
@@ -296,22 +297,22 @@ describe("T3 面板接线：图像面板的两个入口", () => {
   });
 
   it("service 错误显示「稍后重试」，点它走面板现有的提交函数再跑一次", async () => {
-    apiMock.generateImageDirect.mockRejectedValue(
+    apiMock.submitImageJob.mockRejectedValue(
       new ApiApplicationError("generation_failed", "boom", 502),
     );
     renderImagePanel();
 
     fireEvent.click(screen.getByTestId("canvas-image-generator-submit"));
-    await waitFor(() => expect(apiMock.generateImageDirect).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(apiMock.submitImageJob).toHaveBeenCalledTimes(1));
 
     const action = await screen.findByTestId("toast-action");
     expect(action).toHaveTextContent("稍后重试");
 
     fireEvent.click(action);
 
-    await waitFor(() => expect(apiMock.generateImageDirect).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(apiMock.submitImageJob).toHaveBeenCalledTimes(2));
     // 重试用的是同一条提交路径：请求参数还是面板上那一份
-    expect(apiMock.generateImageDirect).toHaveBeenLastCalledWith(
+    expect(apiMock.submitImageJob).toHaveBeenLastCalledWith(
       "token",
       "画一只猫",
       expect.objectContaining({ aspectRatio: "1:1" }),
@@ -319,7 +320,7 @@ describe("T3 面板接线：图像面板的两个入口", () => {
   });
 
   it("图像面板不再写死「图片生成失败，请重试或更换模型。」，文案取自目录", async () => {
-    apiMock.generateImageDirect.mockRejectedValue(
+    apiMock.submitImageJob.mockRejectedValue(
       new ApiApplicationError("invalid_request", "bad params", 400),
     );
     renderImagePanel();
