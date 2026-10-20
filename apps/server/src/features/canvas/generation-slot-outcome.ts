@@ -23,12 +23,31 @@ export type SlotOutcome =
 export const SLOT_TIMEOUT_MESSAGE = "生成超时，请重试";
 
 export function slotOutcomeForStop(stop:
-  | { reason: "job_failed"; jobId: string; errorMessage: string | null }
+  | {
+      reason: "job_failed";
+      jobId: string;
+      errorMessage: string | null;
+      // GN-31: the server writes `timeout` for a job that ran out of its
+      // execution budget; the slot then carries the timeout wording instead of
+      // the generic sanitiser output.
+      errorCode?: string | null;
+    }
   | { reason: "job_canceled"; jobId: string }
   | { reason: "timeout"; jobId: string }
   | { reason: "aborted" }
 ): SlotOutcome {
   if (stop.reason === "job_failed") {
+    // GN-31: a job the server timed out is already terminal with
+    // `error_code=timeout`; it says "timed out" rather than the generic failure
+    // wording, and both chains (image and video) get the same sentence.
+    if (stop.errorCode === "timeout") {
+      return {
+        kind: "failed",
+        message: SLOT_TIMEOUT_MESSAGE,
+        jobId: stop.jobId,
+      };
+    }
+
     // Same sanitising as the image path: the raw provider/DB text is for the
     // server log, the slot gets a message a user can act on.
     return {

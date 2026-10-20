@@ -56,4 +56,53 @@ describe("GN-19 generation slot outcome", () => {
 
     expect(outcome.kind).toBe("dropped");
   });
+
+  it("GN-31: a job the server timed out says it timed out", () => {
+    const outcome = slotOutcomeForStop({
+      reason: "job_failed",
+      jobId: "j",
+      errorMessage: "Job exceeded its execution budget and was reclaimed",
+      errorCode: "timeout",
+    });
+
+    expect(outcome).toEqual({
+      kind: "failed",
+      message: "生成超时，请重试",
+      jobId: "j",
+    });
+  });
+
+  it("GN-31: other failure codes keep the sanitised reason", () => {
+    const withCode = slotOutcomeForStop({
+      reason: "job_failed",
+      jobId: "j",
+      errorMessage: "replicate 500 internal",
+      errorCode: "executor_error",
+    });
+    const withoutCode = slotOutcomeForStop({
+      reason: "job_failed",
+      jobId: "j",
+      errorMessage: "replicate 500 internal",
+    });
+
+    expect(withCode.kind).toBe("failed");
+    if (withCode.kind !== "failed") throw new Error("expected a failed slot");
+    if (withoutCode.kind !== "failed") throw new Error("expected a failed slot");
+    expect(withCode.message).toBe(withoutCode.message);
+    expect(withCode.message).not.toContain("生成超时");
+  });
+
+  it("GN-31: a missing code behaves as before", () => {
+    const outcome = slotOutcomeForStop({
+      reason: "job_failed",
+      jobId: "j",
+      errorMessage: "Job exceeded its execution budget and was reclaimed",
+    });
+
+    expect(outcome.kind).toBe("failed");
+    if (outcome.kind !== "failed") throw new Error("expected a failed slot");
+    expect(outcome.jobId).toBe("j");
+    expect(outcome.message).not.toContain("生成超时");
+    expect(outcome.message.length).toBeGreaterThan(0);
+  });
 });

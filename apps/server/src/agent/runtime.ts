@@ -78,7 +78,7 @@ import {
   toRetryRequest,
 } from "../features/canvas/canvas-element-writer.js";
 import { aspectRatioToDimensions } from "../generation/utils.js";
-import { slotOutcomeForStop } from "../features/canvas/generation-slot-outcome.js";
+import { slotOutcomeForStop, SLOT_TIMEOUT_MESSAGE } from "../features/canvas/generation-slot-outcome.js";
 
 /**
  * Build the text portion of a user message, appending <input_images> XML
@@ -1303,12 +1303,20 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               // with a user-facing reason. `canceled` means the user actively
               // stopped it, so that slot is still removed below.
               if (current.status === "failed") {
-                slotFailure = {
-                  message: sanitizeErrorForClient(
-                    new Error(current.error_message ?? "Job failed"),
-                  ),
+                // GN-31: the same decision the video path makes, so a job the
+                // server timed out says "timed out" here too.
+                const outcome = slotOutcomeForStop({
+                  reason: "job_failed",
                   jobId: job.id,
-                };
+                  errorMessage: current.error_message ?? null,
+                  errorCode: current.error_code ?? null,
+                });
+                if (outcome.kind === "failed") {
+                  slotFailure = {
+                    message: outcome.message,
+                    jobId: job.id,
+                  };
+                }
               }
               return {
                 jobId: job.id,
@@ -1320,7 +1328,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           jobLap("job_poll_done", { pollCount, status: "timeout" });
           // GN-19: same treatment as `failed` — the user waited for a result and
           // gets a slot that says why there is none.
-          slotFailure = { message: "生成超时，请重试", jobId: job.id };
+          slotFailure = { message: SLOT_TIMEOUT_MESSAGE, jobId: job.id };
           return {
             jobId: job.id,
             error: `Job timed out after ${MAX_WAIT / 1000}s`,
@@ -1499,7 +1507,12 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           // Why the slot was abandoned. Left undefined while the loop is still
           // waiting; the cleanup treats "no reason recorded" as an aborted run.
           let stopReason:
-            | { reason: "job_failed"; jobId: string; errorMessage: string | null }
+            | {
+                reason: "job_failed";
+                jobId: string;
+                errorMessage: string | null;
+                errorCode?: string | null;
+              }
             | { reason: "job_canceled"; jobId: string }
             | { reason: "timeout"; jobId: string }
             | undefined;
@@ -1651,6 +1664,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                       reason: "job_failed",
                       jobId: job.id,
                       errorMessage: current.error_message ?? null,
+                      errorCode: current.error_code ?? null,
                     }
                   : { reason: "job_canceled", jobId: job.id };
               return {
