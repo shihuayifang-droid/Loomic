@@ -20,6 +20,7 @@ import {
 } from "../features/chat/thread-service.js";
 import type { SettingsService } from "../features/settings/settings-service.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
+import { sendValidationError } from "./validation-error.js";
 
 export async function registerRunRoutes(
   app: FastifyInstance,
@@ -156,10 +157,7 @@ function sendUnauthorized(reply: FastifyReply) {
 
 function handleZodError(error: unknown, reply: FastifyReply) {
   if (isZodError(error)) {
-    return reply.code(400).send({
-      issues: error.issues,
-      message: "Invalid request body",
-    });
+    return sendValidationError(reply, error.issues);
   }
 
   throw error;

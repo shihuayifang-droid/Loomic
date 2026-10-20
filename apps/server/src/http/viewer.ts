@@ -21,6 +21,7 @@ import type {
   ProfileWriteRow,
 } from "../db/profile-write-repository.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
+import { sendValidationError } from "./validation-error.js";
 
 export async function registerViewerRoutes(
   app: FastifyInstance,
@@ -161,10 +162,7 @@ export async function registerViewerRoutes(
       );
     } catch (error) {
       if (isZodError(error)) {
-        return reply.code(400).send({
-          issues: error.issues,
-          message: "Invalid request body",
-        });
+        return sendValidationError(reply, error.issues);
       }
 
       return sendApplicationError(

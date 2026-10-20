@@ -19,6 +19,7 @@ import {
 import { CanvasVersionConflictError } from "../features/canvas/canvas-version.js";
 import type { TeamAdminService } from "../features/team/team-admin.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
+import { sendValidationError } from "./validation-error.js";
 
 export async function registerCanvasRoutes(
   app: FastifyInstance,
@@ -225,10 +226,7 @@ function sendCanvasError(error: unknown, reply: FastifyReply) {
   }
 
   if (isZodError(error)) {
-    return reply.code(400).send({
-      issues: error.issues,
-      message: "Invalid request body",
-    });
+    return sendValidationError(reply, error.issues);
   }
 
   return reply.code(500).send(

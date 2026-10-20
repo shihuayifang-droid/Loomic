@@ -13,6 +13,7 @@ import {
   type SettingsService,
 } from "../features/settings/settings-service.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
+import { sendValidationError } from "./validation-error.js";
 
 export async function registerSettingsRoutes(
   app: FastifyInstance,
@@ -87,10 +88,7 @@ function sendSettingsError(error: unknown, reply: FastifyReply) {
   }
 
   if (isZodError(error)) {
-    return reply.code(400).send({
-      issues: error.issues,
-      message: "Invalid request body",
-    });
+    return sendValidationError(reply, error.issues);
   }
 
   return reply.code(500).send(

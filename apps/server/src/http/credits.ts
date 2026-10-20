@@ -16,6 +16,7 @@ import {
 } from "../features/credits/credit-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
+import { sendValidationError } from "./validation-error.js";
 
 export async function registerCreditRoutes(
   app: FastifyInstance,
@@ -118,9 +119,7 @@ export async function registerCreditRoutes(
       return reply.code(200).send(toCreditBalanceResponse(balance));
     } catch (error) {
       if (isZodError(error)) {
-        return reply
-          .code(400)
-          .send({ issues: error.issues, message: "Invalid request body" });
+        return sendValidationError(reply, error.issues);
       }
       return sendCreditError(error, reply, "credit_plan_update_failed");
     }
