@@ -19,6 +19,7 @@ import {
 
 const USER_ID = "00000000-0000-0000-0000-0000000000c1";
 const JOB_ID = "eeee0000-0000-4000-8000-0000000000c1";
+const LIVE_JOB_ID = "eeee0000-0000-4000-8000-0000000000c2";
 const PARENT_ASSET_ID = "dddd0000-0000-4000-8000-0000000000c1";
 const CHILD_ASSET_ID = "dddd0000-0000-4000-8000-0000000000c2";
 const UNKNOWN_ASSET_ID = "dddd0000-0000-4000-8000-0000000000ff";
@@ -35,7 +36,7 @@ function provenance(overrides: Partial<AssetProvenance> = {}): AssetProvenance {
     prompt: "a red panda",
     creditsCharged: 0,
     actionId: "act-1",
-    sourceJobId: JOB_ID,
+    sourceJobId: LIVE_JOB_ID,
     parentArtifactId: PARENT_ASSET_ID,
     ...overrides,
   };
@@ -72,6 +73,12 @@ beforeAll(async () => {
     [JOB_ID, workspaceId, USER_ID],
   );
 
+  await db.query(
+    `insert into public.background_jobs (id, workspace_id, queue_name, job_type, status, created_by)
+     values ($1, $2, 'image_generation_jobs', 'image_generation', 'queued', $3)`,
+    [LIVE_JOB_ID, workspaceId, USER_ID],
+  );
+
   await insertAsset(PARENT_ASSET_ID, `${workspaceId}/provenance/parent.png`);
   await insertAsset(CHILD_ASSET_ID, `${workspaceId}/provenance/child.png`);
 }, 120_000);
@@ -82,7 +89,7 @@ afterAll(async () => {
 
 describe("asset provenance repository: real SQL (GN-11)", () => {
   it("GN-11: recorded provenance reads back field by field", async () => {
-    const expected = provenance();
+    const expected = provenance({ sourceJobId: JOB_ID });
 
     await expect(
       repository.recordProvenance({
@@ -109,7 +116,8 @@ describe("asset provenance repository: real SQL (GN-11)", () => {
     expect(after?.creditsCharged).toBe(0);
     expect(after?.operation).toBe("image_generation");
     expect(after?.source).toBe("generator");
-    expect(after?.sourceJobId).toBe(JOB_ID);
+    // GN-12: the FK is ON DELETE SET NULL — the link goes with the job, the provenance (model / cost / operation / source, GN-11 acceptance) stays
+    expect(after?.sourceJobId).toBeNull();
   });
 
   it("GN-11: a tool artifact is recorded as tool:*, not user_upload", async () => {
