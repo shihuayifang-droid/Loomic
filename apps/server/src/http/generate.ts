@@ -29,11 +29,24 @@ import type { ConnectionManager } from "../ws/connection-manager.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { UploadService } from "../features/uploads/upload-service.js";
 import type { AuthenticatedUser, RequestAuthenticator } from "../supabase/user.js";
+import { sanitizeErrorForClient } from "../utils/error-sanitizer.js";
 
 // Workorder 31D ruling 1: the two request-body schemas moved to
 // `@loomic/shared` (`pricing-quote.ts`) and are imported above. The quote route
 // validates the SAME objects, which is what makes "询价的请求体与提交完全同构" a
 // fact instead of two copies that happen to look alike today.
+
+/**
+ * X-40 §3: the fallback answer of the two generation routes. The raw error is
+ * logged server-side by `sanitizeErrorForClient`; the client gets a fixed,
+ * category-level sentence instead of upstream/driver text. Code and status are
+ * unchanged (`generation_failed`, 502).
+ */
+export function generationFailedBody(error: unknown) {
+  return applicationErrorResponseSchema.parse({
+    error: { code: "generation_failed", message: sanitizeErrorForClient(error) },
+  });
+}
 
 export async function registerGenerateRoutes(
   app: FastifyInstance,
@@ -166,14 +179,7 @@ export async function registerGenerateRoutes(
         );
       }
 
-      return reply.code(502).send(
-        applicationErrorResponseSchema.parse({
-          error: {
-            code: "generation_failed",
-            message,
-          },
-        }),
-      );
+      return reply.code(502).send(generationFailedBody(error));
     }
   });
 
@@ -309,17 +315,7 @@ export async function registerGenerateRoutes(
         );
       }
 
-      const message =
-        error instanceof Error ? error.message : "Video generation failed.";
-
-      return reply.code(502).send(
-        applicationErrorResponseSchema.parse({
-          error: {
-            code: "generation_failed",
-            message,
-          },
-        }),
-      );
+      return reply.code(502).send(generationFailedBody(error));
     }
   });
 }
