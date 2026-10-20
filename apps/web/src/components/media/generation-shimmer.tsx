@@ -18,8 +18,15 @@ import { formatModelDisplayName } from "../chat/utils";
  *    Excalidraw sizes custom embeddable content (see VideoCanvasElement)
  */
 
-/** Typical wall-clock cost of one generation, used only as a soft hint. */
-const TYPICAL_SECONDS = { image: 60, video: 180 } as const;
+/**
+ * Typical wall-clock cost of one generation, used only as a soft hint.
+ *
+ * GN-02 ⑥: per-KIND typical values, not per-model. The model-level estimate
+ * arrives with T-97 / MD-07; until then these two numbers are the estimate the
+ * placeholder measures against, so they are exported for the tests that pin the
+ * 「比预期慢」 threshold.
+ */
+export const TYPICAL_SECONDS = { image: 60, video: 180 } as const;
 
 export type GenerationKind = "image" | "video";
 
@@ -187,17 +194,26 @@ const ElapsedTimer = React.memo(function ElapsedTimer({
 
   const typical = isVideo ? TYPICAL_SECONDS.video : TYPICAL_SECONDS.image;
   const overdue = seconds > typical;
-  const remaining = Math.max(0, typical - seconds);
 
   return (
     <div className="flex shrink-0 items-center gap-1 text-[11px] tabular-nums text-muted-foreground">
       <span className="font-medium">{formatDuration(seconds)}</span>
-      <span className="text-muted-foreground/50">
-        {overdue ? "即将完成" : `约剩 ${formatDuration(remaining)}`}
+      <span
+        className="text-muted-foreground/50"
+        data-testid="canvas-generation-elapsed-hint"
+        data-state={overdue ? "slow" : "on_time"}
+      >
+        {elapsedHint(seconds, typical)}
       </span>
     </div>
   );
 });
+
+/** GN-02 ⑥: the hint beside the elapsed time. Past the estimate the job is slower than expected — never "almost done". */
+export function elapsedHint(seconds: number, typicalSeconds: number): string {
+  if (seconds > typicalSeconds) return "比预期慢";
+  return `约剩 ${formatDuration(typicalSeconds - seconds)}`;
+}
 
 function formatDuration(totalSeconds: number): string {
   if (totalSeconds < 60) return `${totalSeconds}s`;
