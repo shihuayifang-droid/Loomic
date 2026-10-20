@@ -11,6 +11,7 @@ import {
 
 import type { MessageMention } from "@loomic/shared";
 import type { ImageAttachmentState } from "../hooks/use-image-attachments";
+import { AGENT_INPUT_PLACEHOLDER } from "../lib/composer-copy";
 import type { CanvasSelectedElement } from "./canvas-editor";
 import { useImageModelPreference } from "../hooks/use-image-model-preference";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
@@ -356,7 +357,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
         )}
         <ChatComposer
           ref={composerRef}
-          placeholder='Start with an idea, or type "@" to mention'
+          placeholder={AGENT_INPUT_PLACEHOLDER}
           {...(disabled ? { disabled } : {})}
           onSubmit={handleSubmit}
           onTextBeforeCaretChange={handleTextBeforeCaret}
