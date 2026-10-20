@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   type SelectionItemKind,
   type ToolbarKind,
+  elementKind,
   TOOLBAR_ITEMS,
   resolveToolbar,
 } from "../src/lib/toolbar-kind";
@@ -236,5 +237,84 @@ describe("resolveToolbar：纯函数", () => {
     expect(resolveToolbar(many("image", "image", "shape"))).toBe("common");
     // 调完之后入参内容没变
     expect(frozen.map((item) => item.kind)).toEqual(["image", "shape"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 工单 30Q §3 裁决 2：Excalidraw 元素 → kind
+// ---------------------------------------------------------------------------
+
+describe("elementKind：裁决 2 的表格逐行（工单 30Q）", () => {
+  it("`customData.generating === true` → placeholder_generating（优先级最高）", () => {
+    expect(elementKind({ type: "rectangle", customData: { generating: true } })).toBe(
+      "placeholder_generating",
+    );
+    // 生成中的占位常常就是一个 image 元素：先判 generating 才不会把它当可编辑的图片
+    expect(elementKind({ type: "image", customData: { generating: true } })).toBe(
+      "placeholder_generating",
+    );
+  });
+
+  it("`generating` 不是布尔 true 时不算占位（`=== true` 才认）", () => {
+    expect(elementKind({ type: "image", customData: { generating: "true" } })).toBe("image");
+    expect(elementKind({ type: "image", customData: { generating: 1 } })).toBe("image");
+    expect(elementKind({ type: "image", customData: { generating: false } })).toBe("image");
+    expect(elementKind({ type: "image", customData: {} })).toBe("image");
+    expect(elementKind({ type: "image", customData: null })).toBe("image");
+    expect(elementKind({ type: "image" })).toBe("image");
+  });
+
+  it("`image` → image", () => {
+    expect(elementKind({ type: "image" })).toBe("image");
+  });
+
+  it("`text` → text", () => {
+    expect(elementKind({ type: "text" })).toBe("text");
+  });
+
+  it("`rectangle` / `ellipse` / `diamond` → shape", () => {
+    expect(elementKind({ type: "rectangle" })).toBe("shape");
+    expect(elementKind({ type: "ellipse" })).toBe("shape");
+    expect(elementKind({ type: "diamond" })).toBe("shape");
+  });
+
+  it("`line` / `arrow` → line", () => {
+    expect(elementKind({ type: "line" })).toBe("line");
+    expect(elementKind({ type: "arrow" })).toBe("line");
+  });
+
+  it("`freedraw` → freedraw", () => {
+    expect(elementKind({ type: "freedraw" })).toBe("freedraw");
+  });
+
+  it("`frame` / `magicframe` → frame", () => {
+    expect(elementKind({ type: "frame" })).toBe("frame");
+    expect(elementKind({ type: "magicframe" })).toBe("frame");
+  });
+
+  it("其余一律 null：`embeddable`（视频留给接视频那张单）", () => {
+    expect(elementKind({ type: "embeddable" })).toBeNull();
+  });
+
+  it("其余一律 null：未知 / 缺失 type，以及 `selection` / `iframe` 这类非画布元素", () => {
+    expect(elementKind({})).toBeNull();
+    expect(elementKind({ type: undefined })).toBeNull();
+    expect(elementKind({ type: "selection" })).toBeNull();
+    expect(elementKind({ type: "iframe" })).toBeNull();
+    expect(elementKind({ type: "IMAGE" })).toBeNull();
+  });
+
+  it("本单不映射的两格：placeholder_failed 与 vector 都拿不到（见 T-78）", () => {
+    // 没有任何输入会产出这两个 kind —— 它们是留给后续单子的位置，不是这个函数的返回值。
+    const inputs: Array<{ type?: string; customData?: { generating?: unknown } }> = [
+      { type: "image" },
+      { type: "image", customData: { generating: false } },
+      { type: "embeddable" },
+      { type: "frame" },
+      {},
+    ];
+    const kinds = inputs.map((input) => elementKind(input));
+    expect(kinds).not.toContain("placeholder_failed");
+    expect(kinds).not.toContain("vector");
   });
 });

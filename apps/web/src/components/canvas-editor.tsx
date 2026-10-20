@@ -42,6 +42,7 @@ import {
   type MergeableContent,
 } from "../lib/canvas-merge";
 import { CanvasToolMenu } from "./canvas-tool-menu";
+import { ImageToolbarLayer } from "./canvas/image-toolbar-layer";
 import { normalizeCanvasElements } from "../lib/canvas-normalize";
 import { ErrorBoundary } from "./error-boundary";
 
@@ -1169,6 +1170,7 @@ export function CanvasEditor({
             {...(ws ? { ws } : {})}
           />
         )}
+        {excalidrawApi && <ImageToolbarLayer accessToken={accessToken} excalidrawApi={excalidrawApi} />}
 
         {/*
           Save state has to be visible. A save that exhausted its retries used to

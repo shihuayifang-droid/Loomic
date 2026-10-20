@@ -104,6 +104,64 @@ export const TOOLBAR_ITEMS: Record<ToolbarKind, readonly string[]> = {
 };
 
 /**
+ * 参与映射的 Excalidraw 元素字段（结构子集，不引 Excalidraw 的类型）。
+ *
+ * `customData` 用 `unknown` 而不是 `boolean`：Excalidraw 的元素是 `Record<string, any>`，
+ * 真实数据里这个键可能被写成任何东西，所以只在 `=== true` 时才认（见 {@link elementKind}）。
+ */
+export type ElementKindInput = {
+  readonly type?: string | undefined;
+  readonly customData?: { readonly generating?: unknown } | null | undefined;
+};
+
+/**
+ * 元素 → kind（工单 30Q §3 裁决 2 的表格，**顺序即优先级**）。
+ *
+ * | 元素 | kind |
+ * |---|---|
+ * | `customData.generating === true` | `placeholder_generating` |
+ * | `type === "image"` | `image` |
+ * | `text` | `text` |
+ * | `rectangle` / `ellipse` / `diamond` | `shape` |
+ * | `line` / `arrow` | `line` |
+ * | `freedraw` | `freedraw` |
+ * | `frame` / `magicframe` | `frame` |
+ * | 其余（含 `embeddable`） | `null` |
+ *
+ * 三处口径：
+ *
+ * 1. **「正在生成」排在最前**。占位符在生成中会显示成一张图（`type` 也是 `image`），
+ *    先判 `generating` 才不会把生成中的占位当成可编辑的图片、弹出一条对占位无意义的工具条。
+ * 2. `placeholder_failed` 与 `vector` **本单不映射**（返回 `null`），接对应工具的那张单再补，
+ *    见 T-78。`embeddable` 同理：视频走另一张单，`video` 的判定不在这里做。
+ * 3. `null` 是「这个元素不在本模块的认知范围」，调用方拿到 `null` 就**不显示工具条**
+ *    （工单 §3 裁决 2 最后一句：任意一个选中元素映射成 null 就不显示）。
+ */
+export function elementKind(el: ElementKindInput): SelectionItemKind | null {
+  if (el.customData?.generating === true) return "placeholder_generating";
+  switch (el.type) {
+    case "image":
+      return "image";
+    case "text":
+      return "text";
+    case "rectangle":
+    case "ellipse":
+    case "diamond":
+      return "shape";
+    case "line":
+    case "arrow":
+      return "line";
+    case "freedraw":
+      return "freedraw";
+    case "frame":
+    case "magicframe":
+      return "frame";
+    default:
+      return null;
+  }
+}
+
+/**
  * 选中内容 → 工具条形态。纯函数，无副作用，可单测。
  *
  * @param selection 当前选中的对象（只用到 `kind`）。顺序无关，重复的 kind 会被合并考虑。
