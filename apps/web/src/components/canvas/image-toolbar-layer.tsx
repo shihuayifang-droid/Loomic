@@ -2,17 +2,27 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import type { CropRect, Size } from "@/lib/crop-geometry";
 import type { FlipRotateState } from "@/lib/flip-rotate";
 import { drawTransformed, fromElementTransform, toElementTransform, transformedFileName, transformedSize } from "@/lib/flip-rotate";
 import type { SelectionItemKind, ToolbarKind } from "@/lib/toolbar-kind";
 import { elementKind, resolveToolbar } from "@/lib/toolbar-kind";
 import { imageToolbarPosition } from "@/lib/toolbar-position";
+import { fetchAsDataURL } from "@/lib/canvas-elements";
+import { browserRenderCrop, commitCropOutput } from "@/lib/crop-commit";
+import { replaceImageInPlace } from "@/lib/tool-output-replace";
 
 import { useToast } from "@/components/toast";
 import { useToolDefinitions } from "@/hooks/use-tool-definitions";
 import { useToolPrices } from "@/hooks/use-tool-prices";
-import { downloadAssetsZip, getAssetDownloadUrl } from "@/lib/server-api";
+import {
+  downloadAssetsZip,
+  getAssetDownloadUrl,
+  getAssetUrl,
+  uploadToolOutput,
+} from "@/lib/server-api";
 
+import { CropToolSession } from "./crop-tool-session";
 import { DownloadAllBar } from "./download-all-bar";
 import { FlipRotateBar } from "./flip-rotate-bar";
 import { ImageToolbar } from "./image-toolbar";
@@ -74,6 +84,9 @@ const FLIP_ROTATE_TOOL_ID = "flip_rotate";
  */
 const DOWNLOAD_TOOL_ID = "download";
 
+/** ED-02: the main toolbar crop tool id. */
+const CROP_TOOL_ID = "crop";
+
 /**
  * `excalidrawApi` 在本仓是 `any`（`canvas-editor.tsx:169`），这里只声明用到的 4 个方法。
  * 方法都可选：真实 API 一定都有，但测试里的假 API 按需给（`test/canvas-bottom-bar-zoom.test.tsx`
@@ -86,6 +99,8 @@ export type ExcalidrawApiLike = {
   getSceneElements?: (() => readonly unknown[]) | undefined;
   getFiles?: (() => Record<string, ExcalidrawFileLike | undefined>) | undefined;
   updateScene?: ((scene: { elements: unknown[]; captureUpdate: string }) => void) | undefined;
+  /** ED-00i: register a new file (the crop output) with the scene. */
+  addFiles?: ((files: any[]) => void) | undefined;
 };
 
 /**
@@ -96,6 +111,9 @@ export type ExcalidrawFileLike = {
   dataURL?: string | undefined;
   mimeType?: string | undefined;
   assetId?: string | undefined;
+  /** Original pixel size, when the file record carries it. */
+  width?: number | undefined;
+  height?: number | undefined;
 };
 
 export type ImageToolbarLayerProps = {
@@ -118,7 +136,31 @@ export type ImageToolbarLayerProps = {
    * 只有测试会传：jsdom 里没有 `URL.createObjectURL`，走默认实现会抛。
    */
   saveBlob?: ((blob: Blob, fileName: string) => void) | undefined;
+  /** ED-02: read the original pixel size of a data URL. Test-injectable; default is the browser Image. */
+  readImageSize?: ((dataUrl: string) => Promise<Size>) | undefined;
+  /** ED-02: render the crop to a PNG Blob. Test-injectable; default is {@link browserRenderCrop}. */
+  renderCrop?: ((sourceDataUrl: string, rect: CropRect) => Promise<Blob>) | undefined;
+  /** ED-00j: load the original (signed URL) as a data URL. Test-injectable; default is fetchAsDataURL. */
+  loadOriginal?: ((url: string) => Promise<string>) | undefined;
 };
+
+/** ED-02 default size reader: load the data URL into an Image and read naturalWidth/Height. */
+function defaultReadImageSize(dataUrl: string): Promise<Size> {
+  return new Promise<Size>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () =>
+      resolve({
+        width: image.naturalWidth || image.width,
+        height: image.naturalHeight || image.height,
+      });
+    image.onerror = () => reject(new Error("failed to load image"));
+    image.src = dataUrl;
+  });
+}
+
+function newCropFileId(): string {
+  return `crop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 /** ED-05 的默认「打开下载地址」：造一个带 `download` 的 anchor 直接点。 */
 function defaultOpenDownload(url: string): void {
@@ -172,7 +214,15 @@ type SelectionBox = {
 /** 「主工具条」或「翻转与旋转的二级条」。二级条记住自己是在改哪个元素。 */
 type Mode =
   | { kind: "toolbar" }
-  | { kind: "flip-rotate"; elementId: string; state: FlipRotateState };
+  | { kind: "flip-rotate"; elementId: string; state: FlipRotateState }
+  | {
+      kind: "crop";
+      elementId: string;
+      source: Size;
+      sourceDataUrl: string;
+      assetId: string;
+      fileName: string;
+    };
 
 /** 元素上本文件会读的字段（Excalidraw 元素的结构子集）。 */
 type ElementLike = {
@@ -337,6 +387,9 @@ export function ImageToolbarLayer({
   openDownload,
   projectName = DEFAULT_PROJECT_NAME,
   saveBlob,
+  readImageSize,
+  renderCrop,
+  loadOriginal,
 }: ImageToolbarLayerProps) {
   const { toast } = useToast();
   const definitions = useToolDefinitions(accessToken);
@@ -450,7 +503,7 @@ export function ImageToolbarLayer({
   // 二级条只在「选中的还是那一张图」时成立：选中集合一变就退回主工具条（工单 §3 裁决 5）。
   const selectedElementId = snapshot?.elementId ?? null;
   useEffect(() => {
-    if (mode.kind !== "flip-rotate") return;
+    if (mode.kind !== "flip-rotate" && mode.kind !== "crop") return;
     if (selectedElementId !== mode.elementId) setMode({ kind: "toolbar" });
   }, [mode, selectedElementId]);
 
@@ -600,8 +653,107 @@ export function ImageToolbarLayer({
     }
   }, [snapshot, excalidrawApi, toast, accessToken, openDownload]);
 
+  /** ED-02: enter the crop panel for the selected image (needs dataURL, assetId and a known size). */
+  const enterCrop = useCallback(async () => {
+    const el = snapshot?.element as ElementLike | null | undefined;
+    if (!el || typeof el.id !== "string") return;
+    const elementId = el.id;
+    const files = excalidrawApi.getFiles?.() ?? {};
+    const fileId = typeof el.fileId === "string" ? el.fileId : "";
+    const file = fileId === "" ? undefined : files[fileId];
+    const assetId = file?.assetId;
+    if (
+      typeof assetId !== "string" ||
+      assetId === "" ||
+      accessToken === null ||
+      accessToken === ""
+    ) {
+      toast(DOWNLOAD_FAILED_MESSAGE);
+      return;
+    }
+    try {
+      // ED-00j: crop the ORIGINAL, never the canvas display copy (file.dataURL is a downsampled one).
+      const { url } = await getAssetUrl(accessToken, assetId);
+      if (typeof url !== "string" || url === "") {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return;
+      }
+      const original = await (loadOriginal ?? fetchAsDataURL)(url);
+      const source: Size = await (readImageSize ?? defaultReadImageSize)(original);
+      if (!(source.width > 0) || !(source.height > 0)) {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return;
+      }
+      setMode({
+        kind: "crop",
+        elementId,
+        source,
+        sourceDataUrl: original,
+        assetId,
+        fileName: downloadBaseName(el, file),
+      });
+    } catch {
+      toast(DOWNLOAD_FAILED_MESSAGE);
+    }
+  }, [snapshot, excalidrawApi, toast, readImageSize, loadOriginal, accessToken]);
+
+  /** ED-00i ①: crop at source pixels → upload as tool:crop → replace the element in place. */
+  const handleCropDone = useCallback(
+    async (rect: CropRect) => {
+      if (mode.kind !== "crop") return;
+      const { elementId, sourceDataUrl, assetId, fileName } = mode;
+      if (accessToken === null || accessToken === "") {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return;
+      }
+      try {
+        const output = await commitCropOutput(
+          {
+            renderCrop: renderCrop ?? browserRenderCrop,
+            upload: (file, parent) =>
+              uploadToolOutput(accessToken, {
+                file,
+                source: "tool:crop",
+                parentArtifactId: parent,
+              }).then((r) => ({ assetId: r.asset.id, url: r.url })),
+            loadAsDataUrl: fetchAsDataURL,
+            addFile: (f) => excalidrawApi.addFiles?.([f]),
+            newFileId: newCropFileId,
+          },
+          { sourceDataUrl, parentAssetId: assetId, rect, fileName },
+        );
+        const scene =
+          elementsRef.current.length > 0
+            ? elementsRef.current
+            : Array.from(excalidrawApi.getSceneElements?.() ?? []);
+        if (scene.length === 0) return;
+        excalidrawApi.updateScene?.({
+          elements: replaceImageInPlace(scene, elementId, {
+            fileId: output.fileId,
+            assetId: output.assetId,
+            parentAssetId: assetId,
+            source: "tool:crop",
+            width: output.width,
+            height: output.height,
+          }),
+          captureUpdate: "IMMEDIATELY",
+        });
+        setMode({ kind: "toolbar" });
+      } catch (err) {
+        toast(err instanceof Error && err.message !== "" ? err.message : DOWNLOAD_FAILED_MESSAGE);
+      }
+    },
+    [mode, accessToken, renderCrop, excalidrawApi, toast],
+  );
+
+  const exitCrop = useCallback(() => setMode({ kind: "toolbar" }), []);
+
   const handleToolSelect = useCallback(
     (toolId: string) => {
+      if (toolId === CROP_TOOL_ID) {
+        void enterCrop();
+        return;
+      }
       if (toolId === FLIP_ROTATE_TOOL_ID) {
         enterFlipRotate();
         return;
@@ -614,7 +766,7 @@ export function ImageToolbarLayer({
       // 其余工具本单都不接（工单 §3 裁决 6）。
       toast(TOOL_PENDING_MESSAGE);
     },
-    [enterFlipRotate, handleDownloadOriginal, toast],
+    [enterFlipRotate, enterCrop, handleDownloadOriginal, toast],
   );
 
   /**
@@ -721,12 +873,18 @@ export function ImageToolbarLayer({
     <div
       ref={containerRef}
       data-testid="image-toolbar-layer"
-      data-state={mode.kind === "flip-rotate" ? "flip-rotate" : "toolbar"}
+      data-state={mode.kind === "flip-rotate" ? "flip-rotate" : mode.kind === "crop" ? "crop" : "toolbar"}
       data-placement={position.placement}
       className="absolute z-20"
       style={{ left: position.x, top: position.y }}
     >
-      {mode.kind === "flip-rotate" ? (
+      {mode.kind === "crop" ? (
+        <CropToolSession
+          source={mode.source}
+          onCancel={exitCrop}
+          onDone={(rect) => void handleCropDone(rect)}
+        />
+      ) : mode.kind === "flip-rotate" ? (
         <FlipRotateBar
           state={mode.state}
           onChange={handleFlipChange}

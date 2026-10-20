@@ -60,6 +60,25 @@ const toolDefinitions = vi.hoisted(() => [
     agent_callable: false,
     availability: "enabled",
   },
+  {
+    id: "crop",
+    label: "裁剪",
+    icon: "crop",
+    testid: "image-toolbar-crop",
+    form: "panel",
+    default_slot: "main",
+    removable: true,
+    consumes: false,
+    pricing: null,
+    output_kind: "image",
+    output_format: null,
+    file_prefix: null,
+    event_type: null,
+    disabled_rules: [],
+    eta_seconds: null,
+    agent_callable: false,
+    availability: "enabled",
+  },
   // ED-05：主工具条的「下载」（服务端定义见 `apps/server/.../tool-definitions.ts` L120）。
   {
     id: "download",
@@ -93,10 +112,21 @@ vi.mock("@/hooks/use-tool-definitions", () => ({
 const getAssetDownloadUrlMock = vi.hoisted(() => vi.fn());
 // 工单 34W（ED-05 多选「下载全部」）：zip 走服务端，替身只证明「组件问没问、带了什么参数」。
 const downloadAssetsZipMock = vi.hoisted(() => vi.fn());
+// 工单 35S（ED-02 / ED-00i）：裁剪产物上传与回读走替身。
+const uploadToolOutputMock = vi.hoisted(() => vi.fn());
+const fetchAsDataURLMock = vi.hoisted(() => vi.fn());
+// 工单 35S-fixup2（ED-00j）：裁剪源取原图签名地址。
+const getAssetUrlMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/server-api", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   getAssetDownloadUrl: getAssetDownloadUrlMock,
+  getAssetUrl: getAssetUrlMock,
   downloadAssetsZip: downloadAssetsZipMock,
+  uploadToolOutput: uploadToolOutputMock,
+}));
+vi.mock("@/lib/canvas-elements", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  fetchAsDataURL: fetchAsDataURLMock,
 }));
 
 vi.mock("@excalidraw/excalidraw", () => ({
@@ -185,6 +215,7 @@ type FakeApi = {
   onChange: ReturnType<typeof vi.fn>;
   updateScene: ReturnType<typeof vi.fn>;
   getFiles: ReturnType<typeof vi.fn>;
+  addFiles: ReturnType<typeof vi.fn>;
 };
 
 /**
@@ -202,6 +233,10 @@ type HarnessOptions = {
   accessToken?: string | null;
   /** 工单 34W：注入「保存 zip」的 spy（jsdom 里没有 `URL.createObjectURL`）。 */
   saveBlob?: ReturnType<typeof vi.fn>;
+  /** 工单 35S：注入原图尺寸读取与裁剪渲染（jsdom 没有真实 Image / canvas）。 */
+  readImageSize?: ReturnType<typeof vi.fn>;
+  renderCrop?: ReturnType<typeof vi.fn>;
+  loadOriginal?: ReturnType<typeof vi.fn>;
 };
 
 function setup(options: HarnessOptions = {}) {
@@ -212,6 +247,7 @@ function setup(options: HarnessOptions = {}) {
       return () => {};
     }),
     updateScene: vi.fn(),
+    addFiles: vi.fn(),
     getFiles: vi.fn(
       () =>
         options.files ?? {
@@ -228,6 +264,9 @@ function setup(options: HarnessOptions = {}) {
   if (options.download !== undefined) props.download = options.download;
   if (options.openDownload !== undefined) props.openDownload = options.openDownload;
   if (options.saveBlob !== undefined) props.saveBlob = options.saveBlob;
+  if (options.readImageSize !== undefined) props.readImageSize = options.readImageSize;
+  if (options.renderCrop !== undefined) props.renderCrop = options.renderCrop;
+  if (options.loadOriginal !== undefined) props.loadOriginal = options.loadOriginal;
 
   render(<ImageToolbarLayer {...props} />);
 
@@ -698,5 +737,111 @@ describe("ED-05：多选「下载全部」（工单 34W）", () => {
 
     await waitFor(() => expect(toastMock.toast).toHaveBeenCalledWith("选中过多，请分批下载"));
     expect(saveBlob).toHaveBeenCalledTimes(0);
+  });
+});
+
+describe("ImageToolbarLayer：裁剪（ED-02 / ED-00i，工单 35S）", () => {
+  const croppableFiles = {
+    "file-1": {
+      dataURL: "data:image/png;base64,AAAA",
+      mimeType: "image/png",
+      assetId: "a-orig",
+    },
+  };
+
+  it("ED-02: 裁剪 opens the crop panel for an uploaded image", async () => {
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/original.png" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    const readImageSize = vi.fn(async () => ({ width: 1254, height: 1254 }));
+    setupSelectedImage({ files: croppableFiles, readImageSize, loadOriginal });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-crop"));
+
+    await waitFor(() => expect(layerState()).toBe("crop"));
+    expect(screen.getByTestId("crop-panel")).toBeInTheDocument();
+  });
+
+  it("ED-02: an image without an asset id cannot be cropped", async () => {
+    const readImageSize = vi.fn(async () => ({ width: 1254, height: 1254 }));
+    setupSelectedImage({
+      files: { "file-1": { dataURL: "data:image/png;base64,AAAA", mimeType: "image/png" } },
+      readImageSize,
+    });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-crop"));
+
+    await waitFor(() => expect(toastMock.toast).toHaveBeenCalledWith(DOWNLOAD_FAILED_MESSAGE));
+    expect(layerState()).toBe("toolbar");
+  });
+
+  it("ED-00i: finishing a crop replaces the image in place", async () => {
+    uploadToolOutputMock.mockReset();
+    uploadToolOutputMock.mockResolvedValue({ asset: { id: "a-new" }, url: "https://x/c.png" });
+    fetchAsDataURLMock.mockReset();
+    fetchAsDataURLMock.mockResolvedValue("data:image/png;base64,CROPPED");
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/original.png" });
+    const loadOriginal = vi.fn(async () => "data:image/png;base64,ORIG");
+    const readImageSize = vi.fn(async () => ({ width: 1254, height: 1254 }));
+    const renderCrop = vi.fn(async () => new Blob(["png"], { type: "image/png" }));
+    const { api } = setupSelectedImage({
+      files: croppableFiles,
+      readImageSize,
+      renderCrop,
+      loadOriginal,
+    });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-crop"));
+    await waitFor(() => expect(layerState()).toBe("crop"));
+
+    fireEvent.change(screen.getByTestId("crop-width-input"), { target: { value: "600" } });
+    fireEvent.change(screen.getByTestId("crop-height-input"), { target: { value: "800" } });
+    fireEvent.click(screen.getByTestId("crop-done-button"));
+
+    await waitFor(() => expect(api.updateScene).toHaveBeenCalledTimes(1));
+    const call = api.updateScene.mock.calls[0]?.[0] as {
+      elements: Array<Record<string, any>>;
+      captureUpdate: string;
+    };
+    const replaced = call.elements.find((el) => el["id"] === "img-1");
+    expect(replaced?.["fileId"]).not.toBe("file-1");
+    expect(replaced?.["fileId"]).toBe(api.addFiles.mock.calls[0]?.[0]?.[0]?.id);
+    expect(replaced?.["customData"].toolSource).toBe("tool:crop");
+    expect(replaced?.["customData"].parentAssetId).toBe("a-orig");
+    expect(call.captureUpdate).toBe("IMMEDIATELY");
+  });
+
+  it("ED-00j: the crop works on the original, not the canvas display copy", async () => {
+    uploadToolOutputMock.mockReset();
+    uploadToolOutputMock.mockResolvedValue({ asset: { id: "a-new" }, url: "https://x/c.png" });
+    fetchAsDataURLMock.mockReset();
+    fetchAsDataURLMock.mockResolvedValue("data:image/png;base64,CROPPED");
+    getAssetUrlMock.mockReset();
+    getAssetUrlMock.mockResolvedValue({ url: "https://x/original.png" });
+    const loadOriginal = vi.fn(async () => "data:original");
+    const readImageSize = vi.fn(async () => ({ width: 1254, height: 1254 }));
+    const renderCrop = vi.fn(
+      async (_source: string, _rect: unknown) => new Blob(["png"], { type: "image/png" }),
+    );
+    const { api } = setupSelectedImage({
+      files: {
+        "file-1": { dataURL: "data:display", mimeType: "image/png", assetId: "a-orig" },
+      },
+      readImageSize,
+      renderCrop,
+      loadOriginal,
+    });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-crop"));
+    await waitFor(() => expect(layerState()).toBe("crop"));
+    fireEvent.change(screen.getByTestId("crop-width-input"), { target: { value: "600" } });
+    fireEvent.change(screen.getByTestId("crop-height-input"), { target: { value: "800" } });
+    fireEvent.click(screen.getByTestId("crop-done-button"));
+
+    await waitFor(() => expect(api.updateScene).toHaveBeenCalledTimes(1));
+    expect(getAssetUrlMock).toHaveBeenCalledWith("test-token", "a-orig");
+    expect(loadOriginal).toHaveBeenCalledWith("https://x/original.png");
+    expect(renderCrop.mock.calls[0]?.[0]).toBe("data:original");
   });
 });
