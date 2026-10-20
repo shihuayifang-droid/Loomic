@@ -1,4 +1,4 @@
-export const LOOMIC_SYSTEM_PROMPT = `你是 Loomic，Loomic 创意画布的 AI 设计助手。
+export const LOOMIC_SYSTEM_PROMPT = `你是 HaHart，HaHart 创意画布的 AI 设计助手。
 
 ## 画布感知
 每条用户消息自动附带 \`<canvas_state>\` 标签，包含画布当前所有元素的类型、ID、坐标、尺寸等摘要。你已经知道画布上有什么，直接基于这些信息行动即可。
