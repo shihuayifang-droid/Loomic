@@ -5,7 +5,7 @@ import {
   AssetReadError,
   FIND_READABLE_ASSET,
   createAssetReadRepository,
-  type AssetReadRepository,
+  type AssetReadListRepository,
 } from "../../db/asset-read-repository.js";
 import {
   withPrivilegedTransaction,
@@ -55,6 +55,18 @@ const OUTSIDER_LOOSE_ASSET = "dddd0000-0000-4000-8000-000000000006";
 const NULLABLE_LOOSE_ASSET = "dddd0000-0000-4000-8000-000000000007";
 const PERSONAL_LOOSE_ASSET = "dddd0000-0000-4000-8000-000000000008";
 
+// AS-06 (workorder 34N) fixtures: three uploads of PROJECT with created_at one
+// minute apart, one generated row that belongs to the generation history, one
+// upload in ANOTHER project, and one row per media kind in that other project.
+const UPLOAD_OLDEST = "eeee0000-0000-4000-8000-000000000001";
+const UPLOAD_MIDDLE = "eeee0000-0000-4000-8000-000000000002";
+const UPLOAD_NEWEST = "eeee0000-0000-4000-8000-000000000003";
+const GENERATED_IN_PROJECT = "eeee0000-0000-4000-8000-000000000004";
+const UPLOAD_OTHER_PROJECT = "eeee0000-0000-4000-8000-000000000005";
+const MEDIA_IMAGE = "eeee0000-0000-4000-8000-000000000006";
+const MEDIA_VIDEO = "eeee0000-0000-4000-8000-000000000007";
+const MEDIA_PDF = "eeee0000-0000-4000-8000-000000000008";
+
 const TEAM_NAME = "HaHart Team";
 const BUCKET = "project-assets";
 const ARCHIVED_AT = "2026-01-09T00:00:00.000Z";
@@ -78,7 +90,7 @@ type AssetRow = {
 
 let db: PGlite;
 let pool: TransactionPool;
-let repository: AssetReadRepository;
+let repository: AssetReadListRepository;
 
 /** Counts `connect()` calls, so "one read is one transaction" is observable. */
 let connectAttempts = 0;
@@ -156,6 +168,45 @@ async function insertAsset(options: {
       options.byteSize === undefined ? 4096 : options.byteSize,
       options.createdBy,
       "2026-01-05T06:07:08.900Z",
+    ],
+  );
+}
+
+/**
+ * An upload row for the AS-06 fixtures (workorder 34N).
+ *
+ * `insertAsset` predates `source` (33F) and `display_name` (33X) and its eight
+ * existing calls are left exactly as they are: this helper writes the columns
+ * the upload list filters on, and takes `created_at` so the two orderings can be
+ * told apart without relying on insertion order or the clock.
+ */
+async function insertUpload(options: {
+  id: string;
+  projectId: string;
+  createdBy: string;
+  createdAt: string;
+  displayName: string;
+  mimeType?: string;
+  source?: string;
+}): Promise<void> {
+  await db.query(
+    `insert into public.asset_objects (
+       id, workspace_id, project_id, bucket, object_path, mime_type,
+       byte_size, created_by, created_at, source, display_name
+     )
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [
+      options.id,
+      teamWorkspaceId,
+      options.projectId,
+      BUCKET,
+      `${teamWorkspaceId}/${options.projectId}/${options.displayName}`,
+      options.mimeType === undefined ? "image/png" : options.mimeType,
+      4096,
+      options.createdBy,
+      options.createdAt,
+      options.source === undefined ? "user_upload" : options.source,
+      options.displayName,
     ],
   );
 }
@@ -289,6 +340,72 @@ beforeAll(async () => {
     projectId: null,
     createdBy: AUTHOR_ID,
     objectPath: `${authorPersonalWorkspaceId}/loose-personal.png`,
+  });
+
+  // AS-06 fixtures: three real uploads of PROJECT, created one minute apart, so
+  // "newest first" and "oldest first" are two different orders of the same rows.
+  await insertUpload({
+    id: UPLOAD_OLDEST,
+    projectId: PROJECT,
+    createdBy: AUTHOR_ID,
+    createdAt: "2026-02-01T00:00:00.000Z",
+    displayName: "first-upload.png",
+  });
+  await insertUpload({
+    id: UPLOAD_MIDDLE,
+    projectId: PROJECT,
+    createdBy: AUTHOR_ID,
+    createdAt: "2026-02-01T00:01:00.000Z",
+    displayName: "second-upload.png",
+  });
+  await insertUpload({
+    id: UPLOAD_NEWEST,
+    projectId: PROJECT,
+    createdBy: AUTHOR_ID,
+    createdAt: "2026-02-01T00:02:00.000Z",
+    displayName: "third-upload.png",
+  });
+  // Same project, but not an upload: a generated row must stay out of the list.
+  await insertUpload({
+    id: GENERATED_IN_PROJECT,
+    projectId: PROJECT,
+    createdBy: AUTHOR_ID,
+    createdAt: "2026-02-01T00:03:00.000Z",
+    displayName: "generated.png",
+    source: "generator",
+  });
+  // A real upload of ANOTHER project, and one row per media kind there, so the
+  // project filter and the media filter are each proven on rows that exist.
+  await insertUpload({
+    id: UPLOAD_OTHER_PROJECT,
+    projectId: MEMBER_PROJECT,
+    createdBy: MEMBER_ID,
+    createdAt: "2026-02-03T00:00:00.000Z",
+    displayName: "other-project.png",
+  });
+  await insertUpload({
+    id: MEDIA_IMAGE,
+    projectId: MEMBER_PROJECT,
+    createdBy: MEMBER_ID,
+    createdAt: "2026-02-04T00:00:00.000Z",
+    displayName: "media-photo.png",
+    mimeType: "image/png",
+  });
+  await insertUpload({
+    id: MEDIA_VIDEO,
+    projectId: MEMBER_PROJECT,
+    createdBy: MEMBER_ID,
+    createdAt: "2026-02-04T00:01:00.000Z",
+    displayName: "clip.mp4",
+    mimeType: "video/mp4",
+  });
+  await insertUpload({
+    id: MEDIA_PDF,
+    projectId: MEMBER_PROJECT,
+    createdBy: MEMBER_ID,
+    createdAt: "2026-02-04T00:02:00.000Z",
+    displayName: "brief.pdf",
+    mimeType: "application/pdf",
   });
 
   const pglitePool = createPGliteTransactionPool(db);
@@ -587,5 +704,169 @@ describe("asset-read-repository: PGlite real SQL ACL", () => {
       user_id: AUTHOR_ID,
       execution_mode: "privileged",
     });
+  });
+});
+
+/**
+ * AS-06 (workorder 34N): the project upload list on real SQL. Same fixture, same
+ * ACL — these five cases prove the list is the project's own UPLOADS (not the
+ * project's generated assets, not another project's uploads), in the two orders
+ * the drawer offers, filtered by media kind, and readable only by members.
+ */
+describe("asset-read-repository: PGlite project upload list (AS-06)", () => {
+  it("AS-06: uploads of the project come back newest first by default", async () => {
+    const rows = await repository.listReadableProjectUploads({
+      actorId: AUTHOR_ID,
+      projectId: PROJECT,
+      order: "newest",
+      limit: 50,
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      UPLOAD_NEWEST,
+      UPLOAD_MIDDLE,
+      UPLOAD_OLDEST,
+    ]);
+    // The name is the stored one, not the object key.
+    expect(rows.map((row) => row.display_name)).toEqual([
+      "third-upload.png",
+      "second-upload.png",
+      "first-upload.png",
+    ]);
+    expect(rows[0]?.created_at).toBe("2026-02-01T00:02:00.000Z");
+    expect(rows[0]?.project_id).toBe(PROJECT);
+    expect(rows[0]?.workspace_id).toBe(teamWorkspaceId);
+
+    // The limit is a bind parameter, and it really limits.
+    const two = await repository.listReadableProjectUploads({
+      actorId: AUTHOR_ID,
+      projectId: PROJECT,
+      order: "newest",
+      limit: 2,
+    });
+    expect(two.map((row) => row.id)).toEqual([UPLOAD_NEWEST, UPLOAD_MIDDLE]);
+  });
+
+  it("AS-06: oldest first puts the earliest upload on top", async () => {
+    const rows = await repository.listReadableProjectUploads({
+      actorId: AUTHOR_ID,
+      projectId: PROJECT,
+      order: "oldest",
+      limit: 50,
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      UPLOAD_OLDEST,
+      UPLOAD_MIDDLE,
+      UPLOAD_NEWEST,
+    ]);
+    expect(rows[0]?.display_name).toBe("first-upload.png");
+    expect(rows[0]?.created_at).toBe("2026-02-01T00:00:00.000Z");
+  });
+
+  it("AS-06: generated assets and other projects are not listed", async () => {
+    const rows = await repository.listReadableProjectUploads({
+      actorId: AUTHOR_ID,
+      projectId: PROJECT,
+      order: "newest",
+      limit: 50,
+    });
+    const ids = rows.map((row) => row.id);
+
+    expect(ids).not.toContain(GENERATED_IN_PROJECT);
+    expect(ids).not.toContain(UPLOAD_OTHER_PROJECT);
+    expect(ids).toEqual([UPLOAD_NEWEST, UPLOAD_MIDDLE, UPLOAD_OLDEST]);
+
+    // Both excluded rows exist and are readable one by one: the list is what
+    // filters them out, not a missing fixture.
+    await expect(
+      repository.findReadableAsset({
+        actorId: AUTHOR_ID,
+        assetId: GENERATED_IN_PROJECT,
+      }),
+    ).resolves.toMatchObject({ id: GENERATED_IN_PROJECT, project_id: PROJECT });
+    await expect(
+      repository.findReadableAsset({
+        actorId: MEMBER_ID,
+        assetId: UPLOAD_OTHER_PROJECT,
+      }),
+    ).resolves.toMatchObject({
+      id: UPLOAD_OTHER_PROJECT,
+      project_id: MEMBER_PROJECT,
+    });
+  });
+
+  it("AS-06: the media filter keeps only that type", async () => {
+    const pdf = await repository.listReadableProjectUploads({
+      actorId: MEMBER_ID,
+      projectId: MEMBER_PROJECT,
+      order: "newest",
+      mediaType: "pdf",
+      limit: 50,
+    });
+    expect(pdf.map((row) => row.id)).toEqual([MEDIA_PDF]);
+    expect(pdf[0]?.display_name).toBe("brief.pdf");
+    expect(pdf[0]?.mime_type).toBe("application/pdf");
+
+    const video = await repository.listReadableProjectUploads({
+      actorId: MEMBER_ID,
+      projectId: MEMBER_PROJECT,
+      order: "newest",
+      mediaType: "video",
+      limit: 50,
+    });
+    expect(video.map((row) => row.id)).toEqual([MEDIA_VIDEO]);
+
+    const image = await repository.listReadableProjectUploads({
+      actorId: MEMBER_ID,
+      projectId: MEMBER_PROJECT,
+      order: "newest",
+      mediaType: "image",
+      limit: 50,
+    });
+    expect(image.map((row) => row.id)).toEqual([
+      MEDIA_IMAGE,
+      UPLOAD_OTHER_PROJECT,
+    ]);
+    expect(image.map((row) => row.display_name)).toEqual([
+      "media-photo.png",
+      "other-project.png",
+    ]);
+
+    // Unfiltered, the same project holds all four: the filter narrows, it does
+    // not invent or drop rows.
+    const all = await repository.listReadableProjectUploads({
+      actorId: MEMBER_ID,
+      projectId: MEMBER_PROJECT,
+      order: "newest",
+      limit: 50,
+    });
+    expect(all.map((row) => row.id)).toEqual([
+      MEDIA_PDF,
+      MEDIA_VIDEO,
+      MEDIA_IMAGE,
+      UPLOAD_OTHER_PROJECT,
+    ]);
+  });
+
+  it("AS-06: a non-member sees nothing", async () => {
+    const rows = await repository.listReadableProjectUploads({
+      actorId: OUTSIDER_ID,
+      projectId: PROJECT,
+      order: "newest",
+      limit: 50,
+    });
+
+    expect(rows).toEqual([]);
+
+    // The same project and the same statement do answer the author: the empty
+    // list is the ACL, not an empty table.
+    const authored = await repository.listReadableProjectUploads({
+      actorId: AUTHOR_ID,
+      projectId: PROJECT,
+      order: "newest",
+      limit: 50,
+    });
+    expect(authored.length).toBe(3);
   });
 });

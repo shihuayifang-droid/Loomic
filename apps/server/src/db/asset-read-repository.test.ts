@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   AssetReadError,
   FIND_READABLE_ASSET,
+  LIST_READABLE_PROJECT_UPLOADS,
   createAssetReadRepository,
-  type AssetReadRepository,
+  type AssetReadListRepository,
 } from "./asset-read-repository.js";
 import {
   TRANSACTION_SETTING_NAMES,
@@ -100,7 +101,7 @@ function contextParams(queries: readonly QueryRecord[]): unknown[][] {
   return pairs;
 }
 
-function repositoryFor(harness: Harness): AssetReadRepository {
+function repositoryFor(harness: Harness): AssetReadListRepository {
   return createAssetReadRepository({
     getTransactionPool: () => harness.pool,
   });
@@ -408,5 +409,95 @@ describe("asset-read-repository: pool is lazy", () => {
     expect(resolutions).toBe(1);
     expect(error).toBeInstanceOf(AssetReadError);
     expect((error as AssetReadError).operation).toBe(FIND_READABLE_ASSET);
+  });
+});
+
+/**
+ * AS-06 (workorder 34N): the project upload list. Same fake pool, same two
+ * questions — which statement is issued and how its values are bound — plus the
+ * one refusal this read has that the lookup does not: a limit nobody can serve.
+ */
+describe("asset-read-repository: listReadableProjectUploads", () => {
+  it("AS-06: limit outside 1..200 is refused before connecting", async () => {
+    for (const limit of [0, 201]) {
+      const harness = createHarness(() => []);
+
+      const error = await repositoryFor(harness)
+        .listReadableProjectUploads({
+          actorId: ACTOR_ID,
+          projectId: PROJECT_ID,
+          order: "newest",
+          limit,
+        })
+        .catch((reason: unknown) => reason);
+
+      expect(error).toBeInstanceOf(AssetReadError);
+      expect((error as AssetReadError).operation).toBe(
+        LIST_READABLE_PROJECT_UPLOADS,
+      );
+      // Refused before the pool is even asked for a connection: a bad limit must
+      // not cost a transaction.
+      expect(harness.connectAttempts()).toBe(0);
+      expect(domainCalls(harness.queries)).toHaveLength(0);
+    }
+  });
+
+  it("AS-06: the list statement binds actor, project and limit and never concatenates them", async () => {
+    const harness = createHarness(() => []);
+
+    await repositoryFor(harness).listReadableProjectUploads({
+      actorId: ACTOR_ID,
+      projectId: PROJECT_ID,
+      order: "newest",
+      mediaType: "image",
+      limit: 25,
+    });
+
+    const statements = domainCalls(harness.queries);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]?.params).toEqual([ACTOR_ID, PROJECT_ID, 25]);
+
+    const sql = statements[0]?.sql ?? "";
+    // The project and the actor are bound, never written into the statement.
+    expect(sql).not.toContain(PROJECT_ID);
+    expect(sql).not.toContain(ACTOR_ID);
+    expect(sql).toContain("a.project_id = $2::uuid");
+    expect(sql).toContain("a.source = 'user_upload'");
+    expect(sql).toContain("limit $3::int");
+    // The SAME ACL as the single-asset read: membership, the ownership branch,
+    // admin/owner, and no archive clause.
+    expect(sql).toContain("join public.workspace_members as m");
+    expect(sql).toContain("m.workspace_id = a.workspace_id");
+    expect(sql).toContain("m.user_id = $1");
+    expect(sql).toContain("left join public.projects as p");
+    expect(sql).toContain("else p.created_by = $1");
+    expect(sql).toContain("m.role in ('admin', 'owner')");
+    expect(sql).not.toContain("archived_at");
+    // Fixed clause per ordering and per media kind, selected — not built.
+    expect(sql).toContain("order by a.created_at desc, a.id desc");
+    expect(sql).toContain("and a.mime_type like 'image/%'");
+  });
+
+  it("AS-06: a driver error is asset read failed (listReadableProjectUploads)", async () => {
+    const harness = createHarness(() => {
+      throw new Error('relation "public.asset_objects" does not exist');
+    });
+
+    const error = await repositoryFor(harness)
+      .listReadableProjectUploads({
+        actorId: ACTOR_ID,
+        projectId: PROJECT_ID,
+        order: "oldest",
+        limit: 10,
+      })
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(AssetReadError);
+    const readError = error as AssetReadError;
+    expect(readError.operation).toBe(LIST_READABLE_PROJECT_UPLOADS);
+    expect(readError.message).toBe(
+      `asset read failed (${LIST_READABLE_PROJECT_UPLOADS})`,
+    );
+    expect(readError.message).not.toContain("relation");
   });
 });

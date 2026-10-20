@@ -67,9 +67,55 @@ export type AssetReadRepository = {
   }): Promise<AssetReadRow | null>;
 };
 
+/**
+ * One row of the project upload list (AS-06): the eight columns above plus the
+ * name a person gave the file (`asset_objects.display_name`, ED-05). It is a
+ * separate row type and not a wider `AssetReadRow`: the single-asset callers
+ * build their DTO from exactly eight fields, and a list-only column must not
+ * appear to be one of them.
+ */
+export type AssetReadListRow = AssetReadRow & { display_name: string | null };
+
+/** The upload kinds the reference drawer filters by (AS-06). */
+export type AssetUploadMediaType = "image" | "video" | "pdf";
+
+/** The two fixed orderings (AS-06): newest upload first, or oldest first. */
+export type AssetUploadOrder = "newest" | "oldest";
+
+export type ListReadableProjectUploadsInput = {
+  actorId: string;
+  projectId: string;
+  order: AssetUploadOrder;
+  mediaType?: AssetUploadMediaType | undefined;
+  /** 1..200; anything else is refused before a connection is opened. */
+  limit: number;
+};
+
+/**
+ * The project upload list added in 34N, kept as its own type instead of growing
+ * `AssetReadRepository`: that type is faked field by field by callers
+ * (`agent/runtime.test.ts`) that only ever need one asset by id, and widening a
+ * type they already satisfy would force those fakes to grow a method they never
+ * call. `createAssetReadRepository` returns this wider type.
+ */
+export type AssetReadListRepository = AssetReadRepository & {
+  listReadableProjectUploads(
+    input: ListReadableProjectUploadsInput,
+  ): Promise<AssetReadListRow[]>;
+};
+
 export const FIND_READABLE_ASSET = "findReadableAsset";
 
-export type AssetReadOperation = typeof FIND_READABLE_ASSET;
+/** AS-06: the project's own uploads, newest or oldest first, optionally by kind. */
+export const LIST_READABLE_PROJECT_UPLOADS = "listReadableProjectUploads";
+
+export type AssetReadOperation =
+  | typeof FIND_READABLE_ASSET
+  | typeof LIST_READABLE_PROJECT_UPLOADS;
+
+/** The inclusive bounds `limit` must sit in; the caller clamps to the same ones. */
+export const PROJECT_UPLOAD_LIMIT_MIN = 1;
+export const PROJECT_UPLOAD_LIMIT_MAX = 200;
 
 /**
  * The failure shape of this module. The message is built from the fixed
@@ -87,7 +133,8 @@ export class AssetReadError extends Error {
 }
 
 /**
- * One asset by id, readable by the caller.
+ * The single-asset read, plus the ACL pieces it shares with the project upload
+ * list (AS-06).
  *
  * `$1` is the actor and is used twice on purpose: once to require a membership
  * row in the asset's workspace, once to recognise the author (of the project
@@ -98,7 +145,33 @@ export class AssetReadError extends Error {
  *
  * `left join` and not `join`: an asset WITHOUT a project must still be found,
  * and the project is only consulted by the branch that has one.
+ *
+ * The ACL is the two pieces below: the joins that
+ * carry the membership row and the project, and the predicate that decides
+ * readability. Both statements below use THESE constants, so the single-asset
+ * lookup and the project upload list cannot drift apart — a widening of one is
+ * a widening of both, in the same edit.
+ *
+ * `$1` is the actor in both pieces, on purpose: once to require a membership row
+ * in the asset's workspace, once to recognise the author (of the project when
+ * there is one, of the asset itself when there is not).
  */
+const READABLE_ASSET_ACL_FROM = `
+join public.workspace_members as m
+  on m.workspace_id = a.workspace_id
+ and m.user_id = $1
+left join public.projects as p
+  on p.id = a.project_id
+`;
+
+const READABLE_ASSET_ACL_WHERE = `(
+    case
+      when a.project_id is null then a.created_by = $1
+      else p.created_by = $1
+    end
+    or m.role in ('admin', 'owner')
+  )`;
+
 const READABLE_ASSET_SQL = `
 select
   a.id as id,
@@ -109,21 +182,58 @@ select
   a.workspace_id as workspace_id,
   a.project_id as project_id,
   a.created_at as created_at
-from public.asset_objects as a
-join public.workspace_members as m
-  on m.workspace_id = a.workspace_id
- and m.user_id = $1
-left join public.projects as p
-  on p.id = a.project_id
-where a.id = $2
-  and (
-    case
-      when a.project_id is null then a.created_by = $1
-      else p.created_by = $1
-    end
-    or m.role in ('admin', 'owner')
-  )
+from public.asset_objects as a${READABLE_ASSET_ACL_FROM}where a.id = $2
+  and ${READABLE_ASSET_ACL_WHERE}
 `;
+
+/**
+ * The project upload list (AS-06). Only `source = 'user_upload'` rows are the
+ * project's own uploads: a generated row belongs to the generation history, not
+ * to the reference drawer. `project_id = $2` is what makes the project branch of
+ * the ACL the only branch here — a row with no project is not "this project's".
+ *
+ * The three lines the caller chooses (media kind, ordering, limit) are appended
+ * from the fixed constants below; no caller value ever enters the text.
+ */
+const PROJECT_UPLOAD_LIST_SQL = `
+select
+  a.id as id,
+  a.bucket as bucket,
+  a.object_path as object_path,
+  a.mime_type as mime_type,
+  a.byte_size as byte_size,
+  a.workspace_id as workspace_id,
+  a.project_id as project_id,
+  a.created_at as created_at,
+  a.display_name as display_name
+from public.asset_objects as a${READABLE_ASSET_ACL_FROM}where a.project_id = $2::uuid
+  and a.source = 'user_upload'
+  and ${READABLE_ASSET_ACL_WHERE}
+`;
+
+/**
+ * The media filter, one fixed clause per kind, never built from the input. The
+ * `pdf` branch is an equality and not `like 'application/pdf%'`: the column
+ * carries the exact registered type, so a prefix would admit types that are not
+ * a PDF.
+ */
+const PROJECT_UPLOAD_MEDIA_CLAUSES: Readonly<
+  Record<AssetUploadMediaType, string>
+> = {
+  image: "and a.mime_type like 'image/%'",
+  video: "and a.mime_type like 'video/%'",
+  pdf: "and a.mime_type = 'application/pdf'",
+};
+
+/**
+ * The two orderings, fixed. `a.id` is the tie-break in both directions so two
+ * uploads created in the same millisecond still have one deterministic order —
+ * the drawer needs a stable list across refetches, not just a sort.
+ */
+const PROJECT_UPLOAD_ORDER_CLAUSES: Readonly<Record<AssetUploadOrder, string>> = {
+  newest: "order by a.created_at desc, a.id desc",
+  oldest: "order by a.created_at asc, a.id asc",
+};
 
 /**
  * Build the PostgreSQL implementation. The pool is reached through a getter,
@@ -132,7 +242,7 @@ where a.id = $2
  */
 export function createAssetReadRepository(options: {
   getTransactionPool: () => TransactionPool;
-}): AssetReadRepository {
+}): AssetReadListRepository {
   return {
     async findReadableAsset({ actorId, assetId }) {
       let rows: unknown[];
@@ -176,6 +286,90 @@ export function createAssetReadRepository(options: {
         throw new AssetReadError(FIND_READABLE_ASSET, error);
       }
     },
+
+    /**
+     * The project's own uploaded files, newest or oldest first (AS-06).
+     *
+     * `limit` is refused before the pool is resolved: an out-of-range limit is a
+     * caller bug, and opening a connection just to discover it would make a
+     * rejected request cost a transaction. The order and the media kind are
+     * types, but they are looked up in the fixed tables anyway — a value crossed
+     * from JSON has no type at runtime, and "unknown clause" must not silently
+     * become "no filter" (a list that quietly returns MORE than asked for is the
+     * failure this shape prevents).
+     */
+    async listReadableProjectUploads({
+      actorId,
+      projectId,
+      order,
+      mediaType,
+      limit,
+    }) {
+      if (
+        !Number.isSafeInteger(limit) ||
+        limit < PROJECT_UPLOAD_LIMIT_MIN ||
+        limit > PROJECT_UPLOAD_LIMIT_MAX
+      ) {
+        throw new AssetReadError(
+          LIST_READABLE_PROJECT_UPLOADS,
+          new Error(
+            `asset read refused a limit outside ${PROJECT_UPLOAD_LIMIT_MIN}..${PROJECT_UPLOAD_LIMIT_MAX}`,
+          ),
+        );
+      }
+
+      const orderClause = PROJECT_UPLOAD_ORDER_CLAUSES[order];
+      const mediaClause =
+        mediaType === undefined
+          ? undefined
+          : PROJECT_UPLOAD_MEDIA_CLAUSES[mediaType];
+
+      if (
+        orderClause === undefined ||
+        (mediaType !== undefined && mediaClause === undefined)
+      ) {
+        throw new AssetReadError(
+          LIST_READABLE_PROJECT_UPLOADS,
+          new Error("asset read refused an unknown upload order or media type"),
+        );
+      }
+
+      // Fixed constants only: the caller chooses WHICH clause, never what it
+      // says. Nothing here comes from the input but the three bind parameters.
+      const statement =
+        PROJECT_UPLOAD_LIST_SQL +
+        (mediaClause === undefined ? "" : `  ${mediaClause}\n`) +
+        `${orderClause}\nlimit $3::int\n`;
+
+      let rows: unknown[];
+
+      try {
+        const pool = options.getTransactionPool();
+
+        rows = await withPrivilegedTransaction(
+          pool,
+          { userId: actorId },
+          async (client) => {
+            const result = await client.query(statement, [
+              actorId,
+              projectId,
+              limit,
+            ]);
+            return result.rows;
+          },
+        );
+      } catch (error) {
+        throw new AssetReadError(LIST_READABLE_PROJECT_UPLOADS, error);
+      }
+
+      // Every row is mapped inside one guard: a single unusable row means the
+      // statement and this module disagree, and half a list is not an answer.
+      try {
+        return rows.map((row) => mapProjectUploadRow(asRow(row)));
+      } catch (error) {
+        throw new AssetReadError(LIST_READABLE_PROJECT_UPLOADS, error);
+      }
+    },
   };
 }
 
@@ -189,6 +383,22 @@ function mapAssetRow(row: Readonly<Record<string, unknown>>): AssetReadRow {
     workspace_id: requireText(row, "workspace_id"),
     project_id: optionalText(row, "project_id"),
     created_at: requireTimestamp(row, "created_at"),
+  };
+}
+
+/**
+ * The list row: the eight columns mapped by the same rules as a single read,
+ * plus `display_name`. A present `null` is a real answer — a row uploaded before
+ * ED-05 has no name — and everything else fails loud like every nullable column
+ * here: a `null` folded from a missing column would serve a column drift as "the
+ * file has no name".
+ */
+function mapProjectUploadRow(
+  row: Readonly<Record<string, unknown>>,
+): AssetReadListRow {
+  return {
+    ...mapAssetRow(row),
+    display_name: optionalText(row, "display_name"),
   };
 }
 
