@@ -8,6 +8,10 @@
  * the migration.
  */
 
+import type { MessageMention } from "@loomic/shared";
+
+import type { MessageMentionPickerItem } from "@/components/canvas-image-picker";
+
 export type MentionKind = "shape" | "asset" | "file" | "model" | "skill";
 
 /** AG-03 prefix table. */
@@ -64,4 +68,33 @@ export const MENTION_TEXT_MAX_CHARS = 4000;
 export function isMentionTextTruncated(text: string | null | undefined): boolean {
   if (!text) return false;
   return text.length > MENTION_TEXT_MAX_CHARS;
+}
+
+/** AG-03: the ONE conversion from a picked item to a message mention. Every entry (@, the add-asset button) must call this. Canvas images are not mentions (they become references) → null. */
+export function mentionFromPickerItem(
+  item: MessageMentionPickerItem,
+): MessageMention | null {
+  if (item.kind === "image-model") {
+    return { mentionType: "image-model", id: item.id, label: item.label };
+  }
+  if (item.kind === "skill") {
+    return {
+      mentionType: "skill",
+      id: item.id,
+      label: item.label,
+      slug: item.slug,
+    };
+  }
+  if (item.kind === "brand-kit-asset") {
+    return {
+      mentionType: "brand-kit-asset",
+      id: item.id,
+      label: item.label,
+      assetType: item.assetType,
+      ...(item.textContent !== undefined ? { textContent: item.textContent } : {}),
+      ...(item.fileUrl !== undefined ? { fileUrl: item.fileUrl } : {}),
+    };
+  }
+  // Canvas images become references on the canvas, never mentions.
+  return null;
 }

@@ -2,7 +2,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { MentionPill } from "../src/components/chat/mention-pill";
-import { MENTION_PREFIX, MENTION_TEXT_MAX_CHARS, isMentionTextTruncated, mentionKindOf } from "../src/lib/mention-kinds";
+import { MENTION_PREFIX, MENTION_TEXT_MAX_CHARS, isMentionTextTruncated, mentionFromPickerItem, mentionKindOf } from "../src/lib/mention-kinds";
 
 afterEach(cleanup);
 
@@ -82,5 +82,87 @@ describe("mention kinds (AG-03)", () => {
     render(<MentionPill label="设计指南" kind="brand-kit-asset" />);
 
     expect(screen.queryByTestId("agent-mention-capsule-truncated")).toBeNull();
+  });
+
+  it("AG-03: a brand text asset becomes a mention with its text", () => {
+    const mention = mentionFromPickerItem({
+      kind: "brand-kit-asset",
+      id: "a1",
+      label: "设计指南",
+      assetType: "font",
+      textContent: "正文",
+    });
+
+    expect(mention).toEqual({
+      mentionType: "brand-kit-asset",
+      id: "a1",
+      label: "设计指南",
+      assetType: "font",
+      textContent: "正文",
+    });
+    expect(
+      Object.prototype.hasOwnProperty.call(mention, "fileUrl"),
+    ).toBe(false);
+  });
+
+  it("AG-03: an image model becomes a model mention", () => {
+    const mention = mentionFromPickerItem({
+      kind: "image-model",
+      id: "m1",
+      label: "Imagen 4",
+      description: "A model",
+    });
+
+    expect(mention).toEqual({
+      mentionType: "image-model",
+      id: "m1",
+      label: "Imagen 4",
+    });
+  });
+
+  it("AG-03: a skill keeps its slug", () => {
+    const mention = mentionFromPickerItem({
+      kind: "skill",
+      id: "s1",
+      label: "写文案",
+      slug: "copy-writing",
+      description: "Writes copy",
+    });
+
+    expect(mention).toEqual({
+      mentionType: "skill",
+      id: "s1",
+      label: "写文案",
+      slug: "copy-writing",
+    });
+  });
+
+  it("AG-03: canvas images are references, not mentions", () => {
+    const mention = mentionFromPickerItem({
+      kind: "canvas-image",
+      id: "c1",
+      name: "画布图 1",
+      thumbnailUrl: "https://example.com/thumb.png",
+      assetId: "asset-1",
+      url: "https://example.com/image.png",
+      mimeType: "image/png",
+    });
+
+    expect(mention).toBeNull();
+  });
+
+  it("AG-03: the same pick always serialises the same", () => {
+    const item = {
+      kind: "brand-kit-asset",
+      id: "a1",
+      label: "设计指南",
+      assetType: "font",
+      textContent: "正文",
+    } as const;
+
+    const first = mentionFromPickerItem(item);
+    const second = mentionFromPickerItem(item);
+
+    expect(JSON.stringify(first)).toBe(JSON.stringify(second));
   });
 });

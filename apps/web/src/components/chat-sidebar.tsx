@@ -30,6 +30,7 @@ import { fetchBrandKit } from "../lib/brand-kit-api";
 import { claimDailyCredits } from "../lib/credits-api";
 import { fetchImageModels, fetchWorkspaceSkills, saveMessage } from "../lib/server-api";
 import { visibleOn } from "../lib/model-visibility";
+import { mentionFromPickerItem } from "../lib/mention-kinds";
 import type { CanvasSelectedElement } from "./canvas-editor";
 import type { CanvasImageRef } from "./chat-input";
 import {
@@ -723,27 +724,10 @@ export function ChatSidebar({
         return;
       }
 
-      setMessageMentions((prev) => {
-        let nextMention: MessageMention;
-        if (item.kind === "image-model") {
-          nextMention = { mentionType: "image-model", id: item.id, label: item.label };
-        } else if (item.kind === "skill") {
-          nextMention = { mentionType: "skill", id: item.id, label: item.label, slug: item.slug };
-        } else {
-          nextMention = {
-            mentionType: "brand-kit-asset",
-            id: item.id,
-            label: item.label,
-            assetType: item.assetType,
-            ...(item.textContent !== undefined
-              ? { textContent: item.textContent }
-              : {}),
-            ...(item.fileUrl !== undefined
-              ? { fileUrl: item.fileUrl }
-              : {}),
-          };
-        }
+      const nextMention = mentionFromPickerItem(item);
+      if (!nextMention) return;
 
+      setMessageMentions((prev) => {
         if (
           prev.some(
             (m) =>
