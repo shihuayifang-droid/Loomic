@@ -57,6 +57,7 @@ import {
   type VideoResolution,
 } from "@loomic/shared";
 import { createAgentBackend } from "./backends/index.js";
+import { startAgentJobProgress } from "./agent-job-progress.js";
 import {
   type LoomicAgent,
   type LoomicAgentFactory,
@@ -1136,6 +1137,15 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           if (!job) throw new Error("submitImageJob: withBilling returned no job");
           jobLap("job_created", { jobId: job.id, creditsCost, sessionId, runId });
 
+          // GN-30 / T-58 ③: this job is on the queue now, so report its progress
+          // to the client the same way a generator-panel job does. The polling
+          // loop below still owns persisting the result onto the canvas; the
+          // watcher only pushes progress.
+          startAgentJobProgress(
+            { jobService: jobSvc, connectionManager: options.connectionManager },
+            { jobId: job.id, userId, jobType: "image_generation" },
+          );
+
           const explicitPlacement =
             (input as any).placementX != null && (input as any).placementY != null
               ? {
@@ -1394,6 +1404,13 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           );
           if (!job) throw new Error("submitVideoJob: withBilling returned no job");
           jobLap("job_created", { jobId: job.id, creditsCost, sessionId, runId });
+
+          // GN-30 / T-58 ③: same reporting as the image path above. The poll loop
+          // below keeps owning the canvas write; the watcher only pushes progress.
+          startAgentJobProgress(
+            { jobService: jobSvc, connectionManager: options.connectionManager },
+            { jobId: job.id, userId, jobType: "video_generation" },
+          );
 
           // Poll until terminal state — video generation is slower.
           // Google Vertex Veo can take 300-500s; 600s gives enough headroom
