@@ -1086,6 +1086,11 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             userMetadata: {},
           };
 
+          // BL-07: the tier is resolved ONCE here and used for both the quote and
+          // the job payload, so a job cannot be charged at one tier and generated
+          // at another. `"hd"` stays the default for a request that names no tier.
+          const billedQuality = (input.quality as ImageQualityLevel) ?? "hd";
+
           // Guard + charge + create job. `onRejected` is what makes this differ
           // from the HTTP routes: the client is on a WS run, so a rejection has
           // to be pushed as a billing.error event and abort the run rather than
@@ -1099,7 +1104,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               entryPoint: "agent",
               guard: {
                 jobType: "image_generation",
-                quality: (input.quality as ImageQualityLevel) ?? "hd",
+                quality: billedQuality,
               },
               description: `Image generation: ${input.model}`,
               job: {
@@ -1108,6 +1113,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   title: input.title,
                   model: input.model,
                   aspect_ratio: input.aspectRatio,
+                  quality: billedQuality,
                   ...(input.inputImages ? { input_images: input.inputImages } : {}),
                 },
                 refs: {

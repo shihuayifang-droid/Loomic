@@ -9,6 +9,51 @@ import { applyWatermark } from "../../credits/watermark.js";
 
 import { DEFAULT_IMAGE_MODEL_ID } from "@loomic/shared";
 import type { SubscriptionPlan } from "@loomic/shared";
+import type { ImageGenerateParams, ImageQuality } from "../../../generation/types.js";
+
+// BL-07: the ledger records what a job was charged for, so the job has to be
+// generated at that same tier. These are the three tiers the price table and the
+// billing guard know about; anything else is not a tier we can have billed for
+// and must not be forwarded to a provider by accident.
+const BILLABLE_IMAGE_QUALITIES: readonly string[] = ["standard", "hd", "ultra"];
+
+/**
+ * Derive the provider parameters for an image job from its stored payload.
+ *
+ * Split out of the executor so the mapping can be asserted without a database,
+ * a provider or a CDN download. It is a pure function: no I/O, no side effects
+ * other than one warning for a value that is not a real tier.
+ */
+export function imageJobGenerateParams(
+  payload: {
+    prompt: string;
+    model?: string;
+    aspect_ratio?: string;
+    input_images?: string[];
+    quality?: string;
+  },
+  model: string,
+): ImageGenerateParams {
+  const params: ImageGenerateParams = { prompt: payload.prompt, model };
+
+  if (payload.aspect_ratio !== undefined) params.aspectRatio = payload.aspect_ratio;
+  if (payload.input_images?.length) params.inputImages = payload.input_images;
+
+  // Only a value the billing guard could have charged for is forwarded. An
+  // unknown tier leaves `quality` absent so the provider keeps its own default
+  // rather than receiving a string it cannot interpret.
+  if (payload.quality !== undefined) {
+    if (BILLABLE_IMAGE_QUALITIES.includes(payload.quality)) {
+      params.quality = payload.quality as ImageQuality;
+    } else {
+      console.warn(
+        `[image-job] ignoring unknown payload quality ${JSON.stringify(payload.quality)}; keeping the provider default`,
+      );
+    }
+  }
+
+  return params;
+}
 
 registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorContext) => {
   const t0 = Date.now();
@@ -31,6 +76,7 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     aspect_ratio?: string;
     title?: string;
     input_images?: string[];
+    quality?: string;
   };
 
   if (!payload.prompt) throw new Error(`Job ${jobId} has no prompt in payload`);
@@ -81,12 +127,7 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     lap(`${providerName}_call_start`);
     let generated;
     try {
-      generated = await generateImage(providerName, {
-        prompt: payload.prompt,
-        model,
-        ...(payload.aspect_ratio !== undefined ? { aspectRatio: payload.aspect_ratio } : {}),
-        ...(payload.input_images?.length ? { inputImages: payload.input_images } : {}),
-      });
+      generated = await generateImage(providerName, imageJobGenerateParams(payload, model));
     } catch (genError) {
       const detail = genError instanceof Error ? genError.message : String(genError);
       const wrapped = new Error(`Image generation failed for model ${model}: ${detail}`);
