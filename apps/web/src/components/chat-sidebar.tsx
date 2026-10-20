@@ -713,11 +713,11 @@ export function ChatSidebar({
   );
 
   // ── Mention picker ──
+  // 技能只走 `/` 列表；@ 列表是画布对象 / 我的素材 / 模型。
   const mentionPickerItems: MessageMentionPickerItem[] = [
     ...(onRequestCanvasImages ? onRequestCanvasImages() : []),
     ...brandKitMentionItems,
     ...imageModelMentionItems,
-    ...skillMentionItems,
   ];
 
   const handleMentionSelect = useCallback(
