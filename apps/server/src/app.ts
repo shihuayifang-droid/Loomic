@@ -2,6 +2,7 @@ import type { BaseLanguageModel } from "@langchain/core/language_models/base";
 import multipart from "@fastify/multipart";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import { UPLOAD_MAX_BYTES } from "@loomic/shared";
 
 import type { LoomicAgentFactory } from "./agent/deep-agent.js";
 import {
@@ -287,8 +288,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({
     logger: { level: "info" },
   });
+  // AS-02: the transport has to admit the largest per-type limit; which type may
+  // be how big is decided per upload in the route (UPLOAD_CONSTRAINTS).
   void app.register(multipart, {
-    limits: { fileSize: 10 * 1024 * 1024 },
+    limits: { fileSize: UPLOAD_MAX_BYTES },
   });
   void app.register(async (instance) => {
     await instance.register(websocket);

@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import {
   applicationErrorResponseSchema,
   assetSignedUrlResponseSchema,
+  checkUploadConstraint,
   unauthenticatedErrorResponseSchema,
   uploadResponseSchema,
 } from "@loomic/shared";
@@ -14,14 +15,6 @@ import {
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { TeamAdminService } from "../features/team/team-admin.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
-
-const ALLOWED_MIME_TYPES = new Set([
-  "image/png",
-  "image/jpeg",
-  "image/webp",
-  "image/gif",
-  "image/svg+xml",
-]);
 
 export async function registerUploadRoutes(
   app: FastifyInstance,
@@ -51,18 +44,22 @@ export async function registerUploadRoutes(
       }
 
       const mimeType = file.mimetype;
-      if (!ALLOWED_MIME_TYPES.has(mimeType)) {
+
+      const fileBuffer = await file.toBuffer();
+
+      // AS-02: the shared table decides which types are accepted and how big
+      // each of them may be. A refusal carries the concrete Chinese reason.
+      const constraint = checkUploadConstraint({
+        mimeType,
+        byteSize: fileBuffer.length,
+      });
+      if (!constraint.ok) {
         return reply.code(400).send(
           applicationErrorResponseSchema.parse({
-            error: {
-              code: "upload_failed",
-              message: `Unsupported file type: ${mimeType}. Allowed: ${[...ALLOWED_MIME_TYPES].join(", ")}`,
-            },
+            error: { code: "upload_failed", message: constraint.message },
           }),
         );
       }
-
-      const fileBuffer = await file.toBuffer();
 
       // Content is team-scoped (Q1): uploads land in the team workspace, while
       // credits / generation keep using the personal `viewer.workspace`.
