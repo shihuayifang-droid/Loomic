@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApiApplicationError,
+  cancelJob,
   downloadAssetsZip,
   fetchPriceQuote,
   fetchProjectUploads,
@@ -246,5 +247,30 @@ describe("GN-37: image generation submits a job (35P)", () => {
     expect(init.method).toBe("POST");
     expect(String(init.body)).toContain("a cat");
     expect(String(init.body)).toContain("quality");
+  });
+});
+
+// 工单36F · CV-02 / GN-32：占位上的「取消」打到 `POST /api/jobs/:jobId/cancel`。
+// 替身只钉 URL、方法与鉴权头（退积分规则在服务端）。
+describe("CV-02: cancel job (36F)", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    vi.stubEnv("NEXT_PUBLIC_SERVER_BASE_URL", "http://localhost:3001");
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({ job: { id: "job-1", status: "canceled" } }),
+    });
+  });
+
+  it("CV-02: cancelJob posts to /api/jobs/job-1/cancel", async () => {
+    await cancelJob("tok", "job-1");
+
+    const [url, init] = mockFetch.mock.calls[0] as [
+      string,
+      { method?: string; headers?: Record<string, string> },
+    ];
+    expect(url.endsWith("/api/jobs/job-1/cancel")).toBe(true);
+    expect(init.method).toBe("POST");
+    expect(init.headers?.Authorization).toBe("Bearer tok");
   });
 });

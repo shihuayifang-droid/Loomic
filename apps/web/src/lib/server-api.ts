@@ -912,6 +912,27 @@ export async function fetchJob(
   return (await response.json()) as JobResponse;
 }
 
+/**
+ * `POST /api/jobs/:jobId/cancel` — GN-32 / CV-02 占位上的「取消」。
+ *
+ * 退积分规则在服务端（未开始全额退，已开始不退），这里只发请求、把整行交回；
+ * 返回类型与 `fetchJob` 一致（`{ job }`）。
+ */
+export async function cancelJob(
+  accessToken: string,
+  jobId: string,
+): Promise<JobResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/jobs/${encodeURIComponent(jobId)}/cancel`,
+    {
+      method: "POST",
+      headers: authHeaders(accessToken),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as JobResponse;
+}
+
 // --- Tool definitions API ---
 
 /**

@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 
@@ -142,5 +142,77 @@ describe("GN-30 canvas generating slot", () => {
     expect(screen.getByTestId("canvas-generation-status")).toHaveTextContent(
       "图片生成中...",
     );
+  });
+});
+
+/**
+ * 工单36F · GN-32 / CV-02：生成中的占位带「取消」，确认后才真取消。
+ *
+ * 自己的 render helper：上面的 `renderSlot` 属于已有用例，这里不动它。
+ */
+describe("GN-32 / CV-02 canvas generating slot cancel", () => {
+  function renderCancelSlot(props: {
+    jobId?: string;
+    onCancel?: () => Promise<unknown> | void;
+  }) {
+    return render(
+      <AgentGeneratingSlot
+        {...(props.jobId !== undefined ? { jobId: props.jobId } : {})}
+        {...(props.onCancel !== undefined ? { onCancel: props.onCancel } : {})}
+        kind="image"
+        width={512}
+        height={512}
+      />,
+    );
+  }
+
+  it("GN-32: a generating slot with a job offers cancel", () => {
+    renderCancelSlot({ jobId: "job-1", onCancel: vi.fn() });
+
+    expect(
+      screen.getByTestId("canvas-generating-slot-cancel"),
+    ).toBeInTheDocument();
+  });
+
+  it("GN-32: no job means no cancel", () => {
+    renderCancelSlot({ onCancel: vi.fn() });
+
+    expect(
+      screen.queryByTestId("canvas-generating-slot-cancel"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("CV-02: cancelling asks first, with the exact wording", () => {
+    const onCancel = vi.fn();
+    renderCancelSlot({ jobId: "job-1", onCancel });
+
+    fireEvent.click(screen.getByTestId("canvas-generating-slot-cancel"));
+
+    const confirm = screen.getByTestId("canvas-generating-slot-cancel-confirm");
+    expect(confirm.textContent).toContain("取消这次生成？已开始的任务不退积分");
+    expect(onCancel).toHaveBeenCalledTimes(0);
+  });
+
+  it("GN-32: confirming cancels the job", () => {
+    const onCancel = vi.fn();
+    renderCancelSlot({ jobId: "job-1", onCancel });
+
+    fireEvent.click(screen.getByTestId("canvas-generating-slot-cancel"));
+    fireEvent.click(screen.getByTestId("canvas-generating-slot-cancel-ok"));
+
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("GN-32: going back keeps generating", () => {
+    const onCancel = vi.fn();
+    renderCancelSlot({ jobId: "job-1", onCancel });
+
+    fireEvent.click(screen.getByTestId("canvas-generating-slot-cancel"));
+    fireEvent.click(screen.getByTestId("canvas-generating-slot-cancel-back"));
+
+    expect(
+      screen.queryByTestId("canvas-generating-slot-cancel-confirm"),
+    ).not.toBeInTheDocument();
+    expect(onCancel).toHaveBeenCalledTimes(0);
   });
 });

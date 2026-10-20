@@ -10,6 +10,7 @@ import type { RecoverableArtifact } from "@loomic/shared";
 import type { WebSocketHandle } from "../hooks/use-websocket";
 import { getServerBaseUrl } from "../lib/env";
 import {
+  cancelJob,
   fetchRecoverableArtifacts,
   recoverArtifacts,
   saveCanvas,
@@ -1206,7 +1207,15 @@ export function CanvasEditor({
         return (
           <AgentGeneratingSlot
             {...(ws !== undefined ? { ws } : {})}
-            {...(jobId !== undefined ? { jobId } : {})}
+            {...(jobId !== undefined
+              ? {
+                  jobId,
+                  // GN-32: the slot's「取消」goes through the same job the slot
+                  // narrates; without a jobId there is nothing to cancel, so both
+                  // props are spread together.
+                  onCancel: () => cancelJob(accessTokenRef.current, jobId),
+                }
+              : {})}
             kind={element.customData.kind === "video" ? "video" : "image"}
             modelName={element.customData.modelName}
             startedAt={element.customData.startedAt}
