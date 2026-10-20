@@ -34,6 +34,8 @@ type Scenario = {
   gateClaim?: boolean;
   /** The timeout claim throws instead of answering. */
   gateClaimThrows?: boolean;
+  /** `renewVt` settles on the next macrotask instead of synchronously (T-43). */
+  renewVtAsync?: boolean;
 };
 
 function makeHarness(scenario: Scenario = {}) {
@@ -117,6 +119,13 @@ function makeHarness(scenario: Scenario = {}) {
     renewVt: (vtSeconds: number) => {
       calls.push("renewVt");
       renewals.push(vtSeconds);
+      if (!scenario.renewVtAsync) return Promise.resolve();
+      return new Promise<void>((resolve) =>
+        setTimeout(() => {
+          calls.push("renewVt:settled");
+          resolve();
+        }, 0),
+      );
     },
   } as unknown as ExecutorContext;
 
@@ -462,6 +471,17 @@ describe("processJobMessage: the billing gate (工单21H1)", () => {
     expect(h.calls).not.toContain("archive");
     expect(h.calls).not.toContain("executor");
     expect(h.refunds()).toBe(0);
+  });
+
+  it("T-43: the deferring arm waits for renewVt before returning", async () => {
+    // `renewVt` here settles on the next macrotask, so `renewVt:settled` can only
+    // appear in `calls` if the deferring arm awaited the renewal before returning.
+    const h = makeHarness({ gate: WAITING_UNBILLED, renewVtAsync: true });
+
+    await h.run();
+
+    expect(h.calls).toEqual(["readBillingGate", "renewVt", "renewVt:settled"]);
+    expect(h.renewals).toEqual([BILLING_DEFER_VT_SECONDS]);
   });
 
   it("case G5 (claim threw): a failed claim is treated as G1, not as a refusal", async () => {

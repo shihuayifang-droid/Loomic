@@ -252,8 +252,9 @@ export async function processJobMessage(
     // G4 (and the lost-race half of G5). Wait for the charge without spending
     // anything: no increment, no status write, no archive, no delete, no
     // execution. `renewVt`'s contract is that it never throws, so it is not
-    // wrapped in a try.
-    ctx.renewVt(BILLING_DEFER_VT_SECONDS);
+    // wrapped in a try. It is awaited so the deferral is written before this
+    // delivery returns and releases its worker slot (T-43).
+    await ctx.renewVt(BILLING_DEFER_VT_SECONDS);
     deps.log(
       `Job ${jobId} is not billed yet — deferred for ${BILLING_DEFER_VT_SECONDS}s without consuming an attempt`,
     );
