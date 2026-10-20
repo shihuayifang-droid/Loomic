@@ -33,8 +33,14 @@ export function FailedGenerationSlot(props: {
   onDelete: () => void;
   /** GN-19: present only when the slot can be retried with its original request. */
   onRetry?: () => void;
+  /**
+   * CV-02 / GN-35: "已退回 N 积分", already formatted by `refundLabel`. Null or
+   * absent means nothing came back (or nobody checked), and no line is drawn —
+   * the placeholder never guesses an amount.
+   */
+  refundLabel?: string | null;
 }): JSX.Element {
-  const { kind, message, width, height, onDelete, onRetry } = props;
+  const { kind, message, width, height, onDelete, onRetry, refundLabel } = props;
 
   return (
     <div
@@ -91,6 +97,17 @@ export function FailedGenerationSlot(props: {
             </button>
           </div>
         </div>
+        {/* CV-02 / GN-35: the money line sits under the reason. It is plain text
+            inside a pointer-transparent box, so it needs no pointer events of its
+            own. */}
+        {refundLabel ? (
+          <div
+            data-testid="canvas-failed-slot-refund"
+            className="mt-1 text-[11px] text-muted-foreground"
+          >
+            {refundLabel}
+          </div>
+        ) : null}
       </div>
     </div>
   );

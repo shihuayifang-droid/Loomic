@@ -2,6 +2,7 @@ import type {
   AssetSignedUrlResponse,
   CanvasDetail,
   ChatMessageCreateRequest,
+  JobCreditsResponse,
   JobResponse,
   MarketplaceDetail,
   MarketplaceSearchResponse,
@@ -931,6 +932,26 @@ export async function cancelJob(
   );
   if (!response.ok) return handleErrorResponse(response);
   return (await response.json()) as JobResponse;
+}
+
+/**
+ * `GET /api/jobs/:jobId/credits` — 36K, read by CV-02 / GN-35's refund line.
+ *
+ * The route answers what the job was charged AND what actually came back, so the
+ * client never has to infer a refund from the price: `credits_cost` is null for a
+ * job that was never billed, and `credits_refunded` is 0 when nothing landed.
+ * Only the latter may be announced to the user.
+ */
+export async function fetchJobCredits(
+  accessToken: string,
+  jobId: string,
+): Promise<JobCreditsResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/jobs/${encodeURIComponent(jobId)}/credits`,
+    { headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as JobCreditsResponse;
 }
 
 // --- Tool definitions API ---

@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, memo } from "react";
 
 import type { RecoverableArtifact } from "@loomic/shared";
 import type { WebSocketHandle } from "../hooks/use-websocket";
+import { useJobRefundLabel } from "../hooks/use-job-refund-label";
 import { getServerBaseUrl } from "../lib/env";
 import {
   cancelJob,
@@ -157,6 +158,27 @@ function isRetriableSaveError(err: unknown): boolean {
     return err.status === undefined || err.status >= 500;
   }
   return err instanceof TypeError;
+}
+
+/**
+ * CV-02 / GN-35: `FailedGenerationSlot` plus the 「已退回 N 积分」 line.
+ *
+ * A hook cannot run inside `renderEmbeddable` — that is a plain callback Excalidraw
+ * invokes, not a component, so `useJobRefundLabel` has to live in one. This wrapper
+ * is that component: it asks the credits route for the element's job and hands the
+ * formatted label down. It deliberately takes the already-built slot props as one
+ * object so the conditional `onRetry` spread stays in the caller, where the retry
+ * decision is made.
+ */
+type FailedSlotProps = Parameters<typeof FailedGenerationSlot>[0];
+
+function FailedSlotWithRefund(props: {
+  slot: FailedSlotProps;
+  accessToken: string;
+  jobId: string | undefined;
+}) {
+  const refund = useJobRefundLabel(props.accessToken, props.jobId);
+  return <FailedGenerationSlot {...props.slot} refundLabel={refund} />;
 }
 
 export function CanvasEditor({
@@ -1128,13 +1150,19 @@ export function CanvasEditor({
         // when it cannot be retried do we try the video shape.
         const retry = retryGeneratorFromFailedSlot(element);
         const videoRetry = retry ? null : retryVideoGeneratorFromFailedSlot(element);
-        return (
-          <FailedGenerationSlot
-            kind={element.customData.kind === "video" ? "video" : "image"}
-            message={element.customData.failureMessage ?? "生成失败，请重试"}
-            width={element.width ?? 512}
-            height={element.height ?? 512}
-            onDelete={() => {
+        // CV-02 / GN-35: the dead slot also reports what came back. The read lives
+        // inside FailedSlotWithRefund — a hook cannot be called from this render
+        // callback, only from a component.
+        const refundJobId =
+          typeof element.customData.jobId === "string"
+            ? element.customData.jobId
+            : undefined;
+        const slot: FailedSlotProps = {
+          kind: element.customData.kind === "video" ? "video" : "image",
+          message: element.customData.failureMessage ?? "生成失败，请重试",
+          width: element.width ?? 512,
+          height: element.height ?? 512,
+          onDelete: () => {
               excalidrawApi?.updateScene({
                 elements: excalidrawApi
                   .getSceneElements()
@@ -1142,8 +1170,8 @@ export function CanvasEditor({
                     el.id === element.id ? { ...el, isDeleted: true } : el,
                   ),
               });
-            }}
-            {...(retry || videoRetry
+          },
+          ...(retry || videoRetry
               ? {
                   onRetry: () => {
                     const api = excalidrawApi;
@@ -1187,7 +1215,13 @@ export function CanvasEditor({
                     });
                   },
                 }
-              : {})}
+              : {}),
+        };
+        return (
+          <FailedSlotWithRefund
+            slot={slot}
+            accessToken={accessTokenRef.current}
+            jobId={refundJobId}
           />
         );
       }
