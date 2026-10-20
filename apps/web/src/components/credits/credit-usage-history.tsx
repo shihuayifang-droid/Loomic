@@ -3,40 +3,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Zap } from "lucide-react";
-import type { CreditTransaction } from "@loomic/shared";
+import { ledgerEntryTypeSchema, type CreditTransaction, type LedgerEntryType } from "@loomic/shared";
 
 import { useAuth } from "@/lib/auth-context";
 import { fetchCreditTransactions } from "@/lib/credits-api";
-
-// ── Transaction type labels ──────────────────────────────────
-
-const TYPE_LABELS: Record<string, string> = {
-  subscription_grant: "Subscription Grant",
-  daily_grant: "Daily Grant",
-  purchase: "Purchase",
-  generation_deduct: "Generation",
-  generation_refund: "Refund",
-  admin_adjustment: "Adjustment",
-  bonus: "Bonus",
-};
-
-type FilterMode = "all" | "deducted" | "granted";
-
-const FILTER_OPTIONS: Array<{ value: FilterMode; label: string }> = [
-  { value: "all", label: "All" },
-  { value: "deducted", label: "Deducted" },
-  { value: "granted", label: "Granted" },
-];
-
-const DEDUCT_TYPES = new Set(["generation_deduct"]);
-const GRANT_TYPES = new Set([
-  "subscription_grant",
-  "daily_grant",
-  "purchase",
-  "generation_refund",
-  "admin_adjustment",
-  "bonus",
-]);
+import { LEDGER_ENTRY_LABELS, entryTypeOf, filterByEntryTypes } from "@/lib/ledger-entry-labels";
 
 // ── Page size ────────────────────────────────────────────────
 
@@ -65,7 +36,7 @@ export function CreditUsageHistory() {
   const [transactions, setTransactions] = useState<CreditTransaction[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [filter, setFilter] = useState<FilterMode>("all");
+  const [selectedTypes, setSelectedTypes] = useState<Set<LedgerEntryType>>(new Set());
   const [hasMore, setHasMore] = useState(true);
 
   const loadTransactions = useCallback(async (limit: number) => {
@@ -93,12 +64,20 @@ export function CreditUsageHistory() {
     setLoadingMore(false);
   };
 
-  // Filter transactions
-  const filtered = transactions.filter((t) => {
-    if (filter === "deducted") return DEDUCT_TYPES.has(t.transaction_type);
-    if (filter === "granted") return GRANT_TYPES.has(t.transaction_type);
-    return true;
-  });
+  // BL-06: multi-select by entry type — nothing selected means everything
+  const toggleType = (type: LedgerEntryType) => {
+    setSelectedTypes((prev) => {
+      const next = new Set(prev);
+      if (next.has(type)) {
+        next.delete(type);
+      } else {
+        next.add(type);
+      }
+      return next;
+    });
+  };
+
+  const filtered = filterByEntryTypes(transactions, selectedTypes);
 
   if (loading) {
     return (
@@ -118,20 +97,33 @@ export function CreditUsageHistory() {
         </p>
       </div>
 
-      {/* Filter tabs */}
-      <div className="inline-flex gap-1 rounded-lg bg-muted p-1">
-        {FILTER_OPTIONS.map((opt) => (
-          <button data-testid={`credits-history-filter-${opt.value}`}
-            key={opt.value}
+      {/* Filter buttons — one per entry type, multi-select */}
+      <div className="flex flex-wrap gap-1 rounded-lg bg-muted p-1">
+        <button data-testid="credits-history-filter-all"
+          type="button"
+          onClick={() => setSelectedTypes(new Set())}
+          aria-pressed={selectedTypes.size === 0}
+          className={`rounded-md px-3 py-1.5 text-xs transition-colors ${
+            selectedTypes.size === 0
+              ? "bg-card font-medium text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          全部
+        </button>
+        {ledgerEntryTypeSchema.options.map((type) => (
+          <button data-testid={`credits-history-filter-${type}`}
+            key={type}
             type="button"
-            onClick={() => setFilter(opt.value)}
+            onClick={() => toggleType(type)}
+            aria-pressed={selectedTypes.has(type)}
             className={`rounded-md px-3 py-1.5 text-xs transition-colors ${
-              filter === opt.value
+              selectedTypes.has(type)
                 ? "bg-card font-medium text-foreground shadow-sm"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {opt.label}
+            {LEDGER_ENTRY_LABELS[type]}
           </button>
         ))}
       </div>
@@ -149,27 +141,28 @@ export function CreditUsageHistory() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-secondary text-left text-xs font-medium text-muted-foreground">
-                <th className="px-4 py-2.5">Description</th>
-                <th className="px-4 py-2.5">Type</th>
-                <th className="px-4 py-2.5">Date</th>
-                <th className="px-4 py-2.5 text-right">Credits</th>
+                <th className="px-4 py-2.5">描述</th>
+                <th className="px-4 py-2.5">类型</th>
+                <th className="px-4 py-2.5">时间</th>
+                <th className="px-4 py-2.5 text-right">变动额</th>
               </tr>
             </thead>
             <tbody>
               {filtered.map((t, idx) => {
-                const isGrant = !DEDUCT_TYPES.has(t.transaction_type);
+                const label = LEDGER_ENTRY_LABELS[entryTypeOf(t)];
                 return (
                   <tr
                     key={t.id}
+                    data-testid="credits-history-row"
                     className={`border-b last:border-b-0 transition-colors hover:bg-secondary ${
                       idx % 2 === 1 ? "bg-secondary/50" : ""
                     }`}
                   >
                     <td className="px-4 py-2.5 text-foreground">
-                      {t.description ?? TYPE_LABELS[t.transaction_type] ?? t.transaction_type}
+                      {t.description ?? label}
                     </td>
                     <td className="px-4 py-2.5 text-muted-foreground">
-                      {TYPE_LABELS[t.transaction_type] ?? t.transaction_type}
+                      {label}
                     </td>
                     <td className="px-4 py-2.5 tabular-nums text-muted-foreground">
                       {formatDate(t.created_at)}
@@ -177,12 +170,12 @@ export function CreditUsageHistory() {
                     <td className="px-4 py-2.5 text-right tabular-nums">
                       <span
                         className={
-                          isGrant
-                            ? "font-medium text-foreground"
-                            : "font-medium text-destructive"
+                          t.amount < 0
+                            ? "font-medium text-destructive"
+                            : "font-medium text-foreground"
                         }
                       >
-                        {isGrant ? "+" : ""}
+                        {t.amount > 0 ? "+" : ""}
                         {t.amount}
                       </span>
                     </td>
@@ -207,6 +200,13 @@ export function CreditUsageHistory() {
             {loadingMore ? "Loading..." : "Load More"}
           </button>
         </div>
+      )}
+
+      {/* BL-06: end of list */}
+      {!hasMore && filtered.length > 0 && (
+        <p data-testid="credits-history-end" className="pt-2 text-center text-xs text-muted-foreground">
+          没有更多了
+        </p>
       )}
     </div>
   );
