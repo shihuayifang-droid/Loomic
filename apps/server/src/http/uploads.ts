@@ -4,6 +4,7 @@ import {
   applicationErrorResponseSchema,
   assetSignedUrlResponseSchema,
   checkUploadConstraint,
+  isToolOutputSource,
   unauthenticatedErrorResponseSchema,
   uploadResponseSchema,
 } from "@loomic/shared";
@@ -94,6 +95,109 @@ export async function registerUploadRoutes(
         mimeType,
         workspaceId,
         ...(projectId ? { projectId } : {}),
+      });
+
+      return reply
+        .code(201)
+        .send(uploadResponseSchema.parse(result));
+    } catch (error) {
+      return sendUploadError(error, reply);
+    }
+  });
+
+  // ED-00i: a tool output the browser rendered itself is uploaded here. `source`
+  // is a whitelisted `tool:*` value — anything else is refused, so relaying a tool
+  // output through the front end cannot be recorded as a plain user upload.
+  app.post("/api/uploads/tool-output", async (request, reply) => {
+    try {
+      const user = await options.auth.authenticate(request);
+      if (!user) return sendUnauthorized(reply);
+
+      const file = await request.file();
+      if (!file) {
+        return reply.code(400).send(
+          applicationErrorResponseSchema.parse({
+            error: {
+              code: "upload_failed",
+              message: "No file provided.",
+            },
+          }),
+        );
+      }
+
+      const source =
+        typeof file.fields.source === "object" &&
+        file.fields.source !== null &&
+        "value" in file.fields.source
+          ? String(file.fields.source.value)
+          : undefined;
+
+      // Anything outside the shared whitelist — including `user_upload` — is
+      // refused before the bytes are read, so a mislabelled source uploads nothing.
+      if (!isToolOutputSource(source)) {
+        return reply.code(400).send(
+          applicationErrorResponseSchema.parse({
+            error: { code: "upload_failed", message: "不支持的工具来源" },
+          }),
+        );
+      }
+
+      const parentArtifactId =
+        typeof file.fields.parentArtifactId === "object" &&
+        file.fields.parentArtifactId !== null &&
+        "value" in file.fields.parentArtifactId
+          ? String(file.fields.parentArtifactId.value)
+          : undefined;
+
+      if (
+        typeof parentArtifactId !== "string" ||
+        !/^[0-9a-f-]{36}$/i.test(parentArtifactId)
+      ) {
+        return reply.code(400).send(
+          applicationErrorResponseSchema.parse({
+            error: { code: "upload_failed", message: "缺少源图" },
+          }),
+        );
+      }
+
+      const mimeType = file.mimetype;
+
+      const fileBuffer = await file.toBuffer();
+
+      // Same table as /api/uploads: the tool output is still an upload.
+      const constraint = checkUploadConstraint({
+        mimeType,
+        byteSize: fileBuffer.length,
+      });
+      if (!constraint.ok) {
+        return reply.code(400).send(
+          applicationErrorResponseSchema.parse({
+            error: { code: "upload_failed", message: constraint.message },
+          }),
+        );
+      }
+
+      const viewer = await options.viewerService.ensureViewer(user);
+      const teamWorkspace = viewer.teamWorkspace;
+
+      if (!teamWorkspace) {
+        return reply.code(403).send(
+          applicationErrorResponseSchema.parse({
+            error: {
+              code: "not_team_member",
+              message: "Not a member of the HaHart team workspace.",
+            },
+          }),
+        );
+      }
+
+      const result = await options.uploadService.uploadToolOutput(user, {
+        parentArtifactId,
+        source,
+        fileName: file.filename,
+        fileBuffer,
+        mimeType,
+        workspaceId: teamWorkspace.id,
       });
 
       return reply

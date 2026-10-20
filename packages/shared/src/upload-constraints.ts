@@ -87,3 +87,14 @@ export function checkUploadConstraint(input: {
 
   return { ok: true, mediaType };
 }
+
+/** ED-00i: tool outputs the browser renders and uploads itself. Anything else is refused. */
+export const TOOL_OUTPUT_SOURCES = ["tool:adjust", "tool:crop"] as const;
+export type ToolOutputSource = (typeof TOOL_OUTPUT_SOURCES)[number];
+
+export function isToolOutputSource(value: unknown): value is ToolOutputSource {
+  return (
+    typeof value === "string" &&
+    (TOOL_OUTPUT_SOURCES as readonly string[]).includes(value)
+  );
+}

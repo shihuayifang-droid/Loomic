@@ -1249,3 +1249,98 @@ describe("AS-06: listProjectUploads", () => {
     expect(stub.signedCalls).toEqual([]);
   });
 });
+
+// ED-00i: a tool output the browser rendered itself is uploaded by the front end.
+// Its source is a whitelisted `tool:*` value and its parent is recorded, so a
+// relayed tool artifact can never be filed as a plain `user_upload`.
+describe("ED-00i: uploadToolOutput records a tool source", () => {
+  const TOOL_OUTPUT = {
+    parentArtifactId: "parent-1",
+    source: "tool:adjust" as const,
+    fileName: "adjusted.png",
+    fileBuffer: Buffer.from("abc"),
+    mimeType: "image/png",
+    workspaceId: TEAM_WORKSPACE,
+  };
+
+  it("ED-00i: a tool output is recorded as tool:adjust with its parent and zero credits", async () => {
+    const stub = makeStubs({
+      project: { workspace_id: TEAM_WORKSPACE },
+      provenance: {},
+    });
+
+    const result = await stub.service.uploadToolOutput(USER, TOOL_OUTPUT);
+
+    expect(stub.assetLookups[0]).toEqual({
+      actorId: "user-1",
+      assetId: "parent-1",
+    });
+    expect(stub.provenanceCalls).toHaveLength(1);
+    expect(stub.provenanceCalls[0]?.provenance).toMatchObject({
+      source: "tool:adjust",
+      operation: "adjust",
+      creditsCharged: 0,
+      parentArtifactId: "parent-1",
+    });
+    expect(stub.provenanceCalls[0]?.provenance.source).not.toBe("user_upload");
+    expect(result.asset.id).toBe("asset-1");
+  });
+
+  it("ED-00i: the output joins the parent's project", async () => {
+    const stub = makeStubs({
+      project: { workspace_id: TEAM_WORKSPACE },
+      provenance: {},
+      assetRow: {
+        id: "parent-1",
+        bucket: "project-assets",
+        object_path: "ws/project-9/123-source.png",
+        mime_type: "image/png",
+        byte_size: 3,
+        workspace_id: TEAM_WORKSPACE,
+        project_id: "project-9",
+        created_at: "2026-10-20T00:00:00.000Z",
+      },
+    });
+
+    await stub.service.uploadToolOutput(USER, TOOL_OUTPUT);
+
+    expect(stub.rpcs).toHaveLength(1);
+    expect(stub.rpcs[0]?.params.p_project_id).toBe("project-9");
+    // The object is filed under the parent's project too.
+    expect(stub.uploads[0]?.path).toContain("project-9");
+  });
+
+  it("ED-00i: an unreadable parent is a 404 and nothing is uploaded", async () => {
+    const stub = makeStubs({ assetRow: null, provenance: {} });
+
+    const error = await stub.service
+      .uploadToolOutput(USER, TOOL_OUTPUT)
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as UploadServiceError);
+
+    expect(error).toBeInstanceOf(UploadServiceError);
+    expect(error?.statusCode).toBe(404);
+    expect(error?.code).toBe("upload_failed");
+    expect(stub.uploads).toEqual([]);
+    expect(stub.rpcs).toEqual([]);
+    expect(stub.provenanceCalls).toEqual([]);
+  });
+
+  it("ED-00i: a failing parent lookup is a 500", async () => {
+    const stub = makeStubs({
+      assetReadError: { message: "asset read failed (findReadableAsset)" },
+      provenance: {},
+    });
+
+    const error = await stub.service
+      .uploadToolOutput(USER, TOOL_OUTPUT)
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as UploadServiceError);
+
+    expect(error).toBeInstanceOf(UploadServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("upload_failed");
+    expect(error?.message).toBe("Failed to verify the source artifact.");
+    expect(stub.uploads).toEqual([]);
+  });
+});

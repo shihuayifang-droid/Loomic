@@ -2,7 +2,7 @@ import type { Readable } from "node:stream";
 
 import { ZipFile } from "yazl";
 
-import type { AssetBucket, AssetObject } from "@loomic/shared";
+import type { AssetBucket, AssetObject, ToolOutputSource } from "@loomic/shared";
 
 import type {
   AssetReadRepository,
@@ -62,6 +62,33 @@ export type UploadService = {
   uploadFile(
     user: AuthenticatedUser,
     input: UploadFileInput,
+  ): Promise<{ asset: AssetObject; url: string }>;
+
+  /**
+   * ED-00i: a tool output the browser rendered itself (`tool:adjust`, `tool:crop`)
+   * arrives here. The `source` is a whitelisted `tool:*` value, so relaying such
+   * an artifact through the front end can no longer be recorded as `user_upload`.
+   *
+   * The parent artifact is read first through the same repository every other
+   * read in this file uses — its SQL is the authorization, so "no such asset"
+   * and "not yours" are one answer (404) and a repository that refuses or is not
+   * wired is the existing 500. Nothing is uploaded before that read succeeds.
+   *
+   * The bytes themselves go through `uploadFile` unchanged (no second storage
+   * call), with the parent's project so the output joins the source image's
+   * project. `params` the tool ran with are NOT stored: `asset_objects` has no
+   * column for them. No billing is touched — this service has none.
+   */
+  uploadToolOutput(
+    user: AuthenticatedUser,
+    input: {
+      parentArtifactId: string;
+      source: ToolOutputSource;
+      fileName: string;
+      fileBuffer: Buffer;
+      mimeType: string;
+      workspaceId: string;
+    },
   ): Promise<{ asset: AssetObject; url: string }>;
 
   getAssetUrl(
@@ -160,7 +187,7 @@ export function createUploadService(options: {
     "recordProvenance" | "recordDisplayName" | "readDisplayName"
   >;
 }): UploadService {
-  return {
+  const service: UploadService = {
     async uploadFile(user, input) {
       const client = options.createUserClient(user.accessToken);
 
@@ -359,6 +386,62 @@ export function createUploadService(options: {
         },
         url,
       };
+    },
+
+    // ED-00i: the browser rendered a tool output and uploads it itself. The
+    // parent is read first, so an output can never be filed against a source the
+    // caller cannot read, and the bytes then take the ordinary `uploadFile` path
+    // with `tool:*` provenance — the relay therefore cannot change the source.
+    async uploadToolOutput(user, input) {
+      const repository = options.assetReadRepository;
+
+      if (!repository) {
+        throw new UploadServiceError(
+          "upload_failed",
+          "Failed to verify the source artifact.",
+          500,
+        );
+      }
+
+      let parent: AssetReadRow | null = null;
+
+      try {
+        parent = await repository.findReadableAsset({
+          actorId: user.id,
+          assetId: input.parentArtifactId,
+        });
+      } catch {
+        throw new UploadServiceError(
+          "upload_failed",
+          "Failed to verify the source artifact.",
+          500,
+        );
+      }
+
+      if (!parent) {
+        throw new UploadServiceError(
+          "upload_failed",
+          "源图不存在或无权访问",
+          404,
+        );
+      }
+
+      return service.uploadFile(user, {
+        bucket: "project-assets",
+        fileName: input.fileName,
+        fileBuffer: input.fileBuffer,
+        mimeType: input.mimeType,
+        workspaceId: input.workspaceId,
+        // The output joins the source image's project; a project-less parent
+        // stays project-less rather than inventing one.
+        ...(parent.project_id === null ? {} : { projectId: parent.project_id }),
+        provenance: {
+          source: input.source,
+          operation: input.source.slice("tool:".length),
+          creditsCharged: 0,
+          parentArtifactId: input.parentArtifactId,
+        },
+      });
     },
 
     async getAssetUrl(user, assetId, signOptions) {
@@ -664,6 +747,8 @@ export function createUploadService(options: {
       }
     },
   };
+
+  return service;
 }
 
 function buildObjectPath(
