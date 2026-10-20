@@ -75,6 +75,7 @@ import {
   insertVideoElement,
   markGenerationSlotFailed,
   removeCanvasElement,
+  toRetryRequest,
 } from "../features/canvas/canvas-element-writer.js";
 import { aspectRatioToDimensions } from "../generation/utils.js";
 import { slotOutcomeForStop } from "../features/canvas/generation-slot-outcome.js";
@@ -1323,11 +1324,17 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             if (canvasId && placeholderElementId && !placeholderFilled) {
               try {
                 if (slotFailure) {
+                  // GN-19: keep the request the user submitted, so "retry" can
+                  // re-submit it without rebuilding it (and without the URLs).
+                  const retry = toRetryRequest(
+                    "image",
+                    input as Record<string, unknown>,
+                  );
                   await markGenerationSlotFailed(
                     createClient(accessToken) as UserSupabaseClient,
                     canvasId,
                     placeholderElementId,
-                    slotFailure,
+                    { ...slotFailure, ...(retry ? { retryRequest: retry } : {}) },
                   );
                   options.connectionManager?.pushToCanvas(canvasId, {
                     type: "canvas.sync" as const,
@@ -1664,11 +1671,21 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 try {
                   const cleanupClient = createClient(accessToken) as UserSupabaseClient;
                   if (outcome.kind === "failed") {
+                    // GN-19: same as the image path — keep the request so the
+                    // failed slot can be retried with the original parameters.
+                    const retry = toRetryRequest(
+                      "video",
+                      input as Record<string, unknown>,
+                    );
                     await markGenerationSlotFailed(
                       cleanupClient,
                       canvasId,
                       placeholderElementId,
-                      { message: outcome.message, jobId: outcome.jobId },
+                      {
+                        message: outcome.message,
+                        jobId: outcome.jobId,
+                        ...(retry ? { retryRequest: retry } : {}),
+                      },
                     );
                     options.connectionManager?.pushToCanvas(canvasId, {
                       type: "canvas.sync" as const,

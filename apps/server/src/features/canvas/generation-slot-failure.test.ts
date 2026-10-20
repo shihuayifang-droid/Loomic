@@ -19,6 +19,7 @@ import type { UserSupabaseClient } from "../../supabase/user.js";
 import {
   insertImagePlaceholder,
   markGenerationSlotFailed,
+  toRetryRequest,
 } from "./canvas-element-writer.js";
 
 const CANVAS_ID = "canvas-1";
@@ -232,5 +233,78 @@ describe("GN-19 failed generation slots", () => {
     const versionAfter = findElement(fake, "slot-1")?.version;
     expect(versionBefore).toBe(1);
     expect(versionAfter).toBe(2);
+  });
+
+  it("GN-19: a failed slot keeps the request it can be retried with", async () => {
+    const fake = createFakeCanvasClient(
+      canvasWith([slotElement("slot-1", { generating: true, kind: "image" })]),
+    );
+
+    await markGenerationSlotFailed(fake.client, CANVAS_ID, "slot-1", {
+      message: "图片生成失败，请重试",
+      jobId: "job-6",
+      retryRequest: {
+        kind: "image",
+        prompt: "一只猫",
+        model: "google/imagen-4",
+        aspectRatio: "1:1",
+        quality: "hd",
+      },
+    });
+
+    expect(findElement(fake, "slot-1")?.customData.retryRequest).toEqual({
+      kind: "image",
+      prompt: "一只猫",
+      model: "google/imagen-4",
+      aspectRatio: "1:1",
+      quality: "hd",
+    });
+  });
+
+  it("GN-19: toRetryRequest keeps only whitelisted primitives", () => {
+    const retry = toRetryRequest("image", {
+      prompt: "一只猫",
+      model: "google/imagen-4",
+      inputImages: ["https://x"],
+      foo: 1,
+    });
+
+    expect(retry).not.toBeNull();
+    expect(retry).not.toHaveProperty("inputImages");
+    expect(retry).not.toHaveProperty("foo");
+    expect(retry).toEqual({ kind: "image", prompt: "一只猫", model: "google/imagen-4" });
+  });
+
+  it("GN-19: toRetryRequest refuses a request without a prompt or model", () => {
+    expect(toRetryRequest("image", { model: "google/imagen-4" })).toBeNull();
+    expect(toRetryRequest("image", { prompt: "一只猫" })).toBeNull();
+    expect(toRetryRequest("image", {})).toBeNull();
+  });
+
+  it("GN-19: a very long prompt is cut to 4000 characters", () => {
+    const retry = toRetryRequest("image", {
+      prompt: "字".repeat(4001),
+      model: "google/imagen-4",
+    });
+
+    expect(retry?.prompt.length).toBe(4000);
+  });
+
+  it("GN-19: video retry keeps duration and resolution", () => {
+    const retry = toRetryRequest("video", {
+      prompt: "p",
+      model: "m",
+      duration: 5,
+      resolution: "720p",
+      inputVideo: "u",
+    });
+
+    expect(retry).toEqual({
+      kind: "video",
+      prompt: "p",
+      model: "m",
+      duration: 5,
+      resolution: "720p",
+    });
   });
 });

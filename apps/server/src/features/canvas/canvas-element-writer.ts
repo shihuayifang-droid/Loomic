@@ -416,6 +416,65 @@ export async function removeCanvasElement(
   }
 }
 
+/** GN-19: the parameters a failed slot's "retry" re-submits. Primitives only. */
+export type GenerationRetryRequest = {
+  kind: "image" | "video";
+  prompt: string;
+  model: string;
+  aspectRatio?: string;
+  quality?: string;      // image
+  duration?: number;     // video
+  resolution?: string;   // video
+  title?: string;
+};
+
+function retryString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function retryNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Keep only the whitelisted primitive fields; drop anything else (no URLs, no attachments). */
+export function toRetryRequest(
+  kind: "image" | "video",
+  input: Record<string, unknown>,
+): GenerationRetryRequest | null {
+  const prompt = retryString(input.prompt);
+  const model = retryString(input.model);
+  // Without these two there is nothing a retry could re-submit.
+  if (!prompt || !model) return null;
+
+  const request: GenerationRetryRequest = {
+    kind,
+    // AG-03 caps a prompt at 4000 characters; a stored retry request uses the
+    // same ceiling, so a retry never sends more than the first submit did.
+    prompt: prompt.length > 4000 ? prompt.slice(0, 4000) : prompt,
+    model,
+  };
+
+  const aspectRatio = retryString(input.aspectRatio);
+  if (aspectRatio) request.aspectRatio = aspectRatio;
+
+  const title = retryString(input.title);
+  if (title) request.title = title;
+
+  if (kind === "image") {
+    const quality = retryString(input.quality);
+    if (quality) request.quality = quality;
+  }
+
+  if (kind === "video") {
+    const duration = retryNumber(input.duration);
+    if (duration !== undefined) request.duration = duration;
+    const resolution = retryString(input.resolution);
+    if (resolution) request.resolution = resolution;
+  }
+
+  return request;
+}
+
 /**
  * GN-19: a generation slot whose job failed stays on the canvas as a failed
  * slot (reason + job id), so the user sees what happened and can retry or
@@ -425,7 +484,15 @@ export async function markGenerationSlotFailed(
   client: { from: (table: string) => any },
   canvasId: string,
   elementId: string,
-  failure: { message: string; jobId: string },
+  failure: {
+    message: string;
+    jobId: string;
+    /**
+     * GN-19: what the "retry" action re-submits. Stored on the slot so the
+     * client does not have to reconstruct the original request.
+     */
+    retryRequest?: GenerationRetryRequest;
+  },
 ): Promise<void> {
   try {
     await mutateCanvasContent(
@@ -455,6 +522,11 @@ export async function markGenerationSlotFailed(
                   failed: true,
                   failureMessage: failure.message,
                   jobId: failure.jobId,
+                  // GN-19: orthogonal to the failure reason — a retry needs the
+                  // original request, so it rides on the failed slot.
+                  ...(failure.retryRequest
+                    ? { retryRequest: failure.retryRequest }
+                    : {}),
                   failedAt,
                 },
                 version: (Number(el.version) || 1) + 1,
