@@ -153,12 +153,21 @@ const uploadToolOutputMock = vi.hoisted(() => vi.fn());
 const fetchAsDataURLMock = vi.hoisted(() => vi.fn());
 // 工单 35S-fixup2（ED-00j）：裁剪源取原图签名地址。
 const getAssetUrlMock = vi.hoisted(() => vi.fn());
+/**
+ * 工单 36Q（T-105）：`useToolPrices` 会对夹具里的付费工具真发一次询价，
+ * 走真身就是 `fetch` 到 localhost（stderr 一串 `ECONNREFUSED`，测试在碰网络）。
+ * 这里给一个**永不结算**的替身：询价停在校验中、不触发后续 state 更新。
+ * 为什么不用「立即 resolve / reject」：工具条层的用例只断言工具条渲染与点击后的提示，
+ * 一次都不看价格；结算反而会在与断言无关的位置多推一轮异步重渲染。
+ */
+const fetchPriceQuoteMock = vi.hoisted(() => vi.fn(() => new Promise(() => {})));
 vi.mock("@/lib/server-api", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   getAssetDownloadUrl: getAssetDownloadUrlMock,
   getAssetUrl: getAssetUrlMock,
   downloadAssetsZip: downloadAssetsZipMock,
   uploadToolOutput: uploadToolOutputMock,
+  fetchPriceQuote: fetchPriceQuoteMock,
 }));
 vi.mock("@/lib/canvas-elements", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
