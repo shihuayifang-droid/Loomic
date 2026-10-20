@@ -171,6 +171,17 @@ function buildVideoGenerationPreferenceXml(
   return `<human_video_generation_preference mode="manual" count="${videoGenerationPreference.models.length}">\n  ${modelXml}\n</human_video_generation_preference>`;
 }
 
+/**
+ * AG-03: a text asset mentioned with @ is injected into the prompt, but never
+ * more than this many characters (counted as JS string length). Longer text is
+ * cut and the element says so, so the agent knows it saw only the beginning.
+ *
+ * Length is `String.prototype.length`, i.e. UTF-16 code units: common CJK
+ * characters count as 1. Cutting at this boundary may in principle split a
+ * surrogate pair; that edge case is not handled here.
+ */
+export const MENTION_TEXT_MAX_CHARS = 4000;
+
 function buildMentionXmlBlocks(mentions: MessageMention[]): string[] {
   const xmlBlocks: string[] = [];
 
@@ -200,10 +211,13 @@ function buildMentionXmlBlocks(mentions: MessageMention[]): string[] {
   if (mentionedBrandKitAssets.length > 0) {
     const assetXml = mentionedBrandKitAssets
       .map((mention, i) => {
-        const textContentAttr =
-          mention.textContent != null
-            ? ` text_content="${escapeXmlAttribute(mention.textContent)}"`
-            : "";
+        const raw = mention.textContent;
+        let textContentAttr = "";
+        if (raw != null) {
+          const cut = raw.length > MENTION_TEXT_MAX_CHARS;
+          const text = cut ? raw.slice(0, MENTION_TEXT_MAX_CHARS) : raw;
+          textContentAttr = ` text_content="${escapeXmlAttribute(text)}"${cut ? ' truncated="true"' : ""}`;
+        }
         const fileUrlAttr =
           mention.fileUrl != null
             ? ` file_url="${escapeXmlAttribute(mention.fileUrl)}"`
