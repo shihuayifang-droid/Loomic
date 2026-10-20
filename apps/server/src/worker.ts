@@ -15,6 +15,9 @@ import { loadServerEnv } from "./config/env.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
+import { reapStuckJobs } from "./features/jobs/reap-stuck-jobs.js";
+import { startStuckJobReaper } from "./features/jobs/stuck-job-reaper-schedule.js";
+import { createJobStuckReaderRepository } from "./db/job-stuck-reader-repository.js";
 import { buildWorkerComposition } from "./worker-composition.js";
 import { getExecutor, type ExecutorContext } from "./features/jobs/job-executor.js";
 import {
@@ -65,15 +68,21 @@ async function main() {
   // shape change is the pool getter: the six identical copies of the
   // `DATABASE_URL` expression collapsed into the single `getTransactionPool`
   // argument below, which is character for character what each copy used to be.
+  //
+  // Workorder 36J: the reaper needs the same pool, so the expression has a name
+  // instead of a second copy — a repository pointed at a different pool would
+  // read rows this worker never wrote, and reclaim nothing.
+  const getPool = () =>
+    getTransactionPool(
+      env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
+    );
+
   const { jobService, billingGate, refundJob, baseCtx } = buildWorkerComposition({
     env,
     pgmq,
     createUserClient,
     getAdminClient,
-    getTransactionPool: () =>
-      getTransactionPool(
-        env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
-      ),
+    getTransactionPool: getPool,
   });
 
   const inFlightByQueue = new Map<string, Set<Promise<void>>>(
@@ -89,8 +98,33 @@ async function main() {
 
   let running = true;
 
+  // GN-31 step 3 (workorder 36J): the periodic reclaim of jobs whose worker died
+  // while they were `running`. One pass lives in `reap-stuck-jobs.ts`; this is
+  // only the wiring plus the timer that repeats it. It starts NOW, before the
+  // poll loop, because the rows it collects are the ones this process's previous
+  // life left behind.
+  //
+  // `failedAt` is not passed on: `jobService.markFailed` stamps the time itself,
+  // so the instant this pass read is never used for the write.
+  const stuckReader = createJobStuckReaderRepository({ getTransactionPool: getPool });
+  const reaper = startStuckJobReaper({
+    reap: () =>
+      reapStuckJobs({
+        listRunningStartedBefore: (i) => stuckReader.listRunningStartedBefore(i),
+        markFailed: ({ jobId, errorCode, errorMessage }) =>
+          jobService.markFailed(jobId, errorCode, errorMessage),
+        refundJob: (jobId) => refundJob(jobId, `${tag} [reaper]`),
+        now: () => new Date(),
+        log: (m) => console.log(`${tag} ${m}`),
+      }),
+    log: (m) => console.log(`${tag} ${m}`),
+  });
+
   // Graceful shutdown — wait for in-flight jobs then exit
   const shutdown = async () => {
+    // Stop the timer first: the in-flight jobs waited for below are the ones
+    // that matter, and a tick landing mid-shutdown has nothing left to do.
+    reaper.stop();
     const totalInFlight = [...inFlightByQueue.values()].reduce((n, s) => n + s.size, 0);
     console.log(`${tag} Shutting down, waiting for ${totalInFlight} in-flight jobs...`);
     running = false;
