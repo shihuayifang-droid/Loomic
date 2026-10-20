@@ -7,6 +7,7 @@ import {
   setPlanRequestSchema,
   applicationErrorResponseSchema,
   unauthenticatedErrorResponseSchema,
+  ledgerEntryTypeOf,
 } from "@loomic/shared";
 
 import { toCreditBalanceResponse } from "../features/credits/balance-response.js";
@@ -61,7 +62,12 @@ export async function registerCreditRoutes(
       );
 
       return reply.code(200).send(
-        creditTransactionsResponseSchema.parse({ transactions }),
+        creditTransactionsResponseSchema.parse({
+          transactions: transactions.map((t) => ({
+            ...t,
+            entry_type: ledgerEntryTypeOf(t.transaction_type, t.amount),
+          })),
+        }),
       );
     } catch (error) {
       return sendCreditError(error, reply, "credit_query_failed");

@@ -30,6 +30,41 @@ export const creditTransactionTypeSchema = z.enum([
 ]);
 export type CreditTransactionType = z.infer<typeof creditTransactionTypeSchema>;
 
+/**
+ * BL-06: the ledger entry types, one list for client and server. The database
+ * enum predates it; `ledgerEntryTypeOf` is the one translation between the two.
+ */
+export const ledgerEntryTypeSchema = z.enum([
+  "consume",
+  "refund_failed",
+  "refund_canceled",
+  "daily_grant",
+  "daily_expire",
+  "cycle_grant",
+  "cycle_reset",
+  "topup",
+  "admin_adjust",
+  "trial",
+]);
+export type LedgerEntryType = z.infer<typeof ledgerEntryTypeSchema>;
+
+const LEDGER_ENTRY_TYPE_BY_TRANSACTION_TYPE = {
+  generation_deduct: "consume",
+  generation_refund: "refund_failed",
+  daily_grant: "daily_grant",
+  subscription_grant: "cycle_grant",
+  purchase: "topup",
+  admin_adjustment: "admin_adjust",
+  bonus: "admin_adjust",
+} as const satisfies Record<CreditTransactionType, LedgerEntryType>;
+
+export function ledgerEntryTypeOf(
+  transactionType: CreditTransactionType,
+  _amount?: number,
+): LedgerEntryType {
+  return LEDGER_ENTRY_TYPE_BY_TRANSACTION_TYPE[transactionType];
+}
+
 // ── Quality / resolution types ────────────────────────────────
 
 export type ImageQualityLevel = "standard" | "hd" | "ultra";
@@ -229,6 +264,7 @@ export type CreditBalanceResponse = z.infer<typeof creditBalanceResponseSchema>;
 export const creditTransactionSchema = z.object({
   id: z.string().uuid(),
   transaction_type: creditTransactionTypeSchema,
+  entry_type: ledgerEntryTypeSchema.optional(),
   amount: z.number().int(),
   balance_after: z.number().int(),
   job_id: z.string().uuid().nullable(),
