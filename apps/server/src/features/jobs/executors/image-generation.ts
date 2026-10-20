@@ -7,6 +7,7 @@ import { generateImage } from "../../../generation/image-generation.js";
 import { resolveImageProviderName } from "../../../generation/providers/registry.js";
 import { applyWatermark } from "../../credits/watermark.js";
 
+import { DEFAULT_IMAGE_MODEL_ID } from "@loomic/shared";
 import type { SubscriptionPlan } from "@loomic/shared";
 
 registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorContext) => {
@@ -53,7 +54,7 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
   }
 
   // Resolve provider dynamically from model ID via registry
-  const model = payload.model ?? "black-forest-labs/flux-kontext-pro";
+  const model = payload.model ?? DEFAULT_IMAGE_MODEL_ID;
   const providerName = resolveImageProviderName(model, "generate");
 
   // Keep renewing the visibility timeout so the message does not become visible

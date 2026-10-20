@@ -7,6 +7,7 @@ import type {
   VideoResolution,
 } from "@loomic/shared";
 import {
+  DEFAULT_IMAGE_MODEL_ID,
   applicationErrorResponseSchema,
   createImageJobRequestSchema,
   createVideoJobRequestSchema,
@@ -59,7 +60,7 @@ export async function registerJobRoutes(
       const payload = createImageJobRequestSchema.parse(request.body);
       const viewer = await options.viewerService.ensureViewer(user);
 
-      const model = payload.model ?? "black-forest-labs/flux-kontext-pro";
+      const model = payload.model ?? DEFAULT_IMAGE_MODEL_ID;
 
       const { job } = await withBilling(
         options,

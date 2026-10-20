@@ -2,6 +2,8 @@
 import type { FastifyInstance } from "fastify";
 
 import {
+  DEFAULT_IMAGE_MODEL_ID,
+  DEFAULT_VIDEO_MODEL_ID,
   applicationErrorResponseSchema,
   generateImageRequestSchema,
   generateVideoRequestSchema,
@@ -80,7 +82,7 @@ export async function registerGenerateRoutes(
       );
     }
 
-    const model = payload.model ?? "black-forest-labs/flux-kontext-pro";
+    const model = payload.model ?? DEFAULT_IMAGE_MODEL_ID;
 
     try {
       const viewer = await options.viewerService.ensureViewer(user);
@@ -214,7 +216,7 @@ export async function registerGenerateRoutes(
       );
     }
 
-    const model = payload.model ?? "google-official/veo-3.1-generate-preview";
+    const model = payload.model ?? DEFAULT_VIDEO_MODEL_ID;
 
     try {
       const viewer = await options.viewerService.ensureViewer(user);

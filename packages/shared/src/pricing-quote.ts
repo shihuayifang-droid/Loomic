@@ -50,10 +50,9 @@ export const generateVideoRequestSchema = z.object({
 export type GenerateVideoRequest = z.infer<typeof generateVideoRequestSchema>;
 
 /**
- * 提交路由在请求没给 `model` 时用的默认模型（原先是 `http/generate.ts` 里的字面量，
- * 工单31D 把它们提到这里，好让询价接口对「同一个请求」报出同一个模型的价格）。
- *
- * 提交路由自己那两行字面量不在本单白名单内，所以它们仍在原处；两处值必须一致。
+ * 请求没给 `model` 时的默认模型。询价（`http/pricing.ts`）与三处提交路径
+ * （`http/generate.ts` 图片/视频、`http/jobs.ts` 图片、job executor
+ * `image-generation.ts`）都引用这里，只此一份（工单31D 提出，S-001 收口）。
  */
 export const DEFAULT_IMAGE_MODEL_ID = "black-forest-labs/flux-kontext-pro";
 export const DEFAULT_VIDEO_MODEL_ID = "google-official/veo-3.1-generate-preview";
