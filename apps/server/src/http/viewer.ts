@@ -70,7 +70,10 @@ export async function registerViewerRoutes(
           const balance = await options.creditService.getBalance(
             viewer.workspace.id,
           );
-          if (balance.plan === "free" && !balance.dailyClaimed) {
+          // AD-00 / T-04: /api/viewer is exempt from the member gate so a
+          // non-member can see their status page — but only an admitted member
+          // (team membership present) gets the daily grant.
+          if (viewer.teamMembership && balance.plan === "free" && !balance.dailyClaimed) {
             await options.creditService.claimDailyCredits(viewer.workspace.id);
           }
 

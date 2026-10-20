@@ -5,6 +5,7 @@ import type { FastifyInstance } from "fastify";
 
 import { buildApp } from "../app.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
+import type { CreditService } from "../features/credits/credit-service.js";
 import type { ProjectService } from "../features/projects/project-service.js";
 import type { TeamMembershipService } from "../features/team/team-membership.js";
 import type { UploadService } from "../features/uploads/upload-service.js";
@@ -133,9 +134,35 @@ const uploadService = {
 
 let app: FastifyInstance;
 
+let getBalanceCalls = 0;
+let claimDailyCreditsCalls = 0;
+
+const creditService = {
+  async getBalance() {
+    getBalanceCalls += 1;
+    return { balance: 0, plan: "free", dailyClaimed: false };
+  },
+  async claimDailyCredits() {
+    claimDailyCreditsCalls += 1;
+    return { success: true, balance: 100 };
+  },
+} as unknown as CreditService;
+
 function buildTestApp() {
   return buildApp({
     auth,
+    env: {},
+    projectService,
+    teamMembershipService: membershipService,
+    uploadService,
+    viewerService,
+  });
+}
+
+function buildTestAppWithCredits() {
+  return buildApp({
+    auth,
+    creditService,
     env: {},
     projectService,
     teamMembershipService: membershipService,
@@ -148,6 +175,8 @@ beforeEach(() => {
   mode = "none";
   projectListCalls = 0;
   uploadCalls = [];
+  getBalanceCalls = 0;
+  claimDailyCreditsCalls = 0;
   app = buildTestApp();
 });
 
@@ -332,5 +361,38 @@ describe("team member gate", () => {
 
     expect(closed).toBe(false);
     socket.close();
+  });
+
+  it("AD-00 / T-04: a non-member reading /api/viewer is not given the daily grant", async () => {
+    mode = "none";
+    await app.close();
+    app = buildTestAppWithCredits();
+    await app.ready();
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/viewer",
+      headers: { authorization: `Bearer ${MEMBER_TOKEN}` },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(claimDailyCreditsCalls).toBe(0);
+    expect(getBalanceCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("AD-00 / T-04: a team member reading /api/viewer still gets the daily grant", async () => {
+    mode = "member";
+    await app.close();
+    app = buildTestAppWithCredits();
+    await app.ready();
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/viewer",
+      headers: { authorization: `Bearer ${MEMBER_TOKEN}` },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(claimDailyCreditsCalls).toBe(1);
   });
 });
