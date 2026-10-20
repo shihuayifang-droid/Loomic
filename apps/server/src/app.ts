@@ -158,6 +158,7 @@ import {
 import { registerPaymentRoutes } from "./http/payments.js";
 import { registerPaymentWebhookRoute } from "./http/payments-webhook.js";
 import { registerCreditRoutes } from "./http/credits.js";
+import { registerPricingRoutes } from "./http/pricing.js";
 import { registerFontsRoutes } from "./http/fonts.js";
 import { registerJobRoutes } from "./http/jobs.js";
 import { registerAdminTeamRoutes } from "./http/admin-team.js";
@@ -873,6 +874,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     ...(connectionManager ? { connectionManager } : {}),
   });
   void registerCreditRoutes(app, { auth, creditService, viewerService });
+  // GN-01 / workorder 31D: the quote endpoint sits next to the balance it
+  // returns. It is handed no ledger, no job service and no deduction dependency
+  // (ruling 8), so "a quote cannot touch the balance or the ledger" is a
+  // property of its wiring rather than a promise in a comment.
+  void registerPricingRoutes(app, {
+    auth,
+    creditService,
+    priceQuoter,
+    viewerService,
+  });
   if (jobService) {
     void registerJobRoutes(app, {
       auth,

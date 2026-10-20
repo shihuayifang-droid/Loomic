@@ -81,12 +81,12 @@ import type {
   PriceDetail,
   VideoResolution,
 } from "@loomic/shared";
-import { PLAN_CONFIGS } from "@loomic/shared";
 
 import type { CreditLedgerWriteRepository } from "../../db/credit-ledger-write-repository.js";
 import type { AuthenticatedUser } from "../../supabase/user.js";
 import type { CreateJobInput, JobService } from "../jobs/job-service.js";
 import type { PriceQuoter } from "../pricing/price-quoter.js";
+import { billingSearchKey } from "../pricing/search-key.js";
 import { CreditServiceError, type CreditService } from "./credit-service.js";
 import { TierGuardError, type TierGuard } from "./tier-guard.js";
 
@@ -247,18 +247,28 @@ export async function withBilling<T>(
   } | null = null;
 
   if (billingEnabled) {
-    let effectiveQuality: ImageQualityLevel = "hd";
+    let searchKey: string;
     try {
       const sub = await creditService.getSubscription(workspaceId);
       tierGuard.checkModelAccess(sub.plan, modelId);
+      // Workorder 31D ruling 3: the tier a request is guarded and priced on is
+      // derived by ONE pure function (`features/pricing/search-key.ts`), shared
+      // with `POST /api/pricing/quote`. Two copies of this derivation would let a
+      // quote and the charge that follows it ask the price table about different
+      // tiers of the same request — a difference the ledger cannot show.
+      //
+      // The image branch calls it with the narrowed guard so the resolved tier is
+      // non-nullable: image guards always resolve a concrete level (`plan_max`
+      // included), and `checkResolution` must never be skipped.
       if (guard.jobType === "image_generation") {
-        effectiveQuality =
-          guard.quality === "plan_max"
-            ? PLAN_CONFIGS[sub.plan].maxResolution
-            : guard.quality;
-        tierGuard.checkResolution(sub.plan, effectiveQuality);
-      } else if (guard.resolution) {
-        tierGuard.checkVideoResolution(sub.plan, guard.resolution);
+        const billing = billingSearchKey(guard, sub.plan);
+        searchKey = billing.searchKey;
+        tierGuard.checkResolution(sub.plan, billing.effectiveQuality);
+      } else {
+        searchKey = billingSearchKey(guard, sub.plan).searchKey;
+        if (guard.resolution) {
+          tierGuard.checkVideoResolution(sub.plan, guard.resolution);
+        }
       }
       await tierGuard.checkConcurrency(workspaceId, sub.plan);
     } catch (err) {
@@ -275,10 +285,9 @@ export async function withBilling<T>(
     // row and quietly price a hd request off the model default).
     // Video: the requested resolution, or `"unspecified"`. Video only has a
     // default row today, so that answer is the default row — expected, not a bug.
-    const searchKey =
-      guard.jobType === "image_generation"
-        ? effectiveQuality
-        : (guard.resolution ?? "unspecified");
+    //
+    // Both of those sentences are now implemented by `billingSearchKey` above
+    // (workorder 31D); this comment records the ruling, not a second copy of it.
 
     // One clock reading per request (ruling 5): `at` decides which rules are in
     // force, and quoting twice with two different "now"s could straddle an

@@ -1,10 +1,13 @@
 // @credits-system — Direct generation routes with credit deduction and tier checks
 import type { FastifyInstance } from "fastify";
-import { z } from "zod";
 
 import {
   applicationErrorResponseSchema,
+  generateImageRequestSchema,
+  generateVideoRequestSchema,
   unauthenticatedErrorResponseSchema,
+  type GenerateImageRequest,
+  type GenerateVideoRequest,
   type VideoResolution,
 } from "@loomic/shared";
 
@@ -25,21 +28,10 @@ import type { ViewerService } from "../features/bootstrap/ensure-user-foundation
 import type { UploadService } from "../features/uploads/upload-service.js";
 import type { AuthenticatedUser, RequestAuthenticator } from "../supabase/user.js";
 
-const generateImageRequestSchema = z.object({
-  prompt: z.string().min(1),
-  model: z.string().optional(),
-  aspectRatio: z.enum(["1:1", "16:9", "9:16", "4:3", "3:4"]).optional(),
-  quality: z.enum(["standard", "hd", "ultra"]).optional(),
-});
-
-const generateVideoRequestSchema = z.object({
-  prompt: z.string().min(1),
-  model: z.string().optional(),
-  duration: z.number().int().min(3).max(16).optional(),
-  resolution: z.enum(["720p", "1080p", "4k"]).optional(),
-  aspectRatio: z.enum(["16:9", "9:16"]).optional(),
-  inputImages: z.array(z.string()).max(3).optional(),
-});
+// Workorder 31D ruling 1: the two request-body schemas moved to
+// `@loomic/shared` (`pricing-quote.ts`) and are imported above. The quote route
+// validates the SAME objects, which is what makes "询价的请求体与提交完全同构" a
+// fact instead of two copies that happen to look alike today.
 
 export async function registerGenerateRoutes(
   app: FastifyInstance,
@@ -74,7 +66,7 @@ export async function registerGenerateRoutes(
       );
     }
 
-    let payload: z.infer<typeof generateImageRequestSchema>;
+    let payload: GenerateImageRequest;
     try {
       payload = generateImageRequestSchema.parse(request.body);
     } catch {
@@ -197,7 +189,7 @@ export async function registerGenerateRoutes(
       );
     }
 
-    let payload: z.infer<typeof generateVideoRequestSchema>;
+    let payload: GenerateVideoRequest;
     try {
       payload = generateVideoRequestSchema.parse(request.body);
     } catch {

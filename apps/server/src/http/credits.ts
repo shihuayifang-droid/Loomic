@@ -2,8 +2,6 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 
 import {
-  PLAN_CONFIGS,
-  creditBalanceResponseSchema,
   creditTransactionsResponseSchema,
   claimDailyResponseSchema,
   setPlanRequestSchema,
@@ -11,6 +9,7 @@ import {
   unauthenticatedErrorResponseSchema,
 } from "@loomic/shared";
 
+import { toCreditBalanceResponse } from "../features/credits/balance-response.js";
 import {
   CreditServiceError,
   type CreditService,
@@ -36,21 +35,10 @@ export async function registerCreditRoutes(
       const balance = await options.creditService.getBalance(
         viewer.workspace.id,
       );
-      const config = PLAN_CONFIGS[balance.plan];
 
-      return reply.code(200).send(
-        creditBalanceResponseSchema.parse({
-          balance: balance.balance,
-          plan: balance.plan,
-          dailyClaimed: balance.dailyClaimed,
-          limits: {
-            maxConcurrentJobs: config.maxConcurrentJobs,
-            maxResolution: config.maxResolution,
-            monthlyCredits: config.monthlyCredits,
-            dailyCredits: config.dailyCredits,
-          },
-        }),
-      );
+      // Workorder 31D ruling 7: the payload is assembled by the one helper the
+      // quote route also uses, so "余额与 GET /api/credits 同结构" cannot drift.
+      return reply.code(200).send(toCreditBalanceResponse(balance));
     } catch (error) {
       return sendCreditError(error, reply, "credit_query_failed");
     }
@@ -121,25 +109,13 @@ export async function registerCreditRoutes(
 
       await options.creditService.updatePlan(viewer.workspace.id, body.plan);
 
-      // Return refreshed balance info
+      // Return refreshed balance info — same helper as GET /api/credits and the
+      // quote route (workorder 31D ruling 7).
       const balance = await options.creditService.getBalance(
         viewer.workspace.id,
       );
-      const config = PLAN_CONFIGS[balance.plan];
 
-      return reply.code(200).send(
-        creditBalanceResponseSchema.parse({
-          balance: balance.balance,
-          plan: balance.plan,
-          dailyClaimed: balance.dailyClaimed,
-          limits: {
-            maxConcurrentJobs: config.maxConcurrentJobs,
-            maxResolution: config.maxResolution,
-            monthlyCredits: config.monthlyCredits,
-            dailyCredits: config.dailyCredits,
-          },
-        }),
-      );
+      return reply.code(200).send(toCreditBalanceResponse(balance));
     } catch (error) {
       if (isZodError(error)) {
         return reply
