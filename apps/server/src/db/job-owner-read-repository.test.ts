@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  FIND_OWN_JOB_BY_CLIENT_REQUEST_ID,
   JOB_OWNER_READ_COLUMNS,
   JobOwnerReadError,
   LIST_OWN_JOBS,
@@ -163,6 +164,35 @@ function listOwn(
 function requireRow(row: JobOwnerReadRow | null): JobOwnerReadRow {
   if (row === null) throw new Error("expected a row, got null");
   return row;
+}
+
+/**
+ * The submission-id read (ED-00m), with each argument named once.
+ *
+ * The method is OPTIONAL on the interface, because the service-level doubles in
+ * `features/jobs/job-service.test.ts` implement that interface and predate this
+ * read; the call is therefore narrowed once here instead of at every case. The
+ * real repository always answers it — that is what the cases below prove.
+ */
+function findOwn(
+  repository: JobOwnerReadRepository,
+  input: {
+    actorId?: unknown;
+    clientRequestId?: unknown;
+    withinHours?: unknown;
+  } = {},
+): Promise<JobOwnerReadRow | null> {
+  const find = repository.findOwnJobByClientRequestId;
+  if (find === undefined) {
+    throw new Error("the repository must implement findOwnJobByClientRequestId");
+  }
+
+  return find.call(repository, {
+    actorId: "actorId" in input ? input.actorId : ACTOR_ID,
+    clientRequestId:
+      "clientRequestId" in input ? input.clientRequestId : "req-12345678",
+    withinHours: "withinHours" in input ? input.withinHours : 24,
+  } as { actorId: string; clientRequestId: string; withinHours: number });
 }
 
 function lastStatement(harness: Harness): string | undefined {
@@ -479,15 +509,22 @@ describe("job-owner-read-repository: the statements it issues", () => {
     ]);
   });
 
-  it("case 10: the repository exposes the two owner reads and nothing else", async () => {
+  it("case 10: the repository exposes the three owner reads and nothing else", async () => {
     const harness = createHarness(() => [dbRow()]);
     const repository = repositoryFor(harness);
 
     // No access token, no workspace parameter, no ordering and no page size a
-    // caller could widen the read with.
-    expect(Object.keys(repository)).toEqual([READ_OWN_JOB, LIST_OWN_JOBS]);
+    // caller could widen the read with. The submission-id read (ED-00m) is the
+    // third owner read, and it is still keyed on the actor: no actor list, no
+    // generic predicate.
+    expect(Object.keys(repository)).toEqual([
+      READ_OWN_JOB,
+      LIST_OWN_JOBS,
+      FIND_OWN_JOB_BY_CLIENT_REQUEST_ID,
+    ]);
     expect(repository.readOwnJob).toHaveLength(1);
     expect(repository.listOwnJobs).toHaveLength(1);
+    expect(repository.findOwnJobByClientRequestId).toHaveLength(1);
 
     await readOwn(repository);
     await listOwn(repository);
@@ -904,5 +941,116 @@ describe("job-owner-read-repository: zero rows, unusable arguments, failures", (
       TRANSACTION_SETTING_NAMES.userId,
       OTHER_ACTOR_ID,
     ]);
+  });
+});
+
+describe("job-owner-read-repository: the submission id read (ED-00m)", () => {
+  it("ED-00m: a client request id shorter than 8 or longer than 128 is refused before connecting", async () => {
+    for (const clientRequestId of [
+      undefined,
+      "",
+      7,
+      null,
+      {},
+      "req-123",
+      "a".repeat(129),
+    ]) {
+      const harness = createHarness(() => [dbRow()]);
+      const error = await findOwn(repositoryFor(harness), {
+        clientRequestId,
+      }).catch((reason: unknown) => reason);
+
+      expect(error).toBeInstanceOf(JobOwnerReadError);
+      expect((error as JobOwnerReadError).operation).toBe(
+        FIND_OWN_JOB_BY_CLIENT_REQUEST_ID,
+      );
+      expect((error as JobOwnerReadError).message).toBe(
+        `job owner read failed (${FIND_OWN_JOB_BY_CLIENT_REQUEST_ID})`,
+      );
+      // Refused BEFORE the pool is reached: no connection, no statement.
+      expect(harness.connectAttempts()).toBe(0);
+      expect(harness.queries).toHaveLength(0);
+    }
+
+    // The two bounds themselves are usable: 8 and 128 include the window.
+    for (const clientRequestId of ["a".repeat(8), "a".repeat(128)]) {
+      const harness = createHarness(() => [dbRow()]);
+      await expect(
+        findOwn(repositoryFor(harness), { clientRequestId }),
+      ).resolves.not.toBeNull();
+      expect(harness.connectAttempts()).toBe(1);
+    }
+  });
+
+  it("ED-00m: withinHours outside 1..168 is refused before connecting", async () => {
+    for (const withinHours of [
+      undefined,
+      0,
+      169,
+      1.5,
+      -1,
+      Number.NaN,
+      "24",
+      null,
+      {},
+    ]) {
+      const harness = createHarness(() => [dbRow()]);
+      const error = await findOwn(repositoryFor(harness), {
+        withinHours,
+      }).catch((reason: unknown) => reason);
+
+      expect(error).toBeInstanceOf(JobOwnerReadError);
+      expect((error as JobOwnerReadError).operation).toBe(
+        FIND_OWN_JOB_BY_CLIENT_REQUEST_ID,
+      );
+      expect(harness.connectAttempts()).toBe(0);
+      expect(harness.queries).toHaveLength(0);
+    }
+
+    // A whole hour inside the range is a value, not a refusal.
+    for (const withinHours of [1, 24, 168]) {
+      const harness = createHarness(() => [dbRow()]);
+      await expect(
+        findOwn(repositoryFor(harness), { withinHours }),
+      ).resolves.not.toBeNull();
+      expect(harness.connectAttempts()).toBe(1);
+    }
+  });
+
+  it("ED-00m: the statement binds actor, id and hours", async () => {
+    const harness = createHarness(() => [dbRow()]);
+
+    const row = requireRow(
+      await findOwn(repositoryFor(harness), {
+        clientRequestId: "req-12345678",
+        withinHours: 24,
+      }),
+    );
+
+    const statement = domainCalls(harness.queries)[0];
+    // Position is part of the contract: $1 the ACL, $2 the submission id, $3 the
+    // window — and the hours stay a NUMBER, not a rendered string.
+    expect(statement?.params).toEqual([ACTOR_ID, "req-12345678", 24]);
+
+    const sql = statement?.sql ?? "";
+    const flat = sql.replace(/\s+/g, " ").trim();
+    expect(flat).toContain("where created_by = $1::uuid");
+    expect(flat).toContain("client_request_id = $2");
+    expect(flat).toContain("created_at >= now() - make_interval(hours => $3::int)");
+    // Neither the actor nor the browser-chosen id is written into the text.
+    expect(sql).not.toContain(ACTOR_ID);
+    expect(sql).not.toContain("req-12345678");
+    expect(sql).not.toContain("${");
+    expect(sql.match(/public\.[a-z_]+/g)).toEqual(["public.background_jobs"]);
+
+    // Same 22-column projection as the other two reads, so the write path can map
+    // this row through exactly the same mapper.
+    expect(selectList(sql)).toEqual([...JOB_OWNER_READ_COLUMNS]);
+    expect(row.id).toBe(JOB_ID);
+
+    // Zero rows is "this submission has not happened yet", not a failure.
+    const empty = createHarness(() => []);
+    await expect(findOwn(repositoryFor(empty))).resolves.toBeNull();
+    expect(lastStatement(empty)).toBe(TRANSACTION_STATEMENTS.commit);
   });
 });

@@ -429,6 +429,43 @@ async function listViaRepository(
 }
 
 /**
+ * The submission-id read (ED-00m).
+ *
+ * The method is OPTIONAL on the interface — the service-level double in
+ * `features/jobs/job-service.test.ts` predates it — so the call is narrowed once
+ * here. The real repository under test always answers it.
+ */
+function findOwnByRequestId(
+  actorId: string,
+  clientRequestId: string,
+  withinHours = 24,
+): Promise<JobOwnerReadRow | null> {
+  const find = repository.findOwnJobByClientRequestId;
+  if (find === undefined) {
+    throw new Error("the repository must implement findOwnJobByClientRequestId");
+  }
+
+  return find.call(repository, { actorId, clientRequestId, withinHours });
+}
+
+/**
+ * Stamp an inserted fixture row with a submission id and move its `created_at` to
+ * NOW, because the read is age-bounded: the shared fixture timestamps are months
+ * old and would answer "outside the window" for reasons this file is not testing.
+ */
+async function assignRequestId(
+  jobId: string,
+  clientRequestId: string,
+): Promise<void> {
+  await db.query(
+    `update public.background_jobs
+        set client_request_id = $2, created_at = now()
+      where id = $1::uuid`,
+    [jobId, clientRequestId],
+  );
+}
+
+/**
  * The comparison this file exists for, for ONE identity: the repository (whose
  * statement carries the ACL) and the policy (which decides for the same actor
  * under `authenticated`) must agree — and both must agree with the expected
@@ -1449,5 +1486,138 @@ describe("job owner read: through the real JobService", () => {
     expect(list.statusCode).toBe(500);
     expect(list.message).toBe("Failed to list jobs.");
     expect(list.message).not.toMatch(/connection reset/);
+  });
+});
+
+describe("job owner read: the submission id (ED-00m)", () => {
+  /** The author's job, named by the id its browser chose. */
+  const JOB_REQUEST = "00000000-0000-0000-0000-00000021e001";
+  /** The member's own job, named by a request id only the member uses. */
+  const JOB_MEMBER_NAMED = "00000000-0000-0000-0000-00000021e002";
+  /** The author's own job, named by a request id only the author uses. */
+  const JOB_AUTHOR_NAMED = "00000000-0000-0000-0000-00000021e003";
+  /** A job whose row is 25 hours old. */
+  const JOB_STALE = "00000000-0000-0000-0000-00000021e004";
+  /** Two rows of the SAME actor that try to carry one request id. */
+  const JOB_DUPLICATE_FIRST = "00000000-0000-0000-0000-00000021e005";
+  const JOB_DUPLICATE_SECOND = "00000000-0000-0000-0000-00000021e006";
+  /** Two rows of TWO actors that legitimately carry one request id. */
+  const JOB_SHARED_AUTHOR = "00000000-0000-0000-0000-00000021e007";
+  const JOB_SHARED_MEMBER = "00000000-0000-0000-0000-00000021e008";
+
+  const REQUEST_ID = "req-21e0-found";
+  const MEMBER_REQUEST_ID = "req-21e0-member";
+  const AUTHOR_REQUEST_ID = "req-21e0-author";
+  const STALE_REQUEST_ID = "req-21e0-stale";
+  const DUPLICATE_REQUEST_ID = "req-21e0-duplicate";
+  const SHARED_REQUEST_ID = "req-21e0-shared";
+
+  it("ED-00m: the actor's job with that request id is found", async () => {
+    await insertJob({ id: JOB_REQUEST, status: "queued" });
+    await assignRequestId(JOB_REQUEST, REQUEST_ID);
+
+    const row = await findOwnByRequestId(AUTHOR_ID, REQUEST_ID);
+    if (row === null) throw new Error("expected the job named by the request id");
+
+    expect(row.id).toBe(JOB_REQUEST);
+    expect(row.created_by).toBe(AUTHOR_ID);
+    expect(row.status).toBe("queued");
+    // The row key changed, the projection and the mapping did not: the same row
+    // an id read answers with is what the database itself says it is.
+    expect(row).toEqual(await dbTruth(JOB_REQUEST));
+
+    // An id nobody used is the "not submitted yet" answer, not an error.
+    expect(await findOwnByRequestId(AUTHOR_ID, "req-21e0-unknown")).toBeNull();
+  });
+
+  it("ED-00m: another user's job with the same request id is not", async () => {
+    await insertJob({ id: JOB_MEMBER_NAMED, status: "queued", createdBy: MEMBER_ID });
+    await assignRequestId(JOB_MEMBER_NAMED, MEMBER_REQUEST_ID);
+    await insertJob({ id: JOB_AUTHOR_NAMED, status: "queued" });
+    await assignRequestId(JOB_AUTHOR_NAMED, AUTHOR_REQUEST_ID);
+
+    // Each name resolves for its OWNER...
+    expect((await findOwnByRequestId(MEMBER_ID, MEMBER_REQUEST_ID))?.id).toBe(
+      JOB_MEMBER_NAMED,
+    );
+    expect((await findOwnByRequestId(AUTHOR_ID, AUTHOR_REQUEST_ID))?.id).toBe(
+      JOB_AUTHOR_NAMED,
+    );
+
+    // ...and the same name handed to anybody else is "no such job", even though
+    // both users are members of the very same workspace.
+    expect(await findOwnByRequestId(AUTHOR_ID, MEMBER_REQUEST_ID)).toBeNull();
+    expect(await findOwnByRequestId(MEMBER_ID, AUTHOR_REQUEST_ID)).toBeNull();
+    expect(
+      await findOwnByRequestId(TEAM_OWNER_ID, AUTHOR_REQUEST_ID),
+    ).toBeNull();
+  });
+
+  it("ED-00m: a job older than the window is not found", async () => {
+    await insertJob({ id: JOB_STALE, status: "queued" });
+    await db.query(
+      `update public.background_jobs
+          set client_request_id = $2, created_at = now() - interval '25 hours'
+        where id = $1::uuid`,
+      [JOB_STALE, STALE_REQUEST_ID],
+    );
+
+    // 25 hours old, asked for with a 24 hour window: not this submission.
+    expect(await findOwnByRequestId(AUTHOR_ID, STALE_REQUEST_ID, 24)).toBeNull();
+
+    // The row is really there and really belongs to the actor, so the refusal is
+    // the AGE term: a wider window finds it.
+    expect((await findOwnByRequestId(AUTHOR_ID, STALE_REQUEST_ID, 26))?.id).toBe(
+      JOB_STALE,
+    );
+    expect((await repository.readOwnJob({ actorId: AUTHOR_ID, jobId: JOB_STALE }))?.id).toBe(
+      JOB_STALE,
+    );
+  });
+
+  it("ED-00m: the same user cannot store the same request id twice", async () => {
+    await insertJob({ id: JOB_DUPLICATE_FIRST, status: "queued" });
+    await insertJob({ id: JOB_DUPLICATE_SECOND, status: "queued" });
+    await assignRequestId(JOB_DUPLICATE_FIRST, DUPLICATE_REQUEST_ID);
+
+    // The unique index on (created_by, client_request_id) is what makes "the same
+    // id is the same job" a fact of the database, not a convention of the write
+    // path: a second row of the SAME user is rejected.
+    const refused = await rejection(() =>
+      assignRequestId(JOB_DUPLICATE_SECOND, DUPLICATE_REQUEST_ID),
+    );
+    expect(refused.code).toBe("23505");
+
+    // The first row keeps the name, the rejected one never got it.
+    expect((await findOwnByRequestId(AUTHOR_ID, DUPLICATE_REQUEST_ID))?.id).toBe(
+      JOB_DUPLICATE_FIRST,
+    );
+    expect(
+      firstRow(
+        (
+          await db.query<{ client_request_id: string | null }>(
+            "select client_request_id from public.background_jobs where id = $1::uuid",
+            [JOB_DUPLICATE_SECOND],
+          )
+        ).rows,
+      ).client_request_id,
+    ).toBeNull();
+  });
+
+  it("ED-00m: two different users may use the same request id", async () => {
+    await insertJob({ id: JOB_SHARED_AUTHOR, status: "queued" });
+    await insertJob({ id: JOB_SHARED_MEMBER, status: "queued", createdBy: MEMBER_ID });
+
+    // The uniqueness is per ACTOR: the same browser-generated name in two users'
+    // hands is two rows, and neither update conflicts.
+    await assignRequestId(JOB_SHARED_AUTHOR, SHARED_REQUEST_ID);
+    await assignRequestId(JOB_SHARED_MEMBER, SHARED_REQUEST_ID);
+
+    expect((await findOwnByRequestId(AUTHOR_ID, SHARED_REQUEST_ID))?.id).toBe(
+      JOB_SHARED_AUTHOR,
+    );
+    expect((await findOwnByRequestId(MEMBER_ID, SHARED_REQUEST_ID))?.id).toBe(
+      JOB_SHARED_MEMBER,
+    );
   });
 });
