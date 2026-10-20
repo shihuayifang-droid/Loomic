@@ -10,6 +10,7 @@ import { imageToolbarPosition } from "@/lib/toolbar-position";
 
 import { useToast } from "@/components/toast";
 import { useToolDefinitions } from "@/hooks/use-tool-definitions";
+import { getAssetDownloadUrl } from "@/lib/server-api";
 
 import { FlipRotateBar } from "./flip-rotate-bar";
 import { ImageToolbar } from "./image-toolbar";
@@ -58,6 +59,14 @@ export const DOWNLOAD_FAILED_MESSAGE = "原图还没准备好，暂时无法下�
 const FLIP_ROTATE_TOOL_ID = "flip_rotate";
 
 /**
+ * ED-05：主工具条的「下载」工具 id。
+ *
+ * 它下载的是**服务端原图**（ED-00j），不是前端把 dataURL 转出来的那张 —— 所以走服务端
+ * 签发的带 `Content-Disposition` 的地址，原格式、原文件名都由服务端决定。
+ */
+const DOWNLOAD_TOOL_ID = "download";
+
+/**
  * `excalidrawApi` 在本仓是 `any`（`canvas-editor.tsx:169`），这里只声明用到的 4 个方法。
  * 方法都可选：真实 API 一定都有，但测试里的假 API 按需给（`test/canvas-bottom-bar-zoom.test.tsx`
  * 的 `makeApi()` 就是这种写法）。
@@ -71,10 +80,14 @@ export type ExcalidrawApiLike = {
   updateScene?: ((scene: { elements: unknown[]; captureUpdate: string }) => void) | undefined;
 };
 
-/** Excalidraw 的 `files` 里本组件只用到 `dataURL`（原图）和 `mimeType`（推扩展名）。 */
+/**
+ * Excalidraw 的 `files` 里本组件只用到 `dataURL`（原图）、`mimeType`（推扩展名）
+ * 和 `assetId`（ED-05：服务端画布读投影带回的文件记录 id，`app/canvas/page.tsx` 已在用）。
+ */
 export type ExcalidrawFileLike = {
   dataURL?: string | undefined;
   mimeType?: string | undefined;
+  assetId?: string | undefined;
 };
 
 export type ImageToolbarLayerProps = {
@@ -85,7 +98,21 @@ export type ImageToolbarLayerProps = {
    * 只有测试会传：模块内的 `downloadTransformed` 用 `vi.spyOn` 截不到，只能从外面注入。
    */
   download?: ((dataUrl: string, name: string, state: FlipRotateState) => void) | undefined;
+  /**
+   * ED-05：把服务端签发的下载地址交给浏览器打开，默认 {@link openDownloadAnchor}。
+   * 同样只给测试注入：jsdom 里 `anchor.click()` 没有可断言的行为。
+   */
+  openDownload?: ((url: string) => void) | undefined;
 };
+
+/** ED-05 的默认「打开下载地址」：造一个带 `download` 的 anchor 直接点。 */
+function defaultOpenDownload(url: string): void {
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "";
+  anchor.rel = "noopener";
+  anchor.click();
+}
 
 /** 最近一帧里与渲染有关的全部信息。 */
 type Snapshot = {
@@ -231,6 +258,7 @@ export function ImageToolbarLayer({
   excalidrawApi,
   accessToken,
   download,
+  openDownload,
 }: ImageToolbarLayerProps) {
   const { toast } = useToast();
   const definitions = useToolDefinitions(accessToken);
@@ -436,16 +464,57 @@ export function ImageToolbarLayer({
 
   const exitFlipRotate = useCallback(() => setMode({ kind: "toolbar" }), []);
 
+  /**
+   * ED-05：主工具条的「下载」→ 服务端原图（ED-00j）。
+   *
+   * **不在前端转 dataURL**（规格原文）：只问服务端要一条带 `Content-Disposition`（原名）的
+   * 签名地址，交给浏览器自己下。老对象没有 `assetId`、或还没有 token，就只提示，不回落。
+   */
+  const handleDownloadOriginal = useCallback(async () => {
+    const el = snapshot?.element as ElementLike | null | undefined;
+    if (!el) return;
+    const files = excalidrawApi.getFiles?.() ?? {};
+    const fileId = typeof el.fileId === "string" ? el.fileId : "";
+    const file = fileId === "" ? undefined : files[fileId];
+    const assetId = file?.assetId;
+
+    if (
+      typeof assetId !== "string" ||
+      assetId === "" ||
+      accessToken === null ||
+      accessToken === ""
+    ) {
+      toast(DOWNLOAD_FAILED_MESSAGE);
+      return;
+    }
+
+    try {
+      const { url } = await getAssetDownloadUrl(accessToken, assetId);
+      if (typeof url !== "string" || url === "") {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return;
+      }
+      (openDownload ?? defaultOpenDownload)(url);
+    } catch {
+      toast(DOWNLOAD_FAILED_MESSAGE);
+    }
+  }, [snapshot, excalidrawApi, toast, accessToken, openDownload]);
+
   const handleToolSelect = useCallback(
     (toolId: string) => {
       if (toolId === FLIP_ROTATE_TOOL_ID) {
         enterFlipRotate();
         return;
       }
+      // ED-05：主工具条的下载走服务端原图；二级条的下载（导出变换后的图）不受影响。
+      if (toolId === DOWNLOAD_TOOL_ID) {
+        void handleDownloadOriginal();
+        return;
+      }
       // 其余工具本单都不接（工单 §3 裁决 6）。
       toast(TOOL_PENDING_MESSAGE);
     },
-    [enterFlipRotate, toast],
+    [enterFlipRotate, handleDownloadOriginal, toast],
   );
 
   if (

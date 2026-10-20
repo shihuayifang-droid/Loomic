@@ -543,6 +543,19 @@ export async function getAssetUrl(
   return (await response.json()) as AssetSignedUrlResponse;
 }
 
+/** ED-05: a signed URL that makes the browser save the original under its own name. */
+export async function getAssetDownloadUrl(
+  accessToken: string,
+  assetId: string,
+): Promise<AssetSignedUrlResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/uploads/${assetId}/url?download=1`,
+    { headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as AssetSignedUrlResponse;
+}
+
 export async function deleteAsset(
   accessToken: string,
   assetId: string,

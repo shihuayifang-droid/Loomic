@@ -60,10 +60,40 @@ const toolDefinitions = vi.hoisted(() => [
     agent_callable: false,
     availability: "enabled",
   },
+  // ED-05：主工具条的「下载」（服务端定义见 `apps/server/.../tool-definitions.ts` L120）。
+  {
+    id: "download",
+    label: "下载",
+    icon: "download",
+    testid: "image-toolbar-download",
+    form: "direct",
+    default_slot: "main",
+    removable: false,
+    consumes: false,
+    pricing: null,
+    output_kind: "none",
+    output_format: null,
+    file_prefix: null,
+    event_type: null,
+    disabled_rules: [],
+    eta_seconds: null,
+    agent_callable: false,
+    availability: "enabled",
+  },
 ]);
 
 vi.mock("@/hooks/use-tool-definitions", () => ({
   useToolDefinitions: () => ({ status: "ready", tools: toolDefinitions }),
+}));
+
+/**
+ * ED-05：只替身 `getAssetDownloadUrl`（本单要断言「有没有去问服务端要下载地址」），
+ * 其余导出用 `importOriginal` 保留原样 —— 被测组件与这个文件都还需要 server-api 的其他成员。
+ */
+const getAssetDownloadUrlMock = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/server-api", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getAssetDownloadUrl: getAssetDownloadUrlMock,
 }));
 
 vi.mock("@excalidraw/excalidraw", () => ({
@@ -160,7 +190,16 @@ type FakeApi = {
  * `push()` 包在 `act()` 里：帧是外部事件（Excalidraw 的 onChange）驱动进来的，
  * 不包的话 setState 在 act 之外发生，React 会警告且断言可能看到旧树。
  */
-function setup(options: { files?: Record<string, unknown>; download?: ReturnType<typeof vi.fn> } = {}) {
+type HarnessOptions = {
+  files?: Record<string, unknown>;
+  download?: ReturnType<typeof vi.fn>;
+  /** ED-05：注入「打开下载地址」的 spy（组件内部是造 anchor 并 click）。 */
+  openDownload?: ReturnType<typeof vi.fn>;
+  /** ED-05：有的用例要换 token（默认 `"test-token"`）。 */
+  accessToken?: string | null;
+};
+
+function setup(options: HarnessOptions = {}) {
   const listeners: Array<(elements: Element[], appState: AppState) => void> = [];
   const api: FakeApi = {
     onChange: vi.fn((listener: (elements: Element[], appState: AppState) => void) => {
@@ -179,9 +218,10 @@ function setup(options: { files?: Record<string, unknown>; download?: ReturnType
   // 不给 `download` 时**连 prop 都不传**，走组件默认的 `downloadTransformed`。
   const props: Parameters<typeof ImageToolbarLayer>[0] = {
     excalidrawApi: api as never,
-    accessToken: "test-token",
+    accessToken: options.accessToken === undefined ? "test-token" : options.accessToken,
   };
   if (options.download !== undefined) props.download = options.download;
+  if (options.openDownload !== undefined) props.openDownload = options.openDownload;
 
   render(<ImageToolbarLayer {...props} />);
 
@@ -195,9 +235,7 @@ function setup(options: { files?: Record<string, unknown>; download?: ReturnType
 }
 
 /** 一次「选中一张图」的普通开局。 */
-function setupSelectedImage(
-  options: { files?: Record<string, unknown>; download?: ReturnType<typeof vi.fn> } = {},
-) {
+function setupSelectedImage(options: HarnessOptions = {}) {
   const harness = setup(options);
   harness.push([imageElement(), rectangleElement()], makeAppState());
   return harness;
@@ -487,5 +525,72 @@ describe("ImageToolbarLayer：二级条的下载", () => {
     const lastCall = download.mock.calls[download.mock.calls.length - 1];
     expect(lastCall?.[2]).toEqual({ angle: 0, flipH: true, flipV: false });
     expect(lastCall?.[1]).toBe("cat.png");
+  });
+});
+
+describe("ED-05：工具条下载走服务端原图", () => {
+  /** 服务端画布读投影带回的文件记录（`file.assetId`，见 `app/canvas/page.tsx` L298）。 */
+  const filesWithAsset = {
+    "file-1": {
+      dataURL: "data:image/png;base64,AAAA",
+      mimeType: "image/png",
+      assetId: "asset-9",
+    },
+  };
+
+  beforeEach(() => {
+    getAssetDownloadUrlMock.mockReset();
+  });
+
+  it("ED-05: 有 assetId 时向服务端要下载地址并打开它", async () => {
+    const openDownload = vi.fn();
+    getAssetDownloadUrlMock.mockResolvedValue({ url: "https://x/sign?token=1" });
+    setupSelectedImage({ files: filesWithAsset, openDownload, accessToken: "tok" });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-download"));
+
+    await waitFor(() => expect(openDownload).toHaveBeenCalledWith("https://x/sign?token=1"));
+    expect(getAssetDownloadUrlMock).toHaveBeenCalledWith("tok", "asset-9");
+  });
+
+  it("ED-05: 不在前端转 dataURL", async () => {
+    const download = vi.fn();
+    const openDownload = vi.fn();
+    getAssetDownloadUrlMock.mockResolvedValue({ url: "https://x/sign?token=1" });
+    setupSelectedImage({ files: filesWithAsset, download, openDownload, accessToken: "tok" });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-download"));
+
+    await waitFor(() => expect(openDownload).toHaveBeenCalledTimes(1));
+    // 二级条那条「导出变换后的图」的下载路径一次都不该走。
+    expect(download).toHaveBeenCalledTimes(0);
+  });
+
+  it("ED-05: 没有 assetId 时给下载失败提示，不请求", () => {
+    const openDownload = vi.fn();
+    setupSelectedImage({
+      files: { "file-1": { dataURL: "data:image/png;base64,AAAA", mimeType: "image/png" } },
+      openDownload,
+      accessToken: "tok",
+    });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-download"));
+
+    expect(toastMock.toast).toHaveBeenCalledWith(DOWNLOAD_FAILED_MESSAGE);
+    expect(getAssetDownloadUrlMock).toHaveBeenCalledTimes(0);
+    expect(openDownload).toHaveBeenCalledTimes(0);
+  });
+
+  it("ED-05: 服务端拒绝时给下载失败提示", async () => {
+    const openDownload = vi.fn();
+    getAssetDownloadUrlMock.mockRejectedValue(new Error("403"));
+    setupSelectedImage({ files: filesWithAsset, openDownload, accessToken: "tok" });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-download"));
+
+    await waitFor(() =>
+      expect(toastMock.toast).toHaveBeenCalledWith(DOWNLOAD_FAILED_MESSAGE),
+    );
+    expect(openDownload).toHaveBeenCalledTimes(0);
   });
 });
