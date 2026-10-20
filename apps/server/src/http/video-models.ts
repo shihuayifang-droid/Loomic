@@ -44,6 +44,7 @@ export async function registerVideoModelRoutes(
       description: m.description,
       iconUrl: m.iconUrl,
       provider: m.provider,
+      modality: "video" as const,
       accessible: userPlan !== null && canAccessModel(userPlan, m.id),
       minTier: MODEL_MIN_TIER[m.id] ?? "pro",
       capabilities: m.capabilities,

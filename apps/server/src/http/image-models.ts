@@ -44,6 +44,7 @@ export async function registerImageModelRoutes(
       description: m.description,
       iconUrl: m.iconUrl,
       provider: m.provider,
+      modality: "image" as const,
       accessible: userPlan !== null && canAccessModel(userPlan, m.id),
       minTier: MODEL_MIN_TIER[m.id] ?? "pro",
       // Exposed so the picker can gate the reference-image dropzone and the

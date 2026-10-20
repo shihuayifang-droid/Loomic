@@ -18,6 +18,8 @@
 // Entries marked NEEDS-REVIEW had no configured tier and carry the old implicit
 // default written out explicitly so behaviour is unchanged. They are the tier
 // decisions that were never really made and still need a real answer.
+import { z } from "zod";
+
 import type { SubscriptionPlan } from "./credits.js";
 
 export interface ImageCatalogEntry {
@@ -236,3 +238,18 @@ export const VIDEO_MODEL_CATALOG = {
 export type CataloguedImageModelId = keyof typeof IMAGE_MODEL_CATALOG;
 /** Ids of every catalogued video model. */
 export type CataloguedVideoModelId = keyof typeof VIDEO_MODEL_CATALOG;
+
+/**
+ * MD-04: the modality is its own field, never parsed out of an id or a tool
+ * name. `3d` is kept (D-6: not built, value reserved); `audio` is reserved
+ * (MD-12). Adding a modality adds a value here, not a column.
+ */
+export const modelModalitySchema = z.enum(["image", "video", "3d", "audio"]);
+export type ModelModality = z.infer<typeof modelModalitySchema>;
+
+/** Which catalogue a model belongs to decides its modality — not its name. */
+export function modalityOfCatalogModel(id: string): ModelModality | null {
+  if (Object.prototype.hasOwnProperty.call(IMAGE_MODEL_CATALOG, id)) return "image";
+  if (Object.prototype.hasOwnProperty.call(VIDEO_MODEL_CATALOG, id)) return "video";
+  return null;
+}
