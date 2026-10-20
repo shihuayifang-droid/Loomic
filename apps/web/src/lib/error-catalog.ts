@@ -99,6 +99,8 @@ export const APP_ERROR_CATALOG: Record<ApplicationErrorCode, ErrorEntry> = {
   // quota
   insufficient_credits: quota("积分不足，请充值后再试。"),
   concurrency_limit: quota("同时进行中的任务已满，请等前面的完成后再试。"),
+  personal_cap_reached: quota("个人额度已用完，请稍后再试。"),
+  team_pool_exhausted: quota("团队额度已用完，请稍后再试。"),
 
   // user_fixable — the user can change something and try again
   invalid_request: fixable("请求内容有误，请修改参数后重试。"),
@@ -109,6 +111,12 @@ export const APP_ERROR_CATALOG: Record<ApplicationErrorCode, ErrorEntry> = {
   // row for the model), so it is an exhaustive-catalogue entry, not an EXTRA one.
   model_not_available: fixable("这个模型暂不可用，请更换模型。"),
   feature_disabled: fixable("这个功能暂未开放。"),
+  model_not_allowed: fixable("当前不能使用这个模型，请更换模型。"),
+  quote_mismatch: fixable("价格已经变化，请重新确认后再试。"),
+  tool_disabled: fixable("这个工具暂不可用，请取消勾选后重试。"),
+
+  // policy — account-level, so there is nothing to retry
+  account_suspended: policy("账号已被暂停，无法继续生成。"),
 
   // service — everything else: our side or upstream, retry later
   application_error: service("服务出现异常，请稍后重试。"),
@@ -169,35 +177,20 @@ export const APP_ERROR_CATALOG: Record<ApplicationErrorCode, ErrorEntry> = {
   not_team_member: service("当前账号不在团队里，请确认后再试。"),
   forbidden: service("没有权限执行这个操作。"),
   user_not_found: service("找不到这个成员，请确认邮箱后再试。"),
+  timeout: service("生成超时，请重试。"),
+  upstream_busy: service("模型服务繁忙，请稍后重试。"),
+  canvas_unavailable: service("画布暂时不可用，请稍后重试。"),
 };
 
 // --- Codes outside shared's enum -------------------------------------------
 
 /**
- * Codes the catalogue needs before shared's enum grows them. Two sources:
- * the X-40 §5 initial entries (which the backend line will add to the enum)
- * and the job `error_code` values the worker writes (`timeout`, `upstream_busy`).
- * Adding a code here is a client-side workaround, not the final home — when the
- * enum catches up, the row moves into `APP_ERROR_CATALOG`.
+ * Now empty: every code the catalogue knows lives in shared's
+ * `applicationErrorCodeSchema`, so `APP_ERROR_CATALOG` is the only home.
+ * If the frontend ever needs a code before shared's enum grows it, it goes
+ * here temporarily — and moves into `APP_ERROR_CATALOG` once the enum catches up.
  */
-export const EXTRA_ERROR_CATALOG: Record<string, ErrorEntry> = {
-  // quota (BL-45 / BL-21)
-  personal_cap_reached: quota("个人额度已用完，请稍后再试。"),
-  team_pool_exhausted: quota("团队额度已用完，请稍后再试。"),
-
-  // user_fixable (GN-07 / MD-11 / GN-23 / X-11)
-  model_not_allowed: fixable("当前不能使用这个模型，请更换模型。"),
-  quote_mismatch: fixable("价格已经变化，请重新确认后再试。"),
-  tool_disabled: fixable("这个工具暂不可用，请取消勾选后重试。"),
-
-  // policy (BL-21): account-level, so there is nothing to retry
-  account_suspended: policy("账号已被暂停，无法继续生成。"),
-
-  // service (GN-27 / GN-31 / X-51 / AG-29)
-  timeout: service("生成超时，请重试。"),
-  upstream_busy: service("模型服务繁忙，请稍后重试。"),
-  canvas_unavailable: service("画布暂时不可用，请稍后重试。"),
-};
+export const EXTRA_ERROR_CATALOG: Record<string, ErrorEntry> = {};
 
 /** Unknown codes are our fault, not the user's: service + retry later. */
 const UNKNOWN_ERROR_ENTRY: ErrorEntry = service("生成失败，请稍后重试。");

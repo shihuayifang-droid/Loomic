@@ -203,6 +203,17 @@ export const applicationErrorCodeSchema = z.enum([
   "user_not_found",
   // SK-16: the endpoint exists but is deliberately switched off in this release.
   "feature_disabled",
+  // X-40 §5 / T-58 ②: the remaining initial catalogue codes. The web catalogue
+  // had them as client-side EXTRA rows until the enum caught up.
+  "personal_cap_reached",
+  "team_pool_exhausted",
+  "model_not_allowed",
+  "quote_mismatch",
+  "tool_disabled",
+  "account_suspended",
+  "timeout",
+  "upstream_busy",
+  "canvas_unavailable",
 ]);
 
 export const applicationErrorResponseSchema = z.object({

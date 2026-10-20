@@ -90,6 +90,13 @@ describe("APP_ERROR_CATALOG 与 shared 枚举的对齐（T-49 反方向检查）
       expect(entry === fallback, `${code} 落到了未知码兜底`).toBe(false);
     }
   });
+
+  it("T-58 ②: EXTRA 目录为空，规格 §5 的 13 个码全部在 shared 枚举里", () => {
+    expect(Object.keys(EXTRA_ERROR_CATALOG)).toEqual([]);
+    for (const code of SPEC_INITIAL_CODES) {
+      expect(applicationErrorCodeSchema.options).toContain(code);
+    }
+  });
 });
 
 describe("lookupError", () => {
@@ -165,12 +172,12 @@ describe("useGenerationErrorHandler（X-40 一期接线）", () => {
     expect(message.startsWith("生成超时")).toBe(true);
   });
 
-  it("JobFailed(code=upstream_busy) 走 EXTRA 目录，不是通用文案", () => {
+  it("JobFailed(code=upstream_busy) 走目录文案，不是通用文案", () => {
     const handle = handler();
     handle(new JobFailed("job-1", "upstream_busy", "busy"));
 
     expect(mocks.showErrorToast).toHaveBeenCalledWith(
-      EXTRA_ERROR_CATALOG.upstream_busy?.message,
+      APP_ERROR_CATALOG.upstream_busy.message,
     );
     expect(mocks.showErrorToast).not.toHaveBeenCalledWith(OLD_GENERIC);
   });
