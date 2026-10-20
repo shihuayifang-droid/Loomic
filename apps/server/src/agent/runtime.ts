@@ -77,6 +77,7 @@ import {
   removeCanvasElement,
 } from "../features/canvas/canvas-element-writer.js";
 import { aspectRatioToDimensions } from "../generation/utils.js";
+import { slotOutcomeForStop } from "../features/canvas/generation-slot-outcome.js";
 
 /**
  * Build the text portion of a user message, appending <input_images> XML
@@ -1462,6 +1463,62 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             { jobId: job.id, userId, jobType: "video_generation" },
           );
 
+          // GN-19: reserve the canvas slot NOW, before the job is polled — the
+          // same rule as the image path above. Upstream inserted nothing until
+          // the job succeeded, so the canvas sat empty for the whole 300-600s
+          // generation with no indication that anything was happening.
+          const placementInput = input as VideoPlacementInput;
+          const explicitPlacement =
+            placementInput.placementX != null && placementInput.placementY != null
+              ? {
+                  x: placementInput.placementX,
+                  y: placementInput.placementY,
+                  width: placementInput.placementWidth ?? 640,
+                  height: placementInput.placementHeight ?? 360,
+                }
+              : undefined;
+
+          let placeholderElementId: string | undefined;
+          // Set once the real video element is on the canvas, so the cleanup
+          // below knows the slot was filled rather than abandoned.
+          let slotFilled = false;
+          // Why the slot was abandoned. Left undefined while the loop is still
+          // waiting; the cleanup treats "no reason recorded" as an aborted run.
+          let stopReason:
+            | { reason: "job_failed"; jobId: string; errorMessage: string | null }
+            | { reason: "job_canceled"; jobId: string }
+            | { reason: "timeout"; jobId: string }
+            | undefined;
+
+          if (canvasId) {
+            try {
+              const slot = await insertImagePlaceholder(
+                createClient(accessToken) as UserSupabaseClient,
+                {
+                  canvasId,
+                  width: explicitPlacement?.width ?? 640,
+                  height: explicitPlacement?.height ?? 360,
+                  kind: "video",
+                  ...(placementInput.title
+                    ? { title: placementInput.title }
+                    : {}),
+                },
+                explicitPlacement,
+              );
+              placeholderElementId = slot.elementId;
+              options.connectionManager?.pushToCanvas(canvasId, {
+                type: "canvas.sync" as const,
+                runId,
+                timestamp: new Date().toISOString(),
+              });
+              jobLap("canvas_placeholder_inserted", { elementId: slot.elementId });
+            } catch (slotErr) {
+              // Non-fatal: without a slot the video simply gets appended later.
+              console.error("[submitVideoJob] placeholder insert failed:", slotErr);
+            }
+          }
+
+          try {
           // Poll until terminal state — video generation is slower.
           // Google Vertex Veo can take 300-500s; 600s gives enough headroom
           // to avoid poll timeout while worker is still processing.
@@ -1505,17 +1562,41 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               if (canvasId) {
                 try {
                   const writerClient = createClient(accessToken) as UserSupabaseClient;
+                  // GN-19: the reserved slot goes away before the video lands, so
+                  // the canvas holds one element for this job, not two.
+                  if (placeholderElementId) {
+                    await removeCanvasElement(
+                      writerClient,
+                      canvasId,
+                      placeholderElementId,
+                    );
+                    placeholderElementId = undefined;
+                  }
                   elementId = await insertVideoElementForJobResult({
                     client: writerClient,
                     canvasId,
                     jobId: job.id,
                     objectPath,
                     result,
-                    input: input as VideoPlacementInput,
+                    // When the caller stated a rectangle, the video takes the
+                    // slot's rectangle so the result lands where the user was
+                    // already looking.
+                    input: {
+                      ...placementInput,
+                      ...(explicitPlacement
+                        ? {
+                            placementX: explicitPlacement.x,
+                            placementY: explicitPlacement.y,
+                            placementWidth: explicitPlacement.width,
+                            placementHeight: explicitPlacement.height,
+                          }
+                        : {}),
+                    },
                     prompt: input.prompt,
                   });
 
                   if (elementId != null) {
+                    slotFilled = true;
                     // Notify connected frontends to refresh canvas
                     options.connectionManager?.pushToCanvas(canvasId, {
                       type: "canvas.sync" as const,
@@ -1546,6 +1627,17 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             // `retrying`), so there is nothing to wait for beyond these two.
             if (current.status === "failed" || current.status === "canceled") {
               jobLap("job_poll_done", { pollCount, status: current.status });
+              // GN-19: a failed job keeps its slot, marked failed with a
+              // user-facing reason; a canceled one is the user's own choice, so
+              // its slot is removed by the cleanup below.
+              stopReason =
+                current.status === "failed"
+                  ? {
+                      reason: "job_failed",
+                      jobId: job.id,
+                      errorMessage: current.error_message ?? null,
+                    }
+                  : { reason: "job_canceled", jobId: job.id };
               return {
                 jobId: job.id,
                 error: current.error_message ?? `Job ${current.status}`,
@@ -1554,10 +1646,63 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           }
 
           jobLap("job_poll_done", { pollCount, status: "timeout" });
+          // GN-19: same treatment as `failed` — the user waited for a result and
+          // gets a slot that says why there is none.
+          stopReason = { reason: "timeout", jobId: job.id };
           return {
             jobId: job.id,
             error: `Job timed out after ${MAX_WAIT / 1000}s`,
           };
+          } finally {
+            // Covers every exit path — failure, timeout, the abort throw, and
+            // success.
+            if (canvasId && placeholderElementId && !slotFilled) {
+              const outcome = slotOutcomeForStop(
+                stopReason ?? { reason: "aborted" },
+              );
+              if (outcome.kind !== "filled") {
+                try {
+                  const cleanupClient = createClient(accessToken) as UserSupabaseClient;
+                  if (outcome.kind === "failed") {
+                    await markGenerationSlotFailed(
+                      cleanupClient,
+                      canvasId,
+                      placeholderElementId,
+                      { message: outcome.message, jobId: outcome.jobId },
+                    );
+                    options.connectionManager?.pushToCanvas(canvasId, {
+                      type: "canvas.sync" as const,
+                      runId,
+                      timestamp: new Date().toISOString(),
+                    });
+                    jobLap("canvas_placeholder_failed", {
+                      elementId: placeholderElementId,
+                      jobId: outcome.jobId,
+                    });
+                  } else {
+                    await removeCanvasElement(
+                      cleanupClient,
+                      canvasId,
+                      placeholderElementId,
+                    );
+                    options.connectionManager?.pushToCanvas(canvasId, {
+                      type: "canvas.sync" as const,
+                      runId,
+                      timestamp: new Date().toISOString(),
+                    });
+                    jobLap("canvas_placeholder_removed", {
+                      elementId: placeholderElementId,
+                    });
+                  }
+                } catch (cleanupErr) {
+                  console.error(
+                    "[submitVideoJob] placeholder cleanup failed:",
+                    cleanupErr,
+                  );
+                }
+              }
+            }
+          }
         };
 
       }
