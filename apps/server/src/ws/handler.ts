@@ -21,6 +21,7 @@ import type { ConnectionManager } from "./connection-manager.js";
 import type { CanvasEventBuffer } from "./event-buffer.js";
 import type { ChatService } from "../features/chat/chat-service.js";
 import type { ContentBlock, ToolBlock } from "@loomic/shared";
+import { persistAssistantMessage } from "./assistant-message-persist.js";
 import { createPipelineLogger } from "./logger.js";
 
 type RegisterWsOptions = {
@@ -399,23 +400,20 @@ async function handleRunCommand(
 
     // ── Server-side assistant message persistence ──
     if (services.chatService && (assistantText.length > 0 || assistantBlocks.length > 0)) {
-      try {
-        await services.chatService.createMessage(
-          authenticatedUser,
-          payload.sessionId,
-          {
-            role: "assistant",
-            content: assistantText.join(""),
-            contentBlocks: assistantBlocks,
-          },
-        );
-        log.lap("assistant_message_persisted", { runId });
-      } catch (err) {
-        log.warn("assistant_message_persist_failed", {
-          runId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      const persisted = await persistAssistantMessage({
+        chatService: services.chatService,
+        user: authenticatedUser,
+        sessionId: payload.sessionId,
+        runId,
+        text: assistantText.join(""),
+        blocks: assistantBlocks,
+        push: (event) => {
+          services.eventBuffer?.push(canvasId, event);
+          connectionManager.pushToCanvas(canvasId, event);
+        },
+        warn: (label, data) => log.warn(label, data),
+      });
+      if (persisted) log.lap("assistant_message_persisted", { runId });
     }
   } catch (error) {
     log.error("stream_error", { runId, error: error instanceof Error ? error.message : "unknown" });

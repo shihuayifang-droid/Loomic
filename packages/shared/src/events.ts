@@ -148,6 +148,18 @@ export const jobProgressEventSchema = z.object({
     .optional(),
 });
 
+/**
+ * AG-35 §4: the server could not store the assistant's reply of this run after
+ * its own retries. The client keeps the reply it already rendered and tells the
+ * user it may disappear on reload, instead of the reply vanishing silently.
+ */
+export const messagePersistFailedEventSchema = z.object({
+  type: z.literal("message.persist_failed"),
+  runId: runIdSchema,
+  sessionId: z.string(),
+  timestamp: timestampSchema,
+});
+
 export const streamEventSchema = z.discriminatedUnion("type", [
   runStartedEventSchema,
   messageDeltaEventSchema,
@@ -160,6 +172,7 @@ export const streamEventSchema = z.discriminatedUnion("type", [
   canvasSyncEventSchema,
   billingErrorEventSchema,
   jobProgressEventSchema,
+  messagePersistFailedEventSchema,
 ]);
 
 export type StreamEvent = z.infer<typeof streamEventSchema>;
