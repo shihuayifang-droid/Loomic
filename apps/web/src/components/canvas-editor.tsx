@@ -17,9 +17,9 @@ import {
   ApiApplicationError,
   CanvasVersionConflict,
 } from "../lib/server-api";
+import { AgentGeneratingSlot } from "./canvas/agent-generating-slot";
 import { VideoCanvasElement } from "./canvas/video-canvas-element";
 import { FailedGenerationSlot } from "./media/failed-generation-slot";
-import { GenerationShimmer } from "./media/generation-shimmer";
 import {
   partitionCanvasFiles,
   collectReferencedFileIds,
@@ -1174,8 +1174,18 @@ export function CanvasEditor({
       // same component the chat sidebar uses, so both views show one state for
       // one job — and, being a live component, it can actually animate.
       if (element?.customData?.generating) {
+        // GN-30: the slot knows which job it belongs to (35B stamps `jobId` on
+        // the element) and can therefore narrate the retries. Both optional
+        // props are spread conditionally: exactOptionalPropertyTypes rejects an
+        // explicit `undefined`.
+        const jobId =
+          typeof element.customData.jobId === "string"
+            ? element.customData.jobId
+            : undefined;
         return (
-          <GenerationShimmer
+          <AgentGeneratingSlot
+            {...(ws !== undefined ? { ws } : {})}
+            {...(jobId !== undefined ? { jobId } : {})}
             kind={element.customData.kind === "video" ? "video" : "image"}
             modelName={element.customData.modelName}
             startedAt={element.customData.startedAt}
@@ -1204,7 +1214,9 @@ export function CanvasEditor({
       // Return null to let Excalidraw handle non-video embeddables with default behavior
       return null;
     },
-    [handleVideoLoadError, excalidrawApi],
+    // `ws` is read inside the generating branch (GN-30), so a replacement handle
+    // has to invalidate the renderer.
+    [handleVideoLoadError, excalidrawApi, ws],
   );
 
   // Allow any URL as a valid embeddable so our video links are accepted

@@ -30,6 +30,7 @@ export function GenerationShimmer({
   width,
   height,
   startedAt,
+  statusLabel,
 }: {
   kind: GenerationKind;
   aspectRatio?: string;
@@ -40,11 +41,26 @@ export function GenerationShimmer({
    * Epoch ms the job actually started. Pass it wherever it is known (the canvas
    * stores it on the element) so the counter stays honest across reloads; the
    * chat has no such record and falls back to mount time.
+   *
+   * `| undefined` is required, not redundant: with exactOptionalPropertyTypes a
+   * plain `?:` rejects an explicitly undefined value, and callers forward
+   * `number | undefined` straight from the element.
    */
-  startedAt?: number;
+  startedAt?: number | undefined;
+  /**
+   * GN-30: replaces the default 「图片/视频生成中...」 copy, e.g. 「重试中（2/3）」 while
+   * the job is between attempts. Null/empty = keep the default.
+   *
+   * The default copy claims a specific thing ("it is generating"), which is a lie
+   * during a retry: the attempt that just ran has already failed. So the caller
+   * gets to say what is actually happening rather than the box guessing.
+   */
+  statusLabel?: string | null;
 }) {
   const isVideo = kind === "video";
   const fixedSize = width != null && height != null;
+  const customLabel =
+    statusLabel != null && statusLabel !== "" ? statusLabel : null;
 
   return (
     <div
@@ -92,8 +108,12 @@ export function GenerationShimmer({
 
       <div className="shrink-0 px-3 py-2">
         <div className="flex items-baseline justify-between gap-2">
-          <div className="text-[12px] font-medium text-muted-foreground/70">
-            {isVideo ? "视频生成中..." : "图片生成中..."}
+          <div
+            className="text-[12px] font-medium text-muted-foreground/70"
+            data-testid="canvas-generation-status"
+            data-state={customLabel === null ? "default" : "custom"}
+          >
+            {customLabel ?? (isVideo ? "视频生成中..." : "图片生成中...")}
           </div>
           <ElapsedTimer isVideo={isVideo} startedAt={startedAt} />
         </div>
