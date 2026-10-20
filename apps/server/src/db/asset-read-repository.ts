@@ -65,6 +65,18 @@ export type AssetReadRepository = {
     actorId: string;
     assetId: string;
   }): Promise<AssetReadRow | null>;
+
+  /**
+   * AS-06 / workorder 34O: the project upload list, on the BASE type but
+   * OPTIONAL. It is optional on purpose: the field-by-field doubles that only
+   * ever need one asset by id (`agent/runtime.test.ts`, the upload service's
+   * fixture, `app.ts`'s wiring) keep satisfying this type without growing a
+   * method they never call, and a caller that finds it absent answers its own
+   * 503 instead of pretending the list is empty.
+   */
+  listReadableProjectUploads?: (
+    input: ListReadableProjectUploadsInput,
+  ) => Promise<AssetReadListRow[]>;
 };
 
 /**
@@ -92,11 +104,11 @@ export type ListReadableProjectUploadsInput = {
 };
 
 /**
- * The project upload list added in 34N, kept as its own type instead of growing
- * `AssetReadRepository`: that type is faked field by field by callers
- * (`agent/runtime.test.ts`) that only ever need one asset by id, and widening a
- * type they already satisfy would force those fakes to grow a method they never
- * call. `createAssetReadRepository` returns this wider type.
+ * The project upload list added in 34N: the base type with the list method
+ * REQUIRED. The method is optional on `AssetReadRepository` (see the note there)
+ * so the single-asset doubles stay valid, and this type is what
+ * `createAssetReadRepository` actually returns — a caller holding it knows the
+ * list exists and does not have to prove it.
  */
 export type AssetReadListRepository = AssetReadRepository & {
   listReadableProjectUploads(

@@ -23,6 +23,7 @@ import { planZipDownload } from "../downloads/zip-download-plan.js";
 import {
   ProjectAssetUrlError,
   signProjectAssetUrl,
+  signProjectAssetUrls,
 } from "../storage/project-asset-urls.js";
 
 export class UploadServiceError extends Error {
@@ -73,6 +74,32 @@ export type UploadService = {
     user: AuthenticatedUser,
     assetId: string,
   ): Promise<void>;
+
+  /**
+   * AS-06: the reference tab — this project's own uploaded files, newest first by
+   * default, optionally oldest first and/or filtered to one media kind.
+   *
+   * `url` is a short-lived signature, exactly like every other URL this file hands
+   * out; a row whose object could not be signed keeps its metadata with `url: null`
+   * rather than being dropped, so one unreadable object does not empty the drawer.
+   */
+  listProjectUploads(
+    user: AuthenticatedUser,
+    input: {
+      projectId: string;
+      order?: "newest" | "oldest";
+      mediaType?: "image" | "video" | "pdf";
+    },
+  ): Promise<
+    Array<{
+      id: string;
+      name: string;
+      mimeType: string | null;
+      byteSize: number | null;
+      createdAt: string;
+      url: string | null;
+    }>
+  >;
 
   /**
    * ED-05: bundle several readable artifacts into one zip stream.
@@ -397,6 +424,88 @@ export function createUploadService(options: {
         assetRow.object_path,
         storedName ?? lastPathSegment(assetRow.object_path),
       );
+    },
+
+    /**
+     * AS-06: the reference drawer's list.
+     *
+     * Two answers this method must not collapse:
+     *
+     * - a repository that does not carry the list at all is a WIRING gap, not an
+     *   empty project: 503, so a half-wired deployment is visible instead of
+     *   looking like "this project has no uploads";
+     * - a repository that refused is a read failure: the existing 500 shape.
+     *
+     * The URLs are minted through the one signing helper every other path uses,
+     * grouped by the bucket each row names — no second storage call is introduced
+     * (34G: the dependency audit counts those), and a path that cannot be signed is
+     * simply `null` on that row, exactly as the helper's contract says.
+     */
+    async listProjectUploads(user, input) {
+      const repository = options.assetReadRepository;
+      const listReadable = repository?.listReadableProjectUploads;
+
+      if (!repository || !listReadable) {
+        throw new UploadServiceError(
+          "upload_failed",
+          "Listing uploads is not available.",
+          503,
+        );
+      }
+
+      let rows: Awaited<ReturnType<typeof listReadable>>;
+
+      try {
+        rows = await listReadable.call(repository, {
+          actorId: user.id,
+          projectId: input.projectId,
+          order: input.order ?? "newest",
+          ...(input.mediaType === undefined
+            ? {}
+            : { mediaType: input.mediaType }),
+          limit: 200,
+        });
+      } catch {
+        throw new UploadServiceError(
+          "upload_failed",
+          "Failed to list uploads.",
+          500,
+        );
+      }
+
+      const pathsByBucket = new Map<string, string[]>();
+
+      for (const row of rows) {
+        const paths = pathsByBucket.get(row.bucket);
+        if (paths) paths.push(row.object_path);
+        else pathsByBucket.set(row.bucket, [row.object_path]);
+      }
+
+      const client = options.createUserClient(user.accessToken);
+      const signedByBucket = new Map<string, Map<string, string>>();
+
+      await Promise.all(
+        [...pathsByBucket].map(async ([bucket, paths]) => {
+          signedByBucket.set(
+            bucket,
+            await signProjectAssetUrls(client, paths, { bucket }),
+          );
+        }),
+      );
+
+      return rows.map((row) => ({
+        id: row.id,
+        // ED-05: what the person called the file, falling back to the object key's
+        // last segment for rows that predate the stored name.
+        name:
+          row.display_name !== null && row.display_name.trim() !== ""
+            ? row.display_name
+            : lastPathSegment(row.object_path),
+        mimeType: row.mime_type,
+        byteSize: row.byte_size,
+        createdAt: row.created_at,
+        url: signedByBucket.get(row.bucket)?.get(row.object_path) ?? null,
+      }));
     },
 
     async prepareZipDownload(user, input) {

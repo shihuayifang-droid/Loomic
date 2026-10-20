@@ -202,6 +202,40 @@ export async function registerUploadRoutes(
     },
   );
 
+  // AS-06: the reference tab's list — this project's own uploads, newest first by
+  // default. `order` and `type` are the only two knobs, and a value outside the two
+  // / three allowed spellings is a 400 rather than a silently ignored filter: a list
+  // that quietly answers MORE than asked for is the failure this refuses.
+  app.get<{
+    Params: { projectId: string };
+    Querystring: { order?: string; type?: string };
+  }>("/api/projects/:projectId/uploads", async (request, reply) => {
+    try {
+      const user = await options.auth.authenticate(request);
+      if (!user) return sendUnauthorized(reply);
+
+      const { order, type } = request.query;
+
+      if (order !== undefined && order !== "newest" && order !== "oldest") {
+        return sendInvalidQuery(reply);
+      }
+
+      if (type !== undefined && type !== "image" && type !== "video" && type !== "pdf") {
+        return sendInvalidQuery(reply);
+      }
+
+      const uploads = await options.uploadService.listProjectUploads(user, {
+        projectId: request.params.projectId,
+        ...(order === undefined ? {} : { order }),
+        ...(type === undefined ? {} : { mediaType: type }),
+      });
+
+      return reply.code(200).send({ uploads });
+    } catch (error) {
+      return sendUploadError(error, reply);
+    }
+  });
+
   // Delete an asset
   app.delete<{ Params: { assetId: string } }>(
     "/api/uploads/:assetId",
@@ -230,6 +264,15 @@ function sendUnauthorized(reply: FastifyReply) {
         code: "unauthorized",
         message: "Missing or invalid bearer token.",
       },
+    }),
+  );
+}
+
+/** AS-06: `order` / `type` outside their enums, and a project id that is not one. */
+function sendInvalidQuery(reply: FastifyReply) {
+  return reply.code(400).send(
+    applicationErrorResponseSchema.parse({
+      error: { code: "upload_failed", message: "请求参数无效" },
     }),
   );
 }

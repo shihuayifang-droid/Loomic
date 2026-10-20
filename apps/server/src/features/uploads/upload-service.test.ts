@@ -48,6 +48,13 @@ function makeStubs(options: {
   /** ED-05: a display-name write that fails, and the name a read answers. */
   displayNameError?: Error;
   storedDisplayName?: string | null;
+  /**
+   * AS-06: the project upload list the read repository answers, and a failure it
+   * throws. Passing NEITHER leaves the double without the method at all, which is
+   * the "not wired" case, not an empty list.
+   */
+  uploadList?: Array<Record<string, unknown>>;
+  uploadListError?: { message: string } | null;
 }) {
   const rpcs: RpcCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
@@ -75,6 +82,8 @@ function makeStubs(options: {
   const projectLookups: Array<{ actorId: string; projectId: string }> = [];
   const assetLookups: Array<{ actorId: string; assetId: string }> = [];
   const assetDeletes: Array<{ actorId: string; assetId: string }> = [];
+  /** AS-06: what `listProjectUploads` asked the repository, in order. */
+  const uploadListCalls: Array<Record<string, unknown>> = [];
 
   const projectRepository = {
     async findReadableProjectWorkspaceForMutation(input: {
@@ -105,6 +114,17 @@ function makeStubs(options: {
       if (options.assetRow === null) return null;
       return options.assetRow ?? defaultAssetRow;
     },
+    // AS-06: appended only when a case asks for the list, so the doubles of the
+    // 25 cases above stay exactly the single-method fakes they were.
+    ...(options.uploadList !== undefined || options.uploadListError
+      ? {
+          async listReadableProjectUploads(input: Record<string, unknown>) {
+            uploadListCalls.push(input);
+            if (options.uploadListError) throw options.uploadListError;
+            return options.uploadList ?? [];
+          },
+        }
+      : {}),
   };
 
   const assetWriteRepository = {
@@ -243,6 +263,7 @@ function makeStubs(options: {
     projectLookups,
     assetLookups,
     assetDeletes,
+    uploadListCalls,
     provenanceCalls,
     displayNameCalls,
     displayNameReads,
@@ -1125,5 +1146,106 @@ describe("prepareZipDownload (ED-05)", () => {
 
     expect(result.fileName).toBe("角色设定_20261021-0005.zip");
     await readAll(result.stream);
+  });
+});
+
+// AS-06: the reference tab's list. Three answers must stay apart — a repository
+// that does not carry the list (a wiring gap, 503), one that refused (500) and an
+// empty project (200 with no rows) — and the name and the URL come from the row and
+// the one signing helper, never from the object key alone.
+describe("AS-06: listProjectUploads", () => {
+  const LIST_ROWS = [
+    {
+      id: "asset-1",
+      bucket: "project-assets",
+      object_path: "ws/p/123-b.png",
+      mime_type: "image/png",
+      byte_size: 3,
+      workspace_id: TEAM_WORKSPACE,
+      project_id: PROJECT,
+      created_at: "2026-10-13T00:00:00.000Z",
+      display_name: "角色-小橘.png",
+    },
+    {
+      id: "asset-2",
+      bucket: "project-assets",
+      object_path: "ws/p/123-a.png",
+      mime_type: "image/png",
+      byte_size: 4,
+      workspace_id: TEAM_WORKSPACE,
+      project_id: PROJECT,
+      created_at: "2026-10-12T00:00:00.000Z",
+      display_name: null,
+    },
+  ];
+
+  it("AS-06: uploads are listed with their display names and signed urls", async () => {
+    const stub = makeStubs({ uploadList: LIST_ROWS });
+
+    const uploads = await stub.service.listProjectUploads(USER, {
+      projectId: PROJECT,
+    });
+
+    // ED-05: the stored name wins, the object key's last segment is the fallback.
+    expect(uploads.map((upload) => upload.name)).toEqual([
+      "角色-小橘.png",
+      "123-a.png",
+    ]);
+    expect(uploads.map((upload) => upload.id)).toEqual(["asset-1", "asset-2"]);
+    for (const upload of uploads) expect(upload.url).toContain("token=sig");
+    // Each row is signed in the bucket that row names.
+    expect(stub.signedCalls).toEqual([
+      { bucket: "project-assets", path: "ws/p/123-b.png", expiresIn: 3600 },
+      { bucket: "project-assets", path: "ws/p/123-a.png", expiresIn: 3600 },
+    ]);
+  });
+
+  it("AS-06: the default order is newest and the limit is 200", async () => {
+    const stub = makeStubs({ uploadList: [] });
+
+    await stub.service.listProjectUploads(USER, { projectId: PROJECT });
+
+    // No media filter is sent at all when the caller did not name one: "absent" and
+    // "undefined" must not look different to the repository.
+    expect(stub.uploadListCalls).toEqual([
+      { actorId: "user-1", projectId: PROJECT, order: "newest", limit: 200 },
+    ]);
+  });
+
+  it("AS-06: a repository failure is a 500 upload_failed", async () => {
+    const stub = makeStubs({
+      uploadListError: {
+        message: "asset read failed (listReadableProjectUploads)",
+      },
+    });
+
+    const error = await stub.service
+      .listProjectUploads(USER, { projectId: PROJECT })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as UploadServiceError);
+
+    expect(error).toBeInstanceOf(UploadServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("upload_failed");
+    expect(error?.message).toBe("Failed to list uploads.");
+    // The repository's own text never becomes the client's answer.
+    expect(error?.message).not.toContain("listReadableProjectUploads");
+    expect(stub.signedCalls).toEqual([]);
+  });
+
+  it("AS-06: without the list method the service answers 503", async () => {
+    const stub = makeStubs({});
+
+    const error = await stub.service
+      .listProjectUploads(USER, { projectId: PROJECT })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as UploadServiceError);
+
+    expect(error).toBeInstanceOf(UploadServiceError);
+    expect(error?.statusCode).toBe(503);
+    expect(error?.code).toBe("upload_failed");
+    expect(error?.message).toBe("Listing uploads is not available.");
+    expect(stub.uploadListCalls).toEqual([]);
+    expect(stub.signedCalls).toEqual([]);
   });
 });
