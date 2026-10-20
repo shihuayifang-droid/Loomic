@@ -15,7 +15,10 @@ import {
   type ProjectListRow,
   type ProjectReadRepository,
 } from "../../db/project-read-repository.js";
-import type { ProjectWriteRepository } from "../../db/project-write-repository.js";
+import {
+  ProjectWriteError,
+  type ProjectWriteRepository,
+} from "../../db/project-write-repository.js";
 import {
   isTransportFailure,
   withTransportRetry,
@@ -486,11 +489,25 @@ export function createProjectService(options: {
       // `project_create_failed` 500 with "Failed to save thumbnail reference.".
       // Zero rows stays silent: the object and the asset row are already in place,
       // and the removed write did not inspect the count either.
+      // AG-35 §1: a fixed-patch UPDATE by id is safe to replay, so a transport
+      // failure is retried like the lookup above; anything else is answered once.
       try {
-        await options.projectWriteRepository.setOwnProjectThumbnail({
-          actorId: user.id,
-          projectId,
-          thumbnailPath: objectPath,
+        await withTransportRetry("projects.update(thumbnail_path)", async () => {
+          try {
+            await options.projectWriteRepository.setOwnProjectThumbnail({
+              actorId: user.id,
+              projectId,
+              thumbnailPath: objectPath,
+            });
+          } catch (error) {
+            if (
+              error instanceof ProjectWriteError &&
+              isTransportFailure(error.cause)
+            ) {
+              throw error.cause;
+            }
+            throw error;
+          }
         });
       } catch {
         throw new ProjectServiceError(

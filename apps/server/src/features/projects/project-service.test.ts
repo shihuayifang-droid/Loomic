@@ -187,6 +187,8 @@ function makeWriteRepositoryStub(
     archiveError?: Error;
     thumbnailUpdated?: number;
     thumbnailError?: Error;
+    /** Thrown by the first calls, one per call, before `thumbnailError` applies. */
+    thumbnailErrorsBefore?: Error[];
     updateUpdated?: number;
     updateError?: Error;
   } = {},
@@ -201,6 +203,8 @@ function makeWriteRepositoryStub(
     },
     async setOwnProjectThumbnail(input: Record<string, unknown>) {
       calls.push({ method: SET_OWN_PROJECT_THUMBNAIL, input });
+      const queued = config.thumbnailErrorsBefore;
+      if (queued && queued.length > 0) throw queued.shift() as Error;
       if (config.thumbnailError) throw config.thumbnailError;
       return { updated: config.thumbnailUpdated ?? 1 };
     },
@@ -675,6 +679,7 @@ describe("saveThumbnail answers with a signed URL", () => {
     signError?: { message: string } | null;
     writeUpdated?: number;
     writeError?: Error;
+    writeErrorsBefore?: Error[];
   }) {
     const signedCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
     // 工单20E: the workspace lookup is the repository's now, so the fixture has to
@@ -720,6 +725,7 @@ describe("saveThumbnail answers with a signed URL", () => {
     const writeStub = makeWriteRepositoryStub({
       thumbnailUpdated: options.writeUpdated ?? 1,
       ...(options.writeError ? { thumbnailError: options.writeError } : {}),
+      ...(options.writeErrorsBefore ? { thumbnailErrorsBefore: options.writeErrorsBefore } : {}),
     });
 
     const service = createProjectService({
@@ -814,6 +820,84 @@ describe("saveThumbnail answers with a signed URL", () => {
 
     expect(result.thumbnailUrl).toContain("token=sig");
     expect(stub.writeCalls).toHaveLength(1);
+  });
+
+  // AG-35 §1: the reference write is a fixed-patch UPDATE by id, so a transport
+  // failure (the proxy resetting mid-flight) is replayed instead of answering 500.
+  it("AG-35: a transport failure on the thumbnail reference is retried and the save succeeds", async () => {
+    const stub = makeThumbnailService({
+      writeErrorsBefore: [
+        new ProjectWriteError(
+          SET_OWN_PROJECT_THUMBNAIL,
+          Object.assign(new Error("fetch failed"), { code: "" }),
+        ),
+      ],
+    });
+
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const promise = stub.service.saveThumbnail(
+        USER,
+        "project-1",
+        Buffer.from("thumb"),
+        "image/png",
+      );
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stub.writeCalls).toHaveLength(1);
+
+      // The backoff before the replay is one step (400ms).
+      await vi.advanceTimersByTimeAsync(400);
+
+      const result = await promise;
+
+      expect(result.thumbnailUrl).toContain("token=sig");
+      expect(result.thumbnailUrl).not.toContain("cdn.test");
+      // The reference was replayed once, with the same patch both times.
+      expect(stub.writeCalls).toEqual([
+        {
+          method: SET_OWN_PROJECT_THUMBNAIL,
+          input: {
+            actorId: USER_ID,
+            projectId: "project-1",
+            thumbnailPath: `${TEAM_ID}/project-1/thumbnail.png`,
+          },
+        },
+        {
+          method: SET_OWN_PROJECT_THUMBNAIL,
+          input: {
+            actorId: USER_ID,
+            projectId: "project-1",
+            thumbnailPath: `${TEAM_ID}/project-1/thumbnail.png`,
+          },
+        },
+      ]);
+      expect(stub.signedCalls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("AG-35: a non-transport failure is still answered once", async () => {
+    const stub = makeThumbnailService({
+      writeErrorsBefore: [
+        new ProjectWriteError(SET_OWN_PROJECT_THUMBNAIL, new Error("boom")),
+      ],
+    });
+
+    const error = await stub.service
+      .saveThumbnail(USER, "project-1", Buffer.from("thumb"), "image/png")
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as ProjectServiceError);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("project_create_failed");
+    expect(error?.message).toBe("Failed to save thumbnail reference.");
+    // A real answer from the database is not replayed: one attempt, no signing.
+    expect(stub.writeCalls).toHaveLength(1);
+    expect(stub.signedCalls).toEqual([]);
   });
 });
 
