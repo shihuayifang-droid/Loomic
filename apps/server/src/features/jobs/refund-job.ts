@@ -50,6 +50,16 @@ import type { CreditService } from "../credits/credit-service.js";
 export const REFUND_DESCRIPTION = "Auto-refund: job failed";
 
 /**
+ * GN-32 / workorder 36E-v2: the description a cancel refund carries. A cancel
+ * before the job started is a different event from a failure, and the user reads
+ * this line on their credit ledger, so it says what happened. Kept beside
+ * `REFUND_DESCRIPTION` rather than in the route: whoever assembles the refund
+ * picks the sentence, and the sentence is data the caller can assert on.
+ */
+export const CANCEL_REFUND_DESCRIPTION =
+  "Auto-refund: job canceled before start";
+
+/**
  * The read this module needs, narrowed to the one call it makes. Declared
  * structurally rather than as `JobRefundBasisRepository` so a test can hand it a
  * plain function: what matters here is the row, not who produced it.
@@ -66,6 +76,13 @@ export type RefundJobDeps = {
    * `refund_credits` RPC) is untouched by this workorder.
    */
   creditService: Pick<CreditService, "refundCredits">;
+  /**
+   * The sentence the refunded user reads. Defaults to `REFUND_DESCRIPTION`, the
+   * failed-job line, so every existing caller keeps sending exactly what it sent
+   * before. A caller with a different reason (workorder 36E-v2's cancel) passes
+   * its own; the reason lives with the assembly, not in this function.
+   */
+  description?: string;
   /** Defaults to `console.log`; injected by tests. */
   log?: (message: string) => void;
   /** Defaults to `console.error`; injected by tests. */
@@ -90,6 +107,9 @@ export function createRefundJob(deps: RefundJobDeps): RefundJob {
   const logError =
     deps.logError ??
     ((message: string, error: unknown) => console.error(message, error));
+  // Read once, outside the returned function: the caller's reason is fixed when
+  // the refund is built, so a per-call lookup could only introduce a difference.
+  const description = deps.description ?? REFUND_DESCRIPTION;
 
   return async (jobId, tag) => {
     try {
@@ -114,7 +134,7 @@ export function createRefundJob(deps: RefundJobDeps): RefundJob {
         createdBy,
         creditsCost,
         jobId,
-        REFUND_DESCRIPTION,
+        description,
       );
       log(`${tag} Refunded ${creditsCost} credits for job ${jobId} (tx: ${txId})`);
     } catch (refundErr) {

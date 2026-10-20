@@ -151,6 +151,14 @@ import {
   createJobService,
   type JobService,
 } from "./features/jobs/job-service.js";
+// GN-32 / workorder 36E-v2: the cancel refund. The read that says HOW MUCH, to
+// which workspace and to whom is the same repository the worker already uses;
+// the decision (and its "never throws" contract) is `createRefundJob`.
+import { createJobRefundBasisRepository } from "./db/job-refund-basis-repository.js";
+import {
+  CANCEL_REFUND_DESCRIPTION,
+  createRefundJob,
+} from "./features/jobs/refund-job.js";
 import { createLemonSqueezyClient } from "./features/payments/lemon-squeezy-client.js";
 import {
   createPaymentService,
@@ -895,6 +903,20 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     viewerService,
   });
   if (jobService) {
+    // GN-32 / workorder 36E-v2: refunding a cancel that happened BEFORE the job
+    // started. Built from the same two pieces the worker refunds with — the
+    // narrow `pg` read and the credits service — and told its own description so
+    // the ledger line says "canceled before start" rather than "failed". The
+    // route decides WHEN (the cancelled row has no `started_at`); this decides
+    // HOW MUCH, and it never throws, so a cancel cannot be failed by its refund.
+    const cancelRefund = createRefundJob({
+      readRefundBasis: (refundInput) =>
+        createJobRefundBasisRepository({
+          getTransactionPool: () => getTransactionPool(databaseEnv),
+        }).readRefundBasis(refundInput),
+      creditService,
+      description: CANCEL_REFUND_DESCRIPTION,
+    });
     void registerJobRoutes(app, {
       auth,
       creditService,
@@ -903,6 +925,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       priceQuoter,
       creditLedgerWriteRepository,
       viewerService,
+      // The tag is the call site's, exactly as the worker passes its own: both
+      // log lines of a cancel refund are attributable to this route.
+      refundCanceledJob: (canceledJobId: string) =>
+        cancelRefund(canceledJobId, "[cancel]"),
     });
   }
   void registerSkillRoutes(app, { auth, skillRepository, viewerService });

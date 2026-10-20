@@ -50,6 +50,15 @@ export async function registerJobRoutes(
     priceQuoter?: PriceQuoter;
     creditLedgerWriteRepository?: CreditLedgerWriteRepository;
     viewerService: ViewerService;
+    /**
+     * GN-32 / workorder 36E-v2: gives the credits of a cancelled-but-never-started
+     * job back. Injected rather than imported so the route needs no credits rule
+     * and no database, and so a deployment without credits simply passes nothing
+     * and the cancel still answers. The contract is the one `createRefundJob`
+     * already has: it never rejects, so the 200 below is not conditional on the
+     * money moving.
+     */
+    refundCanceledJob?: (jobId: string) => Promise<void>;
   },
 ) {
   // POST /api/jobs/image-generation — create image generation job
@@ -236,6 +245,17 @@ export async function registerJobRoutes(
 
       const { jobId } = request.params as { jobId: string };
       const job = await options.jobService.cancelJob(user, jobId);
+
+      // GN-32 / workorder 36E-v2: `started_at === null` on the row the cancel
+      // just matched is "this job never started executing". It is the only
+      // signal needed and it is already on the returned job: `started_at` is
+      // written by `markRunning` alone, and `retrying` cannot be cancelled, so a
+      // cancelled row with no `started_at` was queued the whole time. No extra
+      // read, no SQL change, and the same test covers a cancel that matched
+      // nothing (it never gets here — `cancelJob` threw a 404).
+      if (job.started_at === null) {
+        await options.refundCanceledJob?.(job.id);
+      }
 
       return reply.code(200).send(jobResponseSchema.parse({ job }));
     } catch (error) {
