@@ -13,7 +13,7 @@ import {
   updateVideoGeneratorElement,
 } from "../../lib/canvas-video-generator";
 import type { VideoModelInfo } from "../../lib/server-api";
-import { fetchVideoModels, submitVideoJob } from "../../lib/server-api";
+import { cancelJob, fetchVideoModels, submitVideoJob } from "../../lib/server-api";
 import { visibleOn } from "../../lib/model-visibility";
 import { awaitJobCompletion, type JobProgress } from "../../lib/await-job";
 import { errorCodeOf, lookupError } from "../../lib/error-catalog";
@@ -66,6 +66,14 @@ export function VideoGeneratorPanel({
   const [resolution, setResolution] = useState(data.resolution);
   const [loading, setLoading] = useState(data.status === "generating");
   const [error, setError] = useState<string | null>(data.errorMessage ?? null);
+  /**
+   * GN-32 / CV-02：面板生成中可取消。`activeJobId` 是这一次等待的任务 id
+   * （`submitVideoJob` 返回之后才有值），确认取消时只拿它调一次 `cancelJob`。
+   */
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
   /**
    * GN-30: the last status the job reported. Held in state (not only written to
    * customData) because the status line has to re-render on `retrying`, and the
@@ -288,6 +296,9 @@ export function VideoGeneratorPanel({
     let jobId: string | null = null;
     const settleJob = (ok: boolean): void => {
       if (jobId !== null) end(jobId, ok);
+      // GN-32：这一轮走到终态了，取消入口与确认条一起收起来。
+      setActiveJobId(null);
+      setConfirmingCancel(false);
     };
 
     try {
@@ -313,6 +324,8 @@ export function VideoGeneratorPanel({
       // CV-10：job 提交成功即进入本轮，与该 job 最终成功与否无关。
       jobId = submitted.jobId;
       begin(jobId);
+      // GN-32：任务已经落到服务端，从这里开始面板才有东西可取消。
+      setActiveJobId(submitted.jobId);
       if (controller.signal.aborted) {
         settleJob(false);
         return;
@@ -450,6 +463,46 @@ export function VideoGeneratorPanel({
     end,
   ]);
 
+  /**
+   * CV-02 / Q-17：点「取消」只弹确认条，不直接发请求 —— 这一步是不可逆的，
+   * 而且文案要先把「已开始的任务不退积分」说清楚。
+   */
+  const handleCancelAsk = useCallback(() => {
+    setCancelError(null);
+    setConfirmingCancel(true);
+  }, []);
+
+  /** CV-02：「继续生成」= 什么都不做，只把确认条关掉。 */
+  const handleCancelBack = useCallback(() => {
+    setCancelError(null);
+    setConfirmingCancel(false);
+  }, []);
+
+  /**
+   * GN-32：确认之后才真正取消服务端任务。成功就把前端这条等待链一起断掉、
+   * 面板回到「可再次提交」；失败留在确认条里，让人可以重试或继续等。
+   * 退积分口径在服务端（未开始全额退，已开始不退），这里只管发请求。
+   */
+  const handleCancelConfirm = useCallback(async () => {
+    const targetJobId = activeJobId;
+    if (targetJobId === null) return;
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await cancelJob(accessTokenRef.current, targetJobId);
+      abortRef.current?.abort();
+      setActiveJobId(null);
+      setConfirmingCancel(false);
+      setLoading(false);
+      updateVideoGeneratorElement(excalidrawApi, elementId, { status: "idle" });
+    } catch (err) {
+      console.error("[video-gen] Cancel error:", err);
+      setCancelError("取消失败，请重试");
+    } finally {
+      setCancelling(false);
+    }
+  }, [activeJobId, excalidrawApi, elementId]);
+
   // X-40 二期: 「稍后重试」重新提交一次，走的还是上面那一条提交路径。
   retryRef.current = () => {
     void handleGenerate();
@@ -581,6 +634,36 @@ export function VideoGeneratorPanel({
           {" H3积分/秒 · 约 ¥"}
           {currentPriceRate.cnyPerSecond.min.toFixed(4)}–¥
           {currentPriceRate.cnyPerSecond.max.toFixed(4)}/秒
+        </div>
+      )}
+
+      {/* GN-32 / CV-02: 取消前先确认，文案逐字固定（Q-17） */}
+      {confirmingCancel && (
+        <div
+          data-testid="canvas-video-generator-cancel-confirm"
+          className="mx-4 mb-2 rounded-lg border-[0.5px] border-border bg-muted/40 px-2 py-1.5 text-xs text-foreground"
+        >
+          <div>取消这次生成？已开始的任务不退积分</div>
+          {cancelError !== null && (
+            <div className="mt-1 text-destructive">{cancelError}</div>
+          )}
+          <div className="mt-1 flex items-center gap-1">
+            <button data-testid="canvas-video-generator-cancel-ok"
+              type="button"
+              onClick={() => void handleCancelConfirm()}
+              disabled={cancelling}
+              className="rounded-md bg-primary px-2 py-1 text-primary-foreground transition-colors hover:bg-primary/80 disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground"
+            >
+              确认取消
+            </button>
+            <button data-testid="canvas-video-generator-cancel-back"
+              type="button"
+              onClick={handleCancelBack}
+              className="rounded-md px-2 py-1 text-muted-foreground transition-colors hover:bg-muted"
+            >
+              继续生成
+            </button>
+          </div>
         </div>
       )}
 
@@ -755,6 +838,18 @@ export function VideoGeneratorPanel({
               </div>
             )}
           </div>
+
+          {/* GN-32: 生成中才有东西可取消 —— 只有拿到 jobId 之后才显示 */}
+          {loading && activeJobId !== null && (
+            <button data-testid="canvas-video-generator-cancel"
+              type="button"
+              aria-label="取消这次生成"
+              onClick={handleCancelAsk}
+              className="flex h-8 items-center rounded-full border-[0.5px] border-border px-3 text-xs text-muted-foreground transition-colors hover:bg-muted"
+            >
+              取消
+            </button>
+          )}
 
           {/* Generate button */}
           <button data-testid="canvas-video-generator-submit"
