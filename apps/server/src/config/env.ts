@@ -27,6 +27,21 @@ export function resolveDefaultAgentModel(env: {
 
 export type AgentBackendMode = "filesystem" | "state";
 
+/**
+ * OP-13: the one place that decides "this is production". NODE_ENV=production.
+ *
+ * Read through the index signature on purpose: the `.env.example` guard in
+ * `env-example.test.ts` treats every property-access reference to the source
+ * object as a variable the server reads at runtime, and NODE_ENV is set by the
+ * process supervisor rather than by `.env`. Keeping it out of that scan keeps
+ * the two guards independent.
+ */
+export function isProductionEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return source["NODE_ENV"] === "production";
+}
+
 export type ServerEnv = {
   agentBackendMode: AgentBackendMode;
   agentFilesRoot?: string;
@@ -221,10 +236,20 @@ export function loadServerEnv(
       openAIApiKey,
     });
 
+  // AG-39 / QA-12: production must never run on the filesystem backend. The
+  // check runs on the RESOLVED value, so neither the env var nor an explicit
+  // `overrides.agentBackendMode` can smuggle "filesystem" into production.
+  const agentBackendMode =
+    overrides.agentBackendMode ??
+    parseAgentBackendMode(source.LOOMIC_AGENT_BACKEND_MODE);
+  if (agentBackendMode === "filesystem" && isProductionEnv(source)) {
+    throw new Error(
+      "LOOMIC_AGENT_BACKEND_MODE=filesystem is not allowed in production (AG-39)",
+    );
+  }
+
   return {
-    agentBackendMode:
-      overrides.agentBackendMode ??
-      parseAgentBackendMode(source.LOOMIC_AGENT_BACKEND_MODE),
+    agentBackendMode,
     agentModel: resolvedAgentModel,
     port: overrides.port ?? parsePort(source.LOOMIC_SERVER_PORT ?? source.PORT),
     version: overrides.version ?? readServerVersion(),
