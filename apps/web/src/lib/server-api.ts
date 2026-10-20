@@ -29,7 +29,7 @@ import type {
   WorkspaceSkillListResponse,
 } from "@loomic/shared";
 
-import { toolListResponseSchema } from "@loomic/shared";
+import { checkUploadConstraint, toolListResponseSchema } from "@loomic/shared";
 
 import { dedupeRequest } from "./dedupe-request";
 import { getServerBaseUrl } from "./env";
@@ -510,6 +510,12 @@ export async function uploadFile(
   file: File,
   projectId?: string,
 ): Promise<UploadResponse> {
+  // AS-02: the shared table decides before a byte leaves the browser.
+  const constraint = checkUploadConstraint({ mimeType: file.type, byteSize: file.size });
+  if (!constraint.ok) {
+    throw new ApiApplicationError("upload_failed", constraint.message, 400);
+  }
+
   const formData = new FormData();
   formData.append("file", file);
   if (projectId) {

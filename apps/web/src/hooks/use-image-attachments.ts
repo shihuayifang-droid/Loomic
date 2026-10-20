@@ -1,6 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+
+import { checkUploadConstraint } from "@loomic/shared";
+
 import { uploadFile } from "../lib/server-api";
 
 export type ImageAttachmentState = {
@@ -146,7 +149,6 @@ export function toCanvasRefAttachments(
   return ready;
 }
 
-const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 export function useImageAttachments(accessToken: string, projectId?: string) {
@@ -180,14 +182,15 @@ export function useImageAttachments(accessToken: string, projectId?: string) {
           console.warn("[image-attachments] Rejected file type:", file.type);
           continue;
         }
-        if (file.size > MAX_FILE_SIZE_BYTES) {
+        const constraint = checkUploadConstraint({ mimeType: file.type, byteSize: file.size });
+        if (!constraint.ok) {
           const id = crypto.randomUUID();
           newAttachments.push({
             id,
             file,
             preview: "",
             uploading: false,
-            error: "File exceeds 10MB limit",
+            error: constraint.message,
             mimeType: file.type,
             source: "upload",
           });

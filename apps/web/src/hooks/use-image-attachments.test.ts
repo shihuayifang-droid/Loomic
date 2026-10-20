@@ -268,3 +268,22 @@ describe("toCanvasRefAttachments", () => {
     expect(parsed.success).toBe(true);
   });
 });
+
+// AS-02: the size rule is the shared table's, not a number this hook keeps for
+// itself. A file the browser can already tell is too big never reaches the
+// network, and the reason it shows is the table's Chinese message.
+describe("useImageAttachments enforces the shared upload constraints (AS-02)", () => {
+  it("AS-02: an image over 20MB is refused locally with 图片最大 20MB and never uploaded", async () => {
+    const file = new File(["x"], "big.png", { type: "image/png" });
+    Object.defineProperty(file, "size", { value: 20 * 1024 * 1024 + 1 });
+
+    const { result } = renderHook(() => useImageAttachments("token"));
+
+    await act(async () => {
+      result.current.addFiles([file]);
+    });
+
+    expect(result.current.attachments[0]?.error).toBe("图片最大 20MB");
+    expect(uploadFileMock).toHaveBeenCalledTimes(0);
+  });
+});
