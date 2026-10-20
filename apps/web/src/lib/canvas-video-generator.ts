@@ -44,6 +44,48 @@ export function getDisplayDimensions(
 }
 
 /**
+ * Build the Excalidraw rectangle skeleton for a video generator placeholder at a
+ * given position. Exported so callers that already know where the element belongs
+ * (GN-19 retry reuses the failed slot's own x/y/width/height) do not have to copy
+ * the shape; `createVideoGeneratorElement` is the viewport-centred wrapper.
+ */
+export function buildVideoGeneratorElement(
+  position: { x: number; y: number; width: number; height: number },
+  data: VideoGeneratorData,
+): Record<string, unknown> {
+  const { x, y, width, height } = position;
+  return {
+    type: "rectangle",
+    id: generateId(),
+    x,
+    y,
+    width,
+    height,
+    angle: 0,
+    strokeColor: "#93C5FD",
+    backgroundColor: "#EFF6FF",
+    fillStyle: "solid",
+    strokeWidth: 1,
+    strokeStyle: "solid",
+    roughness: 0,
+    opacity: 100,
+    groupIds: [],
+    roundness: { type: 3 },
+    boundElements: null,
+    frameId: null,
+    index: null,
+    seed: Math.floor(Math.random() * 2_000_000_000),
+    version: 1,
+    versionNonce: Math.floor(Math.random() * 2_000_000_000),
+    isDeleted: false,
+    updated: Date.now(),
+    link: null,
+    locked: false,
+    customData: data,
+  };
+}
+
+/**
  * Create an Excalidraw rectangle element that serves as a video generator placeholder.
  */
 export function createVideoGeneratorElement(
@@ -73,36 +115,16 @@ export function createVideoGeneratorElement(
     resolution: options?.resolution ?? "720p",
   };
 
-  const id = generateId();
-  const element: Record<string, unknown> = {
-    type: "rectangle",
-    id,
-    x: center.x - width / 2,
-    y: center.y - height / 2,
-    width,
-    height,
-    angle: 0,
-    strokeColor: "#93C5FD",
-    backgroundColor: "#EFF6FF",
-    fillStyle: "solid",
-    strokeWidth: 1,
-    strokeStyle: "solid",
-    roughness: 0,
-    opacity: 100,
-    groupIds: [],
-    roundness: { type: 3 },
-    boundElements: null,
-    frameId: null,
-    index: null,
-    seed: Math.floor(Math.random() * 2_000_000_000),
-    version: 1,
-    versionNonce: Math.floor(Math.random() * 2_000_000_000),
-    isDeleted: false,
-    updated: Date.now(),
-    link: null,
-    locked: false,
+  const element = buildVideoGeneratorElement(
+    {
+      x: center.x - width / 2,
+      y: center.y - height / 2,
+      width,
+      height,
+    },
     customData,
-  };
+  );
+  const id = element.id as string;
 
   api.updateScene({
     elements: [...api.getSceneElements(), element],
@@ -110,6 +132,49 @@ export function createVideoGeneratorElement(
   });
 
   return id;
+}
+
+/**
+ * GN-19: the video generator that replaces a failed slot on "retry". Null when the slot cannot be retried.
+ */
+export function retryVideoGeneratorFromFailedSlot(slot: {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  customData?: unknown;
+}): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  data: VideoGeneratorData;
+} | null {
+  const customData = slot?.customData as Record<string, any> | undefined;
+  if (customData?.failed !== true) return null;
+
+  const retry = customData.retryRequest as Record<string, any> | undefined;
+  if (retry?.kind !== "video") return null;
+
+  const prompt = typeof retry.prompt === "string" ? retry.prompt : "";
+  const model = typeof retry.model === "string" ? retry.model : "";
+  if (prompt.trim() === "" || model.trim() === "") return null;
+
+  return {
+    x: slot.x ?? 0,
+    y: slot.y ?? 0,
+    width: slot.width ?? 0,
+    height: slot.height ?? 0,
+    data: {
+      type: "video-generator",
+      status: "idle",
+      prompt,
+      model,
+      aspectRatio: retry.aspectRatio ?? "16:9",
+      duration: retry.duration ?? 5,
+      resolution: retry.resolution ?? "720p",
+    },
+  };
 }
 
 /**

@@ -46,6 +46,10 @@ import {
   buildImageGeneratorElement,
   retryGeneratorFromFailedSlot,
 } from "../lib/canvas-image-generator";
+import {
+  buildVideoGeneratorElement,
+  retryVideoGeneratorFromFailedSlot,
+} from "../lib/canvas-video-generator";
 import { CanvasToolMenu } from "./canvas-tool-menu";
 import { ImageToolbarLayer } from "./canvas/image-toolbar-layer";
 import { normalizeCanvasElements } from "../lib/canvas-normalize";
@@ -1116,11 +1120,13 @@ export function CanvasEditor({
       // `generating: true`), so show the reason and offer to drop the slot.
       // Sits BEFORE the generating branch so a failure can never be masked.
       if (element?.customData?.failed === true) {
-        // GN-19: an image slot that still knows what was asked for can be retried.
+        // GN-19: a slot that still knows what was asked for can be retried.
         // "重试" never resubmits the dead job — it swaps this placeholder for a
         // fresh generator prefilled with the original prompt/settings, so the user
-        // re-quotes and confirms in the generator panel (video has no prefill yet).
+        // re-quotes and confirms in the generator panel. An image slot wins; only
+        // when it cannot be retried do we try the video shape.
         const retry = retryGeneratorFromFailedSlot(element);
+        const videoRetry = retry ? null : retryVideoGeneratorFromFailedSlot(element);
         return (
           <FailedGenerationSlot
             kind={element.customData.kind === "video" ? "video" : "image"}
@@ -1136,20 +1142,35 @@ export function CanvasEditor({
                   ),
               });
             }}
-            {...(retry
+            {...(retry || videoRetry
               ? {
                   onRetry: () => {
                     const api = excalidrawApi;
                     if (!api) return;
-                    const replacement = buildImageGeneratorElement(
-                      {
-                        x: retry.x,
-                        y: retry.y,
-                        width: retry.width || element.width || 512,
-                        height: retry.height || element.height || 512,
-                      },
-                      retry.data,
-                    );
+                    let replacement: Record<string, unknown>;
+                    if (retry) {
+                      replacement = buildImageGeneratorElement(
+                        {
+                          x: retry.x,
+                          y: retry.y,
+                          width: retry.width || element.width || 512,
+                          height: retry.height || element.height || 512,
+                        },
+                        retry.data,
+                      );
+                    } else if (videoRetry) {
+                      replacement = buildVideoGeneratorElement(
+                        {
+                          x: videoRetry.x,
+                          y: videoRetry.y,
+                          width: videoRetry.width || element.width || 512,
+                          height: videoRetry.height || element.height || 512,
+                        },
+                        videoRetry.data,
+                      );
+                    } else {
+                      return;
+                    }
                     // One updateScene: the failed slot goes away and the prefilled
                     // generator arrives in the same commit, so the canvas never
                     // shows both (or neither) in between.
