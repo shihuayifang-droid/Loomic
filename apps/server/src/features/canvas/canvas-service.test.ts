@@ -33,11 +33,14 @@ describe("CanvasServiceError wire contract", () => {
   });
 
   it("the list above still covers the constructor's accepted codes", () => {
-    // If CanvasErrorCode gains a member, this stops compiling: the parameter type
-    // no longer accepts only CODES[number]. It is a compile-time guard expressed
-    // as a runtime test so it travels with the file it guards.
-    const accepted: (typeof CODES)[number] = "service_unavailable";
-    const err = new CanvasServiceError(accepted, "msg", 503);
+    // Exhaustiveness, stated the way that actually holds: `CanvasServiceError["code"]`
+    // is the whole union the constructor takes, so it only stays assignable to the
+    // literal union of CODES above while the two are equal. A member added to the
+    // union without a line above stops this file compiling — which is the point,
+    // since a code the wire enum does not list is a code the client never receives.
+    const carried: CanvasServiceError["code"] = "service_unavailable";
+    const covered: (typeof CODES)[number] = carried;
+    const err = new CanvasServiceError(covered, "msg", 503);
     expect(err.code).toBe("service_unavailable");
     expect(err.statusCode).toBe(503);
   });

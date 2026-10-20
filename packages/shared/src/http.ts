@@ -186,6 +186,13 @@ export const applicationErrorCodeSchema = z.enum([
   "concurrency_limit",
   "variant_not_found",
   "checkout_failed",
+  // T-49 / S-004: PaymentServiceError carries these, and `sendPaymentError`
+  // parses them inside the error path; absent here, the parse threw and the
+  // client got a generic 500 instead of e.g. the intended 404.
+  "payment_not_configured",
+  "subscription_not_found",
+  "subscription_update_failed",
+  "webhook_processing_failed",
   "generation_failed",
   // AD-08 / PJ-11: the team-member gate rejects a valid token that is not in the
   // HaHart team workspace. Client must be able to tell this apart from 401.
