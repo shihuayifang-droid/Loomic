@@ -8,6 +8,7 @@ import { ledgerEntryTypeSchema, type CreditTransaction, type LedgerEntryType } f
 import { useAuth } from "@/lib/auth-context";
 import { fetchCreditTransactions } from "@/lib/credits-api";
 import { LEDGER_ENTRY_LABELS, entryTypeOf, filterByEntryTypes } from "@/lib/ledger-entry-labels";
+import { poolLabelOf } from "@/lib/ledger-pool-label";
 
 // ── Page size ────────────────────────────────────────────────
 
@@ -143,6 +144,7 @@ export function CreditUsageHistory() {
               <tr className="border-b bg-secondary text-left text-xs font-medium text-muted-foreground">
                 <th className="px-4 py-2.5">描述</th>
                 <th className="px-4 py-2.5">类型</th>
+                <th className="px-4 py-2.5">所属池</th>
                 <th className="px-4 py-2.5">时间</th>
                 <th className="px-4 py-2.5 text-right">变动额</th>
               </tr>
@@ -163,6 +165,9 @@ export function CreditUsageHistory() {
                     </td>
                     <td className="px-4 py-2.5 text-muted-foreground">
                       {label}
+                    </td>
+                    <td data-testid="credits-history-pool" className="px-4 py-2.5 text-muted-foreground">
+                      {poolLabelOf(t)}
                     </td>
                     <td className="px-4 py-2.5 tabular-nums text-muted-foreground">
                       {formatDate(t.created_at)}
