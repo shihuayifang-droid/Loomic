@@ -17,7 +17,9 @@ import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
 import { reapStuckJobs } from "./features/jobs/reap-stuck-jobs.js";
 import { startStuckJobReaper } from "./features/jobs/stuck-job-reaper-schedule.js";
+import { startTeamCycleGrant } from "./features/credits/team-cycle-grant-schedule.js";
 import { createJobStuckReaderRepository } from "./db/job-stuck-reader-repository.js";
+import { createPoolGrantWriteRepository } from "./db/pool-grant-write-repository.js";
 import { buildWorkerComposition } from "./worker-composition.js";
 import { getExecutor, type ExecutorContext } from "./features/jobs/job-executor.js";
 import {
@@ -120,11 +122,28 @@ async function main() {
     log: (m) => console.log(`${tag} ${m}`),
   });
 
+  // BL-44 step 7 (workorder 37R): this month's team pool. `grant_team_cycle`
+  // (37O) is idempotent per month, so the coarse ten-minute period only decides
+  // how many minutes after 00:00 on the 1st the grant lands — not whether it
+  // lands twice. It starts here, beside the reaper, because until the pool row
+  // exists every member's team spend is refused, and a worker that restarts on
+  // the 1st must not wait a whole interval. The repository is built per pass
+  // against the same pool getter as everything else in this file — it resolves
+  // lazily, so a pass that never runs never connects.
+  const teamCycleGrant = startTeamCycleGrant({
+    grant: () =>
+      createPoolGrantWriteRepository({
+        getTransactionPool: getPool,
+      }).grantTeamCycle(),
+    log: (m) => console.log(`${tag} ${m}`),
+  });
+
   // Graceful shutdown — wait for in-flight jobs then exit
   const shutdown = async () => {
-    // Stop the timer first: the in-flight jobs waited for below are the ones
+    // Stop the timers first: the in-flight jobs waited for below are the ones
     // that matter, and a tick landing mid-shutdown has nothing left to do.
     reaper.stop();
+    teamCycleGrant.stop();
     const totalInFlight = [...inFlightByQueue.values()].reduce((n, s) => n + s.size, 0);
     console.log(`${tag} Shutting down, waiting for ${totalInFlight} in-flight jobs...`);
     running = false;

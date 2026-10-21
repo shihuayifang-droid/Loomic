@@ -140,6 +140,11 @@ import {
   createPoolBalanceReadRepository,
   type PoolBalanceReadRepository,
 } from "./db/pool-balance-read-repository.js";
+// BL-45 / workorder 37R: the daily grant that `GET /api/credits` places before it
+// reads the pools. Unlike the balance reader above, its factory takes a pool
+// GETTER, so it is lazy already: the wiring below passes the same lazy getter and
+// `buildApp` still never connects.
+import { createPoolGrantWriteRepository } from "./db/pool-grant-write-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -736,6 +741,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       }).readPoolBalances(input),
   };
 
+  // BL-45 / workorder 37R: today's daily grant, placed by the same balance read
+  // before it reads the pools. `createPoolGrantWriteRepository` takes the pool
+  // GETTER rather than a pool, so this one line is the whole lazy wiring: no
+  // connection at startup, and a missing DATABASE_URL fails the grant (which the
+  // route logs and skips) instead of the process.
+  const poolGrantWriteRepository = createPoolGrantWriteRepository({
+    getTransactionPool: () => getTransactionPool(databaseEnv),
+  });
+
   // Payment service — only created when Lemon Squeezy is configured
   let paymentService: PaymentService | undefined = options.paymentService;
   if (!paymentService && env.lemonSqueezyApiKey && env.lemonSqueezyStoreId) {
@@ -923,6 +937,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     viewerService,
     // BL-45 / workorder 37Q: the three pools ride along on the balance.
     poolBalanceReadRepository,
+    // BL-45 / workorder 37R: and today's daily grant is placed before the read.
+    poolGrantWriteRepository,
   });
   // GN-01 / workorder 31D: the quote endpoint sits next to the balance it
   // returns. It is handed no ledger, no job service and no deduction dependency

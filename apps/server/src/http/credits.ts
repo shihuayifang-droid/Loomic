@@ -17,6 +17,7 @@ import {
 } from "../features/credits/credit-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { PoolBalanceReadRepository } from "../db/pool-balance-read-repository.js";
+import type { PoolGrantWriteRepository } from "../db/pool-grant-write-repository.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 import { sendValidationError } from "./validation-error.js";
 
@@ -30,6 +31,13 @@ export async function registerCreditRoutes(
     // exactly the payload it was before the pools existed; with it the three
     // pools ride along for a caller that has a team workspace.
     poolBalanceReadRepository?: PoolBalanceReadRepository;
+    // BL-45 / workorder 37R: optional on purpose, and narrowed to the ONE method
+    // this route needs. Without it a balance read grants nothing, exactly as
+    // before 37R; with it the read places today's daily grant first.
+    poolGrantWriteRepository?: Pick<
+      PoolGrantWriteRepository,
+      "grantDailyCredits"
+    >;
   },
 ) {
   // GET /api/credits — balance info
@@ -42,6 +50,30 @@ export async function registerCreditRoutes(
       const balance = await options.creditService.getBalance(
         viewer.workspace.id,
       );
+
+      // BL-45 / workorder 37R: today's daily grant is placed BEFORE the pools are
+      // read, so the balance a member sees is the one that already includes it —
+      // and `grant_daily_credits` (37O) is idempotent per day, so reading the
+      // balance five times grants once. Only a member of a team workspace is
+      // granted (33K: not admitted, nothing granted), which is the same
+      // condition the pool read below uses. A failed grant is LOGGED AND
+      // SKIPPED rather than rethrown: a balance without today's free credits is
+      // still a balance, and the pool read below keeps its own fail-closed
+      // behaviour (a missing pool is a 500, a missing grant is not).
+      const poolGrantWriteRepository = options.poolGrantWriteRepository;
+      if (poolGrantWriteRepository !== undefined && viewer.teamWorkspace) {
+        try {
+          await poolGrantWriteRepository.grantDailyCredits({
+            userId: user.id,
+            workspaceId: viewer.teamWorkspace.id,
+          });
+        } catch (error) {
+          request.log.warn(
+            { err: error },
+            "daily credit grant failed; answering the balance without it",
+          );
+        }
+      }
 
       // BL-45 / workorder 37Q: the three pools are bookkept per TEAM workspace
       // (37M / 37N), so a caller with no team workspace reads as `null` rather

@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { PoolBalanceReadRepository } from "../db/pool-balance-read-repository.js";
+import type { PoolGrantWriteRepository } from "../db/pool-grant-write-repository.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { CreditService } from "../features/credits/credit-service.js";
 import type {
@@ -97,6 +98,7 @@ let apps: FastifyInstance[] = [];
 async function buildApp(options: {
   teamWorkspace?: boolean;
   repository?: PoolBalanceReadRepository;
+  grantRepository?: Pick<PoolGrantWriteRepository, "grantDailyCredits">;
 }): Promise<FastifyInstance> {
   const app = Fastify();
   await registerCreditRoutes(app, {
@@ -105,6 +107,9 @@ async function buildApp(options: {
     viewerService: buildViewerService(options.teamWorkspace ?? true),
     ...(options.repository
       ? { poolBalanceReadRepository: options.repository }
+      : {}),
+    ...(options.grantRepository
+      ? { poolGrantWriteRepository: options.grantRepository }
       : {}),
   });
   await app.ready();
@@ -235,5 +240,60 @@ describe("GET /api/credits — BL-45 pools", () => {
       dailyClaimed: false,
       limits: FREE_LIMITS,
     });
+  });
+
+  // ── workorder 37R: the daily grant placed before the read ──
+
+  it("BL-45: reading the balance grants today's daily credits first", async () => {
+    // One shared log of what happened in which order: the grant must be placed
+    // BEFORE the pools are read, or the caller reads yesterday's balance.
+    const order: string[] = [];
+    const grantDailyCredits = vi.fn(async () => {
+      order.push("grant");
+      return true;
+    });
+    const readPoolBalances = vi.fn(async () => {
+      order.push("read");
+      return POOLS;
+    });
+
+    const app = await buildApp({
+      teamWorkspace: true,
+      repository: { readPoolBalances },
+      grantRepository: { grantDailyCredits },
+    });
+
+    const response = await readBalance(app);
+
+    expect(response.statusCode).toBe(200);
+    // The TEAM workspace's pool, granted to the authenticated member.
+    expect(grantDailyCredits).toHaveBeenCalledTimes(1);
+    expect(grantDailyCredits).toHaveBeenCalledWith({
+      userId: USER.id,
+      workspaceId: TEAM_WORKSPACE_ID,
+    });
+    expect(order).toEqual(["grant", "read"]);
+  });
+
+  it("BL-45: a failed daily grant does not fail the balance", async () => {
+    const grantDailyCredits = vi.fn(async () => {
+      throw new Error("daily grant exploded");
+    });
+    const readPoolBalances = vi.fn(async () => POOLS);
+    const app = await buildApp({
+      teamWorkspace: true,
+      repository: { readPoolBalances },
+      grantRepository: { grantDailyCredits },
+    });
+
+    const response = await readBalance(app);
+
+    // Logged and skipped, not rethrown: the balance is still answered, and the
+    // pools are still the ones the read repository returned.
+    expect(response.statusCode).toBe(200);
+    expect(grantDailyCredits).toHaveBeenCalledTimes(1);
+    const body = response.json();
+    expect(body.pools.balances).toEqual(POOLS);
+    expect(body.pools.available).toBe(15250);
   });
 });
