@@ -152,6 +152,14 @@ import {
 // GETTER, so it is lazy already: the wiring below passes the same lazy getter and
 // `buildApp` still never connects.
 import { createPoolGrantWriteRepository } from "./db/pool-grant-write-repository.js";
+// BL-06 / workorder 38U: the member's own three-pool ledger lines out of the team
+// workspace, so `GET /api/credits/transactions` shows the charges and refunds the
+// pools wrote. Like the balance reader above its factory takes a pool, so the
+// wiring below makes it lazy rather than connecting at startup.
+import {
+  createPoolTransactionReadRepository,
+  type PoolTransactionReadRepository,
+} from "./db/pool-transaction-read-repository.js";
 // BL-12 / BL-01 / workorder 37V: the two admin credit writes. Built lazily
 // against the same pool getter as everything above, so the admin surface costs
 // no connection until an administrator actually adjusts something.
@@ -795,6 +803,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     getTransactionPool: () => getTransactionPool(databaseEnv),
   });
 
+  // BL-06 / workorder 38U: `GET /api/credits/transactions` reads this member's
+  // lines out of the TEAM workspace while the switch below is on. Same lazy
+  // wrapper as `poolBalanceReadRepository` above: the pool is resolved per read,
+  // so no connection is made at startup and a missing DATABASE_URL fails the
+  // request (the existing `credit_query_failed` 500) instead of the process.
+  const poolTransactionReadRepository: PoolTransactionReadRepository = {
+    listMemberPoolTransactions: (input) =>
+      createPoolTransactionReadRepository({
+        pool: getTransactionPool(databaseEnv),
+      }).listMemberPoolTransactions(input),
+  };
+
   // Workorder 37T: `LOOMIC_CREDIT_POOLS=on` moves the charge, the refund and the
   // balance pre-check onto the three pools. Anything else leaves the credit
   // service exactly as built above.
@@ -1000,11 +1020,17 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     viewerService,
     // BL-45 / workorder 37Q: the three pools ride along on the balance.
     // BL-45 / workorder 37R: and today's daily grant is placed before the read.
-    // Workorder 38I: both only while `LOOMIC_CREDIT_POOLS=on`; with it off the
-    // route is registered with the pre-pools arguments (no `pools` key in the
-    // payload and no daily grant written).
+    // BL-06 / workorder 38U: and the transaction list is read out of the team
+    // workspace, where the pools write their charges and refunds.
+    // Workorder 38I: all three only while `LOOMIC_CREDIT_POOLS=on`; with it off
+    // the route is registered with the pre-pools arguments (no `pools` key in the
+    // payload, no daily grant written, and the old personal ledger listed).
     ...(creditPools
-      ? { poolBalanceReadRepository, poolGrantWriteRepository }
+      ? {
+          poolBalanceReadRepository,
+          poolGrantWriteRepository,
+          poolTransactionReadRepository,
+        }
       : {}),
   });
   // GN-01 / workorder 31D: the quote endpoint sits next to the balance it

@@ -297,3 +297,135 @@ describe("GET /api/credits — BL-45 pools", () => {
     expect(body.pools.available).toBe(15250);
   });
 });
+
+// ── BL-06 / workorder 38U: the member's three-pool ledger lines ──
+//
+// The three-pool charges and refunds are bookkept per TEAM workspace, while
+// `GET /api/credits/transactions` listed the caller's PERSONAL workspace. What is
+// pinned below is the ROUTE's half, with a stand-in repository and no database:
+// with the repository injected and a team workspace the list is read for the TEAM
+// workspace and for THIS member, the pool columns reach the payload and
+// `entry_type` is still the shared rule's, a caller without a team workspace keeps
+// the old ledger, and without the repository the payload is exactly what it was
+// before 38U.
+
+/** The one pool line the stand-in repository answers. */
+const POOL_LEDGER_ROW = {
+  id: "00000000-0000-0000-0000-0000000000f1",
+  transaction_type: "generation_deduct" as const,
+  amount: -12,
+  balance_after: 88,
+  job_id: null,
+  description: "image generation",
+  created_at: "2026-10-21T00:00:01.001Z",
+  pool: "team" as const,
+  pool_breakdown: { daily: 0, team: 12, topup: 0 },
+};
+
+/** The route's own option type, so no import has to be added for the stand-in. */
+type PoolLedgerRepository = NonNullable<
+  Parameters<typeof registerCreditRoutes>[1]["poolTransactionReadRepository"]
+>;
+
+/**
+ * A credit service whose `getTransactions` is a spy, so "the old ledger was used"
+ * is a call count rather than an inference from an empty list.
+ */
+async function buildLedgerApp(options: {
+  teamWorkspace: boolean;
+  ledger?: PoolLedgerRepository;
+}) {
+  const getTransactions = vi.fn(async () => []);
+  const creditService = {
+    getBalance: vi.fn(async () => BALANCE),
+    getTransactions,
+  } as unknown as CreditService;
+
+  const app = Fastify();
+  await registerCreditRoutes(app, {
+    auth,
+    creditService,
+    viewerService: buildViewerService(options.teamWorkspace),
+    ...(options.ledger
+      ? { poolTransactionReadRepository: options.ledger }
+      : {}),
+  });
+  await app.ready();
+  apps.push(app);
+  return { app, getTransactions };
+}
+
+function readTransactions(app: FastifyInstance) {
+  return app.inject({
+    method: "GET",
+    url: "/api/credits/transactions",
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+}
+
+describe("GET /api/credits/transactions — BL-06 pools", () => {
+  it("BL-06: with pools on, a member's ledger comes from the team workspace with pools", async () => {
+    const listMemberPoolTransactions = vi.fn(async () => [POOL_LEDGER_ROW]);
+    const { app, getTransactions } = await buildLedgerApp({
+      teamWorkspace: true,
+      ledger: { listMemberPoolTransactions },
+    });
+
+    const response = await readTransactions(app);
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.transactions).toHaveLength(1);
+    // The two pool columns the requirement (BL-06) names ride along untouched.
+    expect(body.transactions[0].pool).toBe("team");
+    expect(body.transactions[0].pool_breakdown.team).toBe(12);
+    expect(body.transactions[0].pool_breakdown).toEqual({
+      daily: 0,
+      team: 12,
+      topup: 0,
+    });
+    // `entry_type` is still the one shared translation of the ledger type.
+    expect(body.transactions[0].entry_type).toBe("consume");
+    expect(body.transactions[0].amount).toBe(-12);
+
+    // The TEAM workspace, THIS member, and the route's own default limit of 20.
+    expect(listMemberPoolTransactions).toHaveBeenCalledTimes(1);
+    expect(listMemberPoolTransactions).toHaveBeenCalledWith({
+      workspaceId: TEAM_WORKSPACE_ID,
+      userId: USER.id,
+      limit: 20,
+    });
+    // The personal ledger is not read at all on this path.
+    expect(getTransactions).toHaveBeenCalledTimes(0);
+  });
+
+  it("BL-06: without a team workspace the old ledger is used", async () => {
+    const listMemberPoolTransactions = vi.fn(async () => [POOL_LEDGER_ROW]);
+    const { app, getTransactions } = await buildLedgerApp({
+      teamWorkspace: false,
+      ledger: { listMemberPoolTransactions },
+    });
+
+    const response = await readTransactions(app);
+
+    expect(response.statusCode).toBe(200);
+    // A caller with no team workspace has no pool lines to see: the pool read is
+    // not consulted, and the personal ledger answers as it did before 38U.
+    expect(listMemberPoolTransactions).toHaveBeenCalledTimes(0);
+    expect(getTransactions).toHaveBeenCalledTimes(1);
+    expect(getTransactions).toHaveBeenCalledWith(PERSONAL_WORKSPACE_ID, 20);
+  });
+
+  it("BL-06: without the repository the response is unchanged", async () => {
+    const { app, getTransactions } = await buildLedgerApp({
+      teamWorkspace: true,
+    });
+
+    const response = await readTransactions(app);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ transactions: [] });
+    expect(getTransactions).toHaveBeenCalledTimes(1);
+    expect(getTransactions).toHaveBeenCalledWith(PERSONAL_WORKSPACE_ID, 20);
+  });
+});

@@ -330,6 +330,23 @@ export const creditTransactionSchema = z.object({
   job_id: z.string().uuid().nullable(),
   description: z.string().nullable(),
   created_at: z.string(),
+  // BL-06 / workorder 38U: which pool a ledger line was charged to, and how much
+  // came out of each of the three when it was split. Both are ADDITIVE and
+  // optional on purpose: the older reads project neither column, so a caller that
+  // knows nothing about the pools sees exactly the payload it saw before, while a
+  // pool-aware read can publish the two fields the requirement (BL-06) asks for.
+  // `null` is the database's own answer for "one pool, or not a pool line at all"
+  // (`deduct_from_pools` writes a single `pool` name only when the charge came out
+  // of exactly one pool), so it is a value rather than an absence.
+  pool: z.enum(["daily", "team", "topup"]).nullable().optional(),
+  pool_breakdown: z
+    .object({
+      daily: z.number().int(),
+      team: z.number().int(),
+      topup: z.number().int(),
+    })
+    .nullable()
+    .optional(),
 });
 export type CreditTransaction = z.infer<typeof creditTransactionSchema>;
 
