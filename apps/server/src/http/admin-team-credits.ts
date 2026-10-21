@@ -9,12 +9,14 @@ import {
   creditCapTemplateCreateRequestSchema,
   creditCapTemplateListResponseSchema,
   creditCapTemplateSchema,
+  memberCreditSummaryListResponseSchema,
   unauthenticatedErrorResponseSchema,
 } from "@loomic/shared";
 import type { ApplicationErrorCode } from "@loomic/shared";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { AdminCreditWriteRepository } from "../db/admin-credit-write-repository.js";
+import type { MemberCreditReadRepository } from "../db/member-credit-read-repository.js";
 import type { TeamMembershipService } from "../features/team/team-membership.js";
 import type {
   AuthenticatedUser,
@@ -35,6 +37,10 @@ const INVALID_APPLY_MESSAGE = "userIds (1-500 uuids) are required.";
 const TEMPLATE_FAILED_MESSAGE = "Unable to manage credit cap templates.";
 const LIST_FAILED_MESSAGE = "Unable to list credit cap templates.";
 const APPLY_FAILED_MESSAGE = "Unable to apply the cap template.";
+/** AD-01 / 37Z: the member credit read is missing from this app's wiring. */
+const MEMBER_CREDITS_UNAVAILABLE_MESSAGE =
+  "Member credit read is not configured.";
+const MEMBER_CREDITS_FAILED_MESSAGE = "Unable to read member credits.";
 /** 37W's unique (workspace_id, name): one name per workspace, said plainly. */
 const DUPLICATE_TEMPLATE_MESSAGE = "已有同名模板";
 const TEMPLATE_NOT_FOUND_MESSAGE = "模板不存在";
@@ -113,6 +119,12 @@ export async function registerAdminTeamCreditRoutes(
     auth: RequestAuthenticator;
     teamMembership: TeamMembershipService;
     adminCreditWriteRepository: AdminCreditWriteRepository;
+    /**
+     * AD-01 / workorder 37Z: every member's four credit numbers, merged onto the
+     * member list by `userId`. Optional so an app built without a database still
+     * starts; the route answers 503 rather than pretending the figures are zero.
+     */
+    memberCreditReadRepository?: MemberCreditReadRepository;
   },
 ) {
   async function requireAdmin(
@@ -184,6 +196,49 @@ export async function registerAdminTeamCreditRoutes(
     // used rather than widening the contract for one internal failure.
     return sendApplicationError(reply, 500, "application_error", failedMessage);
   }
+
+  /**
+   * AD-01 / 37Z: every member's credit numbers, so the admin member list can
+   * show "本月个人上限 / 本月已从团队池用 / 充值池余额 / 今日赠送剩余" beside
+   * the name and email it already shows.
+   *
+   * Read-only and registered before the `:userId` writes below for the same
+   * reason they are separated: this route never carries a member id, so a
+   * mistyped one can never reach a write. The answer is parsed before it is
+   * sent, so a malformed row cannot reach the browser.
+   */
+  app.get("/api/admin/team/members/credits", async (request, reply) => {
+    const admin = await requireAdmin(request, reply);
+    if (!admin) return reply;
+
+    // No repository means no database in this app: 503 says "not available
+    // here" instead of answering every member with zeros.
+    if (!options.memberCreditReadRepository) {
+      return sendApplicationError(
+        reply,
+        503,
+        "application_error",
+        MEMBER_CREDITS_UNAVAILABLE_MESSAGE,
+      );
+    }
+
+    try {
+      const members = await options.memberCreditReadRepository.listMemberCredits({
+        workspaceId: admin.workspaceId,
+      });
+
+      return reply
+        .code(200)
+        .send(memberCreditSummaryListResponseSchema.parse({ members }));
+    } catch {
+      return sendApplicationError(
+        reply,
+        500,
+        "application_error",
+        MEMBER_CREDITS_FAILED_MESSAGE,
+      );
+    }
+  });
 
   app.post<{ Params: { userId: string } }>(
     "/api/admin/team/members/:userId/credits",

@@ -140,6 +140,13 @@ import {
   createPoolBalanceReadRepository,
   type PoolBalanceReadRepository,
 } from "./db/pool-balance-read-repository.js";
+// AD-01 / workorder 37Z: the per-member credit numbers the admin member list
+// merges by `userId`. Unlike the balance reader above its factory takes a pool
+// GETTER, so the wiring below is lazy already and `buildApp` never connects.
+import {
+  createMemberCreditReadRepository,
+  type MemberCreditReadRepository,
+} from "./db/member-credit-read-repository.js";
 // BL-45 / workorder 37R: the daily grant that `GET /api/credits` places before it
 // reads the pools. Unlike the balance reader above, its factory takes a pool
 // GETTER, so it is lazy already: the wiring below passes the same lazy getter and
@@ -300,6 +307,14 @@ export type BuildAppOptions = {
    * that nothing reaches PostgREST).
    */
   adminCreditWriteRepository?: AdminCreditWriteRepository;
+  /**
+   * AD-01 / workorder 37Z: the per-member credit read behind
+   * `GET /api/admin/team/members/credits`. Injectable for the same reason the
+   * other repositories are — a route test hands the app its own double and
+   * observes which workspace the route read for (and that nothing reaches
+   * PostgREST).
+   */
+  memberCreditReadRepository?: MemberCreditReadRepository;
   threadService?: ThreadService;
   viewerService?: ViewerService;
   /**
@@ -771,6 +786,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       }).readPoolBalances(input),
   };
 
+  const memberCreditReadRepository: MemberCreditReadRepository =
+    options.memberCreditReadRepository ??
+    createMemberCreditReadRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
+    });
+
   // BL-45 / workorder 37R: today's daily grant, placed by the same balance read
   // before it reads the pools. `createPoolGrantWriteRepository` takes the pool
   // GETTER rather than a pool, so this one line is the whole lazy wiring: no
@@ -937,6 +958,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     auth,
     teamMembership: teamMembershipService,
     adminCreditWriteRepository,
+    memberCreditReadRepository,
   });
   void registerProjectRoutes(app, {
     auth,

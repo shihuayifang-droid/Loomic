@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
+import type { MemberCreditSummary } from "@loomic/shared";
 
 import { buildApp } from "../app.js";
 import type { AdminCreditWriteRepository } from "../db/admin-credit-write-repository.js";
+import type { MemberCreditReadRepository } from "../db/member-credit-read-repository.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { ProjectService } from "../features/projects/project-service.js";
 import type { TeamAdminService } from "../features/team/team-admin.js";
@@ -59,6 +61,11 @@ type ApplyTemplateCall = {
   userIds: string[];
 };
 
+/** AD-01 / 37Z: what the member credit read was asked for. */
+type MemberCreditCall = {
+  workspaceId: string;
+};
+
 /** A template id (uuid) and the two names the cases use. */
 const TEMPLATE_ID = "33333333-3333-3333-3333-333333333333";
 
@@ -66,6 +73,10 @@ let adjustCalls: AdjustCall[] = [];
 let capCalls: CapCall[] = [];
 let createTemplateCalls: CreateTemplateCall[] = [];
 let applyTemplateCalls: ApplyTemplateCall[] = [];
+/** AD-01 / 37Z: the member credit reads the route made, and what it answered. */
+let memberCreditCalls: MemberCreditCall[] = [];
+let memberCreditsResult: MemberCreditSummary[] = [];
+let memberCreditFailure: unknown = null;
 /** The refusal / failure the repository double throws, verbatim. */
 let writeFailure: unknown = null;
 /** The refusal the template methods throw, verbatim. */
@@ -136,6 +147,19 @@ const adminCreditWriteRepository: AdminCreditWriteRepository = {
     applyTemplateCalls.push(input);
     if (templateFailure) throw templateFailure;
     return appliedResult;
+  },
+};
+
+/**
+ * AD-01 / 37Z: the per-member credit read. A double like the write repository
+ * above, so each case observes which workspace the route asked for and the
+ * database is never reached.
+ */
+const memberCreditReadRepository: MemberCreditReadRepository = {
+  async listMemberCredits(input) {
+    memberCreditCalls.push(input);
+    if (memberCreditFailure) throw memberCreditFailure;
+    return memberCreditsResult;
   },
 };
 
@@ -218,6 +242,9 @@ beforeEach(() => {
   capCalls = [];
   createTemplateCalls = [];
   applyTemplateCalls = [];
+  memberCreditCalls = [];
+  memberCreditsResult = [];
+  memberCreditFailure = null;
   writeFailure = null;
   templateFailure = null;
   transactionIdResult = "tx-1";
@@ -229,6 +256,7 @@ beforeEach(() => {
     adminCreditWriteRepository,
     auth,
     env: {},
+    memberCreditReadRepository,
     projectService,
     teamAdminService,
     teamMembershipService: teamMembership,
@@ -501,5 +529,85 @@ describe("admin team credit routes", () => {
     expect(applied.statusCode).toBe(403);
     expect(createTemplateCalls.length).toBe(0);
     expect(applyTemplateCalls.length).toBe(0);
+  });
+
+  it("AD-01: an admin reads every member's credits", async () => {
+    memberCreditsResult = [
+      {
+        userId: MEMBER_ID,
+        personalCap: 20000,
+        teamUsed: 30,
+        topup: 50,
+        dailyRemaining: 0,
+      },
+      {
+        userId: TARGET_ID,
+        personalCap: 30000,
+        teamUsed: 0,
+        topup: 0,
+        dailyRemaining: 100,
+      },
+    ];
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members/credits",
+      headers: bearer("admin-token"),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ members: memberCreditsResult });
+    // 读的是管理员自己的团队工作区，不是个人工作区。
+    expect(memberCreditCalls).toEqual([{ workspaceId: TEAM_ID }]);
+
+    // 同一个前缀上的成员列表路由没有被这条路由挤掉。
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/admin/team/members",
+          headers: bearer("admin-token"),
+        })
+      ).statusCode,
+    ).toBe(200);
+  });
+
+  it("AD-01: a non-admin reads no member credits", async () => {
+    memberCreditsResult = [
+      {
+        userId: MEMBER_ID,
+        personalCap: 20000,
+        teamUsed: 0,
+        topup: 0,
+        dailyRemaining: 0,
+      },
+    ];
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members/credits",
+      headers: bearer("member-token"),
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error.code).toBe("forbidden");
+    expect(memberCreditCalls.length).toBe(0);
+  });
+
+  it("AD-01: a failing member credit read is a 500", async () => {
+    memberCreditFailure = new Error("member credit read failed (listMemberCredits)");
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members/credits",
+      headers: bearer("admin-token"),
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json().error.code).toBe("application_error");
+    expect(response.json().error.message).toBe("Unable to read member credits.");
+    // 管理员的团队工作区被问过，而失败的原因没有漏进响应。
+    expect(memberCreditCalls).toEqual([{ workspaceId: TEAM_ID }]);
+    expect(response.body).not.toMatch(/listMemberCredits|member credit read/);
   });
 });

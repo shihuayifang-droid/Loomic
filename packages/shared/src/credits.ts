@@ -263,6 +263,33 @@ export const poolBalancesSchema = z.object({
 });
 export type PoolBalancesResponse = z.infer<typeof poolBalancesSchema>;
 
+/**
+ * AD-01 / workorder 37Z: one member's credit numbers for the admin member list,
+ * merged onto the existing `GET /api/admin/team/members` rows by `userId`.
+ *
+ * Same four readings `poolBalancesSchema` carries for the member's own surface
+ * (`personalCap`, `personalTeamUsed`, `topup`, `daily`), renamed for the admin
+ * view and answered for EVERY member of a workspace rather than for the caller,
+ * so "本月个人上限 / 本月已从团队池用 / 充值池余额 / 今日赠送剩余" and the
+ * member's own screen cannot disagree about any of them.
+ */
+export const memberCreditSummarySchema = z.object({
+  userId: z.string().min(1),
+  personalCap: z.number().int().nonnegative(),
+  teamUsed: z.number().int().nonnegative(),
+  topup: z.number().int().nonnegative(),
+  dailyRemaining: z.number().int().nonnegative(),
+});
+export type MemberCreditSummary = z.infer<typeof memberCreditSummarySchema>;
+
+/** AD-01 / workorder 37Z: the body of `GET /api/admin/team/members/credits`. */
+export const memberCreditSummaryListResponseSchema = z.object({
+  members: z.array(memberCreditSummarySchema),
+});
+export type MemberCreditSummaryListResponse = z.infer<
+  typeof memberCreditSummaryListResponseSchema
+>;
+
 export const creditBalanceResponseSchema = z.object({
   balance: z.number().int(),
   plan: subscriptionPlanSchema,
