@@ -2,11 +2,7 @@
 "use client";
 
 import { motion, AnimatePresence } from "framer-motion";
-import { AlertTriangle, Gift, Loader2, Zap, X } from "lucide-react";
-import { useCallback, useRef, useState } from "react";
-
-import { useAuth } from "@/lib/auth-context";
-import { createCheckout } from "@/lib/payments-api";
+import { AlertTriangle, Gift, X } from "lucide-react";
 
 interface CreditInsufficientDialogProps {
   open: boolean;
@@ -18,14 +14,6 @@ interface CreditInsufficientDialogProps {
   onClaimDaily?: () => Promise<void>;
 }
 
-function openLemonCheckout(url: string) {
-  if (window.LemonSqueezy?.Url?.Open) {
-    window.LemonSqueezy.Url.Open(url);
-  } else {
-    window.open(url, "_blank");
-  }
-}
-
 export function CreditInsufficientDialog({
   open,
   onClose,
@@ -35,34 +23,9 @@ export function CreditInsufficientDialog({
   dailyClaimed,
   onClaimDaily,
 }: CreditInsufficientDialogProps) {
-  const { session } = useAuth();
-  const accessTokenRef = useRef(session?.access_token);
-  accessTokenRef.current = session?.access_token;
-
   const isFree = plan === "free";
   const canClaim = isFree && !dailyClaimed && !!onClaimDaily;
-  const [upgrading, setUpgrading] = useState(false);
-
-  const handleUpgrade = useCallback(async () => {
-    const token = accessTokenRef.current;
-    if (!token) {
-      window.location.href = "/pricing";
-      return;
-    }
-
-    setUpgrading(true);
-    try {
-      // Default to Pro monthly as the recommended upgrade path
-      const { checkoutUrl } = await createCheckout(token, "pro", "monthly");
-      onClose();
-      openLemonCheckout(checkoutUrl);
-    } catch {
-      // Fallback to pricing page on error
-      window.location.href = "/pricing";
-    } finally {
-      setUpgrading(false);
-    }
-  }, [onClose]);
+  const shortfall = Math.max(0, requiredAmount - currentBalance);
 
   return (
     <AnimatePresence>
@@ -100,39 +63,51 @@ export function CreditInsufficientDialog({
             </div>
 
             {/* Heading */}
-            <h3 className="mb-1 text-lg font-semibold text-foreground">
-              Not Enough Credits
+            <h3
+              data-testid="credits-insufficient-title"
+              className="mb-1 text-lg font-semibold text-foreground"
+            >
+              积分不足
             </h3>
             <p className="mb-4 text-sm text-muted-foreground/70">
-              This generation requires{" "}
+              本次需要{" "}
               <span className="font-medium text-foreground">{requiredAmount}</span>{" "}
-              credits, but you only have{" "}
+              积分，当前可用{" "}
               <span className="font-medium text-foreground">
                 {currentBalance}
-              </span>
-              .
+              </span>{" "}
+              积分。
             </p>
 
             {/* Balance comparison */}
             <div className="mb-5 flex items-center justify-between rounded-lg bg-muted px-4 py-3">
               <div className="text-center">
-                <p className="text-xs text-muted-foreground">Required</p>
-                <p className="text-lg font-semibold tabular-nums text-destructive">
+                <p className="text-xs text-muted-foreground">需要</p>
+                <p
+                  data-testid="credits-insufficient-required"
+                  className="text-lg font-semibold tabular-nums text-destructive"
+                >
                   {requiredAmount}
                 </p>
               </div>
               <div className="text-muted-foreground">/</div>
               <div className="text-center">
-                <p className="text-xs text-muted-foreground">Available</p>
-                <p className="text-lg font-semibold tabular-nums text-foreground">
+                <p className="text-xs text-muted-foreground">可用</p>
+                <p
+                  data-testid="credits-insufficient-available"
+                  className="text-lg font-semibold tabular-nums text-foreground"
+                >
                   {currentBalance}
                 </p>
               </div>
               <div className="text-muted-foreground">=</div>
               <div className="text-center">
-                <p className="text-xs text-muted-foreground">Needed</p>
-                <p className="text-lg font-semibold tabular-nums text-muted-foreground">
-                  {requiredAmount - currentBalance}
+                <p className="text-xs text-muted-foreground">还差</p>
+                <p
+                  data-testid="credits-insufficient-shortfall"
+                  className="text-lg font-semibold tabular-nums text-muted-foreground"
+                >
+                  {shortfall}
                 </p>
               </div>
             </div>
@@ -149,28 +124,21 @@ export function CreditInsufficientDialog({
                   className="flex w-full items-center justify-center gap-2 rounded-lg bg-success px-4 py-2.5 text-sm font-medium text-success-foreground transition-colors hover:bg-success/90"
                 >
                   <Gift className="h-4 w-4" />
-                  Claim Daily Credits
+                  领取今日赠送
                 </button>
               )}
-              <button data-testid="credits-insufficient-upgrade"
-                type="button"
-                onClick={handleUpgrade}
-                disabled={upgrading}
-                className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+              <a data-testid="credits-insufficient-topup"
+                href="/settings?tab=billing"
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
               >
-                {upgrading ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Zap className="h-4 w-4" />
-                )}
-                Upgrade Plan
-              </button>
+                去充值
+              </a>
               <button data-testid="credits-insufficient-cancel"
                 type="button"
                 onClick={onClose}
                 className="w-full rounded-lg px-4 py-2 text-sm text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground"
               >
-                Cancel
+                取消
               </button>
             </div>
           </motion.div>
