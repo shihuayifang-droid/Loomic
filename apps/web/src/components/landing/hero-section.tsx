@@ -108,7 +108,7 @@ function HeroMockup() {
             <span className="size-3 rounded-full bg-green-400/80" />
           </div>
           <span className="text-xs text-muted-foreground font-medium">
-            Loomic Canvas
+            HaHart Canvas
           </span>
           <div className="w-14" />
         </div>
@@ -118,7 +118,7 @@ function HeroMockup() {
           <MockupCursor />
           <Image
             src="/images/showcase/showcase-12.jpg"
-            alt="Loomic Canvas AI creative workspace"
+            alt="HaHart Canvas AI creative workspace"
             width={1200}
             height={675}
             priority
@@ -268,7 +268,7 @@ export function HeroSection() {
           transition={{ delay: descDelay }}
           className="mt-6 text-base md:text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed"
         >
-          从灵感到作品，Loomic 是你的 AI 设计伙伴。智能理解你的创意意图，生成专业级设计，让每一个想法都能成为现实。
+          从灵感到作品，HaHart 是你的 AI 设计伙伴。智能理解你的创意意图，生成专业级设计，让每一个想法都能成为现实。
         </motion.p>
 
         {/* CTA Buttons */}

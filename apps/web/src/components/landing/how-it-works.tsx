@@ -31,7 +31,7 @@ const STEPS: Step[] = [
     icon: Sparkles,
     title: "AI 智能创作",
     description:
-      "Loomic 分析你的需求，生成多个专业设计方案。从配色到排版，每个细节都经过精心考量。",
+      "HaHart 分析你的需求，生成多个专业设计方案。从配色到排版，每个细节都经过精心考量。",
   },
   {
     number: "03",

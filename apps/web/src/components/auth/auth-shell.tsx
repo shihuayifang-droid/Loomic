@@ -39,7 +39,7 @@ export function AuthShell({
             className="mb-4 flex items-center gap-4"
           >
             <LoomicLogoInverted className="size-14" />
-            <h1 className="text-4xl font-bold tracking-tight">Loomic</h1>
+            <h1 className="text-4xl font-bold tracking-tight">HaHart</h1>
           </motion.div>
 
           <motion.p variants={fadeUp} custom={1} className="mb-3 text-3xl font-semibold tracking-tight">
