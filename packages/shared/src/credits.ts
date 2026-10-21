@@ -248,6 +248,21 @@ export function canUseVideoResolution(
 
 // ── API schemas ──────────────────────────────────────────────
 
+/**
+ * BL-45 / workorder 37Q: the three pools behind the ONE available-credit figure,
+ * as `GET /api/credits` carries them. Same five numbers as `PoolBalances` in
+ * `credit-pools.ts`; the schema exists so the balance contract does not
+ * silently accept a missing or fractional pool.
+ */
+export const poolBalancesSchema = z.object({
+  daily: z.number().int().nonnegative(),
+  teamRemaining: z.number().int().nonnegative(),
+  personalTeamUsed: z.number().int().nonnegative(),
+  personalCap: z.number().int().nonnegative(),
+  topup: z.number().int().nonnegative(),
+});
+export type PoolBalancesResponse = z.infer<typeof poolBalancesSchema>;
+
 export const creditBalanceResponseSchema = z.object({
   balance: z.number().int(),
   plan: subscriptionPlanSchema,
@@ -258,6 +273,17 @@ export const creditBalanceResponseSchema = z.object({
     monthlyCredits: z.number().int(),
     dailyCredits: z.number().int(),
   }),
+  // BL-45 / workorder 37Q: additive only — a caller that knows nothing about the
+  // pools still sees the four fields above, and `pools` is absent rather than an
+  // empty object. `null` means "there is a reader, but this caller has no team
+  // workspace to read pools for".
+  pools: z
+    .object({
+      balances: poolBalancesSchema,
+      available: z.number().int().nonnegative(),
+    })
+    .nullable()
+    .optional(),
 });
 export type CreditBalanceResponse = z.infer<typeof creditBalanceResponseSchema>;
 

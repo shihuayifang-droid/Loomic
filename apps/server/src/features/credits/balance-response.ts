@@ -1,5 +1,9 @@
-import type { CreditBalanceResponse } from "@loomic/shared";
-import { PLAN_CONFIGS, creditBalanceResponseSchema } from "@loomic/shared";
+import type { CreditBalanceResponse, PoolBalances } from "@loomic/shared";
+import {
+  PLAN_CONFIGS,
+  availableCredits,
+  creditBalanceResponseSchema,
+} from "@loomic/shared";
 
 import type { BalanceInfo } from "./credit-service.js";
 
@@ -13,9 +17,16 @@ import type { BalanceInfo } from "./credit-service.js";
  *
  * 契约由 `creditBalanceResponseSchema.parse()` 兜着：这里少一个字段就是校验失败，
  * 而不是客户端收到一个「少了 limits」的余额对象。
+ *
+ * 工单37Q / BL-45: the second argument is additive. Omitted → the payload has no
+ * `pools` key at all (every pre-existing caller keeps its exact response).
+ * `null` → `pools: null` (there is a pool reader, but this caller has no team
+ * workspace). An object → the three pools plus the ONE available-credit figure,
+ * computed by `availableCredits` rather than re-derived here.
  */
 export function toCreditBalanceResponse(
   info: BalanceInfo,
+  pools?: PoolBalances | null,
 ): CreditBalanceResponse {
   const config = PLAN_CONFIGS[info.plan];
 
@@ -29,5 +40,13 @@ export function toCreditBalanceResponse(
       monthlyCredits: config.monthlyCredits,
       dailyCredits: config.dailyCredits,
     },
+    ...(pools === undefined
+      ? {}
+      : {
+          pools:
+            pools === null
+              ? null
+              : { balances: pools, available: availableCredits(pools) },
+        }),
   });
 }

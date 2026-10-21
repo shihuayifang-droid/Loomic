@@ -133,6 +133,13 @@ import {
   createAgentRunWriteRepository,
   type AgentRunWriteRepository,
 } from "./db/agent-run-write-repository.js";
+// BL-45 / workorder 37Q: the three-pool read behind `GET /api/credits`. The
+// factory takes a pool, so the wiring below makes it lazy instead of connecting
+// at startup.
+import {
+  createPoolBalanceReadRepository,
+  type PoolBalanceReadRepository,
+} from "./db/pool-balance-read-repository.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -709,11 +716,25 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const pricingRuleRepository = createPricingRuleRepository({
     getTransactionPool: () => getTransactionPool(databaseEnv),
   });
+
   const priceQuoter =
     options.priceQuoter ?? createPriceQuoter({ pricingRuleRepository });
   const creditLedgerWriteRepository = createCreditLedgerWriteRepository({
     getTransactionPool: () => getTransactionPool(databaseEnv),
   });
+
+  // BL-45 / workorder 37Q: `GET /api/credits` also carries the three pools and
+  // the ONE available-credit figure. `createPoolBalanceReadRepository` wants an
+  // already-created pool, so this wrapper builds it per read against the same
+  // pool as every other repository above: no connection at startup, and a
+  // missing DATABASE_URL fails the request (500 `credit_query_failed`) instead
+  // of the process.
+  const poolBalanceReadRepository: PoolBalanceReadRepository = {
+    readPoolBalances: (input) =>
+      createPoolBalanceReadRepository({
+        pool: getTransactionPool(databaseEnv),
+      }).readPoolBalances(input),
+  };
 
   // Payment service — only created when Lemon Squeezy is configured
   let paymentService: PaymentService | undefined = options.paymentService;
@@ -896,7 +917,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     // Lets the video route push job.progress instead of holding the request open.
     ...(connectionManager ? { connectionManager } : {}),
   });
-  void registerCreditRoutes(app, { auth, creditService, viewerService });
+  void registerCreditRoutes(app, {
+    auth,
+    creditService,
+    viewerService,
+    // BL-45 / workorder 37Q: the three pools ride along on the balance.
+    poolBalanceReadRepository,
+  });
   // GN-01 / workorder 31D: the quote endpoint sits next to the balance it
   // returns. It is handed no ledger, no job service and no deduction dependency
   // (ruling 8), so "a quote cannot touch the balance or the ledger" is a

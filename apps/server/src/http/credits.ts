@@ -16,6 +16,7 @@ import {
   type CreditService,
 } from "../features/credits/credit-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
+import type { PoolBalanceReadRepository } from "../db/pool-balance-read-repository.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
 import { sendValidationError } from "./validation-error.js";
 
@@ -25,6 +26,10 @@ export async function registerCreditRoutes(
     auth: RequestAuthenticator;
     creditService: CreditService;
     viewerService: ViewerService;
+    // BL-45 / workorder 37Q: optional on purpose. Without it the balance is
+    // exactly the payload it was before the pools existed; with it the three
+    // pools ride along for a caller that has a team workspace.
+    poolBalanceReadRepository?: PoolBalanceReadRepository;
   },
 ) {
   // GET /api/credits — balance info
@@ -38,9 +43,28 @@ export async function registerCreditRoutes(
         viewer.workspace.id,
       );
 
+      // BL-45 / workorder 37Q: the three pools are bookkept per TEAM workspace
+      // (37M / 37N), so a caller with no team workspace reads as `null` rather
+      // than as a misleading all-zero pool. A failed read is not swallowed: it
+      // falls into the catch below and answers the existing
+      // `credit_query_failed` 500, because a balance with half its pools is
+      // worse than no balance at all.
+      const poolBalanceReadRepository = options.poolBalanceReadRepository;
+      const pools =
+        poolBalanceReadRepository === undefined
+          ? undefined
+          : viewer.teamWorkspace
+            ? await poolBalanceReadRepository.readPoolBalances({
+                workspaceId: viewer.teamWorkspace.id,
+                userId: user.id,
+              })
+            : null;
+
       // Workorder 31D ruling 7: the payload is assembled by the one helper the
       // quote route also uses, so "余额与 GET /api/credits 同结构" cannot drift.
-      return reply.code(200).send(toCreditBalanceResponse(balance));
+      return reply
+        .code(200)
+        .send(toCreditBalanceResponse(balance, pools));
     } catch (error) {
       return sendCreditError(error, reply, "credit_query_failed");
     }
