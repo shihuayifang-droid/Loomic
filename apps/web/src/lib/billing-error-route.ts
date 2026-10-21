@@ -50,7 +50,7 @@ const TIER_TOAST_CODE_SET: ReadonlySet<string> = new Set(TIER_TOAST_CODES);
  * so a server message is only trusted when it really is the cap sentence and
  * not some other, possibly internal, text.
  */
-const PERSONAL_CAP_MESSAGE_PREFIX = "本月额度已用完（上限 ";
+export const PERSONAL_CAP_MESSAGE_PREFIX = "本月额度已用完（上限 ";
 
 /**
  * Where a `billing.error` code goes. Nothing is ever dropped: an unrecognised

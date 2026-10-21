@@ -201,6 +201,25 @@ describe("useGenerationErrorHandler 按目录类别出入口（T2）", () => {
     );
     expect(screen.queryByTestId("toast-action")).toBeNull();
   });
+
+  it("BL-45: a cap refusal shows the server sentence with the cap", () => {
+    const handle = handlerWith({ editParams: vi.fn(), retry: vi.fn() });
+
+    act(() => {
+      handle(
+        new ApiApplicationError(
+          "personal_cap_reached",
+          "本月额度已用完（上限 20000），可联系管理员调整",
+          402,
+        ),
+      );
+    });
+
+    expect(screen.getByTestId("toast-item")).toHaveTextContent(
+      "本月额度已用完（上限 20000），可联系管理员调整",
+    );
+    expect(screen.queryByTestId("toast-action")).toBeNull();
+  });
 });
 
 // --- T3 + X-05：两个生成面板 ------------------------------------------------

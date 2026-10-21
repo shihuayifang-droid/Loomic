@@ -4,6 +4,7 @@ import { useCallback } from "react";
 
 import { useTierLimitToast } from "@/components/credits/tier-limit-toast";
 import { JobFailed } from "@/lib/await-job";
+import { PERSONAL_CAP_MESSAGE_PREFIX } from "@/lib/billing-error-route";
 import { actionLabelOf, lookupError } from "@/lib/error-catalog";
 import type { ErrorEntry } from "@/lib/error-catalog";
 import { ApiApplicationError } from "@/lib/server-api";
@@ -97,6 +98,22 @@ export function useGenerationErrorHandler(
 
         // Other application errors: log raw message, show catalogue copy
         console.error("[generation-error] Application error:", error.code, error.message);
+
+        // BL-45: 个人上限的拒绝带着服务端算出来的上限 N（「本月额度已用完（上限
+        // 20000），可联系管理员调整」），目录文案不知道这个数。只在原文确实是那句
+        // 上限句时替换文案，`category` / `action` 仍取目录，入口按钮规则不变。
+        if (
+          error.code === "personal_cap_reached" &&
+          error.message.startsWith(PERSONAL_CAP_MESSAGE_PREFIX)
+        ) {
+          showCatalogueToast(
+            showErrorToast,
+            { ...lookupError(error.code), message: error.message },
+            actions,
+          );
+          return false;
+        }
+
         showCatalogueToast(showErrorToast, lookupError(error.code), actions);
         return false;
       }
