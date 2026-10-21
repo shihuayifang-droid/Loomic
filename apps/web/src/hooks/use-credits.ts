@@ -8,6 +8,13 @@ import { fetchCredits, claimDailyCredits } from "@/lib/credits-api";
 
 interface UseCreditsReturn {
   balance: number;
+  /**
+   * BL-45 / workorder 38J: the three-pool breakdown behind the one `balance`
+   * figure, when the server sent one (switch on + a team workspace). `null`
+   * means "no pools to read" — either the switch is off (no `pools` key) or the
+   * caller has no team workspace (`pools: null`). Read by the account summary.
+   */
+  pools: CreditBalanceResponse["pools"] | null;
   plan: string;
   dailyClaimed: boolean;
   limits: CreditBalanceResponse["limits"] | null;
@@ -80,7 +87,12 @@ export function useCredits(): UseCreditsReturn {
   }, [refresh]);
 
   return {
-    balance: data?.balance ?? 0,
+    // BL-45: one available-credit figure everywhere. When the server carries the
+    // three pools, `pools.available` IS the available-credit number; the old
+    // `balance` is only the fallback for a response without pools (switch off or
+    // no team workspace).
+    balance: data?.pools?.available ?? data?.balance ?? 0,
+    pools: data?.pools ?? null,
     plan: data?.plan ?? "free",
     dailyClaimed: data?.dailyClaimed ?? false,
     limits: data?.limits ?? null,
