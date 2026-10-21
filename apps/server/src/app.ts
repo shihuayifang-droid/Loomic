@@ -196,14 +196,8 @@ import {
   CANCEL_REFUND_DESCRIPTION,
   createRefundJob,
 } from "./features/jobs/refund-job.js";
-import { createLemonSqueezyClient } from "./features/payments/lemon-squeezy-client.js";
-import {
-  createPaymentService,
-  buildVariantMap,
-  type PaymentService,
-} from "./features/payments/payment-service.js";
-import { registerPaymentRoutes } from "./http/payments.js";
-import { registerPaymentWebhookRoute } from "./http/payments-webhook.js";
+import type { PaymentService } from "./features/payments/payment-service.js";
+import { registerRetiredPaymentRoutes } from "./http/payments-retired.js";
 import { registerCreditRoutes } from "./http/credits.js";
 import { registerPricingRoutes } from "./http/pricing.js";
 import { registerFontsRoutes } from "./http/fonts.js";
@@ -814,20 +808,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       })
     : baseCreditService;
 
-  // Payment service — only created when Lemon Squeezy is configured
-  let paymentService: PaymentService | undefined = options.paymentService;
-  if (!paymentService && env.lemonSqueezyApiKey && env.lemonSqueezyStoreId) {
-    const lsClient = createLemonSqueezyClient({
-      apiKey: env.lemonSqueezyApiKey,
-      storeId: env.lemonSqueezyStoreId,
-    });
-    paymentService = createPaymentService({
-      lemonSqueezy: lsClient,
-      getAdminClient,
-      variantMap: buildVariantMap(env),
-      webOrigin: env.webOrigin,
-    });
-  }
+  // BL-40 / D-27: the Lemon Squeezy subscription link is retired, so no payment
+  // service is constructed and no `LEMON_SQUEEZY_*` value is read here at all.
+  // The retired routes are registered unconditionally below, whatever the env.
 
   const connectionManager = options.connectionManager ?? new ConnectionManager();
   const eventBuffer = new CanvasEventBuffer();
@@ -1060,23 +1043,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerSkillRoutes(app, { auth, skillRepository, viewerService });
   void registerMarketplaceRoutes(app, { auth, skillRepository, viewerService });
 
-  // Payment routes — only registered when Lemon Squeezy is configured
-  if (paymentService) {
-    void registerPaymentRoutes(app, { auth, paymentService, viewerService });
-
-    if (env.lemonSqueezyWebhookSecret) {
-      // Webhook route is registered in an encapsulated plugin so the custom
-      // content-type parser (needed for raw body access) does not leak to
-      // other routes.
-      void app.register(async (webhookScope) => {
-        await registerPaymentWebhookRoute(webhookScope, {
-          getAdminClient,
-          paymentService: paymentService!,
-          webhookSecret: env.lemonSqueezyWebhookSecret!,
-        });
-      });
-    }
-  }
+  // BL-40 / D-27: the payment routes answer 410 for every caller. They are
+  // registered with no condition at all, so a configured `LEMON_SQUEEZY_*` env
+  // cannot bring the payment service (or a credit grant) back.
+  void registerRetiredPaymentRoutes(app);
 
   return app;
 }
