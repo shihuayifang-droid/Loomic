@@ -42,4 +42,16 @@ describe("BL-40 no upgrade entry", () => {
     expect(source).not.toContain("account-billing-plan-change");
     expect(source).not.toContain('href="/pricing"');
   });
+
+  it("BL-40: the top bar popover shows no plan badge", () => {
+    const source = readComponent("credits", "credit-header-button.tsx");
+    expect(source).not.toContain("PLAN_COLORS");
+    expect(source).not.toContain("{plan}</span>");
+  });
+
+  it("BL-40: the sidebar popover shows no plan badge", () => {
+    const source = readComponent("credits", "credit-balance.tsx");
+    expect(source).not.toContain("PLAN_COLORS");
+    expect(source).not.toContain("{plan}</span>");
+  });
 });

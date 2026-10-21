@@ -41,16 +41,6 @@ function AnimatedBalance({ value }: { value: number }) {
   return <span>{displayed.toLocaleString()}</span>;
 }
 
-// ── Plan badge color map ─────────────────────────────────────
-
-const PLAN_COLORS: Record<string, string> = {
-  free: "bg-muted text-muted-foreground",
-  starter: "bg-muted text-muted-foreground",
-  pro: "bg-primary/15 text-foreground",
-  ultra: "bg-primary/20 text-primary-foreground",
-  business: "bg-primary/20 text-primary-foreground",
-};
-
 // ── Main component ───────────────────────────────────────────
 
 export function CreditBalance() {
@@ -173,11 +163,6 @@ export function CreditBalance() {
 
               {/* Plan badge */}
               <div className="mb-3 flex items-center gap-2">
-                <span
-                  className={`inline-flex items-center rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${PLAN_COLORS[plan] ?? PLAN_COLORS.free}`}
-                >
-                  {plan}
-                </span>
                 {limits && (
                   <span className="text-xs text-muted-foreground">
                     {isFree

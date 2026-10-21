@@ -10,16 +10,6 @@ import Link from "next/link";
 import { useAuth } from "@/lib/auth-context";
 import { useCredits } from "@/hooks/use-credits";
 
-// ── Plan badge color map ─────────────────────────────────────
-
-const PLAN_COLORS: Record<string, string> = {
-  free: "bg-secondary text-secondary-foreground",
-  starter: "bg-primary text-primary-foreground",
-  pro: "bg-primary text-primary-foreground",
-  ultra: "bg-primary text-primary-foreground",
-  business: "bg-primary text-primary-foreground",
-};
-
 // ── Main component ───────────────────────────────────────────
 
 export function CreditHeaderButton() {
@@ -136,11 +126,6 @@ export function CreditHeaderButton() {
               >
                 {/* Plan badge + balance */}
                 <div className="mb-3 flex items-center justify-between">
-                  <span
-                    className={`inline-flex items-center rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${PLAN_COLORS[plan] ?? PLAN_COLORS.free}`}
-                  >
-                    {plan}
-                  </span>
                   {limits && (
                     <span className="text-xs text-muted-foreground">
                       {isFree
