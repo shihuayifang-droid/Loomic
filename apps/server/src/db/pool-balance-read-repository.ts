@@ -17,8 +17,10 @@
  *                         `grant_team_cycle` (BL-44), not by a read.
  * - `personal_team_used`  this member's `member_team_usage.used` for this month;
  *                         no row means 0.
- * - `personal_cap`        that row's `personal_cap`; no row means the schema
- *                         default 20000 (BL-45 / D-17).
+ * - `personal_cap`        that row's `personal_cap`; no row means
+ *                         `public.member_personal_cap(ws, user)` — the
+ *                         cross-month setting 37W added, 20000 when unset
+ *                         (BL-45 / D-17).
  * - `topup`               `user_credit_wallets.topup_balance`; no wallet row
  *                         means 0.
  *
@@ -32,9 +34,9 @@
  *   day "now" is, which is the whole class of bug this read exists to avoid.
  * - Nothing is written: the statement is a single `select`, so a read opens a
  *   transaction, answers, and COMMITs with no row touched. A missing pool row,
- *   usage row or wallet row is a LEGAL answer (0 / 0 / 20000 default) rather
- *   than an error, because a member who has never spent or been granted anything
- *   has exactly that state.
+ *   usage row or wallet row is a LEGAL answer (0 / 0 / the member's effective
+ *   cap) rather than an error, because a member who has never spent or been
+ *   granted anything has exactly that state.
  * - Both ids are bind parameters, `$1::uuid` and `$2::uuid`. A malformed one
  *   fails as a real SQL error inside the transaction — no value a caller passes
  *   becomes SQL text, and the shape of a uuid is therefore not pre-validated
@@ -101,8 +103,12 @@ const POOL_BALANCES_LABEL = "pool balance read";
  * "today"; the three relations are LEFT JOINed to it, which is what makes "no
  * such row" an all-zero answer instead of zero rows.
  *
- * `coalesce(u.personal_cap, 20000)` and `coalesce(w.topup_balance, 0)` mirror
- * `deduct_from_pools`' own not-found branches. `daily` keeps the wallet's
+ * `coalesce(u.personal_cap, public.member_personal_cap($1::uuid, $2::uuid))`
+ * and `coalesce(w.topup_balance, 0)` mirror `deduct_from_pools`' own not-found
+ * branches. The cap fallback is the FUNCTION rather than a literal 20000: since
+ * 37W a member's cap can live in `member_cap_settings` across months, so a
+ * member given a 10000 "intern" template and not yet charged this month reads
+ * the cap the deduction would actually enforce. `daily` keeps the wallet's
  * balance only while `daily_date` IS today (`is not distinct from`, so a NULL
  * day is "not today" rather than an unknown).
  *
@@ -140,7 +146,7 @@ select
   end as daily,
   greatest(0, coalesce(p.pool_limit, 0) - coalesce(p.pool_used, 0)) as team_remaining,
   coalesce(u.used, 0) as personal_team_used,
-  coalesce(u.personal_cap, 20000) as personal_cap,
+  coalesce(u.personal_cap, public.member_personal_cap($1::uuid, $2::uuid)) as personal_cap,
   coalesce(w.topup_balance, 0) as topup
 from bounds b
 left join monthly_pool p on true

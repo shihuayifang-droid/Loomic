@@ -362,6 +362,63 @@ describe("readPoolBalances (37P): 三池读取", () => {
     });
   });
 
+  it("BL-01: a member's template cap is what the read reports before the first charge", async () => {
+    const actor = await newActor();
+
+    // 37W：「实习」模板 10000，套到这个成员身上（写 member_cap_settings 和本月用量行）。
+    const templateId = firstRow(
+      (
+        await db.query<{ id: string }>(
+          `insert into public.credit_cap_templates (workspace_id, name, cap)
+           values ($1::uuid, $2::text, $3::integer) returning id`,
+          [actor.workspaceId, "实习", 10000],
+        )
+      ).rows,
+    ).id;
+
+    expect(
+      firstRow(
+        (
+          await db.query<{ n: number }>(
+            "select public.apply_cap_template($1::uuid, $2::uuid, $3::uuid[]) as n",
+            [actor.workspaceId, templateId, [actor.userId]],
+          )
+        ).rows,
+      ).n,
+    ).toBe(1);
+
+    // 删掉本月用量行：这就是下个月、还没扣过费时的样子，本月快照不在了，
+    // 上限只剩跨月设定。
+    await db.query(
+      `delete from public.member_team_usage
+        where workspace_id = $1::uuid and user_id = $2::uuid
+          and period_month = ${MONTH_SQL}`,
+      [actor.workspaceId, actor.userId],
+    );
+    expect(
+      firstRow(
+        (
+          await db.query<{ count: number }>(
+            `select count(*)::int as count from public.member_team_usage
+              where workspace_id = $1::uuid and user_id = $2::uuid
+                and period_month = ${MONTH_SQL}`,
+            [actor.workspaceId, actor.userId],
+          )
+        ).rows,
+      ).count,
+    ).toBe(0);
+
+    // 读到的上限必须是模板给的 10000，与 deduct_from_pools 走
+    // member_personal_cap 的口径一致；不是 schema 默认的 20000。
+    await expect(read(actor)).resolves.toEqual({
+      daily: 0,
+      teamRemaining: 0,
+      personalTeamUsed: 0,
+      personalCap: 10000,
+      topup: 0,
+    });
+  });
+
   it("error: a failing query is wrapped", async () => {
     const actor = await newActor();
 
