@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   creditTransactionSchema,
   creditTransactionTypeSchema,
+  creditTransactionsResponseSchema,
   ledgerEntryTypeOf,
   ledgerEntryTypeSchema,
 } from "./credits.js";
@@ -76,5 +77,48 @@ describe("BL-06 ledger entry types", () => {
     expect(() =>
       creditTransactionSchema.parse({ ...base, entry_type: "bogus" }),
     ).toThrow();
+  });
+});
+
+// BL-06 / workorder 38C: the database enum grew to ten values in 37O; if the
+// shared enum lags, `GET /api/credits/transactions` answers 500 the first time a
+// pool-cycle row is read.
+describe("BL-06 database transaction types, ten of them", () => {
+  it("BL-06: the database's ten transaction types are all known", () => {
+    expect(creditTransactionTypeSchema.options).toEqual([
+      "subscription_grant",
+      "daily_grant",
+      "purchase",
+      "generation_deduct",
+      "generation_refund",
+      "admin_adjustment",
+      "bonus",
+      "cycle_grant",
+      "cycle_reset",
+      "daily_expire",
+    ]);
+  });
+
+  it("BL-06: pool-cycle rows map to their own entry types and parse in a response", () => {
+    expect(ledgerEntryTypeOf("cycle_grant")).toBe("cycle_grant");
+    expect(ledgerEntryTypeOf("cycle_reset")).toBe("cycle_reset");
+    expect(ledgerEntryTypeOf("daily_expire")).toBe("daily_expire");
+
+    const transactions = (
+      ["cycle_grant", "cycle_reset", "daily_expire"] as const
+    ).map((transactionType, index) => ({
+      id: `00000000-0000-0000-0000-000000038c0${index}`,
+      transaction_type: transactionType,
+      entry_type: ledgerEntryTypeOf(transactionType),
+      amount: 10,
+      balance_after: 10,
+      job_id: null,
+      description: null,
+      created_at: "2026-10-20T00:00:00Z",
+    }));
+
+    expect(() =>
+      creditTransactionsResponseSchema.parse({ transactions }),
+    ).not.toThrow();
   });
 });

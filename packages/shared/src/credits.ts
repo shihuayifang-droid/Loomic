@@ -27,6 +27,10 @@ export const creditTransactionTypeSchema = z.enum([
   "generation_refund",
   "admin_adjustment",
   "bonus",
+  // BL-06 / workorder 38C: the three the database gained in 37O.
+  "cycle_grant",
+  "cycle_reset",
+  "daily_expire",
 ]);
 export type CreditTransactionType = z.infer<typeof creditTransactionTypeSchema>;
 
@@ -56,6 +60,9 @@ const LEDGER_ENTRY_TYPE_BY_TRANSACTION_TYPE = {
   purchase: "topup",
   admin_adjustment: "admin_adjust",
   bonus: "admin_adjust",
+  cycle_grant: "cycle_grant",
+  cycle_reset: "cycle_reset",
+  daily_expire: "daily_expire",
 } as const satisfies Record<CreditTransactionType, LedgerEntryType>;
 
 export function ledgerEntryTypeOf(
