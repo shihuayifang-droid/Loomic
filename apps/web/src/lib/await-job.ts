@@ -26,6 +26,8 @@
  * running job, and asking again on every attempt would turn a status stream
  * into a poll.
  */
+import { JOB_POLL_INTERVAL_MS } from "@loomic/shared";
+
 import type { WebSocketHandle } from "../hooks/use-websocket";
 import { isTerminalJobStatus, normalizeJobStatus } from "./job-status";
 import { fetchJob, type JobRecord } from "./server-api";
@@ -88,7 +90,7 @@ export async function awaitJobCompletion(
     ws,
     signal,
     onProgress,
-    pollIntervalMs = 5_000,
+    pollIntervalMs = JOB_POLL_INTERVAL_MS,
     timeoutMs = 900_000, // 15 min, above the worst observed video generation
   } = opts;
 

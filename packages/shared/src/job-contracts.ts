@@ -24,6 +24,13 @@ export const backgroundJobTypeSchema = z.enum([
 ]);
 export type BackgroundJobType = z.infer<typeof backgroundJobTypeSchema>;
 
+// --- Timing constants ---
+
+/** GN-02 ② / GN-39: the slow safety-net poll beside the WebSocket push. One value for every client. */
+export const JOB_POLL_INTERVAL_MS = 3_000;
+/** GN-39: how long a client keeps polling one job before giving up. */
+export const JOB_POLL_MAX_DURATION_MS = 10 * 60 * 1_000;
+
 // --- Payloads ---
 
 export const imageGenerationPayloadSchema = z.object({

@@ -9,8 +9,10 @@ vi.mock("../src/lib/server-api", () => ({
 
 import { useJobFallbackPolling } from "../src/hooks/use-job-fallback-polling";
 
-/** 与 use-job-fallback-polling.ts 里的 POLL_INTERVAL_MS 对齐 */
-const POLL_MS = 5_000;
+// 与 shared 的 JOB_POLL_INTERVAL_MS 同一来源（GN-39）
+import { JOB_POLL_INTERVAL_MS } from "@loomic/shared";
+
+const POLL_MS = JOB_POLL_INTERVAL_MS;
 
 function jobRow(over: Record<string, unknown> = {}) {
   return {

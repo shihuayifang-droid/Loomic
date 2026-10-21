@@ -2,17 +2,20 @@
 
 import { useCallback, useEffect, useRef } from "react";
 
-import type { StreamEvent } from "@loomic/shared";
+import {
+  JOB_POLL_INTERVAL_MS,
+  JOB_POLL_MAX_DURATION_MS,
+  type StreamEvent,
+} from "@loomic/shared";
 
 import { isTerminalJobStatus, normalizeJobStatus } from "../lib/job-status";
 import { fetchJob } from "../lib/server-api";
 
 // --- Constants ---
 
-/** Interval between polling attempts (ms) */
-const POLL_INTERVAL_MS = 5_000;
-/** Maximum total polling duration before giving up (ms) */
-const MAX_POLL_DURATION_MS = 10 * 60 * 1_000; // 10 minutes
+// GN-39: the poll interval and the give-up deadline are shared constants
+// (`packages/shared/src/job-contracts.ts`), so this hook cannot drift from
+// `lib/await-job.ts` or from the spec.
 // GN-30: the terminal set lives in lib/job-status.ts, imported by both waiters,
 // so `retrying` keeps polling and `dead_letter` reads as `failed` in one place.
 
@@ -101,7 +104,7 @@ export function useJobFallbackPolling({
       const intervalId = setInterval(async () => {
         // Safety: check max duration
         const elapsed = Date.now() - startedAt;
-        if (elapsed > MAX_POLL_DURATION_MS) {
+        if (elapsed > JOB_POLL_MAX_DURATION_MS) {
           console.warn(
             `[job-fallback] Giving up on job ${jobId} after ${Math.round(elapsed / 1000)}s`,
           );
@@ -153,7 +156,7 @@ export function useJobFallbackPolling({
             err,
           );
         }
-      }, POLL_INTERVAL_MS);
+      }, JOB_POLL_INTERVAL_MS);
 
       activePollsRef.current.set(jobId, {
         intervalId,
