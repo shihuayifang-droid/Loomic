@@ -52,6 +52,7 @@ import { generationLedgerDescription } from "../features/credits/ledger-descript
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import {
+  JOB_POLL_INTERVAL_MS,
   getPlanConfig,
   type BillingErrorCode,
   type ImageQualityLevel,
@@ -59,6 +60,7 @@ import {
 } from "@loomic/shared";
 import { createAgentBackend } from "./backends/index.js";
 import { startAgentJobProgress } from "./agent-job-progress.js";
+import { agentWaitBudgetMs } from "./job-wait-budget.js";
 import {
   type LoomicAgent,
   type LoomicAgentFactory,
@@ -1273,15 +1275,18 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           }
 
           try {
-          // Poll until terminal state
-          // Worker image VT=120s, but Replicate calls can take 100s+ plus queue delay.
-          const POLL_INTERVAL = 2000;
-          const MAX_WAIT = 240_000; // 4 minutes
+          // Poll until terminal state.
+          // GN-31: the wait is the worker's OWN budget for this job — the image
+          // visibility timeout times the attempts this job was granted — plus a
+          // margin for queueing and the final canvas write, so the agent can no
+          // longer give up on a job the worker is still going to finish and
+          // charge for. GN-39: one shared poll interval for every job.
+          const MAX_WAIT = agentWaitBudgetMs("image_generation", job.max_attempts);
           const start = Date.now();
           let pollCount = 0;
 
           while (Date.now() - start < MAX_WAIT) {
-            await delay(POLL_INTERVAL);
+            await delay(JOB_POLL_INTERVAL_MS);
             pollCount++;
 
             if (run.controller.signal.aborted) {
@@ -1602,15 +1607,16 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
 
           try {
           // Poll until terminal state — video generation is slower.
-          // Google Vertex Veo can take 300-500s; 600s gives enough headroom
-          // to avoid poll timeout while worker is still processing.
-          const POLL_INTERVAL = 3000;
-          const MAX_WAIT = 600_000; // 10 minutes
+          // GN-31: same rule as the image branch — the worker's own budget for a
+          // video job (visibility timeout times its attempts) plus the same
+          // margin, so a slow-but-healthy video is never abandoned here.
+          // GN-39: the shared poll interval, not a private per-tool one.
+          const MAX_WAIT = agentWaitBudgetMs("video_generation", job.max_attempts);
           const start = Date.now();
           let pollCount = 0;
 
           while (Date.now() - start < MAX_WAIT) {
-            await delay(POLL_INTERVAL);
+            await delay(JOB_POLL_INTERVAL_MS);
             pollCount++;
 
             if (run.controller.signal.aborted) {
