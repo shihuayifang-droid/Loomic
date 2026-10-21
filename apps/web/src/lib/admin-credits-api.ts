@@ -1,6 +1,10 @@
 // @credits-system — Frontend API client for the admin team credit APIs
 // (AD-01 member list numbers, BL-12 adjust, BL-01 personal cap / cap templates).
-import type { CreditCapTemplate, MemberCreditSummary } from "@loomic/shared";
+import type {
+  CreditCapTemplate,
+  MemberCreditSummary,
+  TeamMember,
+} from "@loomic/shared";
 
 import {
   adminCreditAdjustResponseSchema,
@@ -9,6 +13,7 @@ import {
   creditCapTemplateListResponseSchema,
   creditCapTemplateSchema,
   memberCreditSummaryListResponseSchema,
+  teamMemberListResponseSchema,
 } from "@loomic/shared";
 
 import { getServerBaseUrl } from "./env";
@@ -57,6 +62,22 @@ export async function fetchMemberCredits(
   );
   if (!response.ok) return handleErrorResponse(response);
   const parsed = memberCreditSummaryListResponseSchema.safeParse(
+    await response.json().catch(() => null),
+  );
+  if (!parsed.success) return invalidResponse();
+  return parsed.data.members;
+}
+
+// ── AD-01: the names behind the credit rows ──────────────────
+
+export async function fetchTeamMembers(
+  accessToken: string,
+): Promise<TeamMember[]> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/team/members`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  const parsed = teamMemberListResponseSchema.safeParse(
     await response.json().catch(() => null),
   );
   if (!parsed.success) return invalidResponse();

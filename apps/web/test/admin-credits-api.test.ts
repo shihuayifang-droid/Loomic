@@ -7,6 +7,7 @@ import {
   createCapTemplate,
   fetchCapTemplates,
   fetchMemberCredits,
+  fetchTeamMembers,
   setMemberCap,
 } from "../src/lib/admin-credits-api";
 import { ApiApplicationError, ApiAuthError } from "../src/lib/server-api";
@@ -54,6 +55,33 @@ describe("admin credits API", () => {
       }),
     );
     expect(members).toEqual([MEMBER]);
+  });
+
+  it("fetchTeamMembers GETs the team member list and returns members", async () => {
+    const members = [
+      {
+        userId: "u1",
+        email: "wang@example.com",
+        displayName: "小王",
+        role: "admin",
+        joinedAt: "2026-01-01T00:00:00Z",
+      },
+    ];
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ members }),
+    });
+
+    const result = await fetchTeamMembers("t");
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "http://localhost:3001/api/admin/team/members",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer t" },
+      }),
+    );
+    expect(result).toEqual(members);
   });
 
   it("adjustMemberTopup POSTs delta and reason and returns the transaction id", async () => {
