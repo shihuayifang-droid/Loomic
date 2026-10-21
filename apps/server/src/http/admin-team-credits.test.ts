@@ -66,6 +66,16 @@ type MemberCreditCall = {
   workspaceId: string;
 };
 
+/** BL-44 / 38N: what the pool limit write was asked for. */
+type PoolLimitCall = {
+  workspaceId: string;
+  limit: number;
+  operatorId: string;
+};
+
+let poolLimitCalls: PoolLimitCall[] = [];
+let poolLimitFailure: unknown = null;
+
 /** A template id (uuid) and the two names the cases use. */
 const TEMPLATE_ID = "33333333-3333-3333-3333-333333333333";
 
@@ -133,6 +143,11 @@ const adminCreditWriteRepository: AdminCreditWriteRepository = {
     capCalls.push(input);
     if (writeFailure) throw writeFailure;
     return capResult;
+  },
+  async setTeamPoolLimit(input) {
+    poolLimitCalls.push(input);
+    if (poolLimitFailure) throw poolLimitFailure;
+    return input.limit;
   },
   async createCapTemplate(input) {
     createTemplateCalls.push(input);
@@ -240,6 +255,8 @@ const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
 beforeEach(() => {
   adjustCalls = [];
   capCalls = [];
+  poolLimitCalls = [];
+  poolLimitFailure = null;
   createTemplateCalls = [];
   applyTemplateCalls = [];
   memberCreditCalls = [];
@@ -609,5 +626,66 @@ describe("admin team credit routes", () => {
     // 管理员的团队工作区被问过，而失败的原因没有漏进响应。
     expect(memberCreditCalls).toEqual([{ workspaceId: TEAM_ID }]);
     expect(response.body).not.toMatch(/listMemberCredits|member credit read/);
+  });
+
+  it("BL-44: an admin changes the team pool limit", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: "/api/admin/team/pool-limit",
+      headers: bearer("admin-token"),
+      payload: { limit: 50000 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ limit: 50000 });
+    expect(poolLimitCalls).toEqual([
+      { workspaceId: TEAM_ID, limit: 50000, operatorId: ADMIN_ID },
+    ]);
+  });
+
+  it("BL-44: a non-admin cannot change the team pool limit", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: "/api/admin/team/pool-limit",
+      headers: bearer("member-token"),
+      payload: { limit: 50000 },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(poolLimitCalls.length).toBe(0);
+  });
+
+  it("BL-44: a negative or non-integer pool limit is a 400", async () => {
+    const negative = await app.inject({
+      method: "PUT",
+      url: "/api/admin/team/pool-limit",
+      headers: bearer("admin-token"),
+      payload: { limit: -1 },
+    });
+    const fraction = await app.inject({
+      method: "PUT",
+      url: "/api/admin/team/pool-limit",
+      headers: bearer("admin-token"),
+      payload: { limit: 1.5 },
+    });
+
+    expect(negative.statusCode).toBe(400);
+    expect(negative.json().error.code).toBe("invalid_request");
+    expect(fraction.statusCode).toBe(400);
+    expect(poolLimitCalls.length).toBe(0);
+  });
+
+  it("BL-44: a database refusal of the limit (22023) is a 400", async () => {
+    poolLimitFailure = { code: "22023" };
+
+    const response = await app.inject({
+      method: "PUT",
+      url: "/api/admin/team/pool-limit",
+      headers: bearer("admin-token"),
+      payload: { limit: 50000 },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("invalid_request");
   });
 });

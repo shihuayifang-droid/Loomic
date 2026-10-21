@@ -30,6 +30,8 @@ const CAP_FAILED_MESSAGE = "Unable to set the personal cap.";
 const INVALID_ADJUST_MESSAGE =
   "delta (non-zero integer) and reason are required.";
 const INVALID_CAP_MESSAGE = "cap (a non-negative integer) is required.";
+const INVALID_POOL_LIMIT_MESSAGE = "limit (a non-negative integer) is required.";
+const POOL_LIMIT_FAILED_MESSAGE = "Unable to set the team pool limit.";
 const INVALID_TEMPLATE_MESSAGE =
   "name (1-40 characters) and cap (a non-negative integer) are required.";
 const INVALID_TEMPLATE_ID_MESSAGE = "templateId must be a uuid.";
@@ -316,6 +318,53 @@ export async function registerAdminTeamCreditRoutes(
       }
     },
   );
+
+  /**
+   * BL-44 / 38N: the administrator changes this month's team pool limit. The
+   * database function updates the current month's row, so the change is
+   * effective at once.
+   */
+  app.put("/api/admin/team/pool-limit", async (request, reply) => {
+    const admin = await requireAdmin(request, reply);
+    if (!admin) return reply;
+
+    const body = request.body as { limit?: unknown } | null | undefined;
+    const limit = body?.limit;
+    if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 0) {
+      return sendApplicationError(
+        reply,
+        400,
+        "invalid_request",
+        INVALID_POOL_LIMIT_MESSAGE,
+      );
+    }
+
+    try {
+      const stored = await options.adminCreditWriteRepository.setTeamPoolLimit({
+        workspaceId: admin.workspaceId,
+        limit,
+        operatorId: admin.user.id,
+      });
+
+      return reply.code(200).send({ limit: stored });
+    } catch (error) {
+      if (readDatabaseError(error).code === INVALID_PARAMETER) {
+        return sendApplicationError(
+          reply,
+          400,
+          "invalid_request",
+          INVALID_POOL_LIMIT_MESSAGE,
+        );
+      }
+
+      return sendApplicationError(
+        reply,
+        500,
+        "application_error",
+        POOL_LIMIT_FAILED_MESSAGE,
+      );
+    }
+  });
 
   /**
    * BL-01 / 37Y: the workspace's credit cap templates.

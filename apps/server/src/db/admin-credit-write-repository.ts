@@ -47,6 +47,15 @@ export type AdminCreditWriteRepository = {
     userId: string;
     cap: number;
   }): Promise<number>;
+  /**
+   * BL-44 / 38N: set this month's team pool limit. The change is effective
+   * immediately and returns the stored limit.
+   */
+  setTeamPoolLimit(input: {
+    workspaceId: string;
+    limit: number;
+    operatorId: string;
+  }): Promise<number>;
   /** BL-01 / 37Y: store one template in the workspace. Returns the stored row. */
   createCapTemplate(input: {
     workspaceId: string;
@@ -101,6 +110,11 @@ select public.admin_adjust_topup(
  */
 const SET_PERSONAL_CAP_SQL = `
 select public.set_personal_cap($1::uuid, $2::uuid, $3::integer) as cap
+`;
+
+/** BL-44 / 38N: the one statement of the pool limit change. */
+const SET_TEAM_POOL_LIMIT_SQL = `
+select public.set_team_pool_limit($1::uuid, $2::int, $3::uuid) as pool_limit
 `;
 
 /**
@@ -203,6 +217,31 @@ export function createAdminCreditWriteRepository(options: {
           }
 
           return mapCapRow(result.rows[0]);
+        },
+      );
+    },
+
+    async setTeamPoolLimit(input) {
+      const workspaceId = requireArgument(input.workspaceId, "workspaceId");
+      const operatorId = requireArgument(input.operatorId, "operatorId");
+
+      return await withPrivilegedTransaction(
+        options.getTransactionPool(),
+        { userId: operatorId, workspaceId, role: "admin" },
+        async (client) => {
+          const result = await client.query(SET_TEAM_POOL_LIMIT_SQL, [
+            workspaceId,
+            input.limit,
+            operatorId,
+          ]);
+
+          if (result.rows.length !== 1) {
+            throw new Error(
+              `${ADMIN_CREDIT_LABEL} returned ${result.rows.length} rows instead of one`,
+            );
+          }
+
+          return mapPoolLimitRow(result.rows[0]);
         },
       );
     },
@@ -319,6 +358,20 @@ function mapCapRow(row: unknown): number {
   const value = (row as Readonly<Record<string, unknown>>).cap;
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new Error(`${ADMIN_CREDIT_LABEL} returned no usable "cap"`);
+  }
+
+  return Number(value);
+}
+
+/** The stored pool limit: the function declares `returns integer`. */
+function mapPoolLimitRow(row: unknown): number {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned a row that is not an object`);
+  }
+
+  const value = (row as Readonly<Record<string, unknown>>).pool_limit;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned no usable "pool_limit"`);
   }
 
   return Number(value);
