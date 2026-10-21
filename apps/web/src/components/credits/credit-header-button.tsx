@@ -97,17 +97,6 @@ export function CreditHeaderButton() {
   return (
     <>
       <div ref={btnRef} className="flex items-center gap-2">
-        {/* Upgrade button (non-business plans) */}
-        {plan !== "business" && (
-          <Link
-            href="/pricing"
-            className="flex h-8 items-center gap-1.5 rounded-lg bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-          >
-            <Zap className="h-3 w-3 text-muted-foreground" />
-            <span>升级</span>
-          </Link>
-        )}
-
         {/* Credit balance button */}
         <button data-testid="credits-header-trigger"
           type="button"

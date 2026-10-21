@@ -4,8 +4,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Sparkles, Plus, ChevronRight, Zap, Gift } from "lucide-react";
-import Link from "next/link";
+import { Sparkles, Plus, Zap, Gift } from "lucide-react";
 import { useCredits } from "@/hooks/use-credits";
 
 // ── Animated number display ──────────────────────────────────
@@ -224,20 +223,6 @@ export function CreditBalance() {
                 </div>
               )}
 
-              {/* Upgrade link */}
-              {plan !== "business" && (
-                <Link
-                  href="/pricing"
-                  onClick={() => setOpen(false)}
-                  className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted"
-                >
-                  <span className="flex items-center gap-2">
-                    <Zap className="h-4 w-4 text-muted-foreground" />
-                    Upgrade Plan
-                  </span>
-                  <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                </Link>
-              )}
               </motion.div>
             </div>
           </AnimatePresence>,

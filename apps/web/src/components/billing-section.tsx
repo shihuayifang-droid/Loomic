@@ -1,9 +1,7 @@
 "use client";
 
 import { useCallback, useState } from "react";
-import Link from "next/link";
 import {
-  CreditCard,
   Crown,
   ExternalLink,
   Loader2,
@@ -102,13 +100,6 @@ export function BillingSection() {
 
       {/* Actions */}
       <div className="flex flex-wrap gap-3">
-        <Link href="/pricing">
-          <Button data-testid="account-billing-plan-change" variant="default" size="lg">
-            <CreditCard className="mr-1.5 h-4 w-4" />
-            {isFree ? "Upgrade Plan" : "Change Plan"}
-          </Button>
-        </Link>
-
         {subscription?.customerPortalUrl && (
           <a
             href={subscription.customerPortalUrl}
