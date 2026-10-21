@@ -30,8 +30,26 @@
  * `grant` carries all of that.
  */
 
+import { creditPoolsEnabled } from "./credit-pools-billing.js";
+
 /** BL-44: how often the worker tries to place this month's team pool grant. */
 export const TEAM_CYCLE_GRANT_INTERVAL_MS = 10 * 60 * 1000;
+
+/**
+ * Workorder 38I: whether the worker should run the monthly team-pool grant AT
+ * ALL. `grant_team_cycle` writes the pool row and the `cycle_grant` ledger line,
+ * which are the three-pool bookkeeping the switch (37T) is supposed to own — so
+ * a switched-off deployment must not schedule a single pass.
+ *
+ * `creditPoolsEnabled` is reused rather than read again here, so the timer and
+ * the charge can never disagree about what "on" means. Injected `source` for the
+ * tests, exactly like `creditPoolsEnabled`.
+ */
+export function shouldStartTeamCycleGrant(
+  source: Record<string, string | undefined> = process.env,
+): boolean {
+  return creditPoolsEnabled(source);
+}
 
 export type StartTeamCycleGrantInput = {
   /** One granting pass. Rejecting or throwing is handled, not propagated. */

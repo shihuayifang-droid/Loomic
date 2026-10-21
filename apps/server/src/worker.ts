@@ -17,7 +17,10 @@ import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
 import { reapStuckJobs } from "./features/jobs/reap-stuck-jobs.js";
 import { startStuckJobReaper } from "./features/jobs/stuck-job-reaper-schedule.js";
-import { startTeamCycleGrant } from "./features/credits/team-cycle-grant-schedule.js";
+import {
+  shouldStartTeamCycleGrant,
+  startTeamCycleGrant,
+} from "./features/credits/team-cycle-grant-schedule.js";
 import { createJobStuckReaderRepository } from "./db/job-stuck-reader-repository.js";
 import { createPoolGrantWriteRepository } from "./db/pool-grant-write-repository.js";
 import { buildWorkerComposition } from "./worker-composition.js";
@@ -130,20 +133,28 @@ async function main() {
   // the 1st must not wait a whole interval. The repository is built per pass
   // against the same pool getter as everything else in this file — it resolves
   // lazily, so a pass that never runs never connects.
-  const teamCycleGrant = startTeamCycleGrant({
-    grant: () =>
-      createPoolGrantWriteRepository({
-        getTransactionPool: getPool,
-      }).grantTeamCycle(),
-    log: (m) => console.log(`${tag} ${m}`),
-  });
+  //
+  // Workorder 38I: this grant is three-pool bookkeeping, so it belongs to the
+  // `LOOMIC_CREDIT_POOLS=on` side of the switch, like the charge and the daily
+  // grant do. With the switch off the schedule is not started at all — no
+  // `cycle_grant` ledger line and no pool row — and the shutdown below stays
+  // safe against the handle that does not exist.
+  const teamCycleGrant = shouldStartTeamCycleGrant()
+    ? startTeamCycleGrant({
+        grant: () =>
+          createPoolGrantWriteRepository({
+            getTransactionPool: getPool,
+          }).grantTeamCycle(),
+        log: (m) => console.log(`${tag} ${m}`),
+      })
+    : null;
 
   // Graceful shutdown — wait for in-flight jobs then exit
   const shutdown = async () => {
     // Stop the timers first: the in-flight jobs waited for below are the ones
     // that matter, and a tick landing mid-shutdown has nothing left to do.
     reaper.stop();
-    teamCycleGrant.stop();
+    teamCycleGrant?.stop();
     const totalInFlight = [...inFlightByQueue.values()].reduce((n, s) => n + s.size, 0);
     console.log(`${tag} Shutting down, waiting for ${totalInFlight} in-flight jobs...`);
     running = false;

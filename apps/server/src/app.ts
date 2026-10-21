@@ -798,7 +798,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // Workorder 37T: `LOOMIC_CREDIT_POOLS=on` moves the charge, the refund and the
   // balance pre-check onto the three pools. Anything else leaves the credit
   // service exactly as built above.
-  const creditService: CreditService = creditPoolsEnabled()
+  //
+  // Workorder 38I: the same one value decides the WHOLE wiring of this app, not
+  // just the credit service. With the switch off the routes below are handed no
+  // pool read and no pool grant either, so a switched-off server answers exactly
+  // the payload it answered before the pools existed and writes no pool row —
+  // otherwise the old single balance and a second "available" figure would be
+  // served side by side and the sender could not tell which one was charged.
+  const creditPools = creditPoolsEnabled();
+  const creditService: CreditService = creditPools
     ? withCreditPools(baseCreditService, {
         ...createCreditPoolWriteRepository({
           getTransactionPool: () => getTransactionPool(databaseEnv),
@@ -991,9 +999,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     creditService,
     viewerService,
     // BL-45 / workorder 37Q: the three pools ride along on the balance.
-    poolBalanceReadRepository,
     // BL-45 / workorder 37R: and today's daily grant is placed before the read.
-    poolGrantWriteRepository,
+    // Workorder 38I: both only while `LOOMIC_CREDIT_POOLS=on`; with it off the
+    // route is registered with the pre-pools arguments (no `pools` key in the
+    // payload and no daily grant written).
+    ...(creditPools
+      ? { poolBalanceReadRepository, poolGrantWriteRepository }
+      : {}),
   });
   // GN-01 / workorder 31D: the quote endpoint sits next to the balance it
   // returns. It is handed no ledger, no job service and no deduction dependency
@@ -1039,8 +1051,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       // not need a second call. Same lazy wrapper as `GET /api/credits`: no
       // connection at startup, and a missing DATABASE_URL fails the pool read
       // (which the route logs and answers as `balance: null`) rather than the
-      // status itself.
-      poolBalanceReadRepository,
+      // status itself. Workorder 38I: only while `LOOMIC_CREDIT_POOLS=on`; with
+      // it off the status carries no `balance` key at all.
+      ...(creditPools ? { poolBalanceReadRepository } : {}),
       // The tag is the call site's, exactly as the worker passes its own: both
       // log lines of a cancel refund are attributable to this route.
       refundCanceledJob: (canceledJobId: string) =>

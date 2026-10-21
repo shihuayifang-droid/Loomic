@@ -9,6 +9,7 @@ import {
 } from "../../test-support/db/pglite-db.js";
 import {
   TEAM_CYCLE_GRANT_INTERVAL_MS,
+  shouldStartTeamCycleGrant,
   startTeamCycleGrant,
 } from "./team-cycle-grant-schedule.js";
 
@@ -317,5 +318,23 @@ describe("pool grant write repository: a team workspace", () => {
       [MEMBER_A_ID],
     );
     expect(firstRow(grants.rows).n).toBe(1);
+  });
+});
+
+describe("shouldStartTeamCycleGrant (workorder 38I)", () => {
+  it("T-108: the worker does not start the team cycle grant with the switch off", () => {
+    expect(shouldStartTeamCycleGrant({})).toBe(false);
+    expect(shouldStartTeamCycleGrant({ LOOMIC_CREDIT_POOLS: "off" })).toBe(
+      false,
+    );
+    expect(shouldStartTeamCycleGrant({ LOOMIC_CREDIT_POOLS: "true" })).toBe(
+      false,
+    );
+    // Only the bare lowercase `on` opens the switch, exactly as 37T ruled.
+    expect(shouldStartTeamCycleGrant({ LOOMIC_CREDIT_POOLS: "ON" })).toBe(false);
+  });
+
+  it("T-108: the worker starts the team cycle grant with the switch on", () => {
+    expect(shouldStartTeamCycleGrant({ LOOMIC_CREDIT_POOLS: "on" })).toBe(true);
   });
 });
