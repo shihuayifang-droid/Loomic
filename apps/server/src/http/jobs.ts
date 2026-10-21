@@ -4,11 +4,13 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import type {
   BackgroundJobStatus,
   BackgroundJobType,
+  PoolBalancesResponse,
   VideoResolution,
 } from "@loomic/shared";
 import {
   DEFAULT_IMAGE_MODEL_ID,
   applicationErrorResponseSchema,
+  availableCredits,
   createImageJobRequestSchema,
   createVideoJobRequestSchema,
   jobCreditsResponseSchema,
@@ -33,10 +35,61 @@ import { withBilling } from "../features/credits/with-billing.js";
 import { generationLedgerDescription } from "../features/credits/ledger-description.js";
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
 import type { JobCreditsReadRepository } from "../db/job-credits-read-repository.js";
+import type { PoolBalanceReadRepository } from "../db/pool-balance-read-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
-import type { RequestAuthenticator } from "../supabase/user.js";
+import type {
+  AuthenticatedUser,
+  RequestAuthenticator,
+} from "../supabase/user.js";
 import { sendValidationError } from "./validation-error.js";
+
+/**
+ * GN-03 / workorder 38D: the credit pools the job status poll carries.
+ *
+ * `undefined` means "this deployment wired no pool reader" and the status
+ * response is the one it was before the field existed. `null` means "there is a
+ * reader, but there is nothing to read for this caller": either no team
+ * workspace (the pools are bookkept per team, 37M / 37N) or a failed read, which
+ * is logged and answered as `null` because a status poll that 500s is worse than
+ * a status poll without the numbers.
+ */
+async function readStatusBalance(
+  options: {
+    viewerService: ViewerService;
+    poolBalanceReadRepository: Pick<PoolBalanceReadRepository, "readPoolBalances">;
+  },
+  user: AuthenticatedUser,
+  warn: (error: unknown) => void,
+): Promise<{
+  balances: PoolBalancesResponse;
+  available: number;
+  monthlyCapRemaining: number;
+} | null> {
+  const viewer = await options.viewerService.ensureViewer(user);
+  if (!viewer.teamWorkspace) return null;
+
+  try {
+    const balances = await options.poolBalanceReadRepository.readPoolBalances({
+      workspaceId: viewer.teamWorkspace.id,
+      userId: user.id,
+    });
+
+    return {
+      balances,
+      // The ONE available figure comes from the shared rule (37Q), never a
+      // second derivation here, so the top bar and `GET /api/credits` agree.
+      available: availableCredits(balances),
+      monthlyCapRemaining: Math.max(
+        0,
+        balances.personalCap - balances.personalTeamUsed,
+      ),
+    };
+  } catch (error) {
+    warn(error);
+    return null;
+  }
+}
 
 export async function registerJobRoutes(
   app: FastifyInstance,
@@ -71,6 +124,17 @@ export async function registerJobRoutes(
      * wrong line about somebody's money.
      */
     jobCreditsReadRepository?: JobCreditsReadRepository;
+    /**
+     * GN-03 / workorder 38D: the three pools of the caller's team workspace, so
+     * the job status poll alone can refresh the top bar and the account centre.
+     * Optional like the reader above — without it the status body is exactly the
+     * one it was before the field existed — and narrowed to the ONE method this
+     * route reads.
+     */
+    poolBalanceReadRepository?: Pick<
+      PoolBalanceReadRepository,
+      "readPoolBalances"
+    >;
   },
 ) {
   // POST /api/jobs/image-generation — create image generation job
@@ -225,7 +289,30 @@ export async function registerJobRoutes(
       const { jobId } = request.params as { jobId: string };
       const job = await options.jobService.getJob(user, jobId);
 
-      return reply.code(200).send(jobResponseSchema.parse({ job }));
+      // GN-03 / workorder 38D: only a deployment that wired a pool reader pays
+      // the extra `ensureViewer` and pool read; without one the response is
+      // byte-for-byte the one before this ticket.
+      const poolBalanceReadRepository = options.poolBalanceReadRepository;
+      const balance =
+        poolBalanceReadRepository === undefined
+          ? undefined
+          : await readStatusBalance(
+              { viewerService: options.viewerService, poolBalanceReadRepository },
+              user,
+              (error) => {
+                request.log.warn(
+                  { err: error },
+                  "job status balance read failed; answering the status without it",
+                );
+              },
+            );
+
+      return reply.code(200).send(
+        jobResponseSchema.parse({
+          job,
+          ...(balance === undefined ? {} : { balance }),
+        }),
+      );
     } catch (error) {
       return sendJobError(error, reply, "job_query_failed");
     }

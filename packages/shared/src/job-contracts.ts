@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { poolBalancesSchema } from "./credits.js";
+
 // --- Enums ---
 
 export const backgroundJobStatusSchema = z.enum([
@@ -138,8 +140,29 @@ export type CreateImageJobRequest = z.infer<typeof createImageJobRequestSchema>;
 
 // --- API Response schemas ---
 
+/**
+ * GN-03 / workorder 38D: the job status carries the caller's available credits,
+ * so the top bar and the account centre refresh from the poll they already make
+ * instead of calling the balance route beside it.
+ *
+ * Additive only — `job` is untouched. `balance` is absent when the deployment
+ * wired no pool reader, `null` when the caller has no team workspace (the pools
+ * are bookkept per team, 37M / 37N) or when the read failed, and a filled object
+ * otherwise. `available` is the shared `availableCredits` rule, not a second
+ * derivation, so this figure and `GET /api/credits` cannot disagree;
+ * `monthlyCapRemaining` is the personal cap minus what this member already took
+ * from the team pool this month.
+ */
 export const jobResponseSchema = z.object({
   job: backgroundJobSchema,
+  balance: z
+    .object({
+      balances: poolBalancesSchema,
+      available: z.number().int().nonnegative(),
+      monthlyCapRemaining: z.number().int().nonnegative(),
+    })
+    .nullable()
+    .optional(),
 });
 export type JobResponse = z.infer<typeof jobResponseSchema>;
 

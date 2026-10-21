@@ -1034,6 +1034,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       jobCreditsReadRepository: createJobCreditsReadRepository({
         getTransactionPool: () => getTransactionPool(databaseEnv),
       }),
+      // GN-03 / workorder 38D: the job status poll also carries the three pools
+      // and the one available figure, so the top bar and the account centre do
+      // not need a second call. Same lazy wrapper as `GET /api/credits`: no
+      // connection at startup, and a missing DATABASE_URL fails the pool read
+      // (which the route logs and answers as `balance: null`) rather than the
+      // status itself.
+      poolBalanceReadRepository,
       // The tag is the call site's, exactly as the worker passes its own: both
       // log lines of a cancel refund are attributable to this route.
       refundCanceledJob: (canceledJobId: string) =>
