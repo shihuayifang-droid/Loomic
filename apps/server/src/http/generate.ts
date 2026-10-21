@@ -18,6 +18,7 @@ import { CreditServiceError } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
 import { TierGuardError } from "../features/credits/tier-guard.js";
 import { withBilling, type BillingRequest } from "../features/credits/with-billing.js";
+import { generationLedgerDescription } from "../features/credits/ledger-description.js";
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import type { JobService } from "../features/jobs/job-service.js";
@@ -88,7 +89,7 @@ export function imageJobBillingRequest(
       jobType: "image_generation",
       quality,
     },
-    description: `Image generation: ${model}`,
+    description: generationLedgerDescription("image", model),
     job: {
       payload: {
         prompt: payload.prompt,

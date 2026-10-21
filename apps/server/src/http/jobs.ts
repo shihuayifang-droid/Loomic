@@ -30,6 +30,7 @@ import {
   type TierGuard,
 } from "../features/credits/tier-guard.js";
 import { withBilling } from "../features/credits/with-billing.js";
+import { generationLedgerDescription } from "../features/credits/ledger-description.js";
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
 import type { JobCreditsReadRepository } from "../db/job-credits-read-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
@@ -93,7 +94,7 @@ export async function registerJobRoutes(
           // This request has no `quality` field, so bill at the plan maximum —
           // what this route already did via getPlanConfig(sub.plan).
           guard: { jobType: "image_generation", quality: "plan_max" },
-          description: `Image generation: ${model}`,
+          description: generationLedgerDescription("image", model),
           job: {
             payload: {
               prompt: payload.prompt,
@@ -171,7 +172,7 @@ export async function registerJobRoutes(
               ? { resolution: payload.resolution as VideoResolution }
               : {}),
           },
-          description: `Video generation: ${model}`,
+          description: generationLedgerDescription("video", model),
           job: {
             payload: {
               prompt: payload.prompt,
