@@ -34,14 +34,6 @@ const HowItWorks = dynamic(
   { ssr: false },
 );
 
-const PricingPreview = dynamic(
-  () =>
-    import("@/components/landing/pricing-preview").then(
-      (m) => m.PricingPreview,
-    ),
-  { ssr: false },
-);
-
 const FinalCTA = dynamic(
   () => import("@/components/landing/final-cta").then((m) => m.FinalCTA),
   { ssr: false },
@@ -68,7 +60,6 @@ export default function LandingPage() {
         <FeatureShowcase />
         <ShowcaseGallery />
         <HowItWorks />
-        <PricingPreview />
         <FinalCTA />
       </main>
       <LandingFooter />
