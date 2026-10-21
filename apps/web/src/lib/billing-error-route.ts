@@ -44,12 +44,36 @@ export const TIER_TOAST_CODES = [
 const TIER_TOAST_CODE_SET: ReadonlySet<string> = new Set(TIER_TOAST_CODES);
 
 /**
+ * BL-45: the server's sentence for a personal cap refusal looks like
+ * `本月额度已用完（上限 20000），可联系管理员调整` — it carries the cap `N`, which
+ * the catalogue cannot know. This is the prefix that identifies that sentence,
+ * so a server message is only trusted when it really is the cap sentence and
+ * not some other, possibly internal, text.
+ */
+const PERSONAL_CAP_MESSAGE_PREFIX = "本月额度已用完（上限 ";
+
+/**
  * Where a `billing.error` code goes. Nothing is ever dropped: an unrecognised
  * code (including `model_not_available`) becomes a `message` carrying the
  * catalogue's copy for it.
+ *
+ * `serverMessage` is the optional `billing.error.message` from the server. Only
+ * the personal cap route reads it: when it is the cap sentence (the one that
+ * carries `N`) that sentence is shown instead of the catalogue copy. Every
+ * other route ignores it, so a caller that passes nothing behaves exactly as
+ * before.
  */
-export function billingErrorRoute(code: string): BillingErrorRoute {
+export function billingErrorRoute(
+  code: string,
+  serverMessage?: string,
+): BillingErrorRoute {
   if (code === "insufficient_credits") return { kind: "credit_dialog" };
   if (TIER_TOAST_CODE_SET.has(code)) return { kind: "tier_toast" };
+  if (
+    code === "personal_cap_reached" &&
+    serverMessage?.startsWith(PERSONAL_CAP_MESSAGE_PREFIX)
+  ) {
+    return { kind: "message", text: serverMessage };
+  }
   return { kind: "message", text: lookupError(code).message };
 }

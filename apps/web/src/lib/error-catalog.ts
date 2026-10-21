@@ -97,10 +97,15 @@ const policy = (message: string): ErrorEntry => ({
  */
 export const APP_ERROR_CATALOG: Record<ApplicationErrorCode, ErrorEntry> = {
   // quota
-  insufficient_credits: quota("积分不足，请充值后再试。"),
+  // BL-45: the three refusal sentences are the spec's wording, verbatim. `N`
+  // (the cap) is not repeated here — the server sends the full sentence in
+  // `billing.error.message`, and `lib/billing-error-route.ts` prefers it for the
+  // cap variant. "请稍后再试" was misleading for both cap codes: waiting does not
+  // refill a personal cap or a team pool.
+  insufficient_credits: quota("积分不足"),
   concurrency_limit: quota("同时进行中的任务已满，请等前面的完成后再试。"),
-  personal_cap_reached: quota("个人额度已用完，请稍后再试。"),
-  team_pool_exhausted: quota("团队额度已用完，请稍后再试。"),
+  personal_cap_reached: quota("本月额度已用完，可联系管理员调整"),
+  team_pool_exhausted: quota("团队本月额度已用完"),
   adjust_exceeds_topup: quota("超出可减额度。"),
 
   // user_fixable — the user can change something and try again
