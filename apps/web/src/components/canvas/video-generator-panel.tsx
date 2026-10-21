@@ -444,16 +444,17 @@ export function VideoGeneratorPanel({
 
       console.error("[video-gen] Generation error:", err);
       const handled = handleGenerationError(err);
+      // X-40 一期: the copy comes from the catalogue by code, not from a string
+      // written here — a job that failed with `timeout` now says so.
+      const reason = lookupError(errorCodeOf(err)).message;
       if (!handled) {
-        // X-40 一期: the copy comes from the catalogue by code, not from a string
-        // written here — a job that failed with `timeout` now says so.
-        setError(lookupError(errorCodeOf(err)).message);
+        setError(reason);
       }
       setLoading(false);
       setJobProgress(null);
       updateVideoGeneratorElement(excalidrawApi, elementId, {
         status: "error",
-        errorMessage: "生成失败",
+        errorMessage: reason,
       });
     }
   }, [

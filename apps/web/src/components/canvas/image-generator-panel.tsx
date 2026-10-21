@@ -310,15 +310,16 @@ export function ImageGeneratorPanel({
 
       console.error("[image-gen] Generation error:", err);
       const handled = handleGenerationError(err);
+      // X-40 二期: same as the video panel — the copy comes from the catalogue
+      // by code, not from a line written here (30B left this one hard-coded).
+      const reason = lookupError(errorCodeOf(err)).message;
       if (!handled) {
-        // X-40 二期: same as the video panel — the copy comes from the catalogue
-        // by code, not from a line written here (30B left this one hard-coded).
-        setError(lookupError(errorCodeOf(err)).message);
+        setError(reason);
       }
       setLoading(false);
       updateImageGeneratorElement(excalidrawApi, elementId, {
         status: "error",
-        errorMessage: "生成失败",
+        errorMessage: reason,
       });
     }
   }, [
