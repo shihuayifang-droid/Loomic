@@ -145,6 +145,11 @@ import {
 // GETTER, so it is lazy already: the wiring below passes the same lazy getter and
 // `buildApp` still never connects.
 import { createPoolGrantWriteRepository } from "./db/pool-grant-write-repository.js";
+import { createCreditPoolWriteRepository } from "./db/credit-pool-write-repository.js";
+import {
+  creditPoolsEnabled,
+  withCreditPools,
+} from "./features/credits/credit-pools-billing.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -688,7 +693,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // repositories above. The admin client stays: every other method of this
   // service still uses it. With no repository wired those two reads fail closed
   // as their existing `credit_query_failed` 500 rather than falling back.
-  const creditService =
+  const baseCreditService =
     options.creditService ??
     createCreditService({
       getAdminClient,
@@ -749,6 +754,19 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const poolGrantWriteRepository = createPoolGrantWriteRepository({
     getTransactionPool: () => getTransactionPool(databaseEnv),
   });
+
+  // Workorder 37T: `LOOMIC_CREDIT_POOLS=on` moves the charge, the refund and the
+  // balance pre-check onto the three pools. Anything else leaves the credit
+  // service exactly as built above.
+  const creditService: CreditService = creditPoolsEnabled()
+    ? withCreditPools(baseCreditService, {
+        ...createCreditPoolWriteRepository({
+          getTransactionPool: () => getTransactionPool(databaseEnv),
+        }),
+        readPoolBalances: (input) =>
+          poolBalanceReadRepository.readPoolBalances(input),
+      })
+    : baseCreditService;
 
   // Payment service — only created when Lemon Squeezy is configured
   let paymentService: PaymentService | undefined = options.paymentService;

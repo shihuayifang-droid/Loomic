@@ -371,8 +371,31 @@ export async function withBilling<T>(
   // HTTP paths created a job, failed the deduction, then cancelled the job.
   // A pending price is 0, so it never reaches here — exactly like a free one.
   if (billingEnabled && creditsCost > 0) {
-    const balanceInfo = await creditService.getBalance(workspaceId);
-    if (balanceInfo.balance < creditsCost) {
+    // Workorder 37T: with the three pools on, the figure to compare is the
+    // pooled available credit, not the old single balance. Absent (switch off)
+    // or null (no team workspace) = the old comparison below, unchanged.
+    const pooledAvailable =
+      (await creditService.availableFor?.({ workspaceId, userId: user.id })) ??
+      null;
+    if (pooledAvailable !== null && pooledAvailable < creditsCost) {
+      request.onRejected?.({
+        kind: "insufficient_credits",
+        currentBalance: pooledAvailable,
+        requiredAmount: creditsCost,
+        plan: "free",
+        dailyClaimed: false,
+      });
+      throw new CreditServiceError(
+        "insufficient_credits",
+        `Insufficient credits: ${pooledAvailable} available, ${creditsCost} required.`,
+        402,
+      );
+    }
+    const balanceInfo =
+      pooledAvailable !== null
+        ? null
+        : await creditService.getBalance(workspaceId);
+    if (balanceInfo !== null && balanceInfo.balance < creditsCost) {
       request.onRejected?.({
         kind: "insufficient_credits",
         currentBalance: balanceInfo.balance,

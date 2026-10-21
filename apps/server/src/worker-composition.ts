@@ -49,6 +49,12 @@ import {
 } from "./db/asset-provenance-repository.js";
 import { createRefundJob, type RefundJob } from "./features/jobs/refund-job.js";
 import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
+import { createCreditPoolWriteRepository } from "./db/credit-pool-write-repository.js";
+import { createPoolBalanceReadRepository } from "./db/pool-balance-read-repository.js";
+import {
+  creditPoolsEnabled,
+  withCreditPools,
+} from "./features/credits/credit-pools-billing.js";
 import type { ServerEnv } from "./config/env.js";
 import type { PgmqClient } from "./queue/pgmq-client.js";
 import type { AdminSupabaseClient } from "./supabase/admin.js";
@@ -141,7 +147,18 @@ export function buildWorkerComposition(
       getTransactionPool,
     }),
   });
-  const creditService = createCreditService({ getAdminClient });
+  const baseCreditService = createCreditService({ getAdminClient });
+  // Workorder 37T: `LOOMIC_CREDIT_POOLS=on` moves the refund (and the charge)
+  // onto the three pools; anything else keeps the service exactly as built.
+  const creditService: CreditService = creditPoolsEnabled()
+    ? withCreditPools(baseCreditService, {
+        ...createCreditPoolWriteRepository({ getTransactionPool }),
+        readPoolBalances: (poolInput) =>
+          createPoolBalanceReadRepository({
+            pool: getTransactionPool(),
+          }).readPoolBalances(poolInput),
+      })
+    : baseCreditService;
 
   // ADR-0001 / workorder 21W: the image executor's watermark decision reads the
   // workspace subscription row to learn the plan. It used to be an admin client

@@ -20,6 +20,9 @@ export class CreditServiceError extends Error {
     | "credit_deduct_failed"
     | "credit_refund_failed"
     | "credit_plan_update_failed"
+    // Workorder 37T: the two refusals only the three-pool charge can give.
+    | "personal_cap_reached"
+    | "team_pool_exhausted"
     // 工单31B / GN-07: the price table has no usable row for this model. Raised by
     // `with-billing.ts` before any job or charge exists, and carried by this class
     // so the two HTTP error mappers that already handle it stay the only place a
@@ -86,6 +89,15 @@ export type CreditService = {
   ): Promise<CreditTransaction[]>;
   getSubscription(workspaceId: string): Promise<SubscriptionInfo>;
   updatePlan(workspaceId: string, plan: SubscriptionPlan): Promise<void>;
+  /**
+   * Workorder 37T: the credits this member can spend under the three pools, or
+   * `null` for "use the old balance". Only the `LOOMIC_CREDIT_POOLS=on` wrapper
+   * has it.
+   */
+  availableFor?(input: {
+    workspaceId: string;
+    userId: string;
+  }): Promise<number | null>;
 };
 
 // ── SQLSTATE ─────────────────────────────────────────────────
