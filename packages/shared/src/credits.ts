@@ -405,3 +405,60 @@ export const adminPersonalCapResponseSchema = z.object({
 export type AdminPersonalCapResponse = z.infer<
   typeof adminPersonalCapResponseSchema
 >;
+
+// -- BL-01 / workorder 37Y: credit cap templates ------------------------------
+
+/**
+ * One stored template. `cap` is a whole number of credits and may be zero, the
+ * same range `member_cap_settings` accepts; a negative or fractional cap is not
+ * representable, so it is not accepted here either.
+ */
+export const creditCapTemplateSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  cap: z.number().int().nonnegative(),
+});
+export type CreditCapTemplate = z.infer<typeof creditCapTemplateSchema>;
+
+/**
+ * The create body. The name is trimmed before the length check, so a name of
+ * blanks is refused here rather than by the table's `btrim(name) <> ''` check
+ * (which would arrive as an unmapped SQLSTATE).
+ */
+export const creditCapTemplateCreateRequestSchema = z.object({
+  name: z.string().trim().min(1).max(40),
+  cap: z.number().int().nonnegative(),
+});
+export type CreditCapTemplateCreateRequest = z.infer<
+  typeof creditCapTemplateCreateRequestSchema
+>;
+
+export const creditCapTemplateListResponseSchema = z.object({
+  templates: z.array(creditCapTemplateSchema),
+});
+export type CreditCapTemplateListResponse = z.infer<
+  typeof creditCapTemplateListResponseSchema
+>;
+
+/**
+ * The apply body: 1..500 member ids, each a uuid. The upper bound keeps one
+ * request from becoming an unbounded loop inside the database function.
+ */
+export const creditCapTemplateApplyRequestSchema = z.object({
+  userIds: z.array(z.string().uuid()).min(1).max(500),
+});
+export type CreditCapTemplateApplyRequest = z.infer<
+  typeof creditCapTemplateApplyRequestSchema
+>;
+
+/**
+ * How many members the template actually changed. Everyone whose cap was set by
+ * hand is skipped by `apply_cap_template`, so this is deliberately not
+ * `userIds.length`.
+ */
+export const creditCapTemplateApplyResponseSchema = z.object({
+  applied: z.number().int().nonnegative(),
+});
+export type CreditCapTemplateApplyResponse = z.infer<
+  typeof creditCapTemplateApplyResponseSchema
+>;

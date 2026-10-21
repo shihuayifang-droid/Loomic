@@ -4,6 +4,11 @@ import {
   adminPersonalCapRequestSchema,
   adminPersonalCapResponseSchema,
   applicationErrorResponseSchema,
+  creditCapTemplateApplyRequestSchema,
+  creditCapTemplateApplyResponseSchema,
+  creditCapTemplateCreateRequestSchema,
+  creditCapTemplateListResponseSchema,
+  creditCapTemplateSchema,
   unauthenticatedErrorResponseSchema,
 } from "@loomic/shared";
 import type { ApplicationErrorCode } from "@loomic/shared";
@@ -23,6 +28,17 @@ const CAP_FAILED_MESSAGE = "Unable to set the personal cap.";
 const INVALID_ADJUST_MESSAGE =
   "delta (non-zero integer) and reason are required.";
 const INVALID_CAP_MESSAGE = "cap (a non-negative integer) is required.";
+const INVALID_TEMPLATE_MESSAGE =
+  "name (1-40 characters) and cap (a non-negative integer) are required.";
+const INVALID_TEMPLATE_ID_MESSAGE = "templateId must be a uuid.";
+const INVALID_APPLY_MESSAGE = "userIds (1-500 uuids) are required.";
+const TEMPLATE_FAILED_MESSAGE = "Unable to manage credit cap templates.";
+const LIST_FAILED_MESSAGE = "Unable to list credit cap templates.";
+const APPLY_FAILED_MESSAGE = "Unable to apply the cap template.";
+/** 37W's unique (workspace_id, name): one name per workspace, said plainly. */
+const DUPLICATE_TEMPLATE_MESSAGE = "已有同名模板";
+const TEMPLATE_NOT_FOUND_MESSAGE = "模板不存在";
+const UNIQUE_VIOLATION = "23505";
 
 /** SQLSTATE of 37U's 「减分不足」 refusal; its `detail` is how much may be taken. */
 const ADJUST_EXCEEDS_TOPUP = "P0405";
@@ -242,6 +258,142 @@ export async function registerAdminTeamCreditRoutes(
           .send(adminPersonalCapResponseSchema.parse({ cap }));
       } catch (error) {
         return sendWriteError(reply, error, CAP_FAILED_MESSAGE);
+      }
+    },
+  );
+
+  /**
+   * BL-01 / 37Y: the workspace's credit cap templates.
+   *
+   * The template list is read through the same privileged repository as the
+   * writes, because the table's policy only lets an admin of the workspace see
+   * its rows and this route has already decided the caller is one. The answer is
+   * parsed before it is sent, so a malformed row cannot reach the browser.
+   */
+  app.get("/api/admin/team/cap-templates", async (request, reply) => {
+    const admin = await requireAdmin(request, reply);
+    if (!admin) return reply;
+
+    try {
+      const templates = await options.adminCreditWriteRepository.listCapTemplates({
+        workspaceId: admin.workspaceId,
+      });
+
+      return reply
+        .code(200)
+        .send(creditCapTemplateListResponseSchema.parse({ templates }));
+    } catch {
+      return sendApplicationError(reply, 500, "application_error", LIST_FAILED_MESSAGE);
+    }
+  });
+
+  app.post("/api/admin/team/cap-templates", async (request, reply) => {
+    const admin = await requireAdmin(request, reply);
+    if (!admin) return reply;
+
+    const parsed = creditCapTemplateCreateRequestSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return sendApplicationError(
+        reply,
+        400,
+        "invalid_request",
+        INVALID_TEMPLATE_MESSAGE,
+      );
+    }
+
+    try {
+      const template = await options.adminCreditWriteRepository.createCapTemplate({
+        workspaceId: admin.workspaceId,
+        name: parsed.data.name,
+        cap: parsed.data.cap,
+      });
+
+      return reply.code(201).send(creditCapTemplateSchema.parse(template));
+    } catch (error) {
+      const databaseError = readDatabaseError(error);
+
+      // One name per workspace: reusing one is refused by the database, and the
+      // administrator is told which rule they hit rather than "something failed".
+      if (databaseError.code === UNIQUE_VIOLATION) {
+        return sendApplicationError(
+          reply,
+          409,
+          "invalid_request",
+          DUPLICATE_TEMPLATE_MESSAGE,
+        );
+      }
+
+      return sendApplicationError(
+        reply,
+        500,
+        "application_error",
+        TEMPLATE_FAILED_MESSAGE,
+      );
+    }
+  });
+
+  /**
+   * Apply one template to a list of members. Who is skipped is the database
+   * function's decision ("a cap set by hand is not overwritten"), so the count
+   * returned here is the authoritative one.
+   */
+  app.post<{ Params: { templateId: string } }>(
+    "/api/admin/team/cap-templates/:templateId/apply",
+    async (request, reply) => {
+      const admin = await requireAdmin(request, reply);
+      if (!admin) return reply;
+
+      if (!USER_ID_PATTERN.test(request.params.templateId)) {
+        return sendApplicationError(
+          reply,
+          400,
+          "invalid_request",
+          INVALID_TEMPLATE_ID_MESSAGE,
+        );
+      }
+
+      const parsed = creditCapTemplateApplyRequestSchema.safeParse(request.body);
+
+      if (!parsed.success) {
+        return sendApplicationError(
+          reply,
+          400,
+          "invalid_request",
+          INVALID_APPLY_MESSAGE,
+        );
+      }
+
+      try {
+        const applied = await options.adminCreditWriteRepository.applyCapTemplate({
+          workspaceId: admin.workspaceId,
+          templateId: request.params.templateId,
+          userIds: parsed.data.userIds,
+        });
+
+        return reply
+          .code(200)
+          .send(creditCapTemplateApplyResponseSchema.parse({ applied }));
+      } catch (error) {
+        const databaseError = readDatabaseError(error);
+
+        // A template that is not this workspace's is, to this administrator,
+        // simply not there — 404 says that without confirming it exists.
+        if (databaseError.code === INVALID_PARAMETER) {
+          return sendApplicationError(
+            reply,
+            404,
+            "invalid_request",
+            TEMPLATE_NOT_FOUND_MESSAGE,
+          );
+        }
+
+        return sendApplicationError(
+          reply,
+          500,
+          "application_error",
+          APPLY_FAILED_MESSAGE,
+        );
       }
     },
   );

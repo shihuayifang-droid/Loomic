@@ -47,12 +47,33 @@ type CapCall = {
   cap: number;
 };
 
+type CreateTemplateCall = {
+  workspaceId: string;
+  name: string;
+  cap: number;
+};
+
+type ApplyTemplateCall = {
+  workspaceId: string;
+  templateId: string;
+  userIds: string[];
+};
+
+/** A template id (uuid) and the two names the cases use. */
+const TEMPLATE_ID = "33333333-3333-3333-3333-333333333333";
+
 let adjustCalls: AdjustCall[] = [];
 let capCalls: CapCall[] = [];
+let createTemplateCalls: CreateTemplateCall[] = [];
+let applyTemplateCalls: ApplyTemplateCall[] = [];
 /** The refusal / failure the repository double throws, verbatim. */
 let writeFailure: unknown = null;
+/** The refusal the template methods throw, verbatim. */
+let templateFailure: unknown = null;
 let transactionIdResult = "tx-1";
 let capResult = 30000;
+let templatesResult: { id: string; name: string; cap: number }[] = [];
+let appliedResult = 1;
 /** When set, `teamMembership.get` throws instead of answering. */
 let membershipFailure: Error | null = null;
 
@@ -101,6 +122,20 @@ const adminCreditWriteRepository: AdminCreditWriteRepository = {
     capCalls.push(input);
     if (writeFailure) throw writeFailure;
     return capResult;
+  },
+  async createCapTemplate(input) {
+    createTemplateCalls.push(input);
+    if (templateFailure) throw templateFailure;
+    return { id: TEMPLATE_ID, name: input.name, cap: input.cap };
+  },
+  async listCapTemplates() {
+    if (templateFailure) throw templateFailure;
+    return templatesResult;
+  },
+  async applyCapTemplate(input) {
+    applyTemplateCalls.push(input);
+    if (templateFailure) throw templateFailure;
+    return appliedResult;
   },
 };
 
@@ -181,9 +216,14 @@ const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
 beforeEach(() => {
   adjustCalls = [];
   capCalls = [];
+  createTemplateCalls = [];
+  applyTemplateCalls = [];
   writeFailure = null;
+  templateFailure = null;
   transactionIdResult = "tx-1";
   capResult = 30000;
+  templatesResult = [];
+  appliedResult = 1;
   membershipFailure = null;
   app = buildApp({
     adminCreditWriteRepository,
@@ -353,5 +393,113 @@ describe("admin team credit routes", () => {
     expect(response.statusCode).toBe(503);
     expect(response.json().error.code).toBe("application_error");
     expect(adjustCalls.length).toBe(0);
+  });
+
+  it("BL-01: an admin creates a template", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/admin/team/cap-templates",
+      headers: bearer("admin-token"),
+      payload: { name: "实习", cap: 10000 },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toEqual({
+      id: TEMPLATE_ID,
+      name: "实习",
+      cap: 10000,
+    });
+    expect(createTemplateCalls).toEqual([
+      { workspaceId: TEAM_ID, name: "实习", cap: 10000 },
+    ]);
+  });
+
+  it("BL-01: a duplicate template name is refused", async () => {
+    templateFailure = { code: "23505" };
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/admin/team/cap-templates",
+      headers: bearer("admin-token"),
+      payload: { name: "实习", cap: 10000 },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("invalid_request");
+    expect(response.json().error.message).toBe("已有同名模板");
+  });
+
+  it("BL-01: templates are listed", async () => {
+    templatesResult = [
+      { id: TEMPLATE_ID, name: "主美", cap: 40000 },
+      { id: "44444444-4444-4444-4444-444444444444", name: "美术", cap: 20000 },
+    ];
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/cap-templates",
+      headers: bearer("admin-token"),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ templates: templatesResult });
+  });
+
+  it("BL-01: applying a template reports how many were changed", async () => {
+    appliedResult = 1;
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/admin/team/cap-templates/${TEMPLATE_ID}/apply`,
+      headers: bearer("admin-token"),
+      payload: { userIds: [TARGET_ID] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ applied: 1 });
+    expect(applyTemplateCalls).toEqual([
+      { workspaceId: TEAM_ID, templateId: TEMPLATE_ID, userIds: [TARGET_ID] },
+    ]);
+  });
+
+  it("BL-01: an unknown template is a 404", async () => {
+    templateFailure = { code: "22023" };
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/admin/team/cap-templates/${TEMPLATE_ID}/apply`,
+      headers: bearer("admin-token"),
+      payload: { userIds: [TARGET_ID] },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error.code).toBe("invalid_request");
+    expect(response.json().error.message).toBe("模板不存在");
+  });
+
+  it("AD-01: a non-admin cannot manage templates", async () => {
+    const listed = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/cap-templates",
+      headers: bearer("member-token"),
+    });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/admin/team/cap-templates",
+      headers: bearer("member-token"),
+      payload: { name: "实习", cap: 10000 },
+    });
+    const applied = await app.inject({
+      method: "POST",
+      url: `/api/admin/team/cap-templates/${TEMPLATE_ID}/apply`,
+      headers: bearer("member-token"),
+      payload: { userIds: [TARGET_ID] },
+    });
+
+    expect(listed.statusCode).toBe(403);
+    expect(created.statusCode).toBe(403);
+    expect(applied.statusCode).toBe(403);
+    expect(createTemplateCalls.length).toBe(0);
+    expect(applyTemplateCalls.length).toBe(0);
   });
 });

@@ -47,6 +47,33 @@ export type AdminCreditWriteRepository = {
     userId: string;
     cap: number;
   }): Promise<number>;
+  /** BL-01 / 37Y: store one template in the workspace. Returns the stored row. */
+  createCapTemplate(input: {
+    workspaceId: string;
+    name: string;
+    cap: number;
+  }): Promise<AdminCreditCapTemplate>;
+  /** BL-01 / 37Y: the workspace's templates, largest cap first. */
+  listCapTemplates(input: {
+    workspaceId: string;
+  }): Promise<AdminCreditCapTemplate[]>;
+  /**
+   * BL-01 / 37Y: apply one template to the given members. Members whose cap was
+   * set by hand are skipped inside the function, so the returned count is how
+   * many were actually changed.
+   */
+  applyCapTemplate(input: {
+    workspaceId: string;
+    templateId: string;
+    userIds: string[];
+  }): Promise<number>;
+};
+
+/** One stored template, as the routes publish it. */
+export type AdminCreditCapTemplate = {
+  id: string;
+  name: string;
+  cap: number;
 };
 
 /** Fixed row-shape label: a shape failure never carries a statement or an id. */
@@ -74,6 +101,38 @@ select public.admin_adjust_topup(
  */
 const SET_PERSONAL_CAP_SQL = `
 select public.set_personal_cap($1::uuid, $2::uuid, $3::integer) as cap
+`;
+
+/**
+ * Insert one template. The unique index on (workspace_id, name) is the only
+ * duplicate guard, and its `23505` is re-thrown unchanged so the route can turn
+ * that one SQLSTATE into 「已有同名模板」 and nothing else.
+ */
+const CREATE_CAP_TEMPLATE_SQL = `
+insert into public.credit_cap_templates (workspace_id, name, cap)
+values ($1::uuid, $2::text, $3::integer)
+returning id::text as id, name, cap
+`;
+
+/**
+ * The workspace's templates. Ordered by the stored cap, largest first, then by
+ * name — the order the admin surface shows, decided in one place rather than by
+ * the caller.
+ */
+const LIST_CAP_TEMPLATES_SQL = `
+select id::text as id, name, cap
+from public.credit_cap_templates
+where workspace_id = $1::uuid
+order by cap desc, name asc
+`;
+
+/**
+ * Apply one template. The function decides who is skipped (a cap set by hand is
+ * never overwritten) and returns how many members it changed; a template from
+ * another workspace is refused with `22023`.
+ */
+const APPLY_CAP_TEMPLATE_SQL = `
+select public.apply_cap_template($1::uuid, $2::uuid, $3::uuid[]) as applied
 `;
 
 /**
@@ -147,6 +206,74 @@ export function createAdminCreditWriteRepository(options: {
         },
       );
     },
+
+    async createCapTemplate(input) {
+      const workspaceId = requireArgument(input.workspaceId, "workspaceId");
+      const name = requireArgument(input.name, "name");
+
+      return await withPrivilegedTransaction(
+        options.getTransactionPool(),
+        { workspaceId },
+        async (client) => {
+          const result = await client.query(CREATE_CAP_TEMPLATE_SQL, [
+            workspaceId,
+            name,
+            input.cap,
+          ]);
+
+          if (result.rows.length !== 1) {
+            throw new Error(
+              `${ADMIN_CREDIT_LABEL} returned ${result.rows.length} rows instead of one`,
+            );
+          }
+
+          return mapTemplateRow(result.rows[0]);
+        },
+      );
+    },
+
+    async listCapTemplates(input) {
+      const workspaceId = requireArgument(input.workspaceId, "workspaceId");
+
+      return await withPrivilegedTransaction(
+        options.getTransactionPool(),
+        { workspaceId },
+        async (client) => {
+          const result = await client.query(LIST_CAP_TEMPLATES_SQL, [workspaceId]);
+
+          return result.rows.map((row) => mapTemplateRow(row));
+        },
+      );
+    },
+
+    async applyCapTemplate(input) {
+      const workspaceId = requireArgument(input.workspaceId, "workspaceId");
+      const templateId = requireArgument(input.templateId, "templateId");
+
+      if (!Array.isArray(input.userIds) || input.userIds.length === 0) {
+        throw new Error(`${ADMIN_CREDIT_LABEL} needs at least one "userIds" member`);
+      }
+
+      return await withPrivilegedTransaction(
+        options.getTransactionPool(),
+        { workspaceId },
+        async (client) => {
+          const result = await client.query(APPLY_CAP_TEMPLATE_SQL, [
+            workspaceId,
+            templateId,
+            [...input.userIds],
+          ]);
+
+          if (result.rows.length !== 1) {
+            throw new Error(
+              `${ADMIN_CREDIT_LABEL} returned ${result.rows.length} rows instead of one`,
+            );
+          }
+
+          return mapAppliedRow(result.rows[0]);
+        },
+      );
+    },
   };
 }
 
@@ -192,6 +319,53 @@ function mapCapRow(row: unknown): number {
   const value = (row as Readonly<Record<string, unknown>>).cap;
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new Error(`${ADMIN_CREDIT_LABEL} returned no usable "cap"`);
+  }
+
+  return Number(value);
+}
+
+/**
+ * One template row. Every column is checked: an id that is not a non-empty
+ * string, or a cap that is not a finite number, is drift against the table's own
+ * declaration, and publishing it as `""` / `0` would invent a template nobody
+ * stored.
+ */
+function mapTemplateRow(row: unknown): AdminCreditCapTemplate {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned a row that is not an object`);
+  }
+
+  const record = row as Readonly<Record<string, unknown>>;
+  const id = record.id;
+  const name = record.name;
+  const cap = record.cap;
+
+  if (typeof id !== "string" || id.length === 0) {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned no usable template "id"`);
+  }
+  if (typeof name !== "string" || name.length === 0) {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned no usable template "name"`);
+  }
+  if (typeof cap !== "number" || !Number.isFinite(cap)) {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned no usable template "cap"`);
+  }
+
+  return { id, name, cap: Number(cap) };
+}
+
+/**
+ * `apply_cap_template` declares `returns integer`, so a missing or non-numeric
+ * `applied` is drift. Reporting it as 0 would say "nobody was changed" about a
+ * call that may well have changed people.
+ */
+function mapAppliedRow(row: unknown): number {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned a row that is not an object`);
+  }
+
+  const value = (row as Readonly<Record<string, unknown>>).applied;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned no usable "applied"`);
   }
 
   return Number(value);
