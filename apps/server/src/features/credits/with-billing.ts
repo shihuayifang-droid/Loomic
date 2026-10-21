@@ -371,43 +371,85 @@ export async function withBilling<T>(
   // HTTP paths created a job, failed the deduction, then cancelled the job.
   // A pending price is 0, so it never reaches here — exactly like a free one.
   if (billingEnabled && creditsCost > 0) {
-    // Workorder 37T: with the three pools on, the figure to compare is the
-    // pooled available credit, not the old single balance. Absent (switch off)
-    // or null (no team workspace) = the old comparison below, unchanged.
-    const pooledAvailable =
-      (await creditService.availableFor?.({ workspaceId, userId: user.id })) ??
-      null;
-    if (pooledAvailable !== null && pooledAvailable < creditsCost) {
+    // Workorder 38E (T-107 / BL-45): with the three pools on, ask the pools for
+    // the precise refusal FIRST. Without it the pre-check always said
+    // `insufficient_credits` and the member never learned that their own cap or
+    // the team pool is what ran out. `undefined` (switch off, or no team
+    // workspace) means the old comparison below is the answer, unchanged.
+    const refusal = creditService.refusalFor
+      ? await creditService.refusalFor({
+          workspaceId,
+          userId: user.id,
+          amount: creditsCost,
+        })
+      : undefined;
+
+    if (refusal !== null && refusal !== undefined) {
+      // Same refusal event shape as 37T; only the thrown code and the message
+      // are more precise.
+      const refusalAvailable =
+        (await creditService.availableFor?.({
+          workspaceId,
+          userId: user.id,
+        })) ?? 0;
       request.onRejected?.({
         kind: "insufficient_credits",
-        currentBalance: pooledAvailable,
+        currentBalance: refusalAvailable,
         requiredAmount: creditsCost,
         plan: "free",
         dailyClaimed: false,
       });
-      throw new CreditServiceError(
-        "insufficient_credits",
-        `Insufficient credits: ${pooledAvailable} available, ${creditsCost} required.`,
-        402,
-      );
+      const personalCap = refusal.personalCap;
+      const refusalMessage =
+        refusal.code === "personal_cap_reached"
+          ? Number.isFinite(personalCap) && personalCap > 0
+            ? `本月额度已用完（上限 ${personalCap}），可联系管理员调整`
+            : "本月额度已用完，可联系管理员调整"
+          : refusal.code === "team_pool_exhausted"
+            ? "团队本月额度已用完"
+            : "积分不足";
+      throw new CreditServiceError(refusal.code, refusalMessage, 402);
     }
-    const balanceInfo =
-      pooledAvailable !== null
-        ? null
-        : await creditService.getBalance(workspaceId);
-    if (balanceInfo !== null && balanceInfo.balance < creditsCost) {
-      request.onRejected?.({
-        kind: "insufficient_credits",
-        currentBalance: balanceInfo.balance,
-        requiredAmount: creditsCost,
-        plan: balanceInfo.plan,
-        dailyClaimed: balanceInfo.dailyClaimed,
-      });
-      throw new CreditServiceError(
-        "insufficient_credits",
-        `Insufficient credits: ${balanceInfo.balance} available, ${creditsCost} required.`,
-        402,
-      );
+
+    if (refusal === undefined) {
+      // Workorder 37T: with the three pools on, the figure to compare is the
+      // pooled available credit, not the old single balance. Absent (switch off)
+      // or null (no team workspace) = the old comparison below, unchanged.
+      const pooledAvailable =
+        (await creditService.availableFor?.({ workspaceId, userId: user.id })) ??
+        null;
+      if (pooledAvailable !== null && pooledAvailable < creditsCost) {
+        request.onRejected?.({
+          kind: "insufficient_credits",
+          currentBalance: pooledAvailable,
+          requiredAmount: creditsCost,
+          plan: "free",
+          dailyClaimed: false,
+        });
+        throw new CreditServiceError(
+          "insufficient_credits",
+          `Insufficient credits: ${pooledAvailable} available, ${creditsCost} required.`,
+          402,
+        );
+      }
+      const balanceInfo =
+        pooledAvailable !== null
+          ? null
+          : await creditService.getBalance(workspaceId);
+      if (balanceInfo !== null && balanceInfo.balance < creditsCost) {
+        request.onRejected?.({
+          kind: "insufficient_credits",
+          currentBalance: balanceInfo.balance,
+          requiredAmount: creditsCost,
+          plan: balanceInfo.plan,
+          dailyClaimed: balanceInfo.dailyClaimed,
+        });
+        throw new CreditServiceError(
+          "insufficient_credits",
+          `Insufficient credits: ${balanceInfo.balance} available, ${creditsCost} required.`,
+          402,
+        );
+      }
     }
   }
 

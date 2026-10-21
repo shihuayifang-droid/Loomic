@@ -9,7 +9,11 @@
  * other method is the base service's own.
  */
 
-import { availableCredits, type PoolBalances } from "@loomic/shared";
+import {
+  availableCredits,
+  planDeduction,
+  type PoolBalances,
+} from "@loomic/shared";
 
 import { CreditServiceError, type CreditService } from "./credit-service.js";
 
@@ -149,6 +153,22 @@ export function withCreditPools(
           userId: input.userId,
         }),
       );
+    },
+
+    // Workorder 38E (T-107 / BL-45): the same pools, the same split rule, but
+    // asked BEFORE the charge so the pre-check can name which pool ran out.
+    // The code comes from `planDeduction`, which is also what the SQL charge
+    // applies — the two answers cannot drift apart.
+    async refusalFor(input) {
+      const teamWorkspaceId = await deps.resolveTeamWorkspaceId();
+      if (teamWorkspaceId === null) return undefined;
+      const balances = await deps.readPoolBalances({
+        workspaceId: teamWorkspaceId,
+        userId: input.userId,
+      });
+      const plan = planDeduction(balances, input.amount);
+      if (plan.ok) return null;
+      return { code: plan.code, personalCap: balances.personalCap };
     },
   };
 }

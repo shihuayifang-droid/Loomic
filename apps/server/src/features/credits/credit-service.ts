@@ -98,6 +98,30 @@ export type CreditService = {
     workspaceId: string;
     userId: string;
   }): Promise<number | null>;
+  /**
+   * Workorder 38E (T-107 / BL-45): the precise refusal for `amount`, so the
+   * pre-check can name the pool that ran out instead of always saying
+   * `insufficient_credits`.
+   *
+   * `undefined` = no team workspace, use the old comparison;
+   * `null` = the amount fits;
+   * otherwise the BL-45 code plus the cap the message quotes.
+   */
+  refusalFor?(input: {
+    workspaceId: string;
+    userId: string;
+    amount: number;
+  }): Promise<
+    | {
+        code:
+          | "personal_cap_reached"
+          | "team_pool_exhausted"
+          | "insufficient_credits";
+        personalCap: number;
+      }
+    | null
+    | undefined
+  >;
 };
 
 // ── SQLSTATE ─────────────────────────────────────────────────

@@ -454,3 +454,161 @@ describe("a pool charge on a real database", () => {
     expect(failure?.code).toBe("P0403");
   });
 });
+
+// ── withBilling pre-check: the precise refusal (workorder 38E / BL-45) ──
+
+type RefusalError = {
+  code?: unknown;
+  statusCode?: unknown;
+  message?: unknown;
+};
+
+function refusalOf(promise: Promise<unknown>): Promise<RefusalError | null> {
+  return promise.then(
+    () => null,
+    (error: unknown) => error as RefusalError,
+  );
+}
+
+describe("withBilling pre-check: the precise refusal (BL-45)", () => {
+  it("BL-45: a member at 19990 of the cap is refused with personal_cap_reached before any charge", async () => {
+    const base = makeBase();
+    const deps = makeDeps({
+      readPoolBalances: vi.fn(async () => ({
+        daily: 0,
+        teamRemaining: 50000,
+        personalTeamUsed: 19990,
+        personalCap: 20000,
+        topup: 0,
+      })),
+    });
+    const creditService = withCreditPools(base, deps);
+
+    const error = await refusalOf(
+      withBilling(
+        {
+          creditService,
+          tierGuard: makeTierGuard(),
+          priceQuoter: makeQuoter(12),
+        },
+        IMAGE_REQUEST,
+        vi.fn(async () => "done"),
+      ),
+    );
+
+    expect(error?.code).toBe("personal_cap_reached");
+    expect(error?.statusCode).toBe(402);
+    expect(String(error?.message)).toContain("上限 20000");
+    expect(deps.deductFromPools).toHaveBeenCalledTimes(0);
+    expect(base.deductCredits).toHaveBeenCalledTimes(0);
+  });
+
+  it("BL-45: an empty team pool is refused with team_pool_exhausted", async () => {
+    const base = makeBase();
+    const deps = makeDeps({
+      readPoolBalances: vi.fn(async () => ({
+        daily: 0,
+        teamRemaining: 0,
+        personalTeamUsed: 0,
+        personalCap: 20000,
+        topup: 0,
+      })),
+    });
+    const creditService = withCreditPools(base, deps);
+
+    const error = await refusalOf(
+      withBilling(
+        {
+          creditService,
+          tierGuard: makeTierGuard(),
+          priceQuoter: makeQuoter(12),
+        },
+        IMAGE_REQUEST,
+        vi.fn(async () => "done"),
+      ),
+    );
+
+    expect(error?.code).toBe("team_pool_exhausted");
+    expect(error?.statusCode).toBe(402);
+    expect(String(error?.message)).toBe("团队本月额度已用完");
+    expect(deps.deductFromPools).toHaveBeenCalledTimes(0);
+  });
+
+  it("BL-45: someone with nothing is refused with insufficient_credits", async () => {
+    const base = makeBase();
+    const deps = makeDeps({
+      readPoolBalances: vi.fn(async () => ({
+        daily: 0,
+        teamRemaining: 0,
+        personalTeamUsed: 0,
+        personalCap: 0,
+        topup: 0,
+      })),
+    });
+    const creditService = withCreditPools(base, deps);
+
+    const error = await refusalOf(
+      withBilling(
+        {
+          creditService,
+          tierGuard: makeTierGuard(),
+          priceQuoter: makeQuoter(12),
+        },
+        IMAGE_REQUEST,
+        vi.fn(async () => "done"),
+      ),
+    );
+
+    expect(error?.code).toBe("insufficient_credits");
+    expect(error?.statusCode).toBe(402);
+    expect(deps.deductFromPools).toHaveBeenCalledTimes(0);
+  });
+
+  it("BL-45: enough credits passes the pre-check and charges the pools", async () => {
+    const base = makeBase();
+    const deps = makeDeps();
+    const creditService = withCreditPools(base, deps);
+
+    const result = await withBilling(
+      {
+        creditService,
+        tierGuard: makeTierGuard(),
+        priceQuoter: makeQuoter(12),
+      },
+      IMAGE_REQUEST,
+      vi.fn(async () => "done"),
+    );
+
+    expect(result).toBe("done");
+    expect(deps.deductFromPools).toHaveBeenCalledTimes(1);
+    expect(base.deductCredits).toHaveBeenCalledTimes(0);
+  });
+
+  it("refusalFor without a team workspace is undefined, and the old pre-check runs", async () => {
+    const base = makeBase();
+    const deps = makeDeps({
+      resolveTeamWorkspaceId: vi.fn(async () => null),
+    });
+    const creditService = withCreditPools(base, deps);
+
+    await expect(
+      creditService.refusalFor?.({
+        workspaceId: "ws",
+        userId: "u",
+        amount: 12,
+      }),
+    ).resolves.toBeUndefined();
+
+    await withBilling(
+      {
+        creditService,
+        tierGuard: makeTierGuard(),
+        priceQuoter: makeQuoter(12),
+      },
+      IMAGE_REQUEST,
+      vi.fn(async () => "done"),
+    );
+
+    expect(base.getBalance).toHaveBeenCalledTimes(1);
+  });
+});
