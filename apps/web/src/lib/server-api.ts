@@ -34,6 +34,7 @@ import type {
 
 import { checkUploadConstraint, toolListResponseSchema } from "@loomic/shared";
 
+import { publishPoolBalance } from "./credit-balance-events";
 import { dedupeRequest } from "./dedupe-request";
 import { getServerBaseUrl } from "./env";
 import { getSupabaseBrowserClient } from "./supabase-browser";
@@ -902,6 +903,14 @@ export async function submitVideoJob(
 
 // --- Jobs API ---
 
+/**
+ * `GET /api/jobs/:jobId`.
+ *
+ * GN-03 / workorder 38M: the status response carries the caller's balance, so
+ * readers that show credits (`useCredits` — the top bar and the account centre)
+ * refresh from this poll instead of calling the balance route beside it. The
+ * publish is a side effect only; the returned body is unchanged.
+ */
 export async function fetchJob(
   accessToken: string,
   jobId: string,
@@ -910,7 +919,17 @@ export async function fetchJob(
     headers: authHeaders(accessToken),
   });
   if (!response.ok) return handleErrorResponse(response);
-  return (await response.json()) as JobResponse;
+  const body = (await response.json()) as JobResponse;
+  // Absent when the deployment wired no pool reader, `null` when the caller has
+  // no team workspace or the read failed — both mean "nothing to publish".
+  const balance = body.balance;
+  if (balance != null) {
+    publishPoolBalance({
+      balances: balance.balances,
+      available: balance.available,
+    });
+  }
+  return body;
 }
 
 /**

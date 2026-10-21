@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { CreditBalanceResponse } from "@loomic/shared";
 import { useAuth } from "@/lib/auth-context";
+import { subscribePoolBalance } from "@/lib/credit-balance-events";
 import { fetchCredits, claimDailyCredits } from "@/lib/credits-api";
 
 interface UseCreditsReturn {
@@ -66,6 +67,22 @@ export function useCredits(): UseCreditsReturn {
     document.addEventListener("visibilitychange", handler);
     return () => document.removeEventListener("visibilitychange", handler);
   }, [refresh]);
+
+  // GN-03 / workorder 38M: a job status that carried a balance updates the pools
+  // in place — the top bar and the account centre both read `pools.available`,
+  // so neither needs a second call to the account route after a generation.
+  useEffect(() => {
+    return subscribePoolBalance((update) => {
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              pools: { balances: update.balances, available: update.available },
+            }
+          : prev,
+      );
+    });
+  }, []);
 
   const claimDaily = useCallback(async (): Promise<boolean> => {
     const token = accessTokenRef.current;
