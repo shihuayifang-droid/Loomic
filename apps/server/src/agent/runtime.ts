@@ -82,6 +82,7 @@ import {
 } from "../features/canvas/canvas-element-writer.js";
 import { aspectRatioToDimensions } from "../generation/utils.js";
 import { slotOutcomeForStop, SLOT_TIMEOUT_MESSAGE } from "../features/canvas/generation-slot-outcome.js";
+import { fitIntoBox } from "../features/canvas/fit-into-box.js";
 
 /**
  * Build the text portion of a user message, appending <input_images> XML
@@ -820,14 +821,21 @@ export async function insertVideoElementForJobResult(args: {
     return undefined;
   }
 
+  // GN-02 (5): the requested box comes from the *request*, but upstream snaps it
+  // to its own shape — a 9:16 video can land in a 16:9 box. Fit the REAL size
+  // inside the requested box (contain, centred) instead of stretching it.
   const explicitPlacement =
     input.placementX != null && input.placementY != null
-      ? {
-          x: input.placementX,
-          y: input.placementY,
-          width: input.placementWidth ?? 640,
-          height: input.placementHeight ?? 360,
-        }
+      ? fitIntoBox(
+          {
+            x: input.placementX,
+            y: input.placementY,
+            width: input.placementWidth ?? 640,
+            height: input.placementHeight ?? 360,
+          },
+          // `?? null` keeps `exactOptionalPropertyTypes` happy; both mean "unknown".
+          { width: result.width ?? null, height: result.height ?? null },
+        )
       : undefined;
 
   const insertResult = await insertVideoElement(
