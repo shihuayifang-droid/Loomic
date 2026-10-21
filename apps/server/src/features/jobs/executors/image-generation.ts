@@ -1,14 +1,12 @@
-// @credits-system — Image generation executor: applies watermark for free-tier users
+// Image generation executor (BL-40: generated images are never watermarked)
 import { registerExecutor, type ExecutorContext } from "../job-executor.js";
 import { loadExecutorJob } from "./load-executor-job.js";
 import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateImage } from "../../../generation/image-generation.js";
 import { resolveImageProviderName } from "../../../generation/providers/registry.js";
-import { applyWatermark } from "../../credits/watermark.js";
 
 import { DEFAULT_IMAGE_MODEL_ID } from "@loomic/shared";
-import type { SubscriptionPlan } from "@loomic/shared";
 import type { ImageGenerateParams, ImageQuality } from "../../../generation/types.js";
 
 // BL-07: the ledger records what a job was charged for, so the job has to be
@@ -143,42 +141,10 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
       throw new Error(`Failed to download generated image from ${model}: ${response.status} ${response.statusText}`);
     }
     const arrayBuffer = await response.arrayBuffer();
-    let buffer: Buffer = Buffer.from(arrayBuffer);
+    // BL-40: the downloaded bytes are uploaded as they are. Nothing reads the
+    // subscription plan here any more, so no image is ever watermarked.
+    const buffer: Buffer = Buffer.from(arrayBuffer);
     lap("image_download_done");
-
-    // Apply watermark for free-plan users
-    if (workspaceId) {
-      // The plan decides whether this image is watermarked, and the only
-      // acceptable failure direction is "watermark it": a paid workspace that
-      // cannot be read loses nothing but a watermark, while a free one that
-      // cannot be read must NOT hand out an unwatermarked image. So an absent
-      // repository, a missing subscription row and a failed read all mean the
-      // free plan. That is what this read did before it moved onto the credit
-      // repository: it used a client whose `error` field was discarded, which
-      // left the plan at `free` for exactly those three cases.
-      let plan: SubscriptionPlan = "free";
-      try {
-        const sub = ctx.creditReadRepository
-          ? await ctx.creditReadRepository.readSubscription({ workspaceId })
-          : null;
-        plan = (sub?.plan as SubscriptionPlan) ?? "free";
-      } catch {
-        // Read failure is the free plan — see above. Deliberately a separate
-        // try from the watermark below: merging them would turn a failed READ
-        // into a skipped watermark.
-        plan = "free";
-      }
-
-      if (plan === "free") {
-        try {
-          buffer = await applyWatermark(buffer, generated.mimeType ?? "image/png");
-          lap("watermark_applied");
-        } catch (wmErr) {
-          // Non-fatal: log and continue without watermark rather than failing the job
-          console.warn(`${tag} Watermark failed, continuing without:`, wmErr);
-        }
-      }
-    }
 
     // Upload to Supabase Storage under the project-assets bucket
     const timestamp = Date.now();

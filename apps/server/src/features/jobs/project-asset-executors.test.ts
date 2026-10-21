@@ -444,101 +444,15 @@ describe("generation executors record project asset ownership", () => {
   });
 });
 
-// Workorder 21W: the watermark decision and the plan read behind it. The two
-// failure directions are NOT symmetric and both are pinned here — an unreadable
-// plan watermarks (fail-closed for a free workspace), while a watermark that
-// itself fails only warns and lets the job finish.
-describe("the watermark decision reads the plan through the credit repository", () => {
-  it("case 8: a paid plan is never watermarked", async () => {
-    const admin = makeAdmin();
-    const credit = makeCreditRead({ plan: "pro" });
-
-    const result = await getExecutor("image_generation")!(
-      "job-8",
-      {},
-      makeContext(admin.client, jobRow(), credit),
-    );
-
-    expect(credit.calls).toEqual([{ workspaceId: PERSONAL_WORKSPACE }]);
-    expect(applyWatermark).not.toHaveBeenCalled();
-    expect(result.asset_id).toBe("asset-1");
-  });
-
-  it("case 9: a free plan is watermarked once and the MARKED buffer is uploaded", async () => {
+// BL-40 (workorder 38A): generated images are never watermarked, so neither the
+// mark nor the plan read that used to decide it runs any more. The two fakes stay
+// wired by the shared `beforeEach` above, so a regression that puts either of
+// them back fails here instead of quietly marking an image again.
+describe("BL-40: generated images are never watermarked", () => {
+  it("BL-40: a free plan is not watermarked and the raw buffer is uploaded", async () => {
     const admin = makeAdmin();
     const credit = makeCreditRead({ plan: "free" });
-    // The mark GROWS the buffer (32 -> 64), so the uploaded byte count says
-    // WHICH buffer reached the bucket. Case 13 is its mirror image.
-    applyWatermark.mockImplementationOnce(async () => Buffer.alloc(64));
-
-    await getExecutor("image_generation")!(
-      "job-9",
-      {},
-      makeContext(admin.client, jobRow(), credit),
-    );
-
-    expect(applyWatermark).toHaveBeenCalledTimes(1);
-    expect(credit.calls).toEqual([{ workspaceId: PERSONAL_WORKSPACE }]);
-    expect(admin.uploads).toHaveLength(1);
-    expect(admin.uploads[0]?.bytes).toBe(64);
-  });
-
-  it("case 10: a workspace with no subscription row is treated as free", async () => {
-    const admin = makeAdmin();
-    const credit = makeCreditRead({ plan: null });
-
-    const result = await getExecutor("image_generation")!(
-      "job-10",
-      {},
-      makeContext(admin.client, jobRow(), credit),
-    );
-
-    expect(credit.calls).toEqual([{ workspaceId: PERSONAL_WORKSPACE }]);
-    expect(applyWatermark).toHaveBeenCalledTimes(1);
-    expect(result.asset_id).toBe("asset-1");
-  });
-
-  it("case 11: no repository on the context is treated as free", async () => {
-    const admin = makeAdmin();
-    const ctx = makeContext(admin.client, jobRow(), null);
-
-    // The shape this pins: the worker did not wire the repository, so the field
-    // is genuinely absent rather than present and undefined.
-    expect("creditReadRepository" in ctx).toBe(false);
-
-    const result = await getExecutor("image_generation")!("job-11", {}, ctx);
-
-    expect(applyWatermark).toHaveBeenCalledTimes(1);
-    expect(result.asset_id).toBe("asset-1");
-  });
-
-  it("case 12: a FAILED plan read still watermarks and the job still succeeds", async () => {
-    const admin = makeAdmin();
-    const credit = makeCreditRead({
-      failWith: new Error("credit read failed (readSubscription)"),
-    });
-
-    const result = await getExecutor("image_generation")!(
-      "job-12",
-      {},
-      makeContext(admin.client, jobRow(), credit),
-    );
-
-    // The read was attempted and threw — and a free workspace's image is still
-    // watermarked. This is the fail-closed direction: the old code discarded the
-    // same error and fell through to the free plan.
-    expect(credit.calls).toEqual([{ workspaceId: PERSONAL_WORKSPACE }]);
-    expect(applyWatermark).toHaveBeenCalledTimes(1);
-    expect(admin.uploads).toHaveLength(1);
-    expect(result.asset_id).toBe("asset-1");
-  });
-
-  it("case 13: a watermark failure warns once, keeps the job alive and uploads the RAW image", async () => {
-    const admin = makeAdmin();
-    const credit = makeCreditRead({ plan: "free" });
-    // 40 bytes in and nothing added: the bucket must receive the download's own
-    // buffer. Case 9 showed a SUCCESSFUL mark reaching it with the size the mark
-    // produced, so the pair distinguishes "raw" from "marked".
+    // 40 bytes in and nothing added: the bucket gets the download's own buffer.
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => ({
@@ -548,69 +462,50 @@ describe("the watermark decision reads the plan through the credit repository", 
         arrayBuffer: async () => new ArrayBuffer(40),
       })),
     );
-    applyWatermark.mockRejectedValueOnce(new Error("sharp exploded"));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    try {
-      const result = await getExecutor("image_generation")!(
-        "job-13",
-        {},
-        makeContext(admin.client, jobRow(), credit),
-      );
-
-      expect(applyWatermark).toHaveBeenCalledTimes(1);
-      expect(result.asset_id).toBe("asset-1");
-
-      const watermarkWarnings = warn.mock.calls.filter((call) =>
-        String(call[0]).includes("Watermark failed, continuing without:"),
-      );
-      expect(watermarkWarnings).toHaveLength(1);
-      // The frozen sentence, ending exactly where it always did: only the tag in
-      // front of it is allowed to vary.
-      expect(String(watermarkWarnings[0]?.[0])).toMatch(
-        /^\[image-job:job-13 [^\]]*\] Watermark failed, continuing without:$/,
-      );
-      expect(String(watermarkWarnings[0]?.[1])).toContain("sharp exploded");
-
-      // The job finished and the object was stored — unwatermarked, at the size
-      // it was downloaded with.
-      expect(admin.uploads).toHaveLength(1);
-      expect(admin.uploads[0]?.bytes).toBe(40);
-    } finally {
-      warn.mockRestore();
-    }
-  });
-
-  it("case 14: the plan read is asked for the billing workspace and nothing else", async () => {
-    const admin = makeAdmin();
-    const credit = makeCreditRead();
-
-    await getExecutor("image_generation")!(
-      "job-14",
+    const result = await getExecutor("image_generation")!(
+      "job-38a-free",
       {},
       makeContext(admin.client, jobRow(), credit),
     );
 
-    expect(credit.calls).toHaveLength(1);
-    expect(credit.calls[0]).toEqual({ workspaceId: PERSONAL_WORKSPACE });
-    // "Exactly" means no second key hiding beside it.
-    expect(Object.keys(credit.calls[0] ?? {})).toEqual(["workspaceId"]);
+    expect(applyWatermark).not.toHaveBeenCalled();
+    expect(admin.uploads).toHaveLength(1);
+    expect(admin.uploads[0]?.bytes).toBe(40);
+    expect(result.asset_id).toBe("asset-1");
   });
 
-  it("case 15: with no billing workspace neither the plan read nor the mark runs", async () => {
+  it("BL-40: no subscription row and no repository are not watermarked", async () => {
+    // A missing subscription row: the shape the old decision read as "free".
+    const noRowAdmin = makeAdmin();
+    await getExecutor("image_generation")!(
+      "job-38a-no-row",
+      {},
+      makeContext(noRowAdmin.client, jobRow(), makeCreditRead({ plan: null })),
+    );
+
+    // No repository wired at all: the field is absent, not present-and-undefined.
+    const noRepoAdmin = makeAdmin();
+    const noRepo = makeContext(noRepoAdmin.client, jobRow(), null);
+    expect("creditReadRepository" in noRepo).toBe(false);
+    await getExecutor("image_generation")!("job-38a-no-repo", {}, noRepo);
+
+    expect(applyWatermark).not.toHaveBeenCalled();
+    expect(noRowAdmin.uploads).toHaveLength(1);
+    expect(noRepoAdmin.uploads).toHaveLength(1);
+  });
+
+  it("BL-40: the image executor no longer reads the plan", async () => {
     const admin = makeAdmin();
     const credit = makeCreditRead();
 
     const result = await getExecutor("image_generation")!(
-      "job-15",
+      "job-38a-plan-read",
       {},
-      makeContext(admin.client, jobRow({ workspace_id: "" }), credit),
+      makeContext(admin.client, jobRow(), credit),
     );
 
     expect(credit.calls).toEqual([]);
-    expect(applyWatermark).not.toHaveBeenCalled();
-    // The JOB still ran: this is a skipped watermark, not a skipped job.
-    expect(admin.uploads).toHaveLength(1);
     expect(result.asset_id).toBe("asset-1");
   });
 });
