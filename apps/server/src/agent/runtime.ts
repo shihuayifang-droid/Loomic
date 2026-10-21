@@ -83,6 +83,7 @@ import {
 import { aspectRatioToDimensions } from "../generation/utils.js";
 import { slotOutcomeForStop, SLOT_TIMEOUT_MESSAGE } from "../features/canvas/generation-slot-outcome.js";
 import { fitIntoBox } from "../features/canvas/fit-into-box.js";
+import { videoSlotSize } from "./video-slot-size.js";
 
 /**
  * Build the text portion of a user message, appending <input_images> XML
@@ -1586,12 +1587,18 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
 
           if (canvasId) {
             try {
+              // CV-02 / GN-02: with no explicit placement the slot follows the
+              // REQUESTED aspect ratio instead of a fixed 16:9 box, so a 9:16
+              // request no longer reserves a landscape frame and then jumps
+              // when the finished video lands in it. An explicit placement
+              // still wins, unchanged.
+              const slotSize = videoSlotSize(input.aspectRatio);
               const slot = await insertImagePlaceholder(
                 createClient(accessToken) as UserSupabaseClient,
                 {
                   canvasId,
-                  width: explicitPlacement?.width ?? 640,
-                  height: explicitPlacement?.height ?? 360,
+                  width: explicitPlacement?.width ?? slotSize.width,
+                  height: explicitPlacement?.height ?? slotSize.height,
                   kind: "video",
                   ...(placementInput.title
                     ? { title: placementInput.title }
