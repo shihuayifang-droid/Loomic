@@ -10,6 +10,7 @@ import {
   type TeamCreditsAdminProps,
   type TeamCreditsMemberName,
 } from "@/components/credits/team-credits-admin";
+import { CreditPoolSummary } from "@/components/credits/credit-pool-summary";
 import { CreditUsageHistory } from "@/components/credits/credit-usage-history";
 import { ProfileSection } from "@/components/profile-section";
 import { SettingsSkeleton } from "@/components/skeletons/settings-skeleton";
@@ -235,7 +236,10 @@ export default function SettingsPage() {
         ) : activeTab === "team-credits" && isTeamAdmin ? (
           <TeamCreditsAdmin {...teamCreditsProps} />
         ) : activeTab === "usage" ? (
-          <CreditUsageHistory />
+          <>
+            <CreditPoolSummary />
+            <CreditUsageHistory />
+          </>
         ) : (
           <BillingSection />
         )}
