@@ -101,6 +101,7 @@ export const APP_ERROR_CATALOG: Record<ApplicationErrorCode, ErrorEntry> = {
   concurrency_limit: quota("同时进行中的任务已满，请等前面的完成后再试。"),
   personal_cap_reached: quota("个人额度已用完，请稍后再试。"),
   team_pool_exhausted: quota("团队额度已用完，请稍后再试。"),
+  adjust_exceeds_topup: quota("超出可减额度。"),
 
   // user_fixable — the user can change something and try again
   invalid_request: fixable("请求内容有误，请修改参数后重试。"),

@@ -207,6 +207,10 @@ export const applicationErrorCodeSchema = z.enum([
   // had them as client-side EXTRA rows until the enum caught up.
   "personal_cap_reached",
   "team_pool_exhausted",
+  // BL-12 / workorder 37V: an admin tried to take more top-up credits than the
+  // member still has. The message carries 「最多可减 N」 and is built by the route
+  // from the database's `detail`; the database reports SQLSTATE P0405.
+  "adjust_exceeds_topup",
   "model_not_allowed",
   "quote_mismatch",
   "tool_disabled",

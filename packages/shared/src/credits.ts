@@ -365,3 +365,43 @@ export const annotatedModelSchema = z.object({
     .optional(),
 });
 export type AnnotatedModel = z.infer<typeof annotatedModelSchema>;
+
+// -- BL-12 / BL-01 / workorder 37V: admin credit adjust and personal cap ------
+
+/**
+ * The admin adjustment. `delta` is signed and may not be zero, and `reason` is
+ * mandatory — the database refuses either omission with SQLSTATE 22023, so the
+ * route refuses them first with the same 400 the browser already understands.
+ */
+export const adminCreditAdjustRequestSchema = z.object({
+  delta: z
+    .number()
+    .int()
+    .refine((n) => n !== 0),
+  reason: z.string().trim().min(1),
+});
+export type AdminCreditAdjustRequest = z.infer<
+  typeof adminCreditAdjustRequestSchema
+>;
+
+export const adminCreditAdjustResponseSchema = z.object({
+  transactionId: z.string().min(1),
+});
+export type AdminCreditAdjustResponse = z.infer<
+  typeof adminCreditAdjustResponseSchema
+>;
+
+/** BL-01: the admin's per-member monthly cap; zero is legal, negative is not. */
+export const adminPersonalCapRequestSchema = z.object({
+  cap: z.number().int().nonnegative(),
+});
+export type AdminPersonalCapRequest = z.infer<
+  typeof adminPersonalCapRequestSchema
+>;
+
+export const adminPersonalCapResponseSchema = z.object({
+  cap: z.number().int().nonnegative(),
+});
+export type AdminPersonalCapResponse = z.infer<
+  typeof adminPersonalCapResponseSchema
+>;

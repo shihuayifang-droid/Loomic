@@ -145,6 +145,14 @@ import {
 // GETTER, so it is lazy already: the wiring below passes the same lazy getter and
 // `buildApp` still never connects.
 import { createPoolGrantWriteRepository } from "./db/pool-grant-write-repository.js";
+// BL-12 / BL-01 / workorder 37V: the two admin credit writes. Built lazily
+// against the same pool getter as everything above, so the admin surface costs
+// no connection until an administrator actually adjusts something.
+import {
+  createAdminCreditWriteRepository,
+  type AdminCreditWriteRepository,
+} from "./db/admin-credit-write-repository.js";
+import { registerAdminTeamCreditRoutes } from "./http/admin-team-credits.js";
 import { createCreditPoolWriteRepository } from "./db/credit-pool-write-repository.js";
 import {
   creditPoolsEnabled,
@@ -284,6 +292,14 @@ export type BuildAppOptions = {
   teamAdminReadRepository?: TeamAdminReadRepository;
   teamAdminService?: TeamAdminService;
   teamMembershipService?: TeamMembershipService;
+  /**
+   * ADR-0001 / workorder 37V: the only writer of an admin's top-up adjustment
+   * and of a member's monthly personal cap. Injectable for the same reason the
+   * other repositories are — a route test hands the app its own double and
+   * observes which workspace, member, operator, delta and reason went down (and
+   * that nothing reaches PostgREST).
+   */
+  adminCreditWriteRepository?: AdminCreditWriteRepository;
   threadService?: ThreadService;
   viewerService?: ViewerService;
   /**
@@ -500,6 +516,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       getAdminClient,
       teamMembership: teamMembershipService,
       teamAdminReadRepository,
+    });
+  // BL-12 / BL-01 / workorder 37V: the admin credit writes sit beside the member
+  // administration they serve. The factory takes the pool GETTER, not a pool, so
+  // this line is the whole lazy wiring: no connection at startup, and a missing
+  // DATABASE_URL fails the write (500) instead of the process.
+  const adminCreditWriteRepository =
+    options.adminCreditWriteRepository ??
+    createAdminCreditWriteRepository({
+      getTransactionPool: () => getTransactionPool(databaseEnv),
     });
   const viewerService =
     options.viewerService ??
@@ -905,6 +930,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     auth,
     teamAdminService,
     teamMembership: teamMembershipService,
+  });
+  // BL-12 / BL-01 / AD-01 / workorder 37V: the two credit writes of the same
+  // admin surface, registered right after it and behind the same admin gate.
+  void registerAdminTeamCreditRoutes(app, {
+    auth,
+    teamMembership: teamMembershipService,
+    adminCreditWriteRepository,
   });
   void registerProjectRoutes(app, {
     auth,
