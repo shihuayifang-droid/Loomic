@@ -1219,6 +1219,18 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                       requiredAmount: rejection.requiredAmount,
                     },
                   );
+                } else if (rejection.kind === "account_suspended") {
+                  // 工单39P (AD-01 / BL-21): an administrator paused this member's
+                  // generation, so `withBilling` refused before any quote, job or
+                  // charge. The code and the sentence are the thrown error's own,
+                  // forwarded verbatim, so the conversation shows the same reason
+                  // the HTTP routes answer with — and no balance fields, because
+                  // buying credits does not fix a suspension.
+                  pushBillingErrorAndAbort(
+                    run, canvasId, options,
+                    "account_suspended",
+                    "账户已被管理员暂停生成，请联系管理员",
+                  );
                 } else {
                   pushBillingErrorAndAbort(
                     run, canvasId, options,
@@ -1558,6 +1570,18 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                       currentBalance: rejection.currentBalance,
                       requiredAmount: rejection.requiredAmount,
                     },
+                  );
+                } else if (rejection.kind === "account_suspended") {
+                  // 工单39P (AD-01 / BL-21): an administrator paused this member's
+                  // generation, so `withBilling` refused before any quote, job or
+                  // charge. The code and the sentence are the thrown error's own,
+                  // forwarded verbatim, so the conversation shows the same reason
+                  // the HTTP routes answer with — and no balance fields, because
+                  // buying credits does not fix a suspension.
+                  pushBillingErrorAndAbort(
+                    run, canvasId, options,
+                    "account_suspended",
+                    "账户已被管理员暂停生成，请联系管理员",
                   );
                 } else {
                   pushBillingErrorAndAbort(

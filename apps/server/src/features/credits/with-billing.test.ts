@@ -1541,3 +1541,176 @@ describe("with-billing: BL-41 a failed refund is recorded for compensation", () 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// AD-01 / BL-21 / workorder 39P: an administrator paused this member, so the
+// submission is refused BEFORE the price is quoted, before a job exists and
+// before any money moves. The gate sits after the ED-00m duplicate lookup (a job
+// that already exists is still returned) and before the tier guard.
+//
+// A credit service WITHOUT `isGenerationPaused` must keep the pre-39P flow: the
+// method is optional, and every existing case above is that case (E-020).
+// ---------------------------------------------------------------------------
+describe("with-billing: BL-21 a paused member is refused before any quote or job", () => {
+  /** The 39G atomic entry, so "no job was created" can be asserted on BOTH paths. */
+  function makeChargedJobService() {
+    const service = makeJobService();
+    service.createChargedJob = vi.fn(async () => ({
+      job: { id: "job-1" } as BackgroundJob,
+      transactionId: "tx-atomic",
+    }));
+    return service;
+  }
+
+  /** A credit service whose pause read answers `answer` (or throws it). */
+  function makePausedCreditService(answer: boolean | Error) {
+    return makeCreditService({
+      isGenerationPaused: vi.fn(async () => {
+        if (answer instanceof Error) throw answer;
+        return answer;
+      }) as unknown as (userId: string) => Promise<boolean>,
+    });
+  }
+
+  it("BL-21: a paused member is refused before any quote or job", async () => {
+    const creditService = makePausedCreditService(true);
+    const tierGuard = makeTierGuard();
+    const jobService = makeChargedJobService();
+    const priceQuoter = makePriceQuoter();
+    const onRejected = vi.fn();
+    const runSpy = vi.fn(async () => "ok");
+
+    const error = await withBilling(
+      {
+        creditService,
+        tierGuard,
+        jobService,
+        priceQuoter,
+        creditLedgerWriteRepository: makeLedger(),
+      },
+      { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } }, onRejected },
+      runSpy,
+    )
+      .then(() => null)
+      .catch((thrown: unknown) => thrown);
+
+    // The refusal: `account_suspended` / 403, the same error the two HTTP error
+    // mappers already turn into a status code.
+    expect(error).toBeInstanceOf(CreditServiceError);
+    expect((error as CreditServiceError).code).toBe("account_suspended");
+    expect((error as CreditServiceError).statusCode).toBe(403);
+    expect((error as CreditServiceError).message).toBe(
+      "账户已被管理员暂停生成，请联系管理员",
+    );
+
+    // The event the agent runtime and the HTTP routes read.
+    expect(onRejected).toHaveBeenCalledTimes(1);
+    expect(onRejected).toHaveBeenCalledWith({ kind: "account_suspended" });
+
+    // Nothing was priced, created, linked or charged, and the work never ran.
+    expect(priceQuoter.quote).not.toHaveBeenCalled();
+    expect(jobService.createJob).not.toHaveBeenCalled();
+    expect(jobService.createChargedJob).not.toHaveBeenCalled();
+    expect(jobService.setCreditsInfo).not.toHaveBeenCalled();
+    expect(creditService.deductCredits).not.toHaveBeenCalled();
+    expect(creditService.refundCredits).not.toHaveBeenCalled();
+    expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  it("BL-21: a member who is not paused goes on as before", async () => {
+    const creditService = makePausedCreditService(false);
+    const tierGuard = makeTierGuard();
+    const jobService = makeJobService();
+    const priceQuoter = makePriceQuoter();
+    const onRejected = vi.fn();
+    const runSpy = vi.fn(async () => "ok");
+
+    await withBilling(
+      {
+        creditService,
+        tierGuard,
+        jobService,
+        priceQuoter,
+        creditLedgerWriteRepository: makeLedger(),
+      },
+      { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } }, onRejected },
+      runSpy,
+    );
+
+    // Asked ONCE, for the requesting user, and answered "not paused".
+    expect(creditService.isGenerationPaused).toHaveBeenCalledTimes(1);
+    expect(creditService.isGenerationPaused).toHaveBeenCalledWith(USER.id);
+
+    // Then the pre-39P flow, unchanged: quoted, created, charged, run.
+    expect(onRejected).not.toHaveBeenCalled();
+    expect(priceQuoter.quote).toHaveBeenCalledTimes(1);
+    expect(jobService.createJob).toHaveBeenCalledTimes(1);
+    expect(creditService.deductCredits).toHaveBeenCalledTimes(1);
+    expect(jobService.setCreditsInfo).toHaveBeenCalledWith("job-1", 10, "tx-1");
+    expect(runSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("BL-21: without the check the flow is unchanged", async () => {
+    // The default double has NO `isGenerationPaused` — the shape of every test
+    // double and wiring that predates 39P.
+    const creditService = makeCreditService();
+    const tierGuard = makeTierGuard();
+    const jobService = makeJobService();
+    const priceQuoter = makePriceQuoter();
+    const onRejected = vi.fn();
+    const runSpy = vi.fn(async () => "ok");
+
+    await withBilling(
+      {
+        creditService,
+        tierGuard,
+        jobService,
+        priceQuoter,
+        creditLedgerWriteRepository: makeLedger(),
+      },
+      { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } }, onRejected },
+      runSpy,
+    );
+
+    expect(creditService.isGenerationPaused).toBeUndefined();
+    expect(onRejected).not.toHaveBeenCalled();
+    expect(priceQuoter.quote).toHaveBeenCalledTimes(1);
+    expect(jobService.createJob).toHaveBeenCalledTimes(1);
+    expect(creditService.deductCredits).toHaveBeenCalledTimes(1);
+    expect(runSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("BL-21: a failed pause read refuses rather than lets through", async () => {
+    const readFailure = new Error("pause read down");
+    const creditService = makePausedCreditService(readFailure);
+    const tierGuard = makeTierGuard();
+    const jobService = makeChargedJobService();
+    const priceQuoter = makePriceQuoter();
+    const onRejected = vi.fn();
+    const runSpy = vi.fn(async () => "ok");
+
+    const error = await withBilling(
+      {
+        creditService,
+        tierGuard,
+        jobService,
+        priceQuoter,
+        creditLedgerWriteRepository: makeLedger(),
+      },
+      { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } }, onRejected },
+      runSpy,
+    )
+      .then(() => null)
+      .catch((thrown: unknown) => thrown);
+
+    // The READ error is what the caller sees (not a 403 dressed over it), and
+    // nothing was generated: "we could not tell" is never answered with a
+    // generation.
+    expect(error).toBe(readFailure);
+    expect(priceQuoter.quote).not.toHaveBeenCalled();
+    expect(jobService.createJob).not.toHaveBeenCalled();
+    expect(jobService.createChargedJob).not.toHaveBeenCalled();
+    expect(creditService.deductCredits).not.toHaveBeenCalled();
+    expect(runSpy).not.toHaveBeenCalled();
+  });
+});

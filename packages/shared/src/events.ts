@@ -99,6 +99,12 @@ export const billingErrorCodeSchema = z.enum([
   // which does not fix either one.
   "personal_cap_reached",
   "team_pool_exhausted",
+  // 工单39P / AD-01 / BL-21: an administrator paused this member's generation, so
+  // the server refused the submission before it was quoted. Its own code for the
+  // same reason the thrown error has its own: no top-up, plan change or new day
+  // lifts it — only an administrator does — so it must not be shown as
+  // "insufficient credits".
+  "account_suspended",
 ]);
 
 export type BillingErrorCode = z.infer<typeof billingErrorCodeSchema>;

@@ -133,7 +133,12 @@ export type BillingRejection =
       message: string;
       currentBalance: number;
       requiredAmount: number;
-    };
+    }
+  // Workorder 39P (AD-01 / BL-21 step 3): an administrator paused this member's
+  // generation. Its own shape rather than `pool_refusal` or `tier`: nothing was
+  // charged and no plan change or top-up fixes it, and the client has to say
+  // exactly that, so there is no balance or price to report.
+  | { kind: "account_suspended" };
 
 export interface BillingDeps {
   /** Absent = credit system not configured; guards and charging are skipped. */
@@ -310,6 +315,42 @@ export async function withBilling<T>(
       if (existing) {
         return await run({ job: existing, creditsCost: 0, priceStatus: null });
       }
+    }
+  }
+
+  // Workorder 39P (AD-01 / BL-21 step 3) — the administrator's pause, AFTER the
+  // duplicate lookup and BEFORE the tier guard, the quote, the balance read, the
+  // job, the charge and `run`:
+  //
+  //   paused -> `onRejected({ kind: "account_suspended" })` then a 403
+  //   `account_suspended`. Nothing is quoted, created, charged or generated.
+  //
+  // After the duplicate lookup on purpose: a re-submission of a job that was
+  // created BEFORE the pause still returns that job (it already exists and was
+  // already paid for), instead of turning a double-click into an error the
+  // member cannot act on. The pause governs new generation, not the answer to
+  // "what happened to the one I already submitted".
+  //
+  // Before the tier guard on purpose: a suspended member must be told the one
+  // true reason. Reaching the guard first would answer "your plan does not allow
+  // this model" and reaching the quote first would answer "no price" — both are
+  // wrong and both leave the member trying to fix the wrong thing.
+  //
+  // The method is OPTIONAL on `CreditService` (workorder 39P, E-020): a wiring
+  // or a test double without it keeps the pre-39P flow exactly, so no existing
+  // call site or pinned case changes meaning. A THROW from it is NOT swallowed:
+  // "we could not tell whether the member is suspended" must never be answered
+  // with a generation, which is the same rule the duplicate lookup above
+  // follows.
+  if (creditService?.isGenerationPaused) {
+    const paused = await creditService.isGenerationPaused(user.id);
+    if (paused) {
+      request.onRejected?.({ kind: "account_suspended" });
+      throw new CreditServiceError(
+        "account_suspended",
+        "账户已被管理员暂停生成，请联系管理员",
+        403,
+      );
     }
   }
 

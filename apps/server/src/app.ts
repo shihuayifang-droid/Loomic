@@ -174,6 +174,12 @@ import {
   creditPoolsEnabled,
   withCreditPools,
 } from "./features/credits/credit-pools-billing.js";
+// AD-01 / BL-21 / workorder 39P: the administrator's generation pause. The read
+// is lazy (pool getter), like every repository above, and the wrapper is applied
+// to the FINAL credit service below so the gate works whether or not
+// `LOOMIC_CREDIT_POOLS` is on.
+import { createMemberPauseReadRepository } from "./db/member-pause-read-repository.js";
+import { withGenerationPause } from "./features/credits/generation-pause.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { createPgmqClient } from "./queue/pgmq-client.js";
 import {
@@ -833,7 +839,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // otherwise the old single balance and a second "available" figure would be
   // served side by side and the sender could not tell which one was charged.
   const creditPools = creditPoolsEnabled();
-  const creditService: CreditService = creditPools
+  const pooledCreditService: CreditService = creditPools
     ? withCreditPools(baseCreditService, {
         ...createCreditPoolWriteRepository({
           getTransactionPool: () => getTransactionPool(databaseEnv),
@@ -842,6 +848,29 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           poolBalanceReadRepository.readPoolBalances(input),
       })
     : baseCreditService;
+
+  // AD-01 / BL-21 / workorder 39P: the administrator's generation pause, applied
+  // to the FINAL service — AFTER the pools wrapper and OUTSIDE its branch, because
+  // a suspended member must be refused with the pools on AND off. Putting it
+  // inside either branch would make the refusal depend on a switch that has
+  // nothing to do with whether somebody was paused.
+  //
+  // An INJECTED `options.creditService` is left exactly as the caller handed it
+  // over: it is a complete implementation, and the routes' own tests inject
+  // doubles that predate 39P and do not carry `isGenerationPaused`. Wrapping one
+  // of those with a real database read would make every route test perform a
+  // pause query it never asked for (and fail closed on the missing pool), which is
+  // exactly the "an old substitute keeps the old flow" rule of 39P (E-020).
+  // Production never injects the service, so the gate is always present there.
+  const creditService: CreditService =
+    options.creditService !== undefined && options.creditService !== null
+      ? pooledCreditService
+      : withGenerationPause(
+          pooledCreditService,
+          createMemberPauseReadRepository({
+            getTransactionPool: () => getTransactionPool(databaseEnv),
+          }),
+        );
 
   // BL-40 / D-27: the Lemon Squeezy subscription link is retired, so no payment
   // service is constructed and no `LEMON_SQUEEZY_*` value is read here at all.

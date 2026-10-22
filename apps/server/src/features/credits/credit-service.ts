@@ -27,7 +27,14 @@ export class CreditServiceError extends Error {
     // `with-billing.ts` before any job or charge exists, and carried by this class
     // so the two HTTP error mappers that already handle it stay the only place a
     // billing refusal is turned into a status code.
-    | "model_not_available";
+    | "model_not_available"
+    // Workorder 39P (AD-01 / BL-21 step 3): the member's generation is paused by
+    // an administrator. Raised by `with-billing.ts` before any quote, job or
+    // charge — an upgrade, a top-up or a new day does not lift it, only an
+    // administrator does — and carried by this class so the two HTTP error
+    // mappers that already turn a billing refusal into a status code keep being
+    // the only place that decides one. 403, not 402: paying does not fix it.
+    | "account_suspended";
 
   constructor(
     code: CreditServiceError["code"],
@@ -130,6 +137,18 @@ export type CreditService = {
     | null
     | undefined
   >;
+  /**
+   * Workorder 39P (AD-01 / BL-21 step 3): whether an administrator has paused
+   * this member's generation. It is what `withBilling` asks before it quotes,
+   * creates a job or charges anything.
+   *
+   * Optional on purpose: only `withGenerationPause` provides it, and a credit
+   * service without it (an older wiring, a test double) keeps the pre-39P flow
+   * rather than failing — see `with-billing.ts`. A THROW from it is not "not
+   * paused": the caller lets it propagate, because "we could not tell" must not
+   * be answered with a generation.
+   */
+  isGenerationPaused?(userId: string): Promise<boolean>;
 };
 
 // ── SQLSTATE ─────────────────────────────────────────────────
