@@ -58,6 +58,13 @@ export type GeneratorContext = {
   accessToken: string;
   canvasScrollZoom: CanvasScrollZoom;
   ws?: WebSocketHandle | undefined;
+  /**
+   * BL-45 / T-109: the available credits the host knows about, handed to the
+   * generator panels so they can ask for a price. `undefined` means "the host
+   * does not know" and keeps the quote machinery off; `null` means "known to be
+   * unknown" (still loading) — the panels treat it as a figure, not as absent.
+   */
+  availableCredits?: number | null | undefined;
   onClose: () => void;
 };
 
@@ -104,6 +111,9 @@ export const GENERATOR_SPECS: GeneratorSpec[] = [
         canvasScrollZoom={ctx.canvasScrollZoom}
         onClose={ctx.onClose}
         {...(ctx.ws ? { ws: ctx.ws } : {})}
+        {...(ctx.availableCredits !== undefined
+          ? { availableCredits: ctx.availableCredits }
+          : {})}
       />
     ),
     toolbar: {
@@ -126,6 +136,9 @@ export const GENERATOR_SPECS: GeneratorSpec[] = [
         canvasScrollZoom={ctx.canvasScrollZoom}
         onClose={ctx.onClose}
         {...(ctx.ws ? { ws: ctx.ws } : {})}
+        {...(ctx.availableCredits !== undefined
+          ? { availableCredits: ctx.availableCredits }
+          : {})}
       />
     ),
     toolbar: {

@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import type { WebSocketHandle } from "../hooks/use-websocket";
+import { useCredits } from "@/hooks/use-credits";
 import { formatRetryLabel } from "../lib/job-status";
 import {
   GENERATOR_SPECS,
@@ -151,6 +152,13 @@ const GeneratingOverlay = memo(function GeneratingOverlay({
 });
 
 export function CanvasToolMenu({ accessToken, excalidrawApi, leftPanelOpen, ws }: CanvasToolMenuProps) {
+  // BL-45 / T-109: the canvas is the host that knows the balance, so it is the
+  // one handing the figure to the panels. While the first balance request is in
+  // flight `null` is passed — that keeps the quote machinery on but shows no
+  // figure yet, instead of pretending the user has nothing.
+  const { balance, loading: creditsLoading } = useCredits();
+  const availableCredits = creditsLoading ? null : balance;
+
   const [activeTool, setActiveTool] = useState<string>("selection");
 
   // The one open panel, or none. Single value on purpose: with a trio of state
@@ -420,6 +428,7 @@ export function CanvasToolMenu({ accessToken, excalidrawApi, leftPanelOpen, ws }
             accessToken,
             canvasScrollZoom,
             ws,
+            availableCredits,
             onClose: closePanel,
           },
         })}
