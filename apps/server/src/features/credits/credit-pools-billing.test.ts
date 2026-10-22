@@ -612,3 +612,117 @@ describe("withBilling pre-check: the precise refusal (BL-45)", () => {
     expect(base.getBalance).toHaveBeenCalledTimes(1);
   });
 });
+
+// ── the rejection EVENT carries the precise pool code (workorder 39H / T-107) ──
+
+describe("withBilling rejection event: the precise pool code (39H)", () => {
+  it("BL-45: a pool cap refusal is reported as pool_refusal with the cap sentence", async () => {
+    const base = makeBase();
+    const deps = makeDeps({
+      readPoolBalances: vi.fn(async () => ({
+        daily: 0,
+        teamRemaining: 50000,
+        personalTeamUsed: 19990,
+        personalCap: 20000,
+        topup: 0,
+      })),
+    });
+    const creditService = withCreditPools(base, deps);
+    const onRejected = vi.fn();
+
+    const error = await refusalOf(
+      withBilling(
+        {
+          creditService,
+          tierGuard: makeTierGuard(),
+          priceQuoter: makeQuoter(12),
+        },
+        { ...IMAGE_REQUEST, onRejected },
+        vi.fn(async () => "done"),
+      ),
+    );
+
+    expect(error?.code).toBe("personal_cap_reached");
+    expect(onRejected).toHaveBeenCalledTimes(1);
+    const rejection = onRejected.mock.calls[0]?.[0] as Record<string, unknown>;
+
+    expect(rejection).toMatchObject({
+      kind: "pool_refusal",
+      code: "personal_cap_reached",
+      message: "本月额度已用完（上限 20000），可联系管理员调整",
+      requiredAmount: 12,
+    });
+    expect(typeof rejection.currentBalance).toBe("number");
+    expect(rejection).not.toHaveProperty("plan");
+    expect(rejection).not.toHaveProperty("dailyClaimed");
+  });
+
+  it("BL-45: an empty team pool is reported as team_pool_exhausted", async () => {
+    const base = makeBase();
+    const deps = makeDeps({
+      readPoolBalances: vi.fn(async () => ({
+        daily: 0,
+        teamRemaining: 0,
+        personalTeamUsed: 0,
+        personalCap: 20000,
+        topup: 0,
+      })),
+    });
+    const creditService = withCreditPools(base, deps);
+    const onRejected = vi.fn();
+
+    const error = await refusalOf(
+      withBilling(
+        {
+          creditService,
+          tierGuard: makeTierGuard(),
+          priceQuoter: makeQuoter(12),
+        },
+        { ...IMAGE_REQUEST, onRejected },
+        vi.fn(async () => "done"),
+      ),
+    );
+
+    expect(error?.code).toBe("team_pool_exhausted");
+    expect(onRejected).toHaveBeenCalledTimes(1);
+    const rejection = onRejected.mock.calls[0]?.[0] as Record<string, unknown>;
+
+    expect(rejection).toMatchObject({
+      kind: "pool_refusal",
+      code: "team_pool_exhausted",
+      message: "团队本月额度已用完",
+      requiredAmount: 12,
+    });
+    expect(typeof rejection.currentBalance).toBe("number");
+    expect(rejection).not.toHaveProperty("plan");
+    expect(rejection).not.toHaveProperty("dailyClaimed");
+  });
+
+  it("BL-45: pooled credits short of the price are pool_refusal insufficient_credits", async () => {
+    const creditService = makeBase();
+    (creditService as CreditService).availableFor = vi.fn(async () => 10);
+    const onRejected = vi.fn();
+
+    const error = await refusalOf(
+      withBilling(
+        {
+          creditService,
+          tierGuard: makeTierGuard(),
+          priceQuoter: makeQuoter(12),
+        },
+        { ...IMAGE_REQUEST, onRejected },
+        vi.fn(async () => "done"),
+      ),
+    );
+
+    expect(error?.code).toBe("insufficient_credits");
+    expect(onRejected).toHaveBeenCalledTimes(1);
+    expect(onRejected.mock.calls[0]?.[0]).toEqual({
+      kind: "pool_refusal",
+      code: "insufficient_credits",
+      message: "Insufficient credits: 10 available, 12 required.",
+      currentBalance: 10,
+      requiredAmount: 12,
+    });
+  });
+});

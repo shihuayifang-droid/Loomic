@@ -1203,6 +1203,22 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                     "model_not_available",
                     `Model "${rejection.modelId}" is not available.`,
                   );
+                } else if (rejection.kind === "pool_refusal") {
+                  // 工单39H (T-107 / BL-45): the three-pool pre-check already
+                  // decided WHICH pool refused and the exact sentence to show, so
+                  // both are forwarded verbatim — no `plan` / `dailyClaimed`, and
+                  // no "Insufficient credits" rewrite. Those two fields describe
+                  // only the legacy single balance, and the client rendered them
+                  // as "this is a free-tier user", offering a daily claim to a
+                  // paying member whose own cap or the team pool had run out.
+                  pushBillingErrorAndAbort(
+                    run, canvasId, options,
+                    rejection.code, rejection.message,
+                    {
+                      currentBalance: rejection.currentBalance,
+                      requiredAmount: rejection.requiredAmount,
+                    },
+                  );
                 } else {
                   pushBillingErrorAndAbort(
                     run, canvasId, options,
@@ -1526,6 +1542,22 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                     run, canvasId, options,
                     "model_not_available",
                     `Model "${rejection.modelId}" is not available.`,
+                  );
+                } else if (rejection.kind === "pool_refusal") {
+                  // 工单39H (T-107 / BL-45): the three-pool pre-check already
+                  // decided WHICH pool refused and the exact sentence to show, so
+                  // both are forwarded verbatim — no `plan` / `dailyClaimed`, and
+                  // no "Insufficient credits" rewrite. Those two fields describe
+                  // only the legacy single balance, and the client rendered them
+                  // as "this is a free-tier user", offering a daily claim to a
+                  // paying member whose own cap or the team pool had run out.
+                  pushBillingErrorAndAbort(
+                    run, canvasId, options,
+                    rejection.code, rejection.message,
+                    {
+                      currentBalance: rejection.currentBalance,
+                      requiredAmount: rejection.requiredAmount,
+                    },
                   );
                 } else {
                   pushBillingErrorAndAbort(

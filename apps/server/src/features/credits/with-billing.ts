@@ -120,7 +120,20 @@ export type BillingRejection =
   // Workorder 31B / GN-07: the price table has no usable row for this model, so
   // the request never became a job. This is not a tier limit — upgrading the plan
   // does not make the model sellable, and nothing was charged.
-  | { kind: "model_not_available"; modelId: string };
+  | { kind: "model_not_available"; modelId: string }
+  // Workorder 39H (T-107 / BL-45): one of the three pools refused before any
+  // money moved. A separate shape rather than `insufficient_credits`, because the
+  // precise code and sentence are the whole point: "your own monthly cap ran out"
+  // and "the team pool is empty" are not fixed by buying credits, and the old
+  // shape's `plan` / `dailyClaimed` made the client offer a paying member the
+  // free-tier "claim today's gift" button instead.
+  | {
+      kind: "pool_refusal";
+      code: "personal_cap_reached" | "team_pool_exhausted" | "insufficient_credits";
+      message: string;
+      currentBalance: number;
+      requiredAmount: number;
+    };
 
 export interface BillingDeps {
   /** Absent = credit system not configured; guards and charging are skipped. */
@@ -392,13 +405,6 @@ export async function withBilling<T>(
           workspaceId,
           userId: user.id,
         })) ?? 0;
-      request.onRejected?.({
-        kind: "insufficient_credits",
-        currentBalance: refusalAvailable,
-        requiredAmount: creditsCost,
-        plan: "free",
-        dailyClaimed: false,
-      });
       const personalCap = refusal.personalCap;
       const refusalMessage =
         refusal.code === "personal_cap_reached"
@@ -408,6 +414,19 @@ export async function withBilling<T>(
           : refusal.code === "team_pool_exhausted"
             ? "团队本月额度已用完"
             : "积分不足";
+      // Workorder 39H (T-107 / BL-45): the EVENT now carries exactly the code and
+      // the sentence of the error thrown right below it, in its own
+      // `pool_refusal` shape, and without `plan` / `dailyClaimed`. Reported as
+      // `insufficient_credits` with `plan: "free"` / `dailyClaimed: false`, a
+      // personal cap or an empty team pool reached the user as "buy credits" plus
+      // a daily-claim button that could not help — the pools were what ran out.
+      request.onRejected?.({
+        kind: "pool_refusal",
+        code: refusal.code,
+        message: refusalMessage,
+        currentBalance: refusalAvailable,
+        requiredAmount: creditsCost,
+      });
       throw new CreditServiceError(refusal.code, refusalMessage, 402);
     }
 
@@ -419,16 +438,23 @@ export async function withBilling<T>(
         (await creditService.availableFor?.({ workspaceId, userId: user.id })) ??
         null;
       if (pooledAvailable !== null && pooledAvailable < creditsCost) {
+        const pooledMessage = `Insufficient credits: ${pooledAvailable} available, ${creditsCost} required.`;
+        // Workorder 39H (T-107 / BL-45): no pool cap was hit here — the pooled
+        // figure is simply short of the price — so the code stays
+        // `insufficient_credits`. It still travels in the same `pool_refusal`
+        // shape as the two pool refusals above, with the thrown error's message,
+        // because the old `plan` / `dailyClaimed` pair only describes the legacy
+        // single balance and the client read it as "this is a free-tier user".
         request.onRejected?.({
-          kind: "insufficient_credits",
+          kind: "pool_refusal",
+          code: "insufficient_credits",
+          message: pooledMessage,
           currentBalance: pooledAvailable,
           requiredAmount: creditsCost,
-          plan: "free",
-          dailyClaimed: false,
         });
         throw new CreditServiceError(
           "insufficient_credits",
-          `Insufficient credits: ${pooledAvailable} available, ${creditsCost} required.`,
+          pooledMessage,
           402,
         );
       }

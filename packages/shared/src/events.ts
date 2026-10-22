@@ -92,6 +92,13 @@ export const billingErrorCodeSchema = z.enum([
   // sellable at all. Deliberately separate from `model_not_accessible` (a plan
   // limit): upgrading the plan does not fix this one, and nothing was charged.
   "model_not_available",
+  // 工单39H / T-107 / BL-45: the three-pool pre-check's own refusals. These are
+  // the codes the thrown `CreditServiceError` already carried (38E); before this
+  // ticket the EVENT could only say `insufficient_credits`, so a member whose own
+  // monthly cap ran out — or whose team pool was empty — was told to buy credits,
+  // which does not fix either one.
+  "personal_cap_reached",
+  "team_pool_exhausted",
 ]);
 
 export type BillingErrorCode = z.infer<typeof billingErrorCodeSchema>;
