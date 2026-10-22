@@ -453,9 +453,23 @@ export async function withBilling<T>(
     }
   }
 
+  // Workorder 39G (GN-33): a paid job that is also being created goes through ONE
+  // atomic entry when the job service has it. The job row, the charge and the
+  // queue message are written by a single database transaction, so a refused
+  // charge leaves no queued job behind and a failed enqueue leaves the balance
+  // untouched. The 21H0 H10 (cancel after a failed charge) and 21H2 (compensate
+  // an unlinked charge) compensations below only apply when `createChargedJob`
+  // does not exist, i.e. the charged-job repository is not wired.
+  let charged = false;
+  const atomic =
+    billingEnabled &&
+    creditsCost > 0 &&
+    request.job !== undefined &&
+    typeof jobService?.createChargedJob === "function";
+
   let job: BackgroundJob | undefined;
   if (request.job) {
-    job = await jobService!.createJob(user, {
+    const createInput = {
       workspaceId,
       ...(request.job.refs ?? {}),
       jobType: guard.jobType,
@@ -466,7 +480,25 @@ export async function withBilling<T>(
       ...(request.job.clientRequestId
         ? { clientRequestId: request.job.clientRequestId }
         : {}),
-    });
+    };
+    if (atomic) {
+      const target = creditService.chargeTarget
+        ? await creditService.chargeTarget(workspaceId)
+        : { workspaceId, usePools: false };
+      // Errors (`CreditServiceError` / `JobServiceError`) propagate unchanged:
+      // the transaction rolled back, so there is nothing to cancel or refund.
+      const created = await jobService!.createChargedJob!(user, createInput, {
+        amount: creditsCost,
+        description,
+        usePools: target.usePools,
+        chargeWorkspaceId: target.workspaceId,
+      });
+      job = created.job;
+      // Already charged inside the same transaction, `credits_cost` included.
+      charged = true;
+    } else {
+      job = await jobService!.createJob(user, createInput);
+    }
   }
 
   // Workorder 31B ruling 8 — the pending ledger row, and it comes BEFORE the
@@ -512,8 +544,7 @@ export async function withBilling<T>(
   // Charge before running. Deliberately not moved after generation: the balance
   // check and the deduction have to happen up front or concurrent runs can both
   // pass the check and overdraw.
-  let charged = false;
-  if (billingEnabled && creditsCost > 0) {
+  if (billingEnabled && creditsCost > 0 && !atomic) {
     let chargeTxId: string;
     try {
       chargeTxId = await creditService.deductCredits(
@@ -566,7 +597,7 @@ export async function withBilling<T>(
         throw linkError;
       }
     }
-  } else if (job) {
+  } else if (job && !atomic) {
     // Workorder 21H1: the paths that charge nothing still have to RECORD that
     // they charged nothing. `createJob` enqueues the job before this function
     // runs, so the worker may already be holding the message; with `credits_cost`

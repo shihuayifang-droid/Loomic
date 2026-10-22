@@ -3774,3 +3774,145 @@ describe("createChargedJob: the atomic create-and-charge entry (工单39F)", () 
     expect(error?.message).toBe("Failed to create job record.");
   });
 });
+// ---------------------------------------------------------------------------
+// Workorder 39G (GN-33 step 3): withBilling uses the atomic entry when wired.
+// ---------------------------------------------------------------------------
+
+describe("withBilling through the real JobService with the atomic entry (工单39G)", () => {
+  it("GN-33: withBilling through the real JobService uses createChargedJob when it is wired", async () => {
+    const atomicCalls: Array<Record<string, unknown>> = [];
+    const insertCalls: string[] = [];
+    const sendCalls: string[] = [];
+    const deductCalls: string[] = [];
+
+    const service = createJobService({
+      createUserClient: () => {
+        insertCalls.push("user-client");
+        throw new Error("the user client must not be used");
+      },
+      getAdminClient: () => {
+        insertCalls.push("admin-client");
+        throw new Error("the admin client must not be used");
+      },
+      pgmq: {
+        send: async (queue: string) => {
+          sendCalls.push(queue);
+          throw new Error("pgmq must not be used");
+        },
+      } as unknown as PgmqClient,
+      projectReadRepository: {
+        findReadableProjectWorkspaceForMutation: async () => ({
+          workspace_id: "ws-1",
+        }),
+      } as unknown as ProjectReadRepository,
+      chargedJobWriteRepository: {
+        createChargedJob: async (input: Record<string, unknown>) => {
+          atomicCalls.push(input);
+          return { row: WRITE_JOB_ROW, transactionId: "tx-39g" };
+        },
+      } as never,
+    });
+
+    const creditService = {
+      async getBalance() {
+        return { balance: 1000, plan: "pro" as const, dailyClaimed: false };
+      },
+      async getSubscription() {
+        return {
+          plan: "pro" as const,
+          billingPeriod: null,
+          stripeCustomerId: null,
+          stripeSubscriptionId: null,
+          currentPeriodStart: null,
+          currentPeriodEnd: null,
+          canceledAt: null,
+        };
+      },
+      async deductCredits() {
+        deductCalls.push("deductCredits");
+        return "tx-should-not-happen";
+      },
+      async refundCredits() {
+        return "tx-refund";
+      },
+      async claimDailyCredits() {
+        return { success: false };
+      },
+      async getTransactions() {
+        return [];
+      },
+      async updatePlan() {},
+    } as unknown as CreditService;
+
+    const tierGuard = {
+      checkModelAccess() {},
+      checkResolution() {},
+      checkVideoResolution() {},
+      async checkConcurrency() {},
+    } as unknown as TierGuard;
+
+    const priceQuoter = {
+      async quote() {
+        return {
+          ok: true as const,
+          detail: {
+            base_price: 10,
+            unit_name: "次",
+            unit_count: 1,
+            unit_price: 10,
+            total_price: 10,
+            search_key: "hd",
+            search_key_matched: "hd",
+            time_variant_period: "normal" as const,
+            disable_unlimited: false,
+            entry_point: "canvas_generator" as const,
+            extras: [],
+            price_status: "active" as const,
+          },
+          ruleId: "rule-39g",
+        };
+      },
+    } as unknown as PriceQuoter;
+
+    const outcome = await withBilling(
+      {
+        creditService,
+        tierGuard,
+        priceQuoter,
+        creditLedgerWriteRepository: {
+          async recordPendingConsume() {
+            return { transactionId: "tx-pending" };
+          },
+        },
+        jobService: service,
+      },
+      {
+        user: WRITE_USER,
+        workspaceId: "ws-1",
+        modelId: "model-39g",
+        entryPoint: "canvas_generator",
+        guard: { jobType: "image_generation", quality: "hd" },
+        description: "Image generation: model-39g",
+        job: { payload: { prompt: "a red fox" } },
+      },
+      async (billing) => ({
+        jobId: billing.job?.id ?? null,
+        creditsCost: billing.creditsCost,
+      }),
+    );
+
+    // The one atomic write happened once; nothing went through the old routes.
+    expect(atomicCalls).toHaveLength(1);
+    expect(atomicCalls[0]).toMatchObject({
+      workspaceId: "ws-1",
+      amount: 10,
+      usePools: false,
+      chargeWorkspaceId: "ws-1",
+    });
+    expect(insertCalls).toEqual([]);
+    expect(sendCalls).toEqual([]);
+    expect(deductCalls).toEqual([]);
+    expect(outcome.creditsCost).toBe(10);
+    expect(outcome.jobId).toBe(WRITE_JOB_ROW.id);
+  });
+});

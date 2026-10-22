@@ -1309,4 +1309,154 @@ describe("withBilling", () => {
       ),
     ).rejects.toThrow(/jobService is missing/);
   });
+
+  // Workorder 39G (GN-33): a paid job is created, charged and enqueued by ONE
+  // atomic entry when the job service has it.
+  describe("the atomic charged-job entry (工单39G)", () => {
+    function makeChargedJobService() {
+      const service = makeJobService();
+      service.createChargedJob = vi.fn(async () => ({
+        job: { id: "job-1" } as BackgroundJob,
+        transactionId: "tx-atomic",
+      }));
+      return service;
+    }
+
+    const deps = (
+      jobSvc: unknown,
+      credit: unknown,
+    ) =>
+      ({
+        creditService: credit,
+        tierGuard,
+        jobService: jobSvc,
+        priceQuoter,
+        creditLedgerWriteRepository: ledger,
+      }) as any;
+
+    it("GN-33: a paid job goes through the one atomic entry", async () => {
+      const chargedService = makeChargedJobService();
+      const runSpy = vi.fn(async () => "ok");
+
+      await withBilling(
+        deps(chargedService, creditService),
+        { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } } },
+        runSpy,
+      );
+
+      expect(chargedService.createChargedJob).toHaveBeenCalledTimes(1);
+      expect(chargedService.createJob).not.toHaveBeenCalled();
+      expect(creditService.deductCredits).not.toHaveBeenCalled();
+      expect(chargedService.setCreditsInfo).not.toHaveBeenCalled();
+      expect(chargedService.cancelJob).not.toHaveBeenCalled();
+      expect(runSpy).toHaveBeenCalledTimes(1);
+      expect(runSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          job: expect.objectContaining({ id: "job-1" }),
+          creditsCost: 10,
+        }),
+      );
+    });
+
+    it("GN-33: the charge target comes from the credit service", async () => {
+      const chargedService = makeChargedJobService();
+      const pooled = makeCreditService({
+        chargeTarget: vi.fn(async () => ({
+          workspaceId: "team-ws",
+          usePools: true,
+        })),
+      });
+
+      await withBilling(
+        deps(chargedService, pooled),
+        { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } } },
+        async () => "ok",
+      );
+
+      expect(pooled.chargeTarget).toHaveBeenCalledWith(WORKSPACE);
+      expect(chargedService.createChargedJob).toHaveBeenCalledTimes(1);
+      const call = chargedService.createChargedJob.mock.calls[0] as unknown[];
+      expect(call[2]).toEqual({
+        amount: 10,
+        description: "test image",
+        usePools: true,
+        chargeWorkspaceId: "team-ws",
+      });
+    });
+
+    it("GN-33: without chargeTarget the workspace pays from the old balance", async () => {
+      const chargedService = makeChargedJobService();
+
+      await withBilling(
+        deps(chargedService, creditService),
+        { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } } },
+        async () => "ok",
+      );
+
+      const call = chargedService.createChargedJob.mock.calls[0] as unknown[];
+      expect(call[2]).toEqual({
+        amount: 10,
+        description: "test image",
+        usePools: false,
+        chargeWorkspaceId: WORKSPACE,
+      });
+    });
+
+    it("GN-33: a refused charge leaves nothing to cancel", async () => {
+      const chargedService = makeChargedJobService();
+      const refused = new CreditServiceError(
+        "insufficient_credits",
+        "Insufficient credits",
+        402,
+      );
+      chargedService.createChargedJob = vi.fn(async () => {
+        throw refused;
+      });
+      const runSpy = vi.fn(async () => "ok");
+
+      const error = await withBilling(
+        deps(chargedService, creditService),
+        { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } } },
+        runSpy,
+      )
+        .then(() => null)
+        .catch((thrown: unknown) => thrown);
+
+      expect(error).toBe(refused);
+      expect(chargedService.cancelJob).not.toHaveBeenCalled();
+      expect(creditService.refundCredits).not.toHaveBeenCalled();
+      expect(runSpy).not.toHaveBeenCalled();
+    });
+
+    it("GN-33: a free job still uses createJob and the zero confirmation", async () => {
+      const chargedService = makeChargedJobService();
+      priceQuoter = makeFreeQuoter();
+
+      await withBilling(
+        deps(chargedService, creditService),
+        { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } } },
+        async () => "ok",
+      );
+
+      expect(chargedService.createJob).toHaveBeenCalledTimes(1);
+      expect(chargedService.setCreditsInfo).toHaveBeenCalledTimes(1);
+      expect(chargedService.setCreditsInfo).toHaveBeenCalledWith("job-1", 0, null);
+      expect(chargedService.createChargedJob).not.toHaveBeenCalled();
+    });
+
+    it("GN-33: without the atomic entry the old charge path is unchanged", async () => {
+      const plainService = makeJobService();
+
+      await withBilling(
+        deps(plainService, creditService),
+        { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } } },
+        async () => "ok",
+      );
+
+      expect(plainService.createChargedJob).toBeUndefined();
+      expect(plainService.createJob).toHaveBeenCalledTimes(1);
+      expect(creditService.deductCredits).toHaveBeenCalledTimes(1);
+      expect(plainService.setCreditsInfo).toHaveBeenCalledWith("job-1", 10, "tx-1");
+    });
+  });
 });
