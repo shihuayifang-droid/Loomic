@@ -55,3 +55,18 @@ describe("BL-40 no upgrade entry", () => {
     expect(source).not.toContain("{plan}</span>");
   });
 });
+
+/**
+ * 工单 39S / BL-40 / X-40：tier 提示条改为「白名单 / 额度 / 并发」语义。
+ * 第 4 个入口原来是 toast 里的 CTA 按钮（`credits-tier-limit-cta` → `/pricing`）。
+ * 与上面几条一样读源码：要的是「入口不在源码里」，渲染级用例只能看到当前分支。
+ */
+describe("BL-40 tier toast semantics", () => {
+  it("BL-40: the tier toast has no upgrade button", () => {
+    const source = readComponent("credits", "tier-limit-toast.tsx");
+    expect(source).not.toContain("升级");
+    expect(source).not.toContain("/pricing");
+    expect(source).not.toContain("credits-tier-limit-cta");
+    expect(source).not.toContain("套餐");
+  });
+});

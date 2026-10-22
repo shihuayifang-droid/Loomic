@@ -14,11 +14,14 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { useRouter } from "next/navigation";
 
 // ---------------------------------------------------------------------------
 // Toast config per error code
 // ---------------------------------------------------------------------------
+//
+// BL-40 / X-40：文案一律「白名单 / 额度 / 并发」口径，不再出现订阅档位与
+// 任何购买入口。`model_not_accessible` / `resolution_not_allowed` 服务端已不再
+// 发送（39R），映射保留只为兼容旧事件。
 
 type TierLimitCode =
   | "concurrency_limit"
@@ -30,7 +33,6 @@ interface TierToastConfig {
   accentClass: string; // Tailwind ring/bg/text color classes
   progressColor: string; // Tailwind bg for progress bar
   title: string;
-  cta: string;
 }
 
 const TOAST_CONFIG: Record<TierLimitCode, TierToastConfig> = {
@@ -38,22 +40,19 @@ const TOAST_CONFIG: Record<TierLimitCode, TierToastConfig> = {
     icon: <Timer className="h-5 w-5 text-muted-foreground" />,
     accentClass: "bg-muted",
     progressColor: "bg-primary",
-    title: "\u5E76\u53D1\u4EFB\u52A1\u5DF2\u6EE1",
-    cta: "\u5347\u7EA7\u5957\u9910",
+    title: "并发已满",
   },
   model_not_accessible: {
     icon: <Lock className="h-5 w-5 text-muted-foreground" />,
     accentClass: "bg-muted",
     progressColor: "bg-primary",
-    title: "\u6A21\u578B\u9700\u8981\u66F4\u9AD8\u7EA7\u5957\u9910",
-    cta: "\u5347\u7EA7\u89E3\u9501",
+    title: "该模型未对你开放",
   },
   resolution_not_allowed: {
     icon: <Maximize2 className="h-5 w-5 text-muted-foreground" />,
     accentClass: "bg-muted",
     progressColor: "bg-primary",
-    title: "\u5206\u8FA8\u7387\u8D85\u51FA\u5957\u9910\u9650\u5236",
-    cta: "\u5347\u7EA7\u5957\u9910",
+    title: "该画质暂不可用",
   },
 };
 
@@ -173,7 +172,6 @@ function TierToastItem({
   onDismiss: () => void;
 }) {
   const config = TOAST_CONFIG[toast.code];
-  const router = useRouter();
   const [paused, setPaused] = useState(false);
   const remainingRef = useRef(AUTO_DISMISS_MS);
   const startRef = useRef(Date.now());
@@ -222,24 +220,14 @@ function TierToastItem({
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground/70">
               {toast.message}
             </p>
-            {/* CTA row */}
+            {/* Dismiss row */}
             <div className="mt-3 flex items-center gap-2">
-              <button data-testid="credits-tier-limit-cta"
-                type="button"
-                onClick={() => {
-                  onDismiss();
-                  router.push("/pricing");
-                }}
-                className={`rounded-lg px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 ${config.progressColor}`}
-              >
-                {config.cta}
-              </button>
               <button data-testid="credits-tier-limit-dismiss"
                 type="button"
                 onClick={onDismiss}
                 className="rounded-lg px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
               >
-                {"\u5173\u95ED"}
+                {"关闭"}
               </button>
             </div>
           </div>
