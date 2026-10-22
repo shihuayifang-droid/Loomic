@@ -176,6 +176,8 @@ export type SkillInsertFields = {
   version?: string;
   license?: string | null;
   metadata?: Record<string, unknown> | null;
+  sourceUrl?: string | null;
+  packageName?: string | null;
 };
 
 /** One file of a batch insert. `mimeType` absent keeps the column default. */
@@ -488,11 +490,15 @@ select ${SKILL_COLS_S}, ws.enabled, ws.installed_at
  * They are reached only when the caller leaves the field out — the create route
  * never supplies them, the marketplace install always does — which is precisely
  * the "absent key keeps the column default" behaviour the removed payload had.
+ *
+ * `source_url` / `package_name` (T-61 ②) are bound as `$12` / `$13` and a caller
+ * that omits them writes NULL, which is what the create route wants: only the
+ * marketplace install knows where a skill came from.
  */
 const INSERT_OWN_SKILL_SQL = `
 insert into public.skills
   (name, slug, description, author, version, license, category, icon_name,
-   source, skill_content, metadata, created_by)
+   source, skill_content, metadata, source_url, package_name, created_by)
 values ($2::text,
         $3::text,
         $4::text,
@@ -504,6 +510,8 @@ values ($2::text,
         'user',
         $10::text,
         coalesce($11::jsonb, '{}'::jsonb),
+        $12::text,
+        $13::text,
         $1::uuid)
 returning ${SKILL_COLS}
 `;
@@ -747,6 +755,8 @@ export function createSkillRepository(options: {
           input.iconName,
           input.skillContent,
           input.metadata === null ? null : JSON.stringify(input.metadata),
+          input.sourceUrl,
+          input.packageName,
         ]);
 
         // The insert has no `where`: it either produced the row or PostgreSQL
@@ -945,6 +955,8 @@ type NormalisedInsertFields = {
   version: string | null;
   license: string | null;
   metadata: Record<string, unknown> | null;
+  sourceUrl: string | null;
+  packageName: string | null;
 };
 
 function requireInsertFields(fields: unknown): NormalisedInsertFields {
@@ -971,6 +983,8 @@ function requireInsertFields(fields: unknown): NormalisedInsertFields {
     version: requireOptionalText(record["version"], "version"),
     license: requireOptionalText(record["license"], "license"),
     metadata: requireOptionalMetadata(record["metadata"]),
+    sourceUrl: requireOptionalText(record["sourceUrl"], "sourceUrl"),
+    packageName: requireOptionalText(record["packageName"], "packageName"),
   };
 }
 

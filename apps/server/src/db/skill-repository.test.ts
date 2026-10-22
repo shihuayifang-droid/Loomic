@@ -413,7 +413,9 @@ describe("skill-repository: insertOwnSkill", () => {
     expect(sql).toContain("coalesce($6::text, '1.0')");
     expect(sql).toContain("coalesce($11::jsonb, '{}'::jsonb)");
 
-    // Actor first, the ten column values after it, and `undefined`-as-absent.
+    // Actor first, the twelve column values after it, and `undefined`-as-absent.
+    // `source_url` / `package_name` (T-61 ②) are the last two and are NULL when the
+    // caller omits them, which is the create route's shape.
     expect(statement.params).toEqual([
       ACTOR_ID,
       "Canvas Design",
@@ -425,6 +427,8 @@ describe("skill-repository: insertOwnSkill", () => {
       "design",
       null,
       "# SKILL",
+      null,
+      null,
       null,
     ]);
   });
@@ -451,6 +455,8 @@ describe("skill-repository: insertOwnSkill", () => {
       license: null,
       iconName: null,
       metadata: { source_url: "https://example.test/pkg", package_name: "pkg" },
+      sourceUrl: "https://example.test/pkg",
+      packageName: "pkg",
     });
 
     // Byte-identical SQL: the shape of the payload cannot widen the write.
@@ -464,6 +470,13 @@ describe("skill-repository: insertOwnSkill", () => {
       source_url: "https://example.test/pkg",
       package_name: "pkg",
     });
+
+    // T-61 ②: the same two values also reach their OWN columns, bound after
+    // `metadata`.
+    expect(onlyDomain(marketplace.queries).params?.[11]).toBe(
+      "https://example.test/pkg",
+    );
+    expect(onlyDomain(marketplace.queries).params?.[12]).toBe("pkg");
   });
 
   it("case 12: a unique-slug conflict surfaces as SQLSTATE 23505 on the error", async () => {

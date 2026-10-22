@@ -107,8 +107,8 @@ function mapSkillFileRow(row: SkillFileRow) {
  * pure `pg` repository built in `app.ts`. Only the CALL TARGET changed: the
  * status codes, error codes, messages and every swallow are the ones this file
  * published before. The four T-61 behaviours frozen by the workorder are
- * untouched — `source_url` / `package_name` still go into `metadata` instead of
- * their own columns, and a Zod error still answers 500.
+ * untouched — a Zod error still answers 500 — except T-61 ②: `source_url` /
+ * `package_name` now go to their own columns as well as into `metadata`.
  *
  * The user-scoped Supabase client is no longer a parameter: nothing in this file
  * can reach PostgREST any more.
@@ -185,8 +185,9 @@ export async function registerMarketplaceRoutes(
       const { imported, packageName: pkgName } = await installFromMarketplace(packageName);
       const slug = generateSkillSlug(imported.manifest.name);
 
-      // Insert skill. The `source_url` / `package_name` columns are still NOT written
-      // — they keep going into `metadata` (frozen T-61 behaviour).
+      // Insert skill. T-61 ②: `source_url` / `package_name` are written to their
+      // OWN columns now, and kept in `metadata` too so that anything that still
+      // reads the metadata copy keeps working.
       let skillData: SkillRow;
       try {
         skillData = await options.skillRepository.insertOwnSkill(user.id, {
@@ -203,6 +204,8 @@ export async function registerMarketplaceRoutes(
             source_url: `https://www.npmjs.com/package/${packageName}`,
             package_name: pkgName,
           },
+          sourceUrl: `https://www.npmjs.com/package/${packageName}`,
+          packageName: pkgName,
         });
       } catch (skillError) {
         request.log.error({ err: skillError }, "marketplace install DB insert failed");

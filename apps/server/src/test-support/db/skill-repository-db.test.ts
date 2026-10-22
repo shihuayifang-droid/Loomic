@@ -1139,6 +1139,32 @@ describe("skill repository: skill writes", () => {
 
     expect(remaining).toEqual({ skills: 0, files: 0, installs: 0 });
   });
+
+  it("T-61: a marketplace skill stores its source url and package name in their columns", async () => {
+    const created = await repository.insertOwnSkill(MEMBER_ID, {
+      name: "Marketplace Column Skill",
+      slug: "marketplace-column-skill",
+      description: "From the registry",
+      category: "custom",
+      skillContent: "# marketplace",
+      author: "unknown",
+      version: "1.0",
+      license: null,
+      metadata: {
+        source_url: "https://www.npmjs.com/package/pkg",
+        package_name: "pkg",
+      },
+      sourceUrl: "https://www.npmjs.com/package/pkg",
+      packageName: "pkg",
+    });
+
+    // Read back through the repository, not the insert's own RETURNING shortcut:
+    // the columns really hold the values for a later `select`.
+    const read = await repository.findVisibleSkill(MEMBER_ID, created.id);
+
+    expect(read?.source_url).toBe("https://www.npmjs.com/package/pkg");
+    expect(read?.package_name).toBe("pkg");
+  });
 });
 
 describe("skill repository: bad binds", () => {

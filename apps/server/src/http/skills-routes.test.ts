@@ -1236,8 +1236,9 @@ describe("POST /api/skills/marketplace/install", () => {
     expect(response.json().skill.id).toBe(SKILL_ID);
     expect(response.json().skill.files).toEqual([MAPPED_FILE]);
 
-    // The marketplace columns AND the frozen T-61 shape: `source_url` /
-    // `package_name` still travel inside `metadata`, not in their own columns.
+    // The marketplace columns: `source_url` / `package_name` now go to their own
+    // fields AND stay inside `metadata`, so both readers see the same values
+    // (T-61 ②).
     const insert = repositoryCalls.find(
       (call) => call.method === "insertOwnSkill",
     );
@@ -1257,6 +1258,8 @@ describe("POST /api/skills/marketplace/install", () => {
           source_url: "https://www.npmjs.com/package/pkg",
           package_name: "pkg",
         },
+        sourceUrl: "https://www.npmjs.com/package/pkg",
+        packageName: "pkg",
       },
     ]);
 
