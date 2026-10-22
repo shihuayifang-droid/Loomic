@@ -407,3 +407,93 @@ describe("listMemberPoolTransactions (38U): 成员自己的三池流水", () => 
     await expect(list(USER_A, 20)).resolves.toHaveLength(2);
   });
 });
+
+// ── BL-06 / workorder 39T: 后台调整流水的操作人与原因 ──
+//
+// 37U 把操作人写进 `metadata.operator_id`、原因写进 `metadata.reason`，而列表投影
+// 被上面那条用例逐键钉死（每行键 = `MEMBER_POOL_TRANSACTION_COLUMNS`），所以这两个
+// 字段另走一条查询：按列表已返回的 id 读，由路由合并。本段钉的是那条查询本身 ——
+// 操作人与原因真的从 metadata + profiles 读回；普通扣费 id 不是后台调整，问它得到
+// 空；一个 id 都不给时一条语句都不发（把 pool 换成连上就报错的替身来证明）。
+
+const DETAIL_OPERATOR = "00000000-0000-0000-0000-000000039001";
+
+/** 取仓储真正的详情读；类型上它是可选的，真实现提供。 */
+function detailsOf(ids: string[]) {
+  const reader = repository.listAdminAdjustmentDetails;
+  if (reader === undefined) {
+    throw new Error(
+      "the real repository must implement listAdminAdjustmentDetails",
+    );
+  }
+
+  return reader({ workspaceId, transactionIds: ids });
+}
+
+describe("listAdminAdjustmentDetails (39T): 后台调整的操作人与原因", () => {
+  let adjustmentId = "";
+  let chargeId = "";
+
+  beforeAll(async () => {
+    // 操作人是一行真实 profile：`admin_adjust_topup` 只写 id，名字靠 join profiles。
+    await createUser(db, DETAIL_OPERATOR, "operator-39t@hahart.test");
+    await db.query(
+      "update public.profiles set display_name = $2 where id = $1::uuid",
+      [DETAIL_OPERATOR, "王管理"],
+    );
+
+    // 37U：给 C 充 500（`admin_adjustment`，metadata 带 operator_id / reason）。
+    adjustmentId = firstRow(
+      (
+        await db.query<{ id: string }>(
+          "select public.admin_adjust_topup($1::uuid, $2::uuid, $3::uuid, $4::integer, $5::text) as id",
+          [workspaceId, USER_C, DETAIL_OPERATOR, 500, "补发"],
+        )
+      ).rows,
+    ).id;
+
+    // 37N：同一工作区里的一笔普通扣费，用来证明「不是调整的 id 问不出东西」。
+    chargeId = await deduct(USER_C, 5);
+  }, 120_000);
+
+  it("BL-06: an admin adjustment's details carry its operator and reason", async () => {
+    await expect(detailsOf([adjustmentId])).resolves.toEqual([
+      {
+        transactionId: adjustmentId,
+        operator: { id: DETAIL_OPERATOR, name: "王管理" },
+        reason: "补发",
+      },
+    ]);
+  });
+
+  it("BL-06: a consume id is not an admin adjustment", async () => {
+    // 只有扣费 id：一行都不答复。
+    await expect(detailsOf([chargeId])).resolves.toEqual([]);
+
+    // 两个 id 一起问：答复里只有调整那一条。
+    const mixed = await detailsOf([chargeId, adjustmentId]);
+    expect(mixed.map((detail) => detail.transactionId)).toEqual([
+      adjustmentId,
+    ]);
+  });
+
+  it("BL-06: no ids reads nothing", async () => {
+    // pool 一 connect 就抛：空 id 列表如果连了库，这条用例会红。
+    const neverPool: TransactionPool = {
+      async connect() {
+        throw new Error("the details read must not connect for no ids");
+      },
+    };
+    const never = createPoolTransactionReadRepository({ pool: neverPool });
+    const reader = never.listAdminAdjustmentDetails;
+    if (reader === undefined) {
+      throw new Error(
+        "the real repository must implement listAdminAdjustmentDetails",
+      );
+    }
+
+    await expect(
+      reader({ workspaceId, transactionIds: [] }),
+    ).resolves.toEqual([]);
+  });
+});

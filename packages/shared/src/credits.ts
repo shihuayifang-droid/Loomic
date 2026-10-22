@@ -378,6 +378,19 @@ export const creditTransactionSchema = z.object({
     })
     .nullable()
     .optional(),
+  // BL-06 / workorder 39T: WHO made an admin adjustment, and WHY. The requirement
+  // says every line carries the operator and that `admin_adjust` makes it
+  // mandatory, while the row-level projection of the pool read (38U) is pinned key
+  // by key — so both fields are ADDITIVE and optional here: a route that knows
+  // nothing about them answers exactly the payload it answered before, and a
+  // reader must treat "absent" as "not an adjustment detail", never as null.
+  //
+  // `name` is nullable because `coalesce(display_name, email)` can still be NULL
+  // for a profile with neither, and the screen has its own fallback for that.
+  operator: z
+    .object({ id: z.string().uuid(), name: z.string().nullable() })
+    .optional(),
+  admin_reason: z.string().optional(),
 });
 export type CreditTransaction = z.infer<typeof creditTransactionSchema>;
 

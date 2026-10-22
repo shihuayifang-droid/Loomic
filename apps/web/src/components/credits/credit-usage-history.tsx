@@ -152,6 +152,11 @@ export function CreditUsageHistory() {
             <tbody>
               {filtered.map((t, idx) => {
                 const label = LEDGER_ENTRY_LABELS[entryTypeOf(t)];
+                // BL-06 / workorder 39T: an admin adjustment says WHO made it and
+                // WHY, in the line itself — the stored description is the same
+                // "Admin adjustment" for every one of them, so it cannot tell two
+                // of them apart. Every other row keeps its description.
+                const isAdminAdjust = entryTypeOf(t) === "admin_adjust";
                 return (
                   <tr
                     key={t.id}
@@ -161,7 +166,23 @@ export function CreditUsageHistory() {
                     }`}
                   >
                     <td className="px-4 py-2.5 text-foreground">
-                      {t.description ?? label}
+                      {isAdminAdjust ? (
+                        <div>
+                          <span>
+                            {t.admin_reason
+                              ? `${label} · ${t.admin_reason}`
+                              : label}
+                          </span>
+                          <div
+                            data-testid="credits-history-operator"
+                            className="mt-0.5 text-xs text-muted-foreground"
+                          >
+                            {`操作人：${t.operator?.name ?? "管理员"}`}
+                          </div>
+                        </div>
+                      ) : (
+                        (t.description ?? label)
+                      )}
                     </td>
                     <td className="px-4 py-2.5 text-muted-foreground">
                       {label}

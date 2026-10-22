@@ -114,3 +114,75 @@ describe("CreditUsageHistory · BL-06", () => {
     expect(screen.getByTestId("credits-history-end")).toHaveTextContent("没有更多了");
   });
 });
+
+// ── BL-06 / workorder 39T: 后台调整显示操作人 ──
+//
+// 后台调整的 `description` 在库里一律是 "Admin adjustment"，两笔调整彼此分不出来，
+// 所以调整行的描述改成「后台调整 · 原因」，下面一行小字显示是谁做的；服务端没给
+// 操作人名字时退到「管理员」。别的行一个字都不变。
+
+const ADMIN_ADJUST_WITH_NAME: CreditTransaction = {
+  id: "44444444-4444-4444-8444-444444444444",
+  transaction_type: "admin_adjustment",
+  entry_type: "admin_adjust",
+  amount: 500,
+  balance_after: 500,
+  job_id: null,
+  description: "Admin adjustment",
+  created_at: "2024-05-04T10:00:00.000Z",
+  operator: { id: "55555555-5555-4555-8555-555555555555", name: "王管理" },
+  admin_reason: "补发",
+};
+
+const ADMIN_ADJUST_WITHOUT_NAME: CreditTransaction = {
+  id: "66666666-6666-4666-8666-666666666666",
+  transaction_type: "admin_adjustment",
+  entry_type: "admin_adjust",
+  amount: 20,
+  balance_after: 520,
+  job_id: null,
+  description: "Admin adjustment",
+  created_at: "2024-05-05T10:00:00.000Z",
+  operator: { id: "55555555-5555-4555-8555-555555555555", name: null },
+};
+
+describe("CreditUsageHistory · BL-06 后台调整", () => {
+  it("BL-06: an admin adjustment shows who made it", async () => {
+    vi.mocked(fetchCreditTransactions).mockResolvedValue({
+      transactions: [ADMIN_ADJUST_WITH_NAME, ...TRANSACTIONS.slice(0, 1)],
+    });
+    render(<CreditUsageHistory />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("credits-history-row")).toHaveLength(2);
+    });
+
+    const adminRow = screen.getAllByTestId("credits-history-row")[0];
+    expect(adminRow).toHaveTextContent("后台调整 · 补发");
+    expect(screen.getByTestId("credits-history-operator")).toHaveTextContent(
+      "操作人：王管理",
+    );
+
+    // 另一行不是调整：没有操作人那一行，描述仍是原来那条规则。
+    expect(screen.getAllByTestId("credits-history-operator")).toHaveLength(1);
+  });
+
+  it("BL-06: without a name the operator reads 管理员", async () => {
+    vi.mocked(fetchCreditTransactions).mockResolvedValue({
+      transactions: [ADMIN_ADJUST_WITHOUT_NAME],
+    });
+    render(<CreditUsageHistory />);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("credits-history-row")).toHaveLength(1);
+    });
+
+    expect(screen.getByTestId("credits-history-operator")).toHaveTextContent(
+      "操作人：管理员",
+    );
+    // 没有原因时只显示类型名，不带那个「·」。
+    expect(screen.getAllByTestId("credits-history-row")[0]).not.toHaveTextContent(
+      "·",
+    );
+  });
+});

@@ -136,17 +136,76 @@ export async function registerCreditRoutes(
       // the existing `credit_query_failed` 500, the same way `getTransactions`
       // does, because a list with half its lines missing is worse than no list.
       const poolTransactionReadRepository = options.poolTransactionReadRepository;
-      const transactions: CreditTransaction[] =
-        poolTransactionReadRepository !== undefined && viewer.teamWorkspace
-          ? await poolTransactionReadRepository.listMemberPoolTransactions({
-              workspaceId: viewer.teamWorkspace.id,
-              userId: user.id,
-              limit,
-            })
-          : await options.creditService.getTransactions(
-              viewer.workspace.id,
-              limit,
+      const teamWorkspace = viewer.teamWorkspace;
+
+      let transactions: CreditTransaction[];
+
+      if (
+        poolTransactionReadRepository !== undefined &&
+        teamWorkspace !== null &&
+        teamWorkspace !== undefined
+      ) {
+        transactions =
+          await poolTransactionReadRepository.listMemberPoolTransactions({
+            workspaceId: teamWorkspace.id,
+            userId: user.id,
+            limit,
+          });
+
+        // BL-06 / workorder 39T: the requirement says every ledger line carries its
+        // operator and that an `admin_adjust` line makes it mandatory, but the pool
+        // projection of 38U is pinned column by column, so the operator and the
+        // reason are read SEPARATELY, once, for the adjustment ids the list just
+        // returned — and merged onto exactly those rows.
+        //
+        // Three conditions, all required, otherwise the payload is the one 38U
+        // published: the list actually carries an `admin_adjustment` line, and the
+        // repository implements the details read (the stand-ins of the route's own
+        // tests do not). A failed details read is NOT swallowed: it falls into the
+        // catch below and answers the existing `credit_query_failed` 500, the same
+        // way a failed list read does, because a line that silently lost its
+        // operator would read as an anonymous adjustment.
+        const readAdminDetails =
+          poolTransactionReadRepository.listAdminAdjustmentDetails;
+
+        if (readAdminDetails !== undefined) {
+          const adjustmentIds = transactions
+            .filter((t) => t.transaction_type === "admin_adjustment")
+            .map((t) => t.id);
+
+          if (adjustmentIds.length > 0) {
+            const details = await readAdminDetails.call(
+              poolTransactionReadRepository,
+              { workspaceId: teamWorkspace.id, transactionIds: adjustmentIds },
             );
+
+            const detailById = new Map(
+              details.map((detail) => [detail.transactionId, detail]),
+            );
+
+            transactions = transactions.map((t) => {
+              const detail = detailById.get(t.id);
+              if (detail === undefined) return t;
+
+              // Only these two keys, and only when there is something to say:
+              // every other row keeps exactly the shape it had, and an adjustment
+              // with no reason carries no `admin_reason` rather than an empty
+              // string.
+              const merged: CreditTransaction = { ...t };
+              if (detail.operator !== null) merged.operator = detail.operator;
+              if (detail.reason !== null && detail.reason.length > 0) {
+                merged.admin_reason = detail.reason;
+              }
+              return merged;
+            });
+          }
+        }
+      } else {
+        transactions = await options.creditService.getTransactions(
+          viewer.workspace.id,
+          limit,
+        );
+      }
 
       return reply.code(200).send(
         creditTransactionsResponseSchema.parse({

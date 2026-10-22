@@ -429,3 +429,109 @@ describe("GET /api/credits/transactions — BL-06 pools", () => {
     expect(getTransactions).toHaveBeenCalledWith(PERSONAL_WORKSPACE_ID, 20);
   });
 });
+
+// ── BL-06 / workorder 39T: 后台调整行的操作人与原因 ──
+//
+// 列表投影被 38U 的用例逐键钉死，所以操作人与原因另走一条查询，由路由合并。这里钉的
+// 是路由的那一半：只有列表里真有 `admin_adjustment` 行时才问一次，答复只落在那一行
+// 上（旁边那行一个键都不多），没有调整行时一次都不问，仓储不提供这条读时行保持原样。
+
+const ADMIN_DETAIL_OPERATOR = {
+  id: "00000000-0000-0000-0000-0000000000f2",
+  name: "王管理",
+};
+
+/** The one `admin_adjustment` line the stand-in repository answers. */
+const ADMIN_LEDGER_ROW = {
+  id: "00000000-0000-0000-0000-0000000000f3",
+  transaction_type: "admin_adjustment" as const,
+  amount: 500,
+  balance_after: 500,
+  job_id: null,
+  description: "Admin adjustment",
+  created_at: "2026-10-21T00:00:02.002Z",
+  pool: "topup" as const,
+  pool_breakdown: null,
+};
+
+describe("GET /api/credits/transactions — BL-06 admin adjustment details", () => {
+  it("BL-06: the transactions route merges the operator into admin rows", async () => {
+    const listMemberPoolTransactions = vi.fn(async () => [
+      ADMIN_LEDGER_ROW,
+      POOL_LEDGER_ROW,
+    ]);
+    const listAdminAdjustmentDetails = vi.fn(async () => [
+      {
+        transactionId: ADMIN_LEDGER_ROW.id,
+        operator: ADMIN_DETAIL_OPERATOR,
+        reason: "补发",
+      },
+    ]);
+    const { app } = await buildLedgerApp({
+      teamWorkspace: true,
+      ledger: { listMemberPoolTransactions, listAdminAdjustmentDetails },
+    });
+
+    const response = await readTransactions(app);
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    const adminRow = body.transactions.find(
+      (row: { id: string }) => row.id === ADMIN_LEDGER_ROW.id,
+    );
+    const chargeRow = body.transactions.find(
+      (row: { id: string }) => row.id === POOL_LEDGER_ROW.id,
+    );
+
+    // 调整行带上操作人与原因，`entry_type` 仍是共享规则给的 admin_adjust。
+    expect(adminRow.operator).toEqual(ADMIN_DETAIL_OPERATOR);
+    expect(adminRow.admin_reason).toBe("补发");
+    expect(adminRow.entry_type).toBe("admin_adjust");
+
+    // 扣费行一个键都不多：合并只落在调整行上。
+    expect(chargeRow.operator).toBeUndefined();
+    expect(chargeRow.admin_reason).toBeUndefined();
+
+    // 只问一次，问的是 TEAM 工作区与列表里那个调整行的 id。
+    expect(listAdminAdjustmentDetails).toHaveBeenCalledTimes(1);
+    expect(listAdminAdjustmentDetails).toHaveBeenCalledWith({
+      workspaceId: TEAM_WORKSPACE_ID,
+      transactionIds: [ADMIN_LEDGER_ROW.id],
+    });
+  });
+
+  it("BL-06: a list with no adjustment is not asked for details", async () => {
+    const listAdminAdjustmentDetails = vi.fn(async () => []);
+    const { app } = await buildLedgerApp({
+      teamWorkspace: true,
+      ledger: {
+        listMemberPoolTransactions: vi.fn(async () => [POOL_LEDGER_ROW]),
+        listAdminAdjustmentDetails,
+      },
+    });
+
+    const response = await readTransactions(app);
+
+    expect(response.statusCode).toBe(200);
+    expect(listAdminAdjustmentDetails).toHaveBeenCalledTimes(0);
+    expect(response.json().transactions[0].operator).toBeUndefined();
+    expect(response.json().transactions[0].admin_reason).toBeUndefined();
+  });
+
+  it("BL-06: without the details read an admin row keeps its shape", async () => {
+    const { app } = await buildLedgerApp({
+      teamWorkspace: true,
+      ledger: {
+        listMemberPoolTransactions: vi.fn(async () => [ADMIN_LEDGER_ROW]),
+      },
+    });
+
+    const response = await readTransactions(app);
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.transactions[0].entry_type).toBe("admin_adjust");
+    expect(body.transactions[0].operator).toBeUndefined();
+    expect(body.transactions[0].admin_reason).toBeUndefined();
+  });
+});

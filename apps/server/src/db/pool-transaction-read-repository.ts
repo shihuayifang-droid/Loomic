@@ -44,6 +44,11 @@
  * - A connect or SQL failure throws `PoolTransactionReadError`, whose message is
  *   fixed text: no SQL, no host, no connection string and no id. The driver's own
  *   error rides along as `cause`.
+ *
+ * Workorder 39T adds a SECOND statement, `listAdminAdjustmentDetails`: the pool
+ * projection above is pinned column by column, so the operator and the reason of
+ * an `admin_adjustment` line are read separately, by the ids the list already
+ * returned, and merged onto those rows by the route.
  */
 
 import type { CreditTransactionType } from "@loomic/shared";
@@ -55,7 +60,18 @@ import {
 
 export const LIST_MEMBER_POOL_TRANSACTIONS = "listMemberPoolTransactions";
 
-export type PoolTransactionReadOperation = typeof LIST_MEMBER_POOL_TRANSACTIONS;
+/**
+ * BL-06 / workorder 39T: the second read of this module. It exists because the
+ * list projection above is pinned column by column (a db test holds every row's
+ * keys against `MEMBER_POOL_TRANSACTION_COLUMNS`), so the operator and the reason
+ * of an admin adjustment cannot be added to it: they are read here, by the ids the
+ * list already returned, and merged onto those rows by the route.
+ */
+export const LIST_ADMIN_ADJUSTMENT_DETAILS = "listAdminAdjustmentDetails";
+
+export type PoolTransactionReadOperation =
+  | typeof LIST_MEMBER_POOL_TRANSACTIONS
+  | typeof LIST_ADMIN_ADJUSTMENT_DETAILS;
 
 /**
  * The failure shape of this module. The message is built from the fixed
@@ -129,6 +145,30 @@ export type PoolTransactionReadRepository = {
     userId: string;
     limit: number;
   }): Promise<MemberPoolTransactionRow[]>;
+
+  /**
+   * BL-06 / workorder 39T: who made each admin adjustment among `transactionIds`,
+   * and why. OPTIONAL on purpose — the stand-in repositories written for the
+   * route's own tests before 39T do not implement it, and the route must therefore
+   * treat "no such method" as "nothing to merge" rather than as a broken read.
+   */
+  listAdminAdjustmentDetails?(input: {
+    workspaceId: string;
+    transactionIds: string[];
+  }): Promise<AdminAdjustmentDetail[]>;
+};
+
+/**
+ * One `admin_adjustment` line's operator and reason, as read from its `metadata`.
+ *
+ * `operator` is `null` when the line carries no usable `operator_id`; `reason` is
+ * `null` when it carries none. A line whose `operator_id` names no profile still
+ * reports the operator it was written with, with `name: null`.
+ */
+export type AdminAdjustmentDetail = {
+  transactionId: string;
+  operator: { id: string; name: string | null } | null;
+  reason: string | null;
 };
 
 /** Fixed row-shape label: a refusal never carries SQL, a host or an id. */
@@ -162,6 +202,46 @@ where t.workspace_id = $1::uuid
   and t.user_id = $2::uuid
 order by t.created_at desc, t.id desc
 limit $3::int
+`;
+
+/**
+ * BL-06 / workorder 39T: the operator and the reason of the `admin_adjustment`
+ * lines the list just returned.
+ *
+ * `workspace_id` and `id = any($2::uuid[])` are the row predicates and BOTH are
+ * bound parameters, so a caller can only ask about lines of one workspace that it
+ * already named by id. `transaction_type = 'admin_adjustment'` is the second gate:
+ * a charge id passed in by mistake answers nothing rather than somebody's metadata.
+ *
+ * The operator is read OUT of the column and joined to `profiles` for a name. The
+ * shape check in front of the cast matters: `metadata` is free jsonb written by
+ * several writers, and a non-uuid `operator_id` there would otherwise turn the
+ * whole list into a 22P02 — one bad line must not hide every other line. A line
+ * whose `operator_id` names no profile keeps its operator, with a NULL name.
+ *
+ * `coalesce(display_name, email)` is the same fallback the admin screens use: a
+ * profile with no display name is still identified by its address.
+ */
+const LIST_ADMIN_ADJUSTMENT_DETAILS_SQL = `
+select
+  t.id::text as id,
+  case
+    when t.metadata->>'operator_id' ~ '^[0-9a-fA-F-]{36}$'
+      then t.metadata->>'operator_id'
+  end as operator_id,
+  coalesce(op.display_name, op.email) as operator_name,
+  t.metadata->>'reason' as reason
+from public.credit_transactions t
+left join public.profiles op
+  on op.id = (
+    case
+      when t.metadata->>'operator_id' ~ '^[0-9a-fA-F-]{36}$'
+        then (t.metadata->>'operator_id')::uuid
+    end
+  )
+where t.workspace_id = $1::uuid
+  and t.id = any($2::uuid[])
+  and t.transaction_type = 'admin_adjustment'
 `;
 
 /**
@@ -206,7 +286,136 @@ export function createPoolTransactionReadRepository(options: {
         );
       }
     },
+
+    async listAdminAdjustmentDetails(input) {
+      // Arguments first, and an EMPTY id list before anything else: "no ids" is
+      // "nothing to answer", so it must not open a connection at all.
+      const workspaceId = requireDetailWorkspaceId(input.workspaceId);
+      const transactionIds = requireTransactionIds(input.transactionIds);
+      if (transactionIds.length === 0) return [];
+
+      try {
+        return await withPrivilegedTransaction(
+          options.pool,
+          // Same system read as above: the caller's authorization was decided by
+          // the route, and the two bound predicates are the rule.
+          null,
+          async (client) => {
+            const result = await client.query(
+              LIST_ADMIN_ADJUSTMENT_DETAILS_SQL,
+              [workspaceId, transactionIds],
+            );
+
+            // Zero rows is a LEGAL answer: the ids may name no adjustment at all.
+            return result.rows.map((row) => mapAdminAdjustmentDetailRow(row));
+          },
+        );
+      } catch (error) {
+        throw new PoolTransactionReadError(
+          LIST_ADMIN_ADJUSTMENT_DETAILS,
+          error,
+        );
+      }
+    },
   };
+}
+
+/** Fixed row-shape label for the details read: a refusal carries no SQL and no id. */
+const ADMIN_ADJUSTMENT_DETAILS_LABEL = "admin adjustment details read";
+
+/**
+ * The workspace id of the details read. Same rule as the list read: a non-empty
+ * bound string only, and the UUID shape is PostgreSQL's to refuse (22P02 inside
+ * the transaction, which rolls back and leaves the pool usable).
+ */
+function requireDetailWorkspaceId(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new PoolTransactionReadError(
+      LIST_ADMIN_ADJUSTMENT_DETAILS,
+      new Error('admin adjustment details read needs a non-empty "workspaceId"'),
+    );
+  }
+
+  return value;
+}
+
+/**
+ * The ids to ask about. Every one is bound as `::uuid`, so a malformed id is
+ * PostgreSQL's error rather than a silently empty answer; a non-array or a
+ * non-string element is refused before any connection.
+ */
+function requireTransactionIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw new PoolTransactionReadError(
+      LIST_ADMIN_ADJUSTMENT_DETAILS,
+      new Error(
+        'admin adjustment details read needs an array of "transactionIds"',
+      ),
+    );
+  }
+
+  return value.map((entry) => {
+    if (typeof entry !== "string" || entry.length === 0) {
+      throw new PoolTransactionReadError(
+        LIST_ADMIN_ADJUSTMENT_DETAILS,
+        new Error(
+          'admin adjustment details read needs non-empty "transactionIds"',
+        ),
+      );
+    }
+
+    return entry;
+  });
+}
+
+/**
+ * One detail row. `id` is the key the merge is done on, so it must be a usable
+ * string; the three metadata-derived fields are optional by nature and read as
+ * `null` when the row carries none.
+ */
+function mapAdminAdjustmentDetailRow(row: unknown): AdminAdjustmentDetail {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) {
+    throw new Error(
+      `${ADMIN_ADJUSTMENT_DETAILS_LABEL} returned a row that is not an object`,
+    );
+  }
+
+  const record = row as Readonly<Record<string, unknown>>;
+  const transactionId = record["id"];
+  if (typeof transactionId !== "string" || transactionId.length === 0) {
+    throw new Error(
+      `${ADMIN_ADJUSTMENT_DETAILS_LABEL} returned no usable "id"`,
+    );
+  }
+
+  const operatorId = optionalDetailText(record, "operator_id");
+  const operatorName = optionalDetailText(record, "operator_name");
+
+  return {
+    transactionId,
+    // The operator is reported whenever the line names one — a profile that could
+    // not be found leaves the NAME null rather than dropping the operator.
+    operator:
+      operatorId === null ? null : { id: operatorId, name: operatorName },
+    reason: optionalDetailText(record, "reason"),
+  };
+}
+
+/** A nullable text field of a detail row: absent and NULL both read as `null`. */
+function optionalDetailText(
+  row: Readonly<Record<string, unknown>>,
+  field: string,
+): string | null {
+  const value = row[field];
+  if (value === null || value === undefined) return null;
+
+  if (typeof value !== "string") {
+    throw new Error(
+      `${ADMIN_ADJUSTMENT_DETAILS_LABEL} returned no usable "${field}"`,
+    );
+  }
+
+  return value;
 }
 
 /**
