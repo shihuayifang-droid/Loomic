@@ -21,6 +21,10 @@ import {
   shouldStartTeamCycleGrant,
   startTeamCycleGrant,
 } from "./features/credits/team-cycle-grant-schedule.js";
+import { compensateRefunds } from "./features/credits/compensate-refunds.js";
+import { startRefundCompensator } from "./features/credits/refund-compensation-schedule.js";
+import { createJobCreditsLinkRepository } from "./db/job-credits-link-repository.js";
+import { createRefundCompensationRepository } from "./db/refund-compensation-repository.js";
 import { createJobStuckReaderRepository } from "./db/job-stuck-reader-repository.js";
 import { createPoolGrantWriteRepository } from "./db/pool-grant-write-repository.js";
 import { buildWorkerComposition } from "./worker-composition.js";
@@ -82,13 +86,14 @@ async function main() {
       env.databaseUrl ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl } : {},
     );
 
-  const { jobService, billingGate, refundJob, baseCtx } = buildWorkerComposition({
-    env,
-    pgmq,
-    createUserClient,
-    getAdminClient,
-    getTransactionPool: getPool,
-  });
+  const { jobService, billingGate, creditService, refundJob, baseCtx } =
+    buildWorkerComposition({
+      env,
+      pgmq,
+      createUserClient,
+      getAdminClient,
+      getTransactionPool: getPool,
+    });
 
   const inFlightByQueue = new Map<string, Set<Promise<void>>>(
     JOB_QUEUES.map((q) => [q, new Set()]),
@@ -125,6 +130,39 @@ async function main() {
     log: (m) => console.log(`${tag} ${m}`),
   });
 
+  // BL-41 step 4 (workorder 39L): the refund compensation queue. A refund that
+  // failed was recorded in `refund_compensations` (39K); this schedule beside the
+  // reaper retries it every five minutes, twelve times, and prints the alert line
+  // when it gives up. Both repositories are built here, lazily, against the same
+  // pool getter as everything else in this file — resolving lazily means a pass
+  // that never runs never connects, exactly like the ones above. `creditService`
+  // comes from the composition above, so the payout goes through the same
+  // `LOOMIC_CREDIT_POOLS` switch as the charge and the refund that queued the row.
+  const refundCompensations = createRefundCompensationRepository({
+    getTransactionPool: getPool,
+  });
+  const creditsLink = createJobCreditsLinkRepository({
+    getTransactionPool: getPool,
+  });
+  const refundCompensator = startRefundCompensator({
+    compensate: () =>
+      compensateRefunds({
+        claimDue: (limit) => refundCompensations.claimDue(limit),
+        refund: (input) =>
+          creditService.refundCredits(
+            input.workspaceId,
+            input.userId,
+            input.amount,
+            input.jobId,
+            input.description,
+          ),
+        markLinkRefunded: (input) => creditsLink.markChargeRefunded(input),
+        finish: (input) => refundCompensations.finish(input),
+        log: (m) => console.log(`${tag} [refund-compensator] ${m}`),
+      }),
+    log: (m) => console.log(`${tag} [refund-compensator] ${m}`),
+  });
+
   // BL-44 step 7 (workorder 37R): this month's team pool. `grant_team_cycle`
   // (37O) is idempotent per month, so the coarse ten-minute period only decides
   // how many minutes after 00:00 on the 1st the grant lands — not whether it
@@ -154,6 +192,7 @@ async function main() {
     // Stop the timers first: the in-flight jobs waited for below are the ones
     // that matter, and a tick landing mid-shutdown has nothing left to do.
     reaper.stop();
+    refundCompensator.stop();
     teamCycleGrant?.stop();
     const totalInFlight = [...inFlightByQueue.values()].reduce((n, s) => n + s.size, 0);
     console.log(`${tag} Shutting down, waiting for ${totalInFlight} in-flight jobs...`);
