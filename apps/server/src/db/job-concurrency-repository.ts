@@ -62,8 +62,14 @@ export type JobConcurrencyRepository = {
   /**
    * How many of that workspace's jobs are still holding a concurrency slot:
    * `queued`, `running` or `retrying`. Zero is a legal answer.
+   *
+   * GN-20: with `createdBy` only that member's jobs in the workspace are
+   * counted; without it the whole workspace is.
    */
-  countActiveJobs(input: { workspaceId: string }): Promise<number>;
+  countActiveJobs(input: {
+    workspaceId: string;
+    createdBy?: string;
+  }): Promise<number>;
 };
 
 export const COUNT_ACTIVE_JOBS = "countActiveJobs";
@@ -109,6 +115,19 @@ where workspace_id = $1::uuid
 `;
 
 /**
+ * GN-20: the same count narrowed to one member. A second constant statement, not
+ * a concatenation: `created_by = $2::uuid` is bound with the same explicit cast
+ * as the workspace id.
+ */
+const COUNT_ACTIVE_JOBS_BY_MEMBER_SQL = `
+select count(*)::int as active
+from public.background_jobs
+where workspace_id = $1::uuid
+  and created_by = $2::uuid
+  and status in ('queued', 'running', 'retrying')
+`;
+
+/**
  * Build the PostgreSQL implementation. The pool is reached through a getter,
  * never stored: constructing the repository is free, and a missing
  * `DATABASE_URL` only surfaces as a `JobConcurrencyError` on an actual count.
@@ -127,6 +146,10 @@ export function createJobConcurrencyRepository(options: {
         input.workspaceId,
         "workspaceId",
       );
+      const createdBy =
+        input.createdBy === undefined
+          ? undefined
+          : requireCountArgument(input.createdBy, "createdBy");
 
       try {
         const pool = options.getTransactionPool();
@@ -138,9 +161,13 @@ export function createJobConcurrencyRepository(options: {
           // statement's own predicates are the rule.
           null,
           async (client) => {
-            const result = await client.query(COUNT_ACTIVE_JOBS_SQL, [
-              workspaceId,
-            ]);
+            const result =
+              createdBy === undefined
+                ? await client.query(COUNT_ACTIVE_JOBS_SQL, [workspaceId])
+                : await client.query(COUNT_ACTIVE_JOBS_BY_MEMBER_SQL, [
+                    workspaceId,
+                    createdBy,
+                  ]);
 
             // `count(*)` aggregates the whole table into exactly one row, so
             // any other row count is a statement/mapper disagreement.

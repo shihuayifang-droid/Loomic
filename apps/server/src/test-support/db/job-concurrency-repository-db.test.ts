@@ -576,3 +576,30 @@ describe("job concurrency count: moving a row between statuses moves the count",
     expect(byStatus.size).toBe(2);
   });
 });
+
+describe("job concurrency count: GN-20 counts one member", () => {
+  it("GN-20: createdBy counts only that member's active jobs", async () => {
+    const memberA = "00000000-0000-0000-0000-0000000a1005";
+    const memberB = "00000000-0000-0000-0000-0000000a1006";
+    await createUser(db, memberA, "job-concurrency-e@hahart.test");
+    await createUser(db, memberB, "job-concurrency-f@hahart.test");
+    const shared = await personalWorkspace(memberA);
+
+    // A: two queued + one succeeded. B: one running. All in the same workspace.
+    await insertJob("00000000-0000-0000-0000-0000000a1e01", shared, "queued", memberA);
+    await insertJob("00000000-0000-0000-0000-0000000a1e02", shared, "queued", memberA);
+    await insertJob("00000000-0000-0000-0000-0000000a1e03", shared, "succeeded", memberA);
+    await insertJob("00000000-0000-0000-0000-0000000a1e04", shared, "running", memberB);
+
+    await expect(
+      repository.countActiveJobs({ workspaceId: shared, createdBy: memberA }),
+    ).resolves.toBe(2);
+    await expect(
+      repository.countActiveJobs({ workspaceId: shared, createdBy: memberB }),
+    ).resolves.toBe(1);
+    // Without createdBy the whole workspace is counted.
+    await expect(
+      repository.countActiveJobs({ workspaceId: shared }),
+    ).resolves.toBe(3);
+  });
+});

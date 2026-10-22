@@ -1714,3 +1714,35 @@ describe("with-billing: BL-21 a paused member is refused before any quote or job
     expect(runSpy).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// GN-20 (workorder 39R): concurrency is a per-member limit, so the guard is told
+// WHICH member is submitting.
+// ---------------------------------------------------------------------------
+describe("with-billing: GN-20 concurrency is counted per member", () => {
+  it("GN-20: concurrency is counted for the submitting member", async () => {
+    const creditService = makeCreditService();
+    const tierGuard = makeTierGuard();
+    const jobService = makeJobService();
+    const priceQuoter = makePriceQuoter();
+
+    await withBilling(
+      {
+        creditService,
+        tierGuard,
+        jobService,
+        priceQuoter,
+        creditLedgerWriteRepository: makeLedger(),
+      },
+      { ...IMAGE_REQUEST, job: { payload: { prompt: "x" } } },
+      async () => "ok",
+    );
+
+    expect(tierGuard.checkConcurrency).toHaveBeenCalledTimes(1);
+    expect(tierGuard.checkConcurrency).toHaveBeenCalledWith(
+      WORKSPACE,
+      "pro",
+      USER.id,
+    );
+  });
+});

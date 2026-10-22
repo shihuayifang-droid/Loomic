@@ -389,7 +389,7 @@ export async function withBilling<T>(
           tierGuard.checkVideoResolution(sub.plan, guard.resolution);
         }
       }
-      await tierGuard.checkConcurrency(workspaceId, sub.plan);
+      await tierGuard.checkConcurrency(workspaceId, sub.plan, user.id);
     } catch (err) {
       if (err instanceof TierGuardError) {
         request.onRejected?.({ kind: "tier", error: err });
