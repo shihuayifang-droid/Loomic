@@ -12,6 +12,7 @@ import {
   fetchCapTemplates,
   fetchMemberCredits,
   setMemberCap,
+  setMemberGenerationPaused,
 } from "../src/lib/admin-credits-api";
 import { ApiApplicationError } from "../src/lib/server-api";
 
@@ -35,6 +36,7 @@ vi.mock("@/lib/admin-credits-api", () => ({
   adjustMemberTopup: vi.fn(),
   createCapTemplate: vi.fn(),
   applyCapTemplate: vi.fn(),
+  setMemberGenerationPaused: vi.fn(),
 }));
 
 const MEMBER: MemberCreditSummary = {
@@ -58,6 +60,7 @@ beforeEach(() => {
   vi.mocked(adjustMemberTopup).mockReset();
   vi.mocked(createCapTemplate).mockReset();
   vi.mocked(applyCapTemplate).mockReset();
+  vi.mocked(setMemberGenerationPaused).mockReset();
 
   vi.mocked(fetchMemberCredits).mockResolvedValue([MEMBER]);
   vi.mocked(fetchCapTemplates).mockResolvedValue([TEMPLATE]);
@@ -69,6 +72,10 @@ beforeEach(() => {
     cap: 50000,
   });
   vi.mocked(applyCapTemplate).mockResolvedValue(1);
+  vi.mocked(setMemberGenerationPaused).mockResolvedValue({
+    paused: true,
+    changed: true,
+  });
 });
 
 afterEach(() => {
@@ -263,6 +270,93 @@ describe("TeamCreditsAdmin · BL-01", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("credits-admin-template-error")).toHaveTextContent("已有同名模板");
+    });
+  });
+});
+
+describe("TeamCreditsAdmin · AD-01 pause / resume", () => {
+  /** 39O writes `generationPaused` only when it is true, so this is a whole paused row. */
+  const PAUSED_MEMBER: MemberCreditSummary = { ...MEMBER, generationPaused: true };
+
+  it("AD-01: a paused member shows 已暂停生成", async () => {
+    vi.mocked(fetchMemberCredits).mockResolvedValue([PAUSED_MEMBER]);
+
+    await renderPanel();
+
+    expect(screen.getByTestId("credits-admin-paused-u1")).toHaveTextContent("已暂停生成");
+    expect(screen.getByTestId("credits-admin-resume-u1")).toBeInTheDocument();
+  });
+
+  it("AD-01: pausing needs a reason", async () => {
+    await renderPanel();
+
+    fireEvent.click(screen.getByTestId("credits-admin-pause-open-u1"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("credits-admin-pause-submit-u1")).toBeDisabled();
+    });
+
+    fireEvent.change(screen.getByTestId("credits-admin-pause-reason-u1"), {
+      target: { value: "异常消耗" },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("credits-admin-pause-submit-u1")).not.toBeDisabled();
+    });
+    fireEvent.click(screen.getByTestId("credits-admin-pause-submit-u1"));
+
+    await waitFor(() => {
+      expect(setMemberGenerationPaused).toHaveBeenCalledWith("tok", "u1", {
+        paused: true,
+        reason: "异常消耗",
+      });
+    });
+    await waitFor(() => {
+      expect(vi.mocked(fetchMemberCredits).mock.calls).toHaveLength(2);
+    });
+  });
+
+  it("AD-01: a paused member can be resumed", async () => {
+    vi.mocked(fetchMemberCredits).mockResolvedValue([PAUSED_MEMBER]);
+    vi.mocked(setMemberGenerationPaused).mockResolvedValue({
+      paused: false,
+      changed: true,
+    });
+
+    await renderPanel();
+
+    fireEvent.click(screen.getByTestId("credits-admin-resume-u1"));
+
+    await waitFor(() => {
+      expect(setMemberGenerationPaused).toHaveBeenCalledWith("tok", "u1", {
+        paused: false,
+      });
+    });
+    await waitFor(() => {
+      expect(vi.mocked(fetchMemberCredits).mock.calls).toHaveLength(2);
+    });
+  });
+
+  it("AD-01: a refused pause shows the server message", async () => {
+    vi.mocked(setMemberGenerationPaused).mockRejectedValue(
+      new ApiApplicationError("invalid_request", "暂停需要填写原因"),
+    );
+
+    await renderPanel();
+
+    fireEvent.click(screen.getByTestId("credits-admin-pause-open-u1"));
+    fireEvent.change(screen.getByTestId("credits-admin-pause-reason-u1"), {
+      target: { value: "异常消耗" },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("credits-admin-pause-submit-u1")).not.toBeDisabled();
+    });
+    fireEvent.click(screen.getByTestId("credits-admin-pause-submit-u1"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("credits-admin-pause-error-u1")).toHaveTextContent(
+        "暂停需要填写原因",
+      );
     });
   });
 });

@@ -9,6 +9,7 @@ import {
   fetchMemberCredits,
   fetchTeamMembers,
   setMemberCap,
+  setMemberGenerationPaused,
 } from "../src/lib/admin-credits-api";
 import { ApiApplicationError, ApiAuthError } from "../src/lib/server-api";
 
@@ -244,5 +245,31 @@ describe("admin credits API", () => {
 
     expect(thrown).toBeInstanceOf(ApiApplicationError);
     expect(thrown).toMatchObject({ code: "application_error" });
+  });
+
+  it("AD-01: setMemberGenerationPaused sends paused and reason", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ paused: true, changed: true }),
+    });
+
+    const result = await setMemberGenerationPaused("t", "u1", {
+      paused: true,
+      reason: "异常消耗",
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "http://localhost:3001/api/admin/team/members/u1/generation",
+      expect.objectContaining({
+        method: "PUT",
+        headers: {
+          Authorization: "Bearer t",
+          "content-type": "application/json",
+        },
+        body: '{"paused":true,"reason":"异常消耗"}',
+      }),
+    );
+    expect(result).toEqual({ paused: true, changed: true });
   });
 });

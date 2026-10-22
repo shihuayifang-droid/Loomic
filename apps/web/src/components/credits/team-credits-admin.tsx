@@ -14,6 +14,7 @@ import {
   fetchCapTemplates,
   fetchMemberCredits,
   setMemberCap,
+  setMemberGenerationPaused,
 } from "@/lib/admin-credits-api";
 import { useAuth } from "@/lib/auth-context";
 
@@ -90,6 +91,13 @@ export function TeamCreditsAdmin(props: TeamCreditsAdminProps) {
   const [templateCap, setTemplateCap] = useState("");
   const [templateError, setTemplateError] = useState<string | null>(null);
   const [appliedCount, setAppliedCount] = useState<number | null>(null);
+
+  // AD-01 / BL-21: pause / resume one member's generation
+  const [pauseFor, setPauseFor] = useState<string | null>(null);
+  const [pauseReason, setPauseReason] = useState("");
+  const [pauseErrorFor, setPauseErrorFor] = useState<string | null>(null);
+  const [pauseError, setPauseError] = useState<string | null>(null);
+  const [pausing, setPausing] = useState(false);
 
   const reloadMembers = useCallback(async () => {
     const token = accessTokenRef.current;
@@ -169,6 +177,48 @@ export function TeamCreditsAdmin(props: TeamCreditsAdminProps) {
       setAdjustError(messageOf(error));
     } finally {
       setAdjusting(false);
+    }
+  };
+
+  // ── AD-01 / BL-21: pause / resume a member's generation ──
+
+  const handlePauseSubmit = async (userId: string) => {
+    const token = accessTokenRef.current;
+    const reason = pauseReason.trim();
+    if (!token || reason.length === 0 || pausing) return;
+    setPausing(true);
+    setPauseError(null);
+    setPauseErrorFor(null);
+    try {
+      await setMemberGenerationPaused(token, userId, { paused: true, reason });
+      setPauseFor(null);
+      setPauseReason("");
+      await reloadMembers();
+    } catch (error) {
+      // The server's own words, e.g. 暂停需要填写原因.
+      setPauseErrorFor(userId);
+      setPauseError(messageOf(error));
+    } finally {
+      setPausing(false);
+    }
+  };
+
+  const handleResume = async (userId: string) => {
+    const token = accessTokenRef.current;
+    if (!token || pausing) return;
+    setPausing(true);
+    setPauseError(null);
+    setPauseErrorFor(null);
+    try {
+      await setMemberGenerationPaused(token, userId, { paused: false });
+      setPauseFor(null);
+      setPauseReason("");
+      await reloadMembers();
+    } catch (error) {
+      setPauseErrorFor(userId);
+      setPauseError(messageOf(error));
+    } finally {
+      setPausing(false);
     }
   };
 
@@ -274,6 +324,9 @@ export function TeamCreditsAdmin(props: TeamCreditsAdminProps) {
               const isEditingCap = capEditingFor === member.userId;
               const capDraftValue = parseCapInput(capDraft);
               const isAdjusting = adjustFor === member.userId;
+              // AD-01 / BL-21: the schema writes this key only when it is true.
+              const isPaused = member.generationPaused === true;
+              const isPausing = pauseFor === member.userId;
               return (
                 <Fragment key={member.userId}>
                   <tr
@@ -290,22 +343,32 @@ export function TeamCreditsAdmin(props: TeamCreditsAdminProps) {
                       />
                     </td>
                     <td className="px-4 py-2.5 align-top">
-                      {named ? (
-                        <div className="flex flex-col">
-                          <span className="font-medium text-foreground">
-                            {named.displayName ?? named.email}
-                          </span>
-                          {named.displayName ? (
-                            <span className="text-xs text-muted-foreground">
-                              {named.email}
+                      <div className="flex flex-col gap-1">
+                        {named ? (
+                          <div className="flex flex-col">
+                            <span className="font-medium text-foreground">
+                              {named.displayName ?? named.email}
                             </span>
-                          ) : null}
-                        </div>
-                      ) : (
-                        <span className="font-medium text-foreground">
-                          {member.userId}
-                        </span>
-                      )}
+                            {named.displayName ? (
+                              <span className="text-xs text-muted-foreground">
+                                {named.email}
+                              </span>
+                            ) : null}
+                          </div>
+                        ) : (
+                          <span className="font-medium text-foreground">
+                            {member.userId}
+                          </span>
+                        )}
+                        {isPaused ? (
+                          <span
+                            data-testid={`credits-admin-paused-${member.userId}`}
+                            className="w-fit rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs text-amber-700"
+                          >
+                            已暂停生成
+                          </span>
+                        ) : null}
+                      </div>
                     </td>
                     <td className="px-4 py-2.5 text-right tabular-nums">
                       {formatNumber(member.personalCap)}
@@ -370,7 +433,61 @@ export function TeamCreditsAdmin(props: TeamCreditsAdminProps) {
                         >
                           调积分
                         </button>
+                        {isPaused ? (
+                          <button
+                            data-testid={`credits-admin-resume-${member.userId}`}
+                            type="button"
+                            onClick={() => void handleResume(member.userId)}
+                            disabled={pausing}
+                            aria-label={`恢复 ${named?.displayName ?? named?.email ?? member.userId} 的生成`}
+                            className="rounded-md border px-3 py-1 text-xs transition-colors hover:bg-secondary disabled:opacity-50"
+                          >
+                            恢复生成
+                          </button>
+                        ) : isPausing ? (
+                          <>
+                            <input
+                              data-testid={`credits-admin-pause-reason-${member.userId}`}
+                              type="text"
+                              value={pauseReason}
+                              onChange={(event) => setPauseReason(event.target.value)}
+                              aria-label={`暂停原因（${named?.displayName ?? named?.email ?? member.userId}）`}
+                              className="w-56 rounded-md border px-2 py-1 text-sm"
+                            />
+                            <button
+                              data-testid={`credits-admin-pause-submit-${member.userId}`}
+                              type="button"
+                              onClick={() => void handlePauseSubmit(member.userId)}
+                              disabled={pauseReason.trim().length === 0 || pausing}
+                              className="rounded-md border px-3 py-1 text-xs transition-colors hover:bg-secondary disabled:opacity-50"
+                            >
+                              确认暂停
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            data-testid={`credits-admin-pause-open-${member.userId}`}
+                            type="button"
+                            onClick={() => {
+                              setPauseFor(member.userId);
+                              setPauseReason("");
+                              setPauseError(null);
+                              setPauseErrorFor(null);
+                            }}
+                            className="rounded-md border px-3 py-1 text-xs transition-colors hover:bg-secondary"
+                          >
+                            暂停生成
+                          </button>
+                        )}
                       </div>
+                      {pauseErrorFor === member.userId && pauseError ? (
+                        <p
+                          data-testid={`credits-admin-pause-error-${member.userId}`}
+                          className="mt-1 text-xs text-destructive"
+                        >
+                          {pauseError}
+                        </p>
+                      ) : null}
                       {isEditingCap && capError ? (
                         <p
                           data-testid={`credits-admin-cap-error-${member.userId}`}

@@ -8,6 +8,7 @@ import type {
 
 import {
   adminCreditAdjustResponseSchema,
+  adminGenerationPauseResponseSchema,
   adminPersonalCapResponseSchema,
   creditCapTemplateApplyResponseSchema,
   creditCapTemplateListResponseSchema,
@@ -186,4 +187,39 @@ export async function applyCapTemplate(
   );
   if (!parsed.success) return invalidResponse();
   return parsed.data.applied;
+}
+
+// ── AD-01 / BL-21: pause / resume one member's generation ────
+
+/**
+ * `PUT /api/admin/team/members/:userId/generation`.
+ *
+ * `reason` is sent only when the caller supplies one: the route insists on a
+ * reason for a pause (「暂停需要填写原因」) and a resume carries none, so an
+ * explicit `undefined` would have to be stripped from the body anyway.
+ * `changed: false` is a normal 200 — the member was already in that state.
+ */
+export async function setMemberGenerationPaused(
+  accessToken: string,
+  userId: string,
+  input: { paused: boolean; reason?: string },
+): Promise<{ paused: boolean; changed: boolean }> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/admin/team/members/${encodeURIComponent(userId)}/generation`,
+    {
+      method: "PUT",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify(
+        input.reason === undefined || input.reason === ""
+          ? { paused: input.paused }
+          : { paused: input.paused, reason: input.reason },
+      ),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  const parsed = adminGenerationPauseResponseSchema.safeParse(
+    await response.json().catch(() => null),
+  );
+  if (!parsed.success) return invalidResponse();
+  return { paused: parsed.data.paused, changed: parsed.data.changed };
 }
