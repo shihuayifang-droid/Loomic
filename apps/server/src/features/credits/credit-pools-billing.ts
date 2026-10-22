@@ -58,7 +58,7 @@ function sqlStateOf(error: unknown): string | undefined {
   return undefined;
 }
 
-function toDeductError(error: unknown): CreditServiceError {
+export function toDeductError(error: unknown): CreditServiceError {
   switch (sqlStateOf(error)) {
     case POOL_SQLSTATE.insufficient:
       return new CreditServiceError(
@@ -142,6 +142,16 @@ export function withCreditPools(
 
       // The job was charged the old way: it is refunded the old way.
       return base.refundCredits(workspaceId, userId, amount, jobId, description);
+    },
+
+    // Workorder 39F (GN-33): which workspace the one-transaction charge hits,
+    // and whether it uses the pools. Same decision `deductCredits` makes.
+    async chargeTarget(workspaceId) {
+      const teamWorkspaceId = await deps.resolveTeamWorkspaceId();
+      if (teamWorkspaceId !== null) {
+        return { workspaceId: teamWorkspaceId, usePools: true };
+      }
+      return { workspaceId, usePools: false };
     },
 
     async availableFor(input) {

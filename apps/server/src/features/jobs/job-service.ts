@@ -20,6 +20,8 @@ import type { JobOwnerReadRepository } from "../../db/job-owner-read-repository.
 import type { JobOwnerWriteRepository } from "../../db/job-owner-write-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import type { JobTransitionRepository } from "../../db/job-transition-repository.js";
+import type { ChargedJobWriteRepository } from "../../db/charged-job-write-repository.js";
+import { toDeductError } from "../credits/credit-pools-billing.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -67,6 +69,21 @@ export type CreateJobInput = {
 
 export type JobService = {
   createJob(user: AuthenticatedUser, input: CreateJobInput): Promise<BackgroundJob>;
+  /**
+   * Workorder 39F (GN-33): create the job, charge it and enqueue it in ONE
+   * database transaction. Present only when a charged-job repository is wired.
+   * Runs the same project / canvas authorization as `createJob`.
+   */
+  createChargedJob?(
+    user: AuthenticatedUser,
+    input: CreateJobInput,
+    charge: {
+      amount: number;
+      description?: string;
+      usePools: boolean;
+      chargeWorkspaceId: string;
+    },
+  ): Promise<{ job: BackgroundJob; transactionId: string }>;
   getJob(user: AuthenticatedUser, jobId: string): Promise<BackgroundJob>;
   /**
    * ED-00m: the job this caller already submitted under `clientRequestId` within
@@ -266,6 +283,11 @@ export function createJobService(options: {
    * the job project."). There is deliberately no user-client fallback.
    */
   projectReadRepository?: ProjectReadRepository;
+  /**
+   * Workorder 39F (GN-33): the one-transaction create + charge + enqueue. When
+   * absent, `createChargedJob` does not exist on the service.
+   */
+  chargedJobWriteRepository?: ChargedJobWriteRepository;
 }): JobService {
   function mapJobRow(row: Record<string, unknown>): BackgroundJob {
     return {
@@ -326,7 +348,78 @@ export function createJobService(options: {
     }
   }
 
-  return {
+  /**
+   * Workorder 39F: the project / canvas authorization `createJob` has always run,
+   * lifted out unchanged so `createChargedJob` asks exactly the same question.
+   */
+  async function resolveProjectId(
+    user: AuthenticatedUser,
+    input: CreateJobInput,
+  ): Promise<string | undefined> {
+    let projectId = input.projectId;
+
+    if (input.canvasId) {
+      // The canvas is read through the repository, whose statement applies
+      // `private.can_read_project` — the same rule the `canvases` RLS policy
+      // applied — and, deliberately, no `archived_at` filter.
+      const repository = options.canvasReadRepository;
+      if (!repository) throw jobCanvasNotVerified();
+
+      let canvas: CanvasProjectLinkRow | null;
+      try {
+        canvas = await repository.findReadableCanvasProjectLink({
+          actorId: user.id,
+          canvasId: input.canvasId,
+        });
+      } catch {
+        throw jobCanvasNotVerified();
+      }
+
+      if (!canvas?.project_id) {
+        throw new JobServiceError(
+          "job_create_failed",
+          "Canvas not found or not accessible to this user.",
+          403,
+        );
+      }
+      if (projectId && projectId !== canvas.project_id) {
+        throw new JobServiceError(
+          "job_create_failed",
+          "Canvas and project do not match.",
+          400,
+        );
+      }
+
+      projectId = canvas.project_id;
+    } else if (projectId) {
+      // The no-archive-filter read again: the archived clause belongs to the
+      // read contract, and this is the write-authorization question the
+      // `projects` RLS policy answered.
+      const repository = options.projectReadRepository;
+      if (!repository) throw jobProjectNotVerified();
+
+      let project: ProjectWorkspaceLookupRow | null;
+      try {
+        project = await repository.findReadableProjectWorkspaceForMutation({
+          actorId: user.id,
+          projectId,
+        });
+      } catch {
+        throw jobProjectNotVerified();
+      }
+
+      if (!project) {
+        throw new JobServiceError(
+          "job_create_failed",
+          "Project not found or not accessible to this user.",
+          403,
+        );
+      }
+    }
+    return projectId;
+  }
+
+  const service: JobService = {
     async createJob(user, input) {
       const client = options.createUserClient(user.accessToken);
       const queueName = queueForJobType(input.jobType);
@@ -347,66 +440,7 @@ export function createJobService(options: {
       //
       // `client` is still built here (and still the caller's): the INSERT below
       // and the compensation DELETE of a failed enqueue both run through it.
-      let projectId = input.projectId;
-
-      if (input.canvasId) {
-        // The canvas is read through the repository, whose statement applies
-        // `private.can_read_project` — the same rule the `canvases` RLS policy
-        // applied — and, deliberately, no `archived_at` filter.
-        const repository = options.canvasReadRepository;
-        if (!repository) throw jobCanvasNotVerified();
-
-        let canvas: CanvasProjectLinkRow | null;
-        try {
-          canvas = await repository.findReadableCanvasProjectLink({
-            actorId: user.id,
-            canvasId: input.canvasId,
-          });
-        } catch {
-          throw jobCanvasNotVerified();
-        }
-
-        if (!canvas?.project_id) {
-          throw new JobServiceError(
-            "job_create_failed",
-            "Canvas not found or not accessible to this user.",
-            403,
-          );
-        }
-        if (projectId && projectId !== canvas.project_id) {
-          throw new JobServiceError(
-            "job_create_failed",
-            "Canvas and project do not match.",
-            400,
-          );
-        }
-
-        projectId = canvas.project_id;
-      } else if (projectId) {
-        // The no-archive-filter read again: the archived clause belongs to the
-        // read contract, and this is the write-authorization question the
-        // `projects` RLS policy answered.
-        const repository = options.projectReadRepository;
-        if (!repository) throw jobProjectNotVerified();
-
-        let project: ProjectWorkspaceLookupRow | null;
-        try {
-          project = await repository.findReadableProjectWorkspaceForMutation({
-            actorId: user.id,
-            projectId,
-          });
-        } catch {
-          throw jobProjectNotVerified();
-        }
-
-        if (!project) {
-          throw new JobServiceError(
-            "job_create_failed",
-            "Project not found or not accessible to this user.",
-            403,
-          );
-        }
-      }
+      const projectId = await resolveProjectId(user, input);
 
       const { data: job, error } = await client
         .from("background_jobs")
@@ -787,6 +821,57 @@ export function createJobService(options: {
       };
     },
   };
+
+  // Workorder 39F (GN-33): exists only when the repository is wired.
+  const chargedRepository = options.chargedJobWriteRepository;
+  if (chargedRepository) {
+    service.createChargedJob = async (user, input, charge) => {
+      const queueName = queueForJobType(input.jobType);
+      // Same authorization, same order, same errors as `createJob`.
+      const projectId = await resolveProjectId(user, input);
+
+      try {
+        const { row, transactionId } = await chargedRepository.createChargedJob({
+          workspaceId: input.workspaceId,
+          userId: user.id,
+          projectId: projectId ?? null,
+          canvasId: input.canvasId ?? null,
+          sessionId: input.sessionId ?? null,
+          threadId: input.threadId ?? null,
+          queueName,
+          jobType: input.jobType,
+          payload: input.payload,
+          clientRequestId: input.clientRequestId ? input.clientRequestId : null,
+          amount: charge.amount,
+          description: charge.description ?? null,
+          usePools: charge.usePools,
+          chargeWorkspaceId: charge.chargeWorkspaceId,
+          // `job_id` is added by the SQL function.
+          message: {
+            job_type: input.jobType,
+            workspace_id: input.workspaceId,
+            ...(input.canvasId ? { canvas_id: input.canvasId } : {}),
+            ...(input.sessionId ? { session_id: input.sessionId } : {}),
+          },
+        });
+
+        return { job: mapJobRow(row), transactionId };
+      } catch (error) {
+        const code = (error as { code?: unknown } | null)?.code;
+        if (code === "P0402" || code === "P0403" || code === "P0404") {
+          throw toDeductError(error);
+        }
+        console.error("[job-service] createChargedJob failed:", error);
+        throw new JobServiceError(
+          "job_create_failed",
+          "Failed to create job record.",
+          500,
+        );
+      }
+    };
+  }
+
+  return service;
 }
 
 /**

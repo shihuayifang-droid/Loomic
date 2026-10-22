@@ -125,6 +125,7 @@ import { createJobTransitionRepository } from "./db/job-transition-repository.js
 import { createCreditReadRepository } from "./db/credit-read-repository.js";
 import { createCreditLedgerWriteRepository } from "./db/credit-ledger-write-repository.js";
 import { createPricingRuleRepository } from "./db/pricing-rule-repository.js";
+import { createChargedJobWriteRepository } from "./db/charged-job-write-repository.js";
 import {
   createJobCreditsLinkRepository,
   type JobCreditsLinkRepository,
@@ -676,6 +677,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           pgmq,
           jobAttemptRepository,
           jobCreditsLinkRepository,
+          // Workorder 39F (GN-33): the one-transaction create-and-charge
+          // entry. Built lazily against the same pool; nothing calls it yet.
+          chargedJobWriteRepository: createChargedJobWriteRepository({
+            getTransactionPool: () => getTransactionPool(databaseEnv),
+          }),
           // ADR-0001 / workorder 21I: the admin single-row read behind
           // `getJobAdmin` — the job watcher's poll and the agent runtime's
           // re-read. Built lazily against the same pool as the repositories

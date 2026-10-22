@@ -94,6 +94,14 @@ export type CreditService = {
    * `null` for "use the old balance". Only the `LOOMIC_CREDIT_POOLS=on` wrapper
    * has it.
    */
+  /**
+   * Workorder 39F (GN-33): the workspace a one-transaction charge hits and
+   * whether it draws on the three pools. Only the pools wrapper has it; a
+   * caller without it treats the answer as `{ workspaceId, usePools: false }`.
+   */
+  chargeTarget?(
+    workspaceId: string,
+  ): Promise<{ workspaceId: string; usePools: boolean }>;
   availableFor?(input: {
     workspaceId: string;
     userId: string;

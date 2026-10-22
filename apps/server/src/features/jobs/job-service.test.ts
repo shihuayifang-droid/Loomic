@@ -3611,3 +3611,166 @@ describe("ED-00m: the same submission id is the same job (工单34U)", () => {
     expect(harness.jobOwnerReadCalls).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Workorder 39F (GN-33 step 2): the one-transaction create + charge entry.
+// ---------------------------------------------------------------------------
+
+describe("createChargedJob: the atomic create-and-charge entry (工单39F)", () => {
+  const CHARGE_USER = {
+    accessToken: "token-39f",
+    email: "charged@hahart.test",
+    id: "user-39f",
+    userMetadata: {},
+  };
+  const CHARGE = {
+    amount: 12,
+    description: "image",
+    usePools: true,
+    chargeWorkspaceId: "ws-team",
+  };
+
+  function makeChargedService(
+    options: {
+      project?: { workspace_id: string } | null;
+      write?: () => Promise<{ row: Record<string, unknown>; transactionId: string }>;
+      wired?: boolean;
+    } = {},
+  ) {
+    const writes: Array<Record<string, unknown>> = [];
+    const repository = {
+      createChargedJob: vi.fn(async (input: Record<string, unknown>) => {
+        writes.push(input);
+        if (options.write) return options.write();
+        return { row: WRITE_JOB_ROW, transactionId: "tx-39f" };
+      }),
+    };
+    const service = createJobService({
+      createUserClient: () => {
+        throw new Error("the user client must not be used");
+      },
+      getAdminClient: () => {
+        throw new Error("the admin client must not be used");
+      },
+      pgmq: {
+        send: async () => {
+          throw new Error("pgmq must not be used");
+        },
+      } as unknown as PgmqClient,
+      projectReadRepository: {
+        findReadableProjectWorkspaceForMutation: async () =>
+          options.project === undefined ? { workspace_id: "ws-1" } : options.project,
+      } as unknown as ProjectReadRepository,
+      ...(options.wired === false
+        ? {}
+        : { chargedJobWriteRepository: repository as never }),
+    });
+    return { service, repository, writes };
+  }
+
+  it("GN-33: createChargedJob exists only when the repository is wired", () => {
+    expect(makeChargedService({ wired: false }).service.createChargedJob).toBeUndefined();
+    expect(typeof makeChargedService().service.createChargedJob).toBe("function");
+  });
+
+  it("GN-33: createChargedJob runs the same project check as createJob", async () => {
+    const { service, repository } = makeChargedService({ project: null });
+
+    const error = await service
+      .createChargedJob!(
+        CHARGE_USER,
+        {
+          workspaceId: "ws-1",
+          projectId: "project-1",
+          jobType: "image_generation",
+          payload: {},
+        },
+        CHARGE,
+      )
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_create_failed");
+    expect(error?.statusCode).toBe(403);
+    expect(repository.createChargedJob).toHaveBeenCalledTimes(0);
+  });
+
+  it("GN-33: createChargedJob passes the job, charge and message in one call", async () => {
+    const { service, repository, writes } = makeChargedService();
+
+    const result = await service.createChargedJob!(
+      CHARGE_USER,
+      {
+        workspaceId: "ws-1",
+        projectId: "project-1",
+        sessionId: "session-1",
+        jobType: "image_generation",
+        payload: { prompt: "a red fox" },
+      },
+      CHARGE,
+    );
+
+    expect(repository.createChargedJob).toHaveBeenCalledTimes(1);
+    const write = writes[0] as Record<string, unknown>;
+    expect(write.queueName).toBe("image_generation_jobs");
+    expect(write.jobType).toBe("image_generation");
+    expect(write.amount).toBe(12);
+    expect(write.usePools).toBe(true);
+    expect(write.chargeWorkspaceId).toBe("ws-team");
+    expect(write.userId).toBe("user-39f");
+    expect(write.projectId).toBe("project-1");
+    expect(write.message).toEqual({
+      job_type: "image_generation",
+      workspace_id: "ws-1",
+      session_id: "session-1",
+    });
+    expect(write.message).not.toHaveProperty("job_id");
+    expect(result.transactionId).toBe("tx-39f");
+    expect(result.job.id).toBe("job-21h0");
+    expect(result.job.status).toBe("queued");
+  });
+
+  it("GN-33: a P0403 from the database is personal_cap_reached", async () => {
+    const { service } = makeChargedService({
+      write: async () => {
+        throw Object.assign(new Error("cap"), { code: "P0403" });
+      },
+    });
+
+    const error = await service
+      .createChargedJob!(
+        CHARGE_USER,
+        { workspaceId: "ws-1", jobType: "image_generation", payload: {} },
+        CHARGE,
+      )
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as { code?: string; statusCode?: number });
+
+    expect(error).toBeInstanceOf(CreditServiceError);
+    expect(error?.code).toBe("personal_cap_reached");
+    expect(error?.statusCode).toBe(402);
+  });
+
+  it("GN-33: any other database error is job_create_failed", async () => {
+    const { service } = makeChargedService({
+      write: async () => {
+        throw Object.assign(new Error("boom"), { code: "XX000" });
+      },
+    });
+
+    const error = await service
+      .createChargedJob!(
+        CHARGE_USER,
+        { workspaceId: "ws-1", jobType: "image_generation", payload: {} },
+        CHARGE,
+      )
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_create_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to create job record.");
+  });
+});
