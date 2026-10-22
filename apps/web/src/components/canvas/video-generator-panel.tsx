@@ -1,6 +1,6 @@
 "use client";
 
-import type { VideoResolution } from "@loomic/shared";
+import type { GenerateVideoRequest, VideoResolution } from "@loomic/shared";
 import { Lock, Plus, Zap } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -20,6 +20,13 @@ import { errorCodeOf, lookupError } from "../../lib/error-catalog";
 import { fitResultIntoSlot } from "../../lib/fit-result";
 import { formatRetryLabel } from "../../lib/job-status";
 import type { WebSocketHandle } from "../../hooks/use-websocket";
+
+import { PriceTag } from "@/components/ui/price-tag";
+import {
+  useGenerationQuote,
+  type GenerationQuoteInput,
+} from "@/hooks/use-generation-quote";
+
 // No longer needs poster frame extraction -- videos use embeddable elements
 
 type VideoGeneratorPanelProps = {
@@ -35,6 +42,12 @@ type VideoGeneratorPanelProps = {
    * awaitJobCompletion still delivers the result, just a few seconds later.
    */
   ws?: WebSocketHandle;
+  /**
+   * BL-45 / T-109: 三池可用额度（`useCredits().balance`），由宿主传入。
+   * 不传 = 本面板既不询价也不做额度预检（宿主接 `useCredits` 是下一张单，
+   * 现有三份渲染本面板的测试都不传它）。
+   */
+  availableCredits?: number | null;
 };
 
 const ASPECT_RATIOS = ["16:9", "9:16"] as const;
@@ -59,6 +72,7 @@ export function VideoGeneratorPanel({
   canvasScrollZoom,
   onClose,
   ws,
+  availableCredits,
 }: VideoGeneratorPanelProps) {
   const [prompt, setPrompt] = useState(data.prompt);
   const [model, setModel] = useState(data.model);
@@ -195,6 +209,47 @@ export function VideoGeneratorPanel({
     (rate) => rate.resolution === resolution,
   );
 
+  /**
+   * BL-45 / T-109：提交之前的「这次要花多少」与「够不够」，与图片面板同一口径。
+   *
+   * 只在宿主传了 `availableCredits` 时才启用：不传就整块关掉 —— 不发询价请求、
+   * 不渲染价格、不拦提交。价格数字只来自询价（BL-14 验收 1：前端不算价），
+   * `precheck` 只是把询价结果与余额比一下（口径在 `use-generation-quote` 里）。
+   *
+   * 询价请求体**不带 `inputImages`**：首尾帧是 data URL，体积大且不影响计价；
+   * 服务端提交时仍按真实请求（含帧）扣费。
+   */
+  const quoteEnabled = availableCredits !== undefined;
+  const quoteInput: GenerationQuoteInput | null =
+    quoteEnabled && prompt.trim()
+      ? {
+          kind: "video_generation",
+          request: {
+            prompt: prompt.trim(),
+            model,
+            duration,
+            // 面板状态是元素自定义数据里的字符串（旧数据可能是任意值），提交
+            // 走的是 `submitVideoJob` 的宽松参数；询价请求体按契约收窄。
+            resolution:
+              resolution as NonNullable<GenerateVideoRequest["resolution"]>,
+            aspectRatio:
+              aspectRatio as NonNullable<GenerateVideoRequest["aspectRatio"]>,
+          },
+        }
+      : null;
+  const { price, precheck } = useGenerationQuote(
+    accessToken,
+    quoteInput,
+    availableCredits ?? null,
+  );
+  /**
+   * T-109：额度不够时按钮上方要写清「差多少」，而不是只把按钮变灰。
+   * 这里同时在按钮的 `title` / `aria-label` 上说一遍，鼠标悬停与读屏都拿得到。
+   */
+  const precheckReason = precheck.ok
+    ? null
+    : `积分不足：本次需要 ${precheck.required}，当前可用 ${precheck.available}`;
+
   const handleAspectRatioChange = useCallback(
     (ratio: string) => {
       setAspectRatio(ratio);
@@ -274,6 +329,9 @@ export function VideoGeneratorPanel({
 
   const handleGenerate = useCallback(async () => {
     if (!prompt.trim() || loading) return;
+    // T-109：键盘 Enter 走的也是这条路径，光把按钮 disabled 挡不住回车，
+    // 所以预检在这里再拦一次（与按钮的 disabled 同一个口径）。
+    if (!precheck.ok) return;
 
     // Cancel any previous in-flight request
     abortRef.current?.abort();
@@ -473,6 +531,7 @@ export function VideoGeneratorPanel({
     handleGenerationError,
     begin,
     end,
+    precheck,
   ]);
 
   /**
@@ -679,6 +738,15 @@ export function VideoGeneratorPanel({
         </div>
       )}
 
+      {/* T-109：额度不够时，按钮上方先写清原因（按钮变灰只说「不能点」） */}
+      {precheckReason !== null && (
+        <p data-testid="canvas-video-generator-precheck"
+          className="mx-4 mb-2 text-right text-xs text-destructive"
+        >
+          {precheckReason}
+        </p>
+      )}
+
       {/* Bottom toolbar */}
       <div className="flex items-center justify-between px-2 pb-2">
         {/* Left: params button */}
@@ -863,11 +931,16 @@ export function VideoGeneratorPanel({
             </button>
           )}
 
+          {/* GN-01 / BL-45：提交前先让人看到这次要花多少（与「更多」菜单同一个组件） */}
+          {quoteEnabled && <PriceTag state={price} variant="badge" />}
+
           {/* Generate button */}
           <button data-testid="canvas-video-generator-submit"
             type="button"
             onClick={() => void handleGenerate()}
-            disabled={!prompt.trim() || loading}
+            disabled={!prompt.trim() || loading || !precheck.ok}
+            title={precheckReason ?? undefined}
+            aria-label={precheckReason ?? undefined}
             className="flex h-8 items-center justify-center gap-1 rounded-full bg-primary px-3 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground"
           >
             {loading ? (
