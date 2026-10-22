@@ -923,4 +923,18 @@ describe("admin team credit routes", () => {
     // 未暂停的成员不带这个键，而不是带一个 false。
     expect(Object.hasOwn(members[1] ?? {}, "generationPaused")).toBe(false);
   });
+
+  it("QA-12: a non-admin cannot set a member's cap", async () => {
+    const refused = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/cap`,
+      headers: bearer("member-token"),
+      payload: { cap: 30000 },
+    });
+
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json().error.code).toBe("forbidden");
+    // The repository is never asked: the refusal happens before the write.
+    expect(capCalls.length).toBe(0);
+  });
 });

@@ -103,3 +103,73 @@ describe("OP-13 .env.example", () => {
     ).toEqual([]);
   });
 });
+
+/**
+ * QA-12: the same "carries no real secret" rule, applied to the two per-package
+ * examples the OP-13 case above does not read.
+ *
+ * The judgement is the existing one -- `SECRET_NAME_PATTERN` for "is this a
+ * credential", `EXAMPLE_KEY_PATTERN` for how a line is parsed, `isPlaceholder()`
+ * for "is this an obvious stub". No new rule is introduced here; only the files
+ * being read differ, which is why this case can be appended rather than folded
+ * into the root-file case.
+ */
+const PACKAGE_ENV_EXAMPLES = [
+  "apps/server/.env.local.example",
+  "apps/web/.env.local.example",
+] as const;
+
+describe("QA-12 package env examples", () => {
+  it("QA-12: the package env examples carry no real secret", () => {
+    const sources = [
+      {
+        label: PACKAGE_ENV_EXAMPLES[0],
+        text: readFileSync(
+          new URL("../../.env.local.example", import.meta.url),
+          "utf8",
+        ),
+      },
+      {
+        label: PACKAGE_ENV_EXAMPLES[1],
+        text: readFileSync(
+          new URL("../../../../apps/web/.env.local.example", import.meta.url),
+          "utf8",
+        ),
+      },
+    ];
+
+    const offenders: string[] = [];
+    let secretShapedKeys = 0;
+
+    for (const source of sources) {
+      for (const match of source.text.matchAll(EXAMPLE_KEY_PATTERN)) {
+        const key = match[1];
+        if (!key) {
+          continue;
+        }
+        if (!SECRET_NAME_PATTERN.test(key)) {
+          continue;
+        }
+        secretShapedKeys += 1;
+        const rawValue = match[2] ?? "";
+        const withoutComment = rawValue.split("#")[0] ?? "";
+
+        if (!isPlaceholder(withoutComment.trim())) {
+          // File and key name only: a real value must never be copied into a
+          // test report.
+          offenders.push(`${source.label}: ${key}`);
+        }
+      }
+    }
+
+    expect(
+      secretShapedKeys,
+      "no credential-looking key was found, so the assertion below proves nothing",
+    ).toBeGreaterThan(0);
+
+    expect(
+      offenders,
+      `secret-looking keys with a non-placeholder value: ${offenders.join(", ")}`,
+    ).toEqual([]);
+  });
+});
