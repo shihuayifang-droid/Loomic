@@ -375,7 +375,7 @@ export async function registerSkillRoutes(
       const user = await options.auth.authenticate(request);
       if (!user) return sendUnauthenticated(reply);
 
-      const body = request.body as { skillId?: string };
+      const body = (request.body ?? {}) as { skillId?: unknown };
       if (!body.skillId || typeof body.skillId !== "string") {
         return reply.code(400).send(
           applicationErrorResponseSchema.parse({

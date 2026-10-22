@@ -959,15 +959,17 @@ describe("POST /api/workspaces/skills", () => {
     expect(repositoryCalls).toEqual([]);
   });
 
-  it("case 26: no body at all is still a 500 — the frozen T-61 behaviour, not a fix", async () => {
+  it("case 26: no body at all is the existing 400 (T-61 ④ fixed)", async () => {
     buildAppWith({ findVisibleSkill: async () => unexpected("findVisibleSkill") });
 
     const response = await inject({ method: "POST", url: "/api/workspaces/skills" });
 
-    expect(response.statusCode).toBe(500);
+    // No body is no skillId: the very same 400 as case 25, not a TypeError-derived 500.
+    expect(response.statusCode).toBe(400);
     expect(response.json()).toEqual({
-      error: { code: "skill_install_failed", message: "Unable to install skill." },
+      error: { code: "skill_install_failed", message: "skillId is required." },
     });
+    expect(repositoryCalls).toEqual([]);
   });
 
   it("case 27: an invisible AND a failing lookup both answer 404 'Skill not found.'", async () => {
@@ -1394,7 +1396,7 @@ describe("POST /api/skills/marketplace/install", () => {
     expect(repositoryCalls).toEqual([]);
   });
 
-  it("case 41: a ZodError on the request body is still a 500 — frozen T-61, not a 400", async () => {
+  it("case 41: a ZodError on the request body is a 400 (T-61 ③ fixed)", async () => {
     buildAppWith({ insertOwnSkill: async () => SKILL_ROW });
 
     const response = await inject({
@@ -1403,16 +1405,48 @@ describe("POST /api/skills/marketplace/install", () => {
       payload: {},
     });
 
-    // The route only special-cases `MarketplaceError`, so a ZodError falls through
-    // to the generic 500. That is the behaviour this ticket freezes.
-    expect(response.statusCode).toBe(500);
+    // The route now safeParses the body before any work, so an empty body is a
+    // client error with the shared `invalid_request` code — not the generic 500.
+    expect(response.statusCode).toBe(400);
     expect(response.json()).toEqual({
       error: {
-        code: "marketplace_install_failed",
-        message: "Failed to install marketplace skill.",
+        code: "invalid_request",
+        message: "Invalid request body.",
       },
     });
     expect(repositoryCalls).toEqual([]);
+  });
+
+  it("T-61: a malformed marketplace install body is a 400, not a 500", async () => {
+    buildAppWith({ insertOwnSkill: async () => SKILL_ROW });
+
+    const response = await inject({
+      method: "POST",
+      url: "/api/skills/marketplace/install",
+      payload: { packageName: 42 },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: { code: "invalid_request", message: "Invalid request body." },
+    });
+    expect(installFromMarketplace).not.toHaveBeenCalled();
+    expect(repositoryCalls).toEqual([]);
+  });
+
+  it("T-61: a marketplace install without a body is a 400", async () => {
+    buildAppWith({ insertOwnSkill: async () => SKILL_ROW });
+
+    const response = await inject({
+      method: "POST",
+      url: "/api/skills/marketplace/install",
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: { code: "invalid_request", message: "Invalid request body." },
+    });
+    expect(installFromMarketplace).not.toHaveBeenCalled();
   });
 });
 

@@ -171,7 +171,13 @@ export async function registerMarketplaceRoutes(
       const user = await options.auth.authenticate(request);
       if (!user) return sendUnauthenticated(reply);
 
-      const { packageName } = marketplaceInstallRequestSchema.parse(request.body);
+      // A malformed body is the client's mistake, not a server fault: answer 400
+      // instead of letting the ZodError fall through to the generic 500.
+      const parsedBody = marketplaceInstallRequestSchema.safeParse(request.body);
+      if (!parsedBody.success) {
+        return sendError(reply, "invalid_request", "Invalid request body.", 400);
+      }
+      const { packageName } = parsedBody.data;
       const viewer = await options.viewerService.ensureViewer(user);
       const workspaceId = viewer.workspace.id;
 
