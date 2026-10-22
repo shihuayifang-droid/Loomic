@@ -216,12 +216,12 @@ const ANCHORS = [
   { label: "web.PostgREST", value: 4, key: "web.postgrestFromCalls" },
   { label: "web.Realtime", value: 0, key: "web.realtimeChannelCalls" },
   { label: "server.runtimeRpc", value: 17, key: "server.rpcCallsRuntime" },
-  // 37M: +3 (team_credit_pools, member_team_usage, user_credit_wallets); 37W: +2 (credit_cap_templates, member_cap_settings); 39J: +1 (refund_compensations)
-  { label: "sql.rlsTables", value: 38, key: "sql.rlsEnabledTables" },
+  // 37M: +3 (team_credit_pools, member_team_usage, user_credit_wallets); 37W: +2 (credit_cap_templates, member_cap_settings); 39J: +1 (refund_compensations); 39N: +1 (member_generation_pauses)
+  { label: "sql.rlsTables", value: 39, key: "sql.rlsEnabledTables" },
   { label: "config.envFamily", value: 8, key: "config.supabaseEnvVariableFamily" },
   { label: "manifests", value: 3, key: "manifests.withSupabaseSdk" },
-  // 31A: +1 migration (pricing_rules); 33D: +1 (deduct_credits SQLSTATE); 33F: +1 (asset provenance); 33X: +1 (asset display name); 34T: +1 (job client_request_id); 36C: +1 (asset source_job fk); 36D: +1 (refund once per job); 37N: +1 (deduct_from_pools); 37O: +2 (credit cycle types, cycle grants); 37S: +1 (refund_to_pools); 37U: +1 (admin credit adjust); 37W: +1 (member cap settings); 38N: +1 (set_team_pool_limit); 39E: +1 (create_charged_job); 39J: +1 (refund_compensations)
-  { label: "sql.migrations", value: 54, key: "sql.migrationsActive" },
+  // 31A: +1 migration (pricing_rules); 33D: +1 (deduct_credits SQLSTATE); 33F: +1 (asset provenance); 33X: +1 (asset display name); 34T: +1 (job client_request_id); 36C: +1 (asset source_job fk); 36D: +1 (refund once per job); 37N: +1 (deduct_from_pools); 37O: +2 (credit cycle types, cycle grants); 37S: +1 (refund_to_pools); 37U: +1 (admin credit adjust); 37W: +1 (member cap settings); 38N: +1 (set_team_pool_limit); 39E: +1 (create_charged_job); 39J: +1 (refund_compensations); 39N: +1 (member pause and credit audit)
+  { label: "sql.migrations", value: 55, key: "sql.migrationsActive" },
 ];
 
 function parseArgs(argv) {
