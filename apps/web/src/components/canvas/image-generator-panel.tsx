@@ -24,6 +24,13 @@ import {
   createExcalidrawImageElement,
   fetchAsDataURL,
 } from "../../lib/canvas-elements";
+import type { GenerateImageRequest } from "@loomic/shared";
+
+import { PriceTag } from "@/components/ui/price-tag";
+import {
+  useGenerationQuote,
+  type GenerationQuoteInput,
+} from "@/hooks/use-generation-quote";
 
 type ImageGeneratorPanelProps = {
   elementId: string;
@@ -38,6 +45,12 @@ type ImageGeneratorPanelProps = {
    * awaitJobCompletion still delivers the result, just a few seconds later.
    */
   ws?: WebSocketHandle;
+  /**
+   * BL-45 / T-109: 三池可用额度（`useCredits().balance`），由宿主传入。
+   * 不传 = 本面板既不询价也不做额度预检（宿主接 `useCredits` 是下一张单，
+   * 现有三份渲染本面板的测试都不传它）。
+   */
+  availableCredits?: number | null;
 };
 
 const ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4"] as const;
@@ -57,6 +70,7 @@ export function ImageGeneratorPanel({
   canvasScrollZoom,
   onClose,
   ws,
+  availableCredits,
 }: ImageGeneratorPanelProps) {
   const [prompt, setPrompt] = useState(data.prompt);
   const [model, setModel] = useState(data.model);
@@ -161,6 +175,45 @@ export function ImageGeneratorPanel({
   // selector and send no quality.
   const qualityOptions = qualityOptionsFor(currentModel);
 
+  /**
+   * BL-45 / T-109：提交之前的「这次要花多少」与「够不够」。
+   *
+   * 只在宿主传了 `availableCredits` 时才启用：不传就整块关掉 —— 不发询价请求、
+   * 不渲染价格、不拦提交。价格数字只来自询价（BL-14 验收 1：前端不算价），
+   * `precheck` 只是把询价结果与余额比一下（口径在 `use-generation-quote` 里，
+   * 本面板不重复算）。询价请求体与提交同构，参数跟面板当前状态一致。
+   */
+  const quoteEnabled = availableCredits !== undefined;
+  const quoteInput: GenerationQuoteInput | null =
+    quoteEnabled && prompt.trim()
+      ? {
+          kind: "image_generation",
+          request: {
+            prompt: prompt.trim(),
+            model,
+            // 面板状态是元素自定义数据里的字符串（旧数据可能是任意值），提交
+            // 走的是 `submitImageJob` 的宽松参数；询价请求体按契约收窄。
+            aspectRatio:
+              aspectRatio as NonNullable<GenerateImageRequest["aspectRatio"]>,
+            ...(qualityOptions
+              ? { quality: quality as NonNullable<GenerateImageRequest["quality"]> }
+              : {}),
+          },
+        }
+      : null;
+  const { price, precheck } = useGenerationQuote(
+    accessToken,
+    quoteInput,
+    availableCredits ?? null,
+  );
+  /**
+   * T-109：额度不够时按钮上方要写清「差多少」，而不是只把按钮变灰。
+   * 这里同时在按钮的 `title` / `aria-label` 上说一遍，鼠标悬停与读屏都拿得到。
+   */
+  const precheckReason = precheck.ok
+    ? null
+    : `积分不足：本次需要 ${precheck.required}，当前可用 ${precheck.available}`;
+
   const handleAspectRatioChange = useCallback(
     (ratio: string) => {
       setAspectRatio(ratio);
@@ -193,6 +246,9 @@ export function ImageGeneratorPanel({
 
   const handleGenerate = useCallback(async () => {
     if (!prompt.trim() || loading) return;
+    // T-109：键盘 Enter 走的也是这条路径，光把按钮 disabled 挡不住回车，
+    // 所以预检在这里再拦一次（与按钮的 disabled 同一个口径）。
+    if (!precheck.ok) return;
 
     // Cancel any previous in-flight request
     abortRef.current?.abort();
@@ -337,6 +393,7 @@ export function ImageGeneratorPanel({
     begin,
     end,
     ws,
+    precheck,
   ]);
 
   /**
@@ -444,6 +501,15 @@ export function ImageGeneratorPanel({
             </button>
           </div>
         </div>
+      )}
+
+      {/* T-109：额度不够时，按钮上方先写清原因（按钮变灰只说「不能点」） */}
+      {precheckReason !== null && (
+        <p data-testid="canvas-image-generator-precheck"
+          className="mt-1 px-1 text-right text-xs text-destructive"
+        >
+          {precheckReason}
+        </p>
       )}
 
       {/* Bottom toolbar */}
@@ -662,11 +728,16 @@ export function ImageGeneratorPanel({
             </button>
           )}
 
+          {/* GN-01 / BL-45：提交前先让人看到这次要花多少（与「更多」菜单同一个组件） */}
+          {quoteEnabled && <PriceTag state={price} variant="badge" />}
+
           {/* Generate button */}
           <button data-testid="canvas-image-generator-submit"
             type="button"
             onClick={() => void handleGenerate()}
-            disabled={!prompt.trim() || loading}
+            disabled={!prompt.trim() || loading || !precheck.ok}
+            title={precheckReason ?? undefined}
+            aria-label={precheckReason ?? undefined}
             className="flex h-8 min-w-12 items-center justify-center gap-1 rounded-full bg-primary p-2 text-primary-foreground transition-colors hover:bg-primary/80 hover:accent-glow disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground"
           >
             {loading ? (
