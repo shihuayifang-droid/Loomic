@@ -476,7 +476,7 @@ describe("withBilling", () => {
       });
     });
 
-    it('resolves "plan_max" to standard on the free plan', async () => {
+    it('resolves "plan_max" to hd on the free plan too (U-18)', async () => {
       creditService = makeCreditService({
         getSubscription: vi.fn(async () => ({
           plan: "free" as const,
@@ -499,7 +499,7 @@ describe("withBilling", () => {
         async () => "ok",
       );
 
-      expect(tierGuard.checkResolution).toHaveBeenCalledWith("free", "standard");
+      expect(tierGuard.checkResolution).toHaveBeenCalledWith("free", "hd");
     });
   });
 
