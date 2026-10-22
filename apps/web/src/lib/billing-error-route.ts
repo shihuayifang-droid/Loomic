@@ -77,3 +77,25 @@ export function billingErrorRoute(
   }
   return { kind: "message", text: lookupError(code).message };
 }
+
+/**
+ * BL-45: the credit dialog's plan / daily fields for a billing.error. A pool refusal carries neither, and must not offer the old daily claim.
+ *
+ * The three pool refusal codes (`personal_cap_reached`, `team_pool_exhausted`,
+ * `insufficient_credits`) are sent by the server without `plan` /
+ * `dailyClaimed` — there is no subscription tier and no daily grant in that
+ *口径, so the old `event.plan ?? "free"` / `event.dailyClaimed ?? false`
+ * defaults told the dialog "free plan, not claimed yet" and it offered
+ * 「领取今日赠送」, a button that calls the retired daily-claim endpoint. A
+ * missing `plan` therefore means "pool", and `dailyClaimed: true` reads as
+ * "nothing to claim" so the dialog renders 去充值 only.
+ *
+ * An old-balance refusal does carry `plan`, and keeps today's behaviour exactly.
+ */
+export function creditDialogFieldsOf(event: {
+  plan?: string | undefined;
+  dailyClaimed?: boolean | undefined;
+}): { plan: string; dailyClaimed: boolean } {
+  if (event.plan === undefined) return { plan: "pool", dailyClaimed: true };
+  return { plan: event.plan, dailyClaimed: event.dailyClaimed ?? false };
+}

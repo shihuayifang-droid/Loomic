@@ -104,4 +104,27 @@ describe("CreditInsufficientDialog", () => {
       "领取今日赠送",
     );
   });
+
+  /**
+   * BL-45 / 工单39I：三池口径的拒绝不带 `plan`，`creditDialogFieldsOf` 给的是
+   * `{ plan: "pool", dailyClaimed: true }` —— 弹窗只留「去充值」，不出现
+   * 「领取今日赠送」（旧领取接口已下线）。
+   */
+  it("BL-45: a pool shortfall shows no daily claim", () => {
+    const onClaimDaily = vi.fn(async () => {});
+    renderDialog({
+      open: true,
+      currentBalance: 5,
+      requiredAmount: 12,
+      plan: "pool",
+      dailyClaimed: true,
+      onClaimDaily,
+    });
+
+    expect(screen.queryByTestId("credits-insufficient-claim")).toBeNull();
+    expect(screen.queryByText("领取今日赠送")).toBeNull();
+    expect(screen.getByTestId("credits-insufficient-topup")).toHaveTextContent(
+      "去充值",
+    );
+  });
 });

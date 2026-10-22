@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   billingErrorRoute,
+  creditDialogFieldsOf,
   TIER_TOAST_CODES,
 } from "../src/lib/billing-error-route";
 
@@ -80,5 +81,39 @@ describe("billingErrorRoute", () => {
     // model_not_available 没有 tier toast 的配置，所以它只能走 message。
     expect(acceptedCodes).not.toContain("model_not_available");
     expect(configBlock).not.toContain("model_not_available");
+  });
+
+  /**
+   * BL-45 / 工单39I：三池口径的拒绝事件不带 `plan` / `dailyClaimed`。
+   * 旧的 `plan ?? "free"` + `dailyClaimed ?? false` 会把它当成「免费档、今天没领」，
+   * 弹窗于是出现「领取今日赠送」（调已下线的领取接口）。
+   */
+  it("BL-45: a pool refusal does not offer the daily claim", () => {
+    expect(creditDialogFieldsOf({})).toEqual({
+      plan: "pool",
+      dailyClaimed: true,
+    });
+  });
+
+  it("BL-45: an old-balance refusal keeps its plan and daily flag", () => {
+    expect(
+      creditDialogFieldsOf({ plan: "free", dailyClaimed: false }),
+    ).toEqual({ plan: "free", dailyClaimed: false });
+  });
+
+  it("BL-45: a personal cap billing.error shows the server sentence", () => {
+    const sentence = "本月额度已用完（上限 20000），可联系管理员调整";
+    expect(billingErrorRoute("personal_cap_reached", sentence)).toEqual({
+      kind: "message",
+      text: sentence,
+    });
+  });
+
+  it("BL-45: team_pool_exhausted shows 团队本月额度已用完", () => {
+    const route = billingErrorRoute("team_pool_exhausted");
+    expect(route.kind).toBe("message");
+    expect(route.kind === "message" ? route.text : "").toContain(
+      "团队本月额度已用完",
+    );
   });
 });

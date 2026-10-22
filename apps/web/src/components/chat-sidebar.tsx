@@ -26,7 +26,7 @@ import { useImageModelPreference } from "../hooks/use-image-model-preference";
 import { usePersistFailedNotice } from "../hooks/use-persist-failed-notice";
 import { useVideoModelPreference } from "../hooks/use-video-model-preference";
 import type { WebSocketHandle } from "../hooks/use-websocket";
-import { billingErrorRoute } from "../lib/billing-error-route";
+import { billingErrorRoute, creditDialogFieldsOf } from "../lib/billing-error-route";
 import { fetchBrandKit } from "../lib/brand-kit-api";
 import { claimDailyCredits } from "../lib/credits-api";
 import { acceptedDropFiles, dragHasFiles } from "../lib/drop-files";
@@ -554,14 +554,14 @@ export function ChatSidebar({
 
           // Billing error: route to appropriate UI, run.canceled will follow
           if (event.type === "billing.error") {
-            const route = billingErrorRoute(event.code);
+            const route = billingErrorRoute(event.code, event.message);
             if (route.kind === "credit_dialog") {
               setCreditDialog({
                 open: true,
                 currentBalance: event.currentBalance ?? 0,
                 requiredAmount: event.requiredAmount ?? 0,
-                plan: event.plan ?? "free",
-                dailyClaimed: event.dailyClaimed ?? false,
+                plan: creditDialogFieldsOf(event).plan,
+                dailyClaimed: creditDialogFieldsOf(event).dailyClaimed,
               });
             } else if (route.kind === "tier_toast") {
               // concurrency_limit, model_not_accessible, resolution_not_allowed
