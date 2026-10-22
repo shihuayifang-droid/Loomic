@@ -118,6 +118,30 @@ export const MARK_SUCCEEDED_ATTEMPTS = 3;
 export const BILLING_DEFER_VT_SECONDS = 10;
 
 /**
+ * T-16 (workorder 39X): how many deliveries a message may spend on a counter
+ * that keeps failing before the worker gives up on counting it.
+ *
+ * The attempt counter is what bounds the whole state machine — without it there
+ * is no `attempt_count` to compare against `max_attempts` and no place to write
+ * `failed`. So when the counter's write throws, the old behaviour is to touch
+ * nothing and let the visibility timeout re-deliver the message: the row stays
+ * `queued` / `retrying` and the message comes back. That is right for a hiccup
+ * and wrong for a persistent failure — the delivery loop would go on forever,
+ * the job would never be retired, and the credits already charged for it would
+ * never come back.
+ *
+ * `read_ct` is the queue's own delivery counter (it increments on every read),
+ * so it is the one number available here that measures "how long has this been
+ * going on" without needing the database that is currently failing. Ten
+ * deliveries is far more than a transient outage produces and still bounded:
+ * with the queue's visibility timeouts that is minutes, not forever.
+ *
+ * A message without `read_ct` (an older shape, or a test harness that does not
+ * model it) keeps the old behaviour untouched.
+ */
+export const MAX_DELIVERIES_WITHOUT_COUNT = 10;
+
+/**
  * GN-31: how long one attempt of a job may run before it is failed as `timeout`.
  *
  * The requirement's shape is "the model's estimated duration (MD-07) times 3".
@@ -357,7 +381,7 @@ export async function processJobMessage(
   // archived), G3 (paid for) and G6 (running/succeeded/failed/canceled and every
   // other status) all continue here, unchanged.
 
-  // 4. Counting failed. Touch nothing: the message stays invisible until its
+  // 4. Counting failed. Touch nothing yet: the message stays invisible until its
   //    visibility timeout expires and is then delivered again. Archiving here
   //    would silently drop a job that was already paid for.
   let counted: { attempt_count: number; max_attempts: number } | null;
@@ -370,6 +394,29 @@ export async function processJobMessage(
         countError instanceof Error ? countError.message : String(countError)
       }`,
     );
+
+    // T-16. The retry above is only correct while the failure is transient: the
+    // message comes back, the counter is tried again, and one day it answers.
+    // A counter that keeps failing has the opposite shape — every delivery ends
+    // here, the row never leaves `queued` / `retrying`, the stuck-job reaper
+    // never looks at it (it only sweeps `running`) and the charge already taken
+    // for the job is never refunded. `read_ct` bounds that loop: once this
+    // message has been delivered `MAX_DELIVERIES_WITHOUT_COUNT` times without a
+    // count, the job is retired through the ordinary terminal path (failed +
+    // one refund + archive) instead of being left to the queue forever.
+    const deliveries = typeof msg.read_ct === "number" ? msg.read_ct : null;
+
+    if (deliveries !== null && deliveries >= MAX_DELIVERIES_WITHOUT_COUNT) {
+      deps.log(
+        `incrementAttempt still failing for job ${jobId} after ${deliveries} deliveries — failing it as attempt_count_unavailable`,
+      );
+      await terminalFail(
+        "attempt_count_unavailable",
+        `The attempt counter could not be updated after ${deliveries} deliveries`,
+      );
+      return;
+    }
+
     return;
   }
 

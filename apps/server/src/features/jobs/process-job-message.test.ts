@@ -44,6 +44,12 @@ type Scenario = {
   executorDelayMs?: number;
   /** GN-31: shortens the execution budget, in ms. Omitted = the real default. */
   executorTimeoutMs?: number;
+  /**
+   * T-16 (workorder 39X): how many times the queue has already delivered this
+   * message (`read_ct`). Omitted = the message carries no delivery counter,
+   * which is the shape every case written before this ticket has.
+   */
+  readCt?: number;
 };
 
 function makeHarness(scenario: Scenario = {}) {
@@ -185,6 +191,13 @@ function makeHarness(scenario: Scenario = {}) {
     msg: { msg_id: 7, message: { job_id: "job-1", job_type: "image_generation" } } as never,
     ctx,
   };
+
+  // T-16: opt-in only. A case that does not ask for a delivery counter gets a
+  // message without `read_ct`, exactly like every case written before it.
+  if (scenario.readCt !== undefined) {
+    const delivered = args.msg as unknown as { read_ct?: number };
+    delivered.read_ct = scenario.readCt;
+  }
 
   return {
     deps,
@@ -819,5 +832,94 @@ describe("processJobMessage: recording a success (工单39W / T-15)", () => {
     expect(h.calls.filter((call) => call === "deleteMsg")).toHaveLength(0);
     expect(h.failures).toEqual([]);
     expect(h.logs.join(" ")).toContain("will retry (attempt 1/3)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workorder 39X — a counter that keeps failing (T-16 / GN-31).
+//
+// The attempt counter is the only thing that bounds a job: it is what gets
+// compared against `max_attempts` and what makes `failed` reachable. When its
+// write throws, case 5 above pins the right answer for a transient error —
+// touch nothing and let the message come back. What that leaves open is the
+// persistent failure: every delivery ends in the same catch, the row never
+// leaves `queued` / `retrying`, the stuck-job reaper only sweeps `running`, so
+// the message is re-delivered forever and the charge already taken is never
+// returned.
+//
+// `read_ct` is the queue's own delivery counter and is therefore the one
+// measure of "how long has this been going on" that does not need the database
+// that is currently failing. The cases below pin the boundary: the tenth
+// delivery retires the job through the ordinary terminal path (failed + one
+// refund + archive), the ninth still waits, and a job that somebody else
+// already finished is archived without a second refund.
+//
+// The threshold is the exported `MAX_DELIVERIES_WITHOUT_COUNT`; it is written
+// out as 10 here because this file is append-only for this ticket.
+// ---------------------------------------------------------------------------
+
+describe("processJobMessage: counting keeps failing (工单39X / T-16)", () => {
+  it("T-16: the tenth delivery without a count fails the job and refunds it", async () => {
+    const h = makeHarness({
+      readCt: 10,
+      increment: async () => {
+        throw new Error("rpc down");
+      },
+    });
+
+    await h.run();
+
+    expect(h.calls.filter((call) => call === "markFailed")).toHaveLength(1);
+    expect(h.failures).toEqual([
+      {
+        code: "attempt_count_unavailable",
+        message: expect.stringContaining("10 deliveries"),
+      },
+    ]);
+    expect(h.refunds()).toBe(1);
+    expect(h.calls.filter((call) => call === "archive")).toHaveLength(1);
+    // Nothing was ever started, so nothing may be executed.
+    expect(h.calls.filter((call) => call === "executor")).toHaveLength(0);
+    expect(h.calls.filter((call) => call === "markRunning")).toHaveLength(0);
+  });
+
+  it("T-16: earlier deliveries still wait for the counter", async () => {
+    const h = makeHarness({
+      readCt: 9,
+      increment: async () => {
+        throw new Error("rpc down");
+      },
+    });
+
+    await h.run();
+
+    // Case 5's behaviour, one delivery short of the limit: the message is left
+    // alone so the next delivery can try the counter again.
+    expect(h.calls).not.toContain("markFailed");
+    expect(h.calls).not.toContain("archive");
+    expect(h.calls).not.toContain("deleteMsg");
+    expect(h.refunds()).toBe(0);
+    expect(h.calls).not.toContain("executor");
+    expect(h.logs.join(" ")).toContain("incrementAttempt failed");
+  });
+
+  it("T-16: a job someone else already finished is not refunded twice", async () => {
+    const h = makeHarness({
+      readCt: 10,
+      increment: async () => {
+        throw new Error("rpc down");
+      },
+      // `markFailed` answers false: the row is no longer markable, so another
+      // worker (or a cancel) already owns the outcome and its refund.
+      markFailed: async () => false,
+    });
+
+    await h.run();
+
+    expect(h.calls.filter((call) => call === "markFailed")).toHaveLength(1);
+    expect(h.refunds()).toBe(0);
+    // The message is still dropped: re-delivering it could only repeat this.
+    expect(h.calls.filter((call) => call === "archive")).toHaveLength(1);
+    expect(h.calls.filter((call) => call === "executor")).toHaveLength(0);
   });
 });
