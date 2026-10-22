@@ -13,6 +13,9 @@ import type { ImageAttachmentState, ReadyAttachment } from "../hooks/use-image-a
 import { AGENT_INPUT_PLACEHOLDER } from "@/lib/composer-copy";
 import type { HomeExampleSelection } from "@/lib/home-example-seeds";
 import { AgentModelSelector } from "./agent-model-selector";
+// AG-02: the home input and the canvas chat box are the same component, at two
+// sizes — the home page gets `size="large"`.
+import { ChatComposer, type ChatComposerHandle } from "./chat-composer";
 import { ImageAttachmentBar } from "./image-attachment-bar";
 import { ImageModelPreferencePopover } from "./image-model-preference";
 import { useAgentModel } from "../hooks/use-agent-model";
@@ -75,8 +78,8 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
     },
     ref,
   ) {
-    const [value, setValue] = useState("");
-    const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const [isEmpty, setIsEmpty] = useState(true);
+    const composerRef = useRef<ChatComposerHandle>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
     const agentBtnRef = useRef<HTMLButtonElement>(null);
@@ -86,24 +89,15 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
 
     useImperativeHandle(ref, () => ({
       fill(text: string) {
-        setValue(text);
-        // Auto-resize after filling
-        requestAnimationFrame(() => {
-          const ta = textareaRef.current;
-          if (ta) {
-            ta.style.height = "auto";
-            ta.style.height = `${ta.scrollHeight}px`;
-            ta.focus();
-          }
-        });
+        composerRef.current?.setText(text);
+        composerRef.current?.focus();
       },
     }));
 
-    const hasContent =
-      value.trim().length > 0 || (attachments && attachments.length > 0);
+    const hasContent = !isEmpty || (attachments && attachments.length > 0);
 
     const handleSubmit = useCallback(() => {
-      const trimmed = value.trim();
+      const trimmed = composerRef.current?.getText().trim() ?? "";
       if (
         (!trimmed && (!attachments || attachments.length === 0) && !selectedSeed) ||
         disabled ||
@@ -145,44 +139,8 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
           : undefined,
         agentModel ?? undefined,
       );
-      setValue("");
-      if (textareaRef.current) {
-        textareaRef.current.style.height = "auto";
-      }
-    }, [value, disabled, isUploading, onSubmit, attachments, readyAttachments, preference, videoPreference, agentModel, selectedSeed]);
-
-    const handleKeyDown = useCallback(
-      (e: React.KeyboardEvent) => {
-        // Ignore Enter during IME composition (e.g. Chinese input confirming a candidate)
-        if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-          e.preventDefault();
-          handleSubmit();
-        }
-      },
-      [handleSubmit],
-    );
-
-    const handlePaste = useCallback(
-      (e: React.ClipboardEvent) => {
-        if (!onAddFiles) return;
-        const files = Array.from(e.clipboardData.items)
-          .filter((item) => item.type.startsWith("image/"))
-          .map((item) => item.getAsFile())
-          .filter((f): f is File => f !== null);
-        if (files.length > 0) {
-          e.preventDefault();
-          onAddFiles(files);
-        }
-      },
-      [onAddFiles],
-    );
-
-    const handleInput = useCallback(() => {
-      const textarea = textareaRef.current;
-      if (!textarea) return;
-      textarea.style.height = "auto";
-      textarea.style.height = `${textarea.scrollHeight}px`;
-    }, []);
+      composerRef.current?.clear();
+    }, [disabled, isUploading, onSubmit, attachments, readyAttachments, preference, videoPreference, agentModel, selectedSeed]);
 
     return (
       <div className="overflow-hidden rounded-xl border-[0.5px] border-border bg-muted shadow-[0_4px_8px_rgba(0,0,0,0.04)] sm:rounded-2xl">
@@ -233,17 +191,15 @@ export const HomePrompt = forwardRef<HomePromptHandle, HomePromptProps>(
             </div>
           </div>
         ) : null}
-        <textarea data-testid="home-prompt-input"
-          ref={textareaRef}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
-          onInput={handleInput}
+        <ChatComposer
+          ref={composerRef}
+          size="large"
+          testId="home-prompt-input"
           placeholder={AGENT_INPUT_PLACEHOLDER}
-          disabled={disabled}
-          rows={2}
-          className="w-full resize-none bg-transparent px-3 pt-3 pb-2 text-sm leading-relaxed text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50 sm:px-4 sm:pt-4"
+          {...(disabled ? { disabled } : {})}
+          onSubmit={handleSubmit}
+          onEmptyChange={setIsEmpty}
+          {...(onAddFiles ? { onPasteFiles: onAddFiles } : {})}
         />
 
         <div className="flex items-center justify-between px-2 pb-2 sm:px-3 sm:pb-3">

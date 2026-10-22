@@ -31,8 +31,25 @@ describe("AG-02 composer copy", () => {
     render(<HomePrompt onSubmit={vi.fn()} />);
 
     expect(
-      screen.getByPlaceholderText(AGENT_INPUT_PLACEHOLDER),
-    ).toBeInTheDocument();
+      screen.getByTestId("home-prompt-input").getAttribute("data-placeholder"),
+    ).toBe(AGENT_INPUT_PLACEHOLDER);
+  });
+
+  it("AG-02: home and canvas use the same input component", () => {
+    for (const relativePath of [
+      "src/components/home-prompt.tsx",
+      "src/components/chat-input.tsx",
+    ]) {
+      const source = readComponentSource(relativePath);
+      expect(
+        source.includes('from "./chat-composer"') ||
+          source.includes("from \"@/components/chat-composer\""),
+      ).toBe(true);
+      expect(source).toContain("<ChatComposer");
+    }
+    expect(readComponentSource("src/components/home-prompt.tsx")).not.toContain(
+      "<textarea",
+    );
   });
 
   it("AG-02: no input still says Loomic", () => {

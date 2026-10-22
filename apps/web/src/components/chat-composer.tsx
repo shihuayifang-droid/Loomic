@@ -48,6 +48,14 @@ export type ChatComposerHandle = {
   /** refIds of every chip currently in the text, in document order. */
   getChipRefIds: () => string[];
   clear: () => void;
+  /**
+   * Replace the whole content with plain text and put the caret at the end.
+   *
+   * Goes through `el.textContent` rather than `insertPlainText`: the latter needs
+   * a live selection, which does not exist when the text is set programmatically
+   * (an example pill filling the home input), and it appends instead of replacing.
+   */
+  setText: (text: string) => void;
   focus: () => void;
   /**
    * Insert a chip at the caret.
@@ -76,6 +84,15 @@ export type ChatComposerHandle = {
 type ChatComposerProps = {
   placeholder: string;
   disabled?: boolean;
+  /**
+   * `"compact"` (default) is the canvas chat box; `"large"` is the home prompt.
+   *
+   * One component, two sizes — AG-02 requires the home page and the canvas to use
+   * the SAME input component, so the size is a prop rather than a second copy.
+   */
+  size?: "large" | "compact";
+  /** `data-testid` for the editable surface; omitted when not given. */
+  testId?: string;
   /** Fired after any content change, with the text before the caret. */
   onTextBeforeCaretChange?: (textBeforeCaret: string) => void;
   /** Fired when the content becomes empty / non-empty. */
@@ -91,6 +108,8 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
     {
       placeholder,
       disabled,
+      size = "compact",
+      testId,
       onTextBeforeCaretChange,
       onEmptyChange,
       onSubmit,
@@ -175,6 +194,18 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
         savedRangeRef.current = null;
         wasEmptyRef.current = true;
         onEmptyChange?.(true);
+      },
+      setText: (text) => {
+        const el = editorRef.current;
+        if (!el) return;
+        // Plain text only, and a full replace: no chips survive, which is what
+        // "fill the box with this prompt" means.
+        el.textContent = text;
+        // The caret goes to the end of what was just written, so the next thing
+        // the user does (typing, picking an image from the canvas) continues the
+        // sentence instead of landing at a stale remembered position.
+        rememberCaret(caretRangeAtEnd(el));
+        notifyState();
       },
       focus: () => editorRef.current?.focus(),
       insertChip: (chip, opts) => {
@@ -287,6 +318,13 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
       }
     }, [rememberCaret]);
 
+    // `large` keeps the home textarea's original metrics so swapping the
+    // component does not move the home page layout; the rest is identical.
+    const sizeClass =
+      size === "large"
+        ? "min-h-[56px] px-3 pt-3 pb-2 sm:px-4 sm:pt-4"
+        : "min-h-[48px] px-1";
+
     return (
       <div
         ref={editorRef}
@@ -294,6 +332,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
         aria-multiline="true"
         aria-label="输入消息"
         data-chat-input
+        {...(testId ? { "data-testid": testId } : {})}
         contentEditable={!disabled}
         suppressContentEditableWarning
         onInput={notifyState}
@@ -304,7 +343,9 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
         onPaste={handlePaste}
         style={{ scrollbarWidth: "none" }}
         className={
-          "chat-composer min-h-[48px] max-h-60 overflow-y-auto whitespace-pre-wrap break-words px-1 text-sm leading-[1.8] text-foreground focus:outline-none [&::-webkit-scrollbar]:hidden " +
+          "chat-composer max-h-60 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-[1.8] text-foreground focus:outline-none [&::-webkit-scrollbar]:hidden " +
+          sizeClass +
+          " " +
           (className ?? "")
         }
       />
