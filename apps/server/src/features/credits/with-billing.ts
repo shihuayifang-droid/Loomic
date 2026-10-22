@@ -156,6 +156,23 @@ export interface BillingDeps {
   creditLedgerWriteRepository?: CreditLedgerWriteRepository;
   /** Required whenever `request.job` is set. */
   jobService?: JobService;
+  /**
+   * Workorder 39K (BL-41): where a refund that FAILED is registered for the
+   * compensation queue. Optional on purpose — absent, a failed refund keeps the
+   * pre-39K behaviour (one loud log line) so no existing wiring changes meaning.
+   *
+   * Same shape as `refund-job.ts`'s `recordCompensation`, plus the flag that says
+   * this job must also be marked `credits_link_refunded` once the money is back.
+   */
+  recordRefundCompensation?: (input: {
+    jobId: string;
+    workspaceId: string;
+    userId: string;
+    amount: number;
+    description: string;
+    markLinkRefunded: boolean;
+    error: string;
+  }) => Promise<void>;
 }
 
 export interface BillingRequest {
@@ -619,6 +636,9 @@ export async function withBilling<T>(
           creditsCost,
           transactionId: chargeTxId,
           description,
+          ...(deps.recordRefundCompensation
+            ? { recordRefundCompensation: deps.recordRefundCompensation }
+            : {}),
         });
         throw linkError;
       }
@@ -704,6 +724,21 @@ async function compensateUnlinkedCharge(args: {
   creditsCost: number;
   transactionId: string;
   description: string;
+  /**
+   * Workorder 39K (BL-41): the recorder for a refund that failed HERE. This is the
+   * one place that can lose money without a job ever being failed, so the debt is
+   * registered with `markLinkRefunded: true` — whoever retries it must also write
+   * the `credits_link_refunded` mark that the failed branch below never reached.
+   */
+  recordRefundCompensation?: (input: {
+    jobId: string;
+    workspaceId: string;
+    userId: string;
+    amount: number;
+    description: string;
+    markLinkRefunded: boolean;
+    error: string;
+  }) => Promise<void>;
 }): Promise<void> {
   // STEP 1 — take ownership of the charge.
   let claimed: boolean;
@@ -757,6 +792,30 @@ async function compensateUnlinkedCharge(args: {
         `mark was NOT written, so the compensation pass can find it: ` +
         describeError(refundError),
     );
+    // Workorder 39K (BL-41): the log line above used to be the whole record of
+    // this debt. Register it instead, with the mark the retry still owes. The
+    // recording is best-effort: it must neither throw (the caller is about to
+    // rethrow the link error) nor be silent when it fails.
+    if (args.recordRefundCompensation) {
+      try {
+        await args.recordRefundCompensation({
+          jobId: args.jobId,
+          workspaceId: args.workspaceId,
+          userId: args.userId,
+          amount: args.creditsCost,
+          description: args.description,
+          markLinkRefunded: true,
+          error: describeError(refundError),
+        });
+      } catch (recordError) {
+        console.error(
+          `[with-billing] failed to record the refund compensation for job ` +
+            `${args.jobId}: workspace ${args.workspaceId} is still owed ` +
+            `${args.creditsCost} credits and no queue row was written: ` +
+            describeError(recordError),
+        );
+      }
+    }
     return;
   }
 

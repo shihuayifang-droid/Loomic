@@ -371,3 +371,113 @@ describe("refund-job: the contract every branch keeps", () => {
     }
   });
 });
+
+/**
+ * BL-41 / workorder 39K: a refund that FAILS is recorded for the compensation
+ * queue instead of surviving only as a log line.
+ *
+ * Four cases, one per branch: recorded, recording failed, refund succeeded, and
+ * the read that never learned the amount. The last two are the guard — a
+ * compensation row written when nothing is owed would be a debt that is not one.
+ */
+describe("refund-job: BL-41 a failed refund is recorded for compensation", () => {
+  type CompensationInput = {
+    jobId: string;
+    workspaceId: string;
+    userId: string;
+    amount: number;
+    description: string;
+    error: string;
+  };
+
+  function createRecordingHarness(answer: JobRefundBasisRow | null | Error) {
+    const readRefundBasis = vi.fn(async () => {
+      if (answer instanceof Error) throw answer;
+      return answer;
+    });
+    const refundCredits = vi.fn(async (..._args: unknown[]) => TX_ID);
+    const recordCompensation = vi.fn(async (_input: CompensationInput) => {});
+    const log = vi.fn();
+    const logError = vi.fn();
+
+    const refundJob = createRefundJob({
+      readRefundBasis,
+      creditService: { refundCredits },
+      recordCompensation,
+      log,
+      logError,
+    });
+
+    return { refundJob, refundCredits, recordCompensation, log, logError };
+  }
+
+  it("BL-41: a failed refund is recorded for compensation", async () => {
+    const failure = new Error("RPC refund_credits failed");
+    const harness = createRecordingHarness(basis());
+    harness.refundCredits.mockRejectedValueOnce(failure);
+
+    await expect(harness.refundJob(JOB_ID, TAG)).resolves.toBeUndefined();
+
+    // The pre-39K line is still written, verbatim and first.
+    expect(harness.logError.mock.calls[0]?.[0]).toBe(
+      `${TAG} Failed to refund credits for job ${JOB_ID}:`,
+    );
+    expect(harness.logError.mock.calls[0]?.[1]).toBe(failure);
+    expect(harness.recordCompensation).toHaveBeenCalledTimes(1);
+    expect(harness.recordCompensation.mock.calls[0]?.length).toBe(1);
+    expect(harness.recordCompensation.mock.calls[0]?.[0]).toEqual({
+      jobId: JOB_ID,
+      workspaceId: WORKSPACE_ID,
+      userId: USER_ID,
+      amount: 10,
+      description: "Auto-refund: job failed",
+      error: "RPC refund_credits failed",
+    });
+    // The success line is not written when the refund failed.
+    expect(harness.log).not.toHaveBeenCalled();
+  });
+
+  it("BL-41: a failed record is logged and still resolves", async () => {
+    const recordFailure = new Error("record_refund_compensation failed");
+    const harness = createRecordingHarness(basis());
+    harness.refundCredits.mockRejectedValueOnce(new Error("refund rpc down"));
+    harness.recordCompensation.mockRejectedValueOnce(recordFailure);
+
+    await expect(harness.refundJob(JOB_ID, TAG)).resolves.toBeUndefined();
+
+    expect(harness.recordCompensation).toHaveBeenCalledTimes(1);
+    // Two lines: the refund failure, then the recording failure — the second one
+    // names its own cause so a reader never mistakes it for a refund problem.
+    expect(harness.logError).toHaveBeenCalledTimes(2);
+    expect(harness.logError.mock.calls[1]?.[0]).toBe(
+      `${TAG} Failed to record refund compensation for job ${JOB_ID}:`,
+    );
+    expect(harness.logError.mock.calls[1]?.[1]).toBe(recordFailure);
+  });
+
+  it("BL-41: a refund that succeeds records nothing", async () => {
+    const harness = createRecordingHarness(basis());
+
+    await expect(harness.refundJob(JOB_ID, TAG)).resolves.toBeUndefined();
+
+    expect(harness.refundCredits).toHaveBeenCalledTimes(1);
+    expect(harness.recordCompensation).not.toHaveBeenCalled();
+    expect(harness.logError).not.toHaveBeenCalled();
+  });
+
+  it("BL-41: a failed basis read records nothing", async () => {
+    // The amount is unknown, so there is nothing to record as owed. The read
+    // failure keeps its own pre-39K log line and nothing else happens.
+    const readFailure = new Error("connection terminated unexpectedly");
+    const harness = createRecordingHarness(readFailure);
+
+    await expect(harness.refundJob(JOB_ID, TAG)).resolves.toBeUndefined();
+
+    expect(harness.recordCompensation).not.toHaveBeenCalled();
+    expect(harness.logError).toHaveBeenCalledTimes(1);
+    expect(harness.logError.mock.calls[0]?.[0]).toBe(
+      `${TAG} Failed to refund credits for job ${JOB_ID}:`,
+    );
+    expect(harness.logError.mock.calls[0]?.[1]).toBe(readFailure);
+  });
+});

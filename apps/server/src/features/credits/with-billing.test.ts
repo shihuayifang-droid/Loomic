@@ -1460,3 +1460,84 @@ describe("withBilling", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// BL-41 / workorder 39K: the unlinked-charge path is the one place that can lose
+// money without a job ever being failed, so a refund that fails HERE is recorded
+// for the compensation queue — with `markLinkRefunded: true`, because the mark is
+// exactly what the failed branch above never reached.
+// ---------------------------------------------------------------------------
+describe("with-billing: BL-41 a failed refund is recorded for compensation", () => {
+  type RefundCompensationInput = {
+    jobId: string;
+    workspaceId: string;
+    userId: string;
+    amount: number;
+    description: string;
+    markLinkRefunded: boolean;
+    error: string;
+  };
+
+  it("BL-41: an unlinked charge whose refund fails is recorded with markLinkRefunded", async () => {
+    const linkFailure = new JobServiceError(
+      "job_query_failed",
+      "Failed to record the job credits for job-1.",
+      500,
+    );
+    const creditService = makeCreditService({
+      refundCredits: vi.fn(async () => {
+        throw new CreditServiceError(
+          "credit_refund_failed",
+          "refund rpc down",
+          500,
+        );
+      }) as unknown as CreditService["refundCredits"],
+    });
+    const tierGuard = makeTierGuard();
+    const jobService = makeJobService();
+    jobService.setCreditsInfo = vi.fn(async () => {
+      throw linkFailure;
+    });
+    const recordRefundCompensation = vi.fn(
+      async (_input: RefundCompensationInput) => {},
+    );
+    // The two loud lines this path writes (refund failed + its record) are
+    // captured, not printed; the assertion is on the recorder.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const error = await withBilling(
+        {
+          creditService,
+          tierGuard,
+          jobService,
+          priceQuoter: makePriceQuoter(),
+          creditLedgerWriteRepository: makeLedger(),
+          recordRefundCompensation,
+        },
+        { ...IMAGE_REQUEST, job: { payload: {} } },
+        async () => "ok",
+      )
+        .then(() => null)
+        .catch((thrown: unknown) => thrown);
+
+      // The caller still learns why the REQUEST failed, not how the money is
+      // being chased.
+      expect(error).toBe(linkFailure);
+      expect(recordRefundCompensation).toHaveBeenCalledTimes(1);
+      expect(recordRefundCompensation.mock.calls[0]?.[0]).toEqual({
+        jobId: "job-1",
+        workspaceId: WORKSPACE,
+        userId: USER.id,
+        amount: 10,
+        description: "test image",
+        markLinkRefunded: true,
+        error: "refund rpc down",
+      });
+      // No mark here: the retry owns it, which is what `markLinkRefunded` asks for.
+      expect(jobService.markChargeRefunded).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});

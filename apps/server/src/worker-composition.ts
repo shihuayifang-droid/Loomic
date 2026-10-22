@@ -39,6 +39,7 @@ import {
 } from "./db/job-billing-gate-repository.js";
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
 import { createJobRefundBasisRepository } from "./db/job-refund-basis-repository.js";
+import { createRefundCompensationRepository } from "./db/refund-compensation-repository.js";
 import {
   createCreditReadRepository,
   type CreditReadRepository,
@@ -209,9 +210,27 @@ export function buildWorkerComposition(
   // condition, the amount, the description and the "never throws" contract are
   // unchanged, and the tag stays a call-site argument so both log lines keep
   // naming this worker.
+  //
+  // BL-41 / workorder 39K: a refund that fails is no longer only a log line — it
+  // is recorded in `refund_compensations` so the queue retries it. Built lazily
+  // against the same `DATABASE_URL` as every repository above, exactly like them;
+  // with no reachable pool the recording fails, `refundJob` logs that failure and
+  // still resolves (the refund itself already failed, so nothing regresses).
+  // `markLinkRefunded: false` because the worker refunds a job that HAS its
+  // `credits_cost`; the unlinked-charge path (with-billing) is the one that owns
+  // the mark.
+  const refundCompensationRepository = createRefundCompensationRepository({
+    getTransactionPool,
+  });
   const refundJob = createRefundJob({
     readRefundBasis: (refundInput) => refundBasisRepository.readRefundBasis(refundInput),
     creditService,
+    recordCompensation: async (compensationInput) => {
+      await refundCompensationRepository.record({
+        ...compensationInput,
+        markLinkRefunded: false,
+      });
+    },
   });
 
   // Base context — per-message fields (queue, msgId, renewVt) are added per message below

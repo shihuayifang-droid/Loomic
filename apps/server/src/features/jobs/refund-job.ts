@@ -83,6 +83,20 @@ export type RefundJobDeps = {
    * its own; the reason lives with the assembly, not in this function.
    */
   description?: string;
+  /**
+   * Workorder 39K (BL-41): where a refund that FAILED is registered, so the debt
+   * survives this process instead of only a log line. Optional on purpose — a
+   * caller that does not inject it keeps exactly the old behaviour (log and
+   * resolve), which is what the pre-39K cases in the test file pin.
+   */
+  recordCompensation?: (input: {
+    jobId: string;
+    workspaceId: string;
+    userId: string;
+    amount: number;
+    description: string;
+    error: string;
+  }) => Promise<void>;
   /** Defaults to `console.log`; injected by tests. */
   log?: (message: string) => void;
   /** Defaults to `console.error`; injected by tests. */
@@ -112,8 +126,12 @@ export function createRefundJob(deps: RefundJobDeps): RefundJob {
   const description = deps.description ?? REFUND_DESCRIPTION;
 
   return async (jobId, tag) => {
+    // Workorder 39K: kept OUTSIDE the `try` so the catch can tell "we know how
+    // much is owed" (a refund that failed) from "we never learned the amount" (a
+    // read that failed). Only the first one may be recorded as a compensation.
+    let basis: JobRefundBasisRow | null = null;
     try {
-      const basis = await deps.readRefundBasis({ jobId });
+      basis = await deps.readRefundBasis({ jobId });
 
       // No such job (or, before this workorder, a read that failed): nothing is
       // known about the money, so nothing is moved and nothing is logged.
@@ -141,6 +159,43 @@ export function createRefundJob(deps: RefundJobDeps): RefundJob {
       // Log but don't crash the worker — the job is already dead-lettered. A
       // read failure lands here too (see the header) and refunds nothing.
       logError(`${tag} Failed to refund credits for job ${jobId}:`, refundErr);
+
+      // Workorder 39K (BL-41): the log line above is the only record a failed
+      // refund used to leave, so the workspace's debt disappeared with the log
+      // file. Register it for the compensation queue instead — but ONLY when the
+      // amount is known (a failed READ has no amount to record) and only when a
+      // recorder was injected. The recording is itself best-effort: a failure to
+      // record must not reject, and it must not be silent either.
+      const owedAmount = basis?.creditsCost ?? 0;
+      const owedWorkspace = basis?.workspaceId;
+      const owedUser = basis?.createdBy;
+      if (
+        deps.recordCompensation &&
+        owedAmount > 0 &&
+        owedWorkspace &&
+        owedUser
+      ) {
+        try {
+          await deps.recordCompensation({
+            jobId,
+            workspaceId: owedWorkspace,
+            userId: owedUser,
+            amount: owedAmount,
+            description,
+            error: describeError(refundErr),
+          });
+        } catch (recordErr) {
+          logError(
+            `${tag} Failed to record refund compensation for job ${jobId}:`,
+            recordErr,
+          );
+        }
+      }
     }
   };
+}
+
+/** The error text a compensation row carries: the message, not the object. */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

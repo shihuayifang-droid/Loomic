@@ -196,6 +196,7 @@ import {
 // which workspace and to whom is the same repository the worker already uses;
 // the decision (and its "never throws" contract) is `createRefundJob`.
 import { createJobRefundBasisRepository } from "./db/job-refund-basis-repository.js";
+import { createRefundCompensationRepository } from "./db/refund-compensation-repository.js";
 // GN-35 / workorder 36K: the credits of one job, read by its OWNER, behind
 // `GET /api/jobs/:jobId/credits`. Built lazily against the same pool as its
 // neighbours, so `buildApp` still never connects and never needs
@@ -1068,6 +1069,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         }).readRefundBasis(refundInput),
       creditService,
       description: CANCEL_REFUND_DESCRIPTION,
+      // BL-41 / workorder 39K: a cancel refund that fails is recorded for the
+      // compensation queue instead of vanishing with its log line. Same lazy
+      // `getTransactionPool(databaseEnv)` wrapper as the reader above, and the
+      // same `markLinkRefunded: false` as the worker (a cancel refunds a job that
+      // has its `credits_cost`; the link mark belongs to with-billing).
+      recordCompensation: async (compensationInput) => {
+        await createRefundCompensationRepository({
+          getTransactionPool: () => getTransactionPool(databaseEnv),
+        }).record({ ...compensationInput, markLinkRefunded: false });
+      },
     });
     void registerJobRoutes(app, {
       auth,
