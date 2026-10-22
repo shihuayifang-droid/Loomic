@@ -125,7 +125,16 @@ select
     when w.daily_date is not distinct from b.v_today
       then coalesce(w.daily_balance, 0)
     else 0
-  end as daily_remaining
+  end as daily_remaining,
+  -- AD-01 / BL-21 / 39O: 已暂停生成. An EXISTS against the pause table, keyed by
+  -- the SAME (workspace_id, user_id) pair the pause write uses, so a member
+  -- paused in another team reads as running here.
+  exists (
+    select 1
+    from public.member_generation_pauses p
+    where p.workspace_id = m.workspace_id
+      and p.user_id = m.user_id
+  ) as generation_paused
 from public.workspace_members m
 cross join bounds b
 left join public.member_team_usage u
@@ -218,13 +227,40 @@ function mapMemberCreditRow(row: unknown): MemberCreditSummary {
     throw new Error(`${MEMBER_CREDITS_LABEL} returned no usable "user_id"`);
   }
 
-  return {
+  const paused = readPausedFlag(record);
+
+  const summary: MemberCreditSummary = {
     userId,
     personalCap: requireNumber(record, "personal_cap"),
     teamUsed: requireNumber(record, "team_used"),
     topup: requireNumber(record, "topup"),
     dailyRemaining: requireNumber(record, "daily_remaining"),
   };
+
+  // AD-01 / BL-21 / 39O: the key is written ONLY when the member is paused, so
+  // every whole-object answer that predates 39O keeps its exact shape, while a
+  // paused member is unambiguously `generationPaused === true` and never merely
+  // "a key that is present but false".
+  if (paused) {
+    summary.generationPaused = true;
+  }
+
+  return summary;
+}
+
+/**
+ * The pause flag: `exists (...)` declares a boolean, so an ABSENT column or a
+ * value that is not a boolean is drift rather than "not paused" — the same rule
+ * every number in this module follows.
+ */
+function readPausedFlag(row: Readonly<Record<string, unknown>>): boolean {
+  const value = row.generation_paused;
+
+  if (typeof value !== "boolean") {
+    throw new Error(`${MEMBER_CREDITS_LABEL} returned no usable "generation_paused"`);
+  }
+
+  return value;
 }
 
 function requireNumber(

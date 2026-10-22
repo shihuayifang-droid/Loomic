@@ -29,6 +29,7 @@
 
 import {
   withPrivilegedTransaction,
+  type ActorContext,
   type TransactionPool,
 } from "./transaction.js";
 
@@ -41,11 +42,20 @@ export type AdminCreditWriteRepository = {
     delta: number;
     reason: string;
   }): Promise<string>;
-  /** BL-01: set one member's monthly personal cap. Returns the stored cap. */
+  /**
+   * BL-01: set one member's monthly personal cap. Returns the stored cap.
+   *
+   * AD-01 / workorder 39O: `operatorId` is OPTIONAL on purpose. With it the
+   * write goes through `public.admin_set_personal_cap`, which performs the same
+   * change and also writes the `admin_audit_log` row naming the administrator;
+   * without it the pre-39O statement runs verbatim, so every existing caller and
+   * test keeps the behaviour (and the shape) it had. The routes always pass it.
+   */
   setPersonalCap(input: {
     workspaceId: string;
     userId: string;
     cap: number;
+    operatorId?: string;
   }): Promise<number>;
   /**
    * BL-44 / 38N: set this month's team pool limit. The change is effective
@@ -75,7 +85,24 @@ export type AdminCreditWriteRepository = {
     workspaceId: string;
     templateId: string;
     userIds: string[];
+    /** AD-01 / 39O: same optional-operator rule as `setPersonalCap`. */
+    operatorId?: string;
   }): Promise<number>;
+  /**
+   * AD-01 / BL-21 / 39O: pause or resume one member's generation in this
+   * workspace. Returns whether the state actually changed.
+   *
+   * `22023` (an empty reason while pausing, a NULL `paused` flag, a NULL
+   * operator) is re-thrown UNCHANGED like every other driver error here, so the
+   * route can turn exactly that SQLSTATE into a 400 and nothing else.
+   */
+  setGenerationPaused(input: {
+    workspaceId: string;
+    userId: string;
+    operatorId: string;
+    paused: boolean;
+    reason: string | null;
+  }): Promise<boolean>;
 };
 
 /** One stored template, as the routes publish it. */
@@ -110,6 +137,31 @@ select public.admin_adjust_topup(
  */
 const SET_PERSONAL_CAP_SQL = `
 select public.set_personal_cap($1::uuid, $2::uuid, $3::integer) as cap
+`;
+
+/**
+ * AD-01 / 39O: the same cap change, wrapped so it also writes the audit row.
+ * `p_operator_id` is NOT NULL-checked inside the function (`22023`), which is
+ * why an empty operator is never bound here — it selects the older statement
+ * above instead.
+ */
+const ADMIN_SET_PERSONAL_CAP_SQL = `
+select public.admin_set_personal_cap($1::uuid, $2::uuid, $3::uuid, $4::integer) as cap
+`;
+
+/**
+ * AD-01 / BL-21 / 39O: pause (`paused = true`, a non-empty reason required) or
+ * resume (`paused = false`, the row is deleted) and write the audit row in the
+ * same statement. `returns boolean` = did the state actually change.
+ */
+const SET_GENERATION_PAUSED_SQL = `
+select public.set_member_generation_paused(
+  $1::uuid,
+  $2::uuid,
+  $3::uuid,
+  $4::boolean,
+  $5::text
+) as changed
 `;
 
 /** BL-44 / 38N: the one statement of the pool limit change. */
@@ -147,6 +199,11 @@ order by cap desc, name asc
  */
 const APPLY_CAP_TEMPLATE_SQL = `
 select public.apply_cap_template($1::uuid, $2::uuid, $3::uuid[]) as applied
+`;
+
+/** AD-01 / 39O: the same apply, wrapped so it also writes the audit row. */
+const ADMIN_APPLY_CAP_TEMPLATE_SQL = `
+select public.admin_apply_cap_template($1::uuid, $2::uuid, $3::uuid[], $4::uuid) as applied
 `;
 
 /**
@@ -199,16 +256,28 @@ export function createAdminCreditWriteRepository(options: {
     async setPersonalCap(input) {
       const workspaceId = requireArgument(input.workspaceId, "workspaceId");
       const userId = requireArgument(input.userId, "userId");
+      // AD-01 / 39O: an operator selects the auditing wrapper; its absence keeps
+      // the pre-39O statement and the pre-39O transaction context, so nothing a
+      // caller that never heard of 39O does can change.
+      const operatorId = readOptionalOperator(input.operatorId);
 
       return await withPrivilegedTransaction(
         options.getTransactionPool(),
-        { workspaceId },
+        operatorId === null ? { workspaceId } : actorContext(operatorId, workspaceId),
         async (client) => {
-          const result = await client.query(SET_PERSONAL_CAP_SQL, [
-            workspaceId,
-            userId,
-            input.cap,
-          ]);
+          const result =
+            operatorId === null
+              ? await client.query(SET_PERSONAL_CAP_SQL, [
+                  workspaceId,
+                  userId,
+                  input.cap,
+                ])
+              : await client.query(ADMIN_SET_PERSONAL_CAP_SQL, [
+                  workspaceId,
+                  userId,
+                  operatorId,
+                  input.cap,
+                ]);
 
           if (result.rows.length !== 1) {
             throw new Error(
@@ -217,6 +286,34 @@ export function createAdminCreditWriteRepository(options: {
           }
 
           return mapCapRow(result.rows[0]);
+        },
+      );
+    },
+
+    async setGenerationPaused(input) {
+      const workspaceId = requireArgument(input.workspaceId, "workspaceId");
+      const userId = requireArgument(input.userId, "userId");
+      const operatorId = requireArgument(input.operatorId, "operatorId");
+
+      return await withPrivilegedTransaction(
+        options.getTransactionPool(),
+        actorContext(operatorId, workspaceId),
+        async (client) => {
+          const result = await client.query(SET_GENERATION_PAUSED_SQL, [
+            workspaceId,
+            userId,
+            operatorId,
+            input.paused,
+            input.reason,
+          ]);
+
+          if (result.rows.length !== 1) {
+            throw new Error(
+              `${ADMIN_CREDIT_LABEL} returned ${result.rows.length} rows instead of one`,
+            );
+          }
+
+          return mapChangedRow(result.rows[0]);
         },
       );
     },
@@ -288,6 +385,7 @@ export function createAdminCreditWriteRepository(options: {
     async applyCapTemplate(input) {
       const workspaceId = requireArgument(input.workspaceId, "workspaceId");
       const templateId = requireArgument(input.templateId, "templateId");
+      const operatorId = readOptionalOperator(input.operatorId);
 
       if (!Array.isArray(input.userIds) || input.userIds.length === 0) {
         throw new Error(`${ADMIN_CREDIT_LABEL} needs at least one "userIds" member`);
@@ -295,13 +393,21 @@ export function createAdminCreditWriteRepository(options: {
 
       return await withPrivilegedTransaction(
         options.getTransactionPool(),
-        { workspaceId },
+        operatorId === null ? { workspaceId } : actorContext(operatorId, workspaceId),
         async (client) => {
-          const result = await client.query(APPLY_CAP_TEMPLATE_SQL, [
-            workspaceId,
-            templateId,
-            [...input.userIds],
-          ]);
+          const result =
+            operatorId === null
+              ? await client.query(APPLY_CAP_TEMPLATE_SQL, [
+                  workspaceId,
+                  templateId,
+                  [...input.userIds],
+                ])
+              : await client.query(ADMIN_APPLY_CAP_TEMPLATE_SQL, [
+                  workspaceId,
+                  templateId,
+                  [...input.userIds],
+                  operatorId,
+                ]);
 
           if (result.rows.length !== 1) {
             throw new Error(
@@ -326,6 +432,43 @@ export function createAdminCreditWriteRepository(options: {
 function requireArgument(value: unknown, field: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`${ADMIN_CREDIT_LABEL} needs a non-empty "${field}"`);
+  }
+
+  return value;
+}
+
+/**
+ * AD-01 / 39O: the optional operator, normalised once.
+ *
+ * `undefined` means "the caller has no operator" and selects the pre-39O
+ * statement; a present but EMPTY operator is a programming error, not an
+ * absence, so it is refused exactly like every other unusable argument rather
+ * than silently falling back to the unaudited write.
+ */
+function readOptionalOperator(value: unknown): string | null {
+  if (value === undefined) return null;
+
+  return requireArgument(value, "operatorId");
+}
+
+/** The acting administrator: privileged access, but an auditable actor. */
+function actorContext(operatorId: string, workspaceId: string): ActorContext {
+  return { userId: operatorId, workspaceId, role: "admin" };
+}
+
+/**
+ * `set_member_generation_paused` declares `returns boolean`, so a missing or
+ * non-boolean `changed` is drift. Reporting it as `false` would say "pausing
+ * changed nothing" about a call that may well have paused the member.
+ */
+function mapChangedRow(row: unknown): boolean {
+  if (typeof row !== "object" || row === null || Array.isArray(row)) {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned a row that is not an object`);
+  }
+
+  const value = (row as Readonly<Record<string, unknown>>).changed;
+  if (typeof value !== "boolean") {
+    throw new Error(`${ADMIN_CREDIT_LABEL} returned no usable "changed"`);
   }
 
   return value;

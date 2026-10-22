@@ -308,6 +308,15 @@ export const memberCreditSummarySchema = z.object({
   teamUsed: z.number().int().nonnegative(),
   topup: z.number().int().nonnegative(),
   dailyRemaining: z.number().int().nonnegative(),
+  // AD-01 / BL-21 / workorder 39O: TRUE when this member's generation is paused
+  // in this workspace, so the admin member list can show 正常 / 已暂停生成.
+  //
+  // ADDITIVE and OPTIONAL on purpose: the repository writes the key ONLY when it
+  // is true, so every whole-object assertion and fixture written before 39O
+  // keeps its exact shape, and a caller that knows nothing about pauses reads
+  // the payload it always read. A reader must therefore test `=== true`, never
+  // "the key is present and not false".
+  generationPaused: z.boolean().optional(),
 });
 export type MemberCreditSummary = z.infer<typeof memberCreditSummarySchema>;
 
@@ -534,4 +543,36 @@ export const creditCapTemplateApplyResponseSchema = z.object({
 });
 export type CreditCapTemplateApplyResponse = z.infer<
   typeof creditCapTemplateApplyResponseSchema
+>;
+
+// -- AD-01 / BL-21 / workorder 39O: pause and resume one member's generation ---
+
+/**
+ * The body of `PUT /api/admin/team/members/:userId/generation`.
+ *
+ * `reason` is optional in the SHAPE and mandatory only when pausing: resuming
+ * needs none, while pausing without one is refused by the route (「暂停需要填写
+ * 原因」) and by `set_member_generation_paused` itself (SQLSTATE 22023). Keeping
+ * the condition out of the schema is deliberate — a zod refinement could only
+ * answer "invalid body", while the requirement has its own message.
+ */
+export const adminGenerationPauseRequestSchema = z.object({
+  paused: z.boolean(),
+  reason: z.string().trim().min(1).max(200).optional(),
+});
+export type AdminGenerationPauseRequest = z.infer<
+  typeof adminGenerationPauseRequestSchema
+>;
+
+/**
+ * The answer. `paused` is the state the member is in afterwards, `changed` is
+ * whether this call moved it — pausing an already-paused member or resuming one
+ * that was never paused is a 200 with `changed: false` and no audit row.
+ */
+export const adminGenerationPauseResponseSchema = z.object({
+  paused: z.boolean(),
+  changed: z.boolean(),
+});
+export type AdminGenerationPauseResponse = z.infer<
+  typeof adminGenerationPauseResponseSchema
 >;

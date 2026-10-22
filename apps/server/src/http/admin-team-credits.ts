@@ -1,6 +1,8 @@
 import {
   adminCreditAdjustRequestSchema,
   adminCreditAdjustResponseSchema,
+  adminGenerationPauseRequestSchema,
+  adminGenerationPauseResponseSchema,
   adminPersonalCapRequestSchema,
   adminPersonalCapResponseSchema,
   applicationErrorResponseSchema,
@@ -47,6 +49,12 @@ const MEMBER_CREDITS_FAILED_MESSAGE = "Unable to read member credits.";
 const DUPLICATE_TEMPLATE_MESSAGE = "已有同名模板";
 const TEMPLATE_NOT_FOUND_MESSAGE = "模板不存在";
 const UNIQUE_VIOLATION = "23505";
+
+/** AD-01 / BL-21 / 39O: the pause route's own two refusals. */
+const INVALID_PAUSE_MESSAGE =
+  "paused (a boolean) and reason (1-200 characters) are required.";
+const PAUSE_REASON_REQUIRED_MESSAGE = "暂停需要填写原因";
+const PAUSE_FAILED_MESSAGE = "Unable to change the member's generation pause.";
 
 /** SQLSTATE of 37U's 「减分不足」 refusal; its `detail` is how much may be taken. */
 const ADJUST_EXCEEDS_TOPUP = "P0405";
@@ -308,6 +316,9 @@ export async function registerAdminTeamCreditRoutes(
           workspaceId: admin.workspaceId,
           userId: request.params.userId,
           cap: parsed.data.cap,
+          // AD-01 / 39O: the administrator is named, so the write also lands in
+          // `admin_audit_log` (「每个操作在审计日志有一条」).
+          operatorId: admin.user.id,
         });
 
         return reply
@@ -315,6 +326,85 @@ export async function registerAdminTeamCreditRoutes(
           .send(adminPersonalCapResponseSchema.parse({ cap }));
       } catch (error) {
         return sendWriteError(reply, error, CAP_FAILED_MESSAGE);
+      }
+    },
+  );
+
+  /**
+   * AD-01 / BL-21 / 39O: pause or resume one member's generation.
+   *
+   * `paused: true` needs a reason — the route refuses it first with its own
+   * message and the database refuses it a second time with `22023` — because the
+   * reason is what the audit row (and the member's own screen) explains the
+   * pause with. Resuming carries none.
+   *
+   * The answer is always the resulting state plus whether this call moved it,
+   * so a repeat pause is a 200 `{ paused: true, changed: false }` rather than an
+   * error the browser would have to read a database code to understand.
+   */
+  app.put<{ Params: { userId: string } }>(
+    "/api/admin/team/members/:userId/generation",
+    async (request, reply) => {
+      const admin = await requireAdmin(request, reply);
+      if (!admin) return reply;
+
+      if (!USER_ID_PATTERN.test(request.params.userId)) {
+        return sendInvalidUserId(reply);
+      }
+
+      const parsed = adminGenerationPauseRequestSchema.safeParse(request.body);
+
+      if (!parsed.success) {
+        return sendApplicationError(
+          reply,
+          400,
+          "invalid_request",
+          INVALID_PAUSE_MESSAGE,
+        );
+      }
+
+      if (parsed.data.paused && parsed.data.reason === undefined) {
+        return sendApplicationError(
+          reply,
+          400,
+          "invalid_request",
+          PAUSE_REASON_REQUIRED_MESSAGE,
+        );
+      }
+
+      try {
+        const changed = await options.adminCreditWriteRepository.setGenerationPaused({
+          workspaceId: admin.workspaceId,
+          userId: request.params.userId,
+          operatorId: admin.user.id,
+          paused: parsed.data.paused,
+          // Resuming stores no reason: the pause row is deleted, so there is
+          // nothing for a reason to belong to.
+          reason: parsed.data.paused ? (parsed.data.reason ?? null) : null,
+        });
+
+        return reply.code(200).send(
+          adminGenerationPauseResponseSchema.parse({
+            paused: parsed.data.paused,
+            changed,
+          }),
+        );
+      } catch (error) {
+        if (readDatabaseError(error).code === INVALID_PARAMETER) {
+          return sendApplicationError(
+            reply,
+            400,
+            "invalid_request",
+            INVALID_PAUSE_MESSAGE,
+          );
+        }
+
+        return sendApplicationError(
+          reply,
+          500,
+          "application_error",
+          PAUSE_FAILED_MESSAGE,
+        );
       }
     },
   );
@@ -473,6 +563,8 @@ export async function registerAdminTeamCreditRoutes(
           workspaceId: admin.workspaceId,
           templateId: request.params.templateId,
           userIds: parsed.data.userIds,
+          // AD-01 / 39O: named operator, so the apply is audited too.
+          operatorId: admin.user.id,
         });
 
         return reply

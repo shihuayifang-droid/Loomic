@@ -8,6 +8,7 @@ import {
   createMemberCreditReadRepository,
   type MemberCreditReadRepository,
 } from "../../db/member-credit-read-repository.js";
+import { createAdminCreditWriteRepository } from "../../db/admin-credit-write-repository.js";
 import type { TransactionPool } from "../../db/transaction.js";
 import {
   createMigratedDb,
@@ -423,5 +424,144 @@ describe("listMemberCredits (37Z): 成员额度概览", () => {
         dailyRemaining: 0,
       },
     ]);
+  });
+
+  it("AD-01: a paused member reads as generationPaused: true and others have no such key", async () => {
+    const actor = await newActor();
+    const memberB = await addMember(actor);
+
+    // 39N 的暂停函数：真行写进 member_generation_pauses，读的是同一张表。
+    expect(
+      firstRow(
+        (
+          await db.query<{ v: boolean }>(
+            `select public.set_member_generation_paused(
+               $1::uuid, $2::uuid, $3::uuid, $4::boolean, $5::text
+             ) as v`,
+            [actor.workspaceId, memberB, actor.userId, true, "异常消耗"],
+          )
+        ).rows,
+      ).v,
+    ).toBe(true);
+
+    const rows = await list(actor.workspaceId);
+
+    // 暂停的成员：键在，值是 true。
+    expect(rowFor(rows, memberB)).toEqual({
+      userId: memberB,
+      personalCap: 20000,
+      teamUsed: 0,
+      topup: 0,
+      dailyRemaining: 0,
+      generationPaused: true,
+    });
+
+    // 没暂停的成员：整对象里**没有**这个键，不是带一个 false。
+    const runningRow = rowFor(rows, actor.userId);
+    expect(Object.hasOwn(runningRow, "generationPaused")).toBe(false);
+    expect(runningRow).toEqual({
+      userId: actor.userId,
+      personalCap: 20000,
+      teamUsed: 0,
+      topup: 0,
+      dailyRemaining: 0,
+    });
+
+    // 恢复：键跟着消失。
+    expect(
+      firstRow(
+        (
+          await db.query<{ v: boolean }>(
+            `select public.set_member_generation_paused(
+               $1::uuid, $2::uuid, $3::uuid, $4::boolean, $5::text
+             ) as v`,
+            [actor.workspaceId, memberB, actor.userId, false, null],
+          )
+        ).rows,
+      ).v,
+    ).toBe(true);
+    expect(
+      Object.hasOwn(rowFor(await list(actor.workspaceId), memberB), "generationPaused"),
+    ).toBe(false);
+  });
+});
+
+/**
+ * AD-01 / 39O —— 「有操作人才写审计」的那一半：「不传 operatorId 时跑原函数」。
+ *
+ * `member-pause-and-credit-audit-db.test.ts` 只验数据库函数本身；这一节验的是
+ * **仓储**在有 / 无 operatorId 时选了哪条语句：审计包装写一行，原语句一行不写。
+ */
+
+/** `credits.set_cap` 审计行数（按被改的那个人数）。 */
+async function capAuditCount(targetUserId: string): Promise<number> {
+  return firstRow(
+    (
+      await db.query<{ count: number }>(
+        `select count(*)::int as count from public.admin_audit_log
+          where action = 'credits.set_cap' and target_user_id = $1::uuid`,
+        [targetUserId],
+      )
+    ).rows,
+  ).count;
+}
+
+describe("admin credit write (39O): the auditing wrapper is opt-in", () => {
+  it("AD-01: without an operator the old function runs", async () => {
+    const actor = await newActor();
+    const writes = createAdminCreditWriteRepository({
+      getTransactionPool: () => pool,
+    });
+
+    // 不传 operatorId：走 39O 之前那条语句，审计表一行都不多。
+    expect(
+      await writes.setPersonalCap({
+        workspaceId: actor.workspaceId,
+        userId: actor.userId,
+        cap: 21000,
+      }),
+    ).toBe(21000);
+    expect(await capAuditCount(actor.userId)).toBe(0);
+
+    // 传了 operatorId：同一次改动由审计包装完成，恰好一行审计。
+    expect(
+      await writes.setPersonalCap({
+        workspaceId: actor.workspaceId,
+        userId: actor.userId,
+        cap: 22000,
+        operatorId: actor.userId,
+      }),
+    ).toBe(22000);
+    expect(await capAuditCount(actor.userId)).toBe(1);
+
+    // 两条路径写的是同一个字段：概览读到的就是最后那次的上限。
+    expect(rowFor(await list(actor.workspaceId), actor.userId).personalCap).toBe(
+      22000,
+    );
+  });
+
+  it("AD-01: an empty operator is refused instead of silently unaudited", async () => {
+    const actor = await newActor();
+    const writes = createAdminCreditWriteRepository({
+      getTransactionPool: () => pool,
+    });
+
+    const error = await writes
+      .setPersonalCap({
+        workspaceId: actor.workspaceId,
+        userId: actor.userId,
+        cap: 21000,
+        operatorId: "",
+      })
+      .catch((reason: unknown) => reason);
+
+    expect((error as Error).message).toBe(
+      'admin credit write needs a non-empty "operatorId"',
+    );
+    // 空操作人不能降级成「不写审计」的那条路：一行都没写。
+    expect(await capAuditCount(actor.userId)).toBe(0);
+    expect(rowFor(await list(actor.workspaceId), actor.userId).personalCap).toBe(
+      20000,
+    );
   });
 });

@@ -47,6 +47,8 @@ type CapCall = {
   workspaceId: string;
   userId: string;
   cap: number;
+  /** AD-01 / 39O: the route now names the administrator on every cap write. */
+  operatorId?: string;
 };
 
 type CreateTemplateCall = {
@@ -59,6 +61,17 @@ type ApplyTemplateCall = {
   workspaceId: string;
   templateId: string;
   userIds: string[];
+  /** AD-01 / 39O: same optional-operator rule as the cap write above. */
+  operatorId?: string;
+};
+
+/** AD-01 / BL-21 / 39O: what the generation pause write was asked for. */
+type PauseCall = {
+  workspaceId: string;
+  userId: string;
+  operatorId: string;
+  paused: boolean;
+  reason: string | null;
 };
 
 /** AD-01 / 37Z: what the member credit read was asked for. */
@@ -95,6 +108,10 @@ let transactionIdResult = "tx-1";
 let capResult = 30000;
 let templatesResult: { id: string; name: string; cap: number }[] = [];
 let appliedResult = 1;
+/** AD-01 / 39O: the pause writes the route made, and what the double answers. */
+let pauseCalls: PauseCall[] = [];
+let pauseChangedResult = true;
+let pauseFailure: unknown = null;
 /** When set, `teamMembership.get` throws instead of answering. */
 let membershipFailure: Error | null = null;
 
@@ -162,6 +179,11 @@ const adminCreditWriteRepository: AdminCreditWriteRepository = {
     applyTemplateCalls.push(input);
     if (templateFailure) throw templateFailure;
     return appliedResult;
+  },
+  async setGenerationPaused(input) {
+    pauseCalls.push(input);
+    if (pauseFailure) throw pauseFailure;
+    return pauseChangedResult;
   },
 };
 
@@ -268,6 +290,9 @@ beforeEach(() => {
   capResult = 30000;
   templatesResult = [];
   appliedResult = 1;
+  pauseCalls = [];
+  pauseChangedResult = true;
+  pauseFailure = null;
   membershipFailure = null;
   app = buildApp({
     adminCreditWriteRepository,
@@ -408,7 +433,7 @@ describe("admin team credit routes", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ cap: 30000 });
     expect(capCalls).toEqual([
-      { workspaceId: TEAM_ID, userId: TARGET_ID, cap: 30000 },
+      { workspaceId: TEAM_ID, userId: TARGET_ID, cap: 30000, operatorId: ADMIN_ID },
     ]);
   });
 
@@ -503,7 +528,12 @@ describe("admin team credit routes", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ applied: 1 });
     expect(applyTemplateCalls).toEqual([
-      { workspaceId: TEAM_ID, templateId: TEMPLATE_ID, userIds: [TARGET_ID] },
+      {
+        workspaceId: TEAM_ID,
+        templateId: TEMPLATE_ID,
+        userIds: [TARGET_ID],
+        operatorId: ADMIN_ID,
+      },
     ]);
   });
 
@@ -687,5 +717,210 @@ describe("admin team credit routes", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json().error.code).toBe("invalid_request");
+  });
+
+  // ── AD-01 / BL-21 / 39O: the existing writes name their operator, and the ──
+  // ── pause / resume route exists ─────────────────────────────────────────
+
+  it("AD-01: a cap set through the route is audited", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/cap`,
+      headers: bearer("admin-token"),
+      payload: { cap: 25000 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ cap: 30000 });
+    // 仓储替身收到的就是审计包装的入参：写审计必须知道谁是操作人。
+    expect(capCalls).toEqual([
+      {
+        workspaceId: TEAM_ID,
+        userId: TARGET_ID,
+        cap: 25000,
+        operatorId: ADMIN_ID,
+      },
+    ]);
+  });
+
+  it("AD-01: applying a template passes the operator", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/admin/team/cap-templates/${TEMPLATE_ID}/apply`,
+      headers: bearer("admin-token"),
+      payload: { userIds: [TARGET_ID, MEMBER_ID] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(applyTemplateCalls).toEqual([
+      {
+        workspaceId: TEAM_ID,
+        templateId: TEMPLATE_ID,
+        userIds: [TARGET_ID, MEMBER_ID],
+        operatorId: ADMIN_ID,
+      },
+    ]);
+  });
+
+  it("AD-01: an admin pauses a member with a reason", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/generation`,
+      headers: bearer("admin-token"),
+      payload: { paused: true, reason: "异常消耗" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ paused: true, changed: true });
+    expect(pauseCalls).toEqual([
+      {
+        workspaceId: TEAM_ID,
+        userId: TARGET_ID,
+        operatorId: ADMIN_ID,
+        paused: true,
+        reason: "异常消耗",
+      },
+    ]);
+  });
+
+  it("AD-01: pausing without a reason is a 400", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/generation`,
+      headers: bearer("admin-token"),
+      payload: { paused: true },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("invalid_request");
+    expect(response.json().error.message).toBe("暂停需要填写原因");
+    expect(pauseCalls.length).toBe(0);
+  });
+
+  it("AD-01: a blank reason is refused before the database sees it", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/generation`,
+      headers: bearer("admin-token"),
+      payload: { paused: true, reason: "   " },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("invalid_request");
+    expect(pauseCalls.length).toBe(0);
+  });
+
+  it("AD-01: resuming needs no reason", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/generation`,
+      headers: bearer("admin-token"),
+      payload: { paused: false },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ paused: false, changed: true });
+    expect(pauseCalls).toEqual([
+      {
+        workspaceId: TEAM_ID,
+        userId: TARGET_ID,
+        operatorId: ADMIN_ID,
+        paused: false,
+        reason: null,
+      },
+    ]);
+  });
+
+  it("AD-01: a repeat pause reports changed: false", async () => {
+    pauseChangedResult = false;
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/generation`,
+      headers: bearer("admin-token"),
+      payload: { paused: true, reason: "异常消耗" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ paused: true, changed: false });
+  });
+
+  it("AD-01: a non-admin cannot pause", async () => {
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/generation`,
+      headers: bearer("member-token"),
+      payload: { paused: true, reason: "异常消耗" },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error.code).toBe("forbidden");
+    expect(pauseCalls.length).toBe(0);
+  });
+
+  it("AD-01: a database refusal of the pause (22023) is a 400", async () => {
+    pauseFailure = { code: "22023" };
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/generation`,
+      headers: bearer("admin-token"),
+      payload: { paused: true, reason: "异常消耗" },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("invalid_request");
+  });
+
+  it("AD-01: a failing pause is a 500 that leaks no internals", async () => {
+    pauseFailure = new Error("set_member_generation_paused raised");
+
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/admin/team/members/${TARGET_ID}/generation`,
+      headers: bearer("admin-token"),
+      payload: { paused: true, reason: "异常消耗" },
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json().error.code).toBe("application_error");
+    expect(response.json().error.message).toBe(
+      "Unable to change the member's generation pause.",
+    );
+    expect(response.body).not.toMatch(/set_member_generation_paused|member_generation/);
+  });
+
+  it("AD-01: the member list carries generationPaused", async () => {
+    memberCreditsResult = [
+      {
+        userId: MEMBER_ID,
+        personalCap: 20000,
+        teamUsed: 0,
+        topup: 0,
+        dailyRemaining: 0,
+        generationPaused: true,
+      },
+      {
+        userId: TARGET_ID,
+        personalCap: 20000,
+        teamUsed: 0,
+        topup: 0,
+        dailyRemaining: 0,
+      },
+    ];
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/admin/team/members/credits",
+      headers: bearer("admin-token"),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ members: memberCreditsResult });
+
+    const members = (response.json() as { members: Record<string, unknown>[] }).members;
+    expect(members[0]?.generationPaused).toBe(true);
+    // 未暂停的成员不带这个键，而不是带一个 false。
+    expect(Object.hasOwn(members[1] ?? {}, "generationPaused")).toBe(false);
   });
 });
