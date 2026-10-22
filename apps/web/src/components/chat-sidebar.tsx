@@ -43,7 +43,7 @@ import {
   MessageMentionPicker,
   type MessageMentionPickerItem,
 } from "./canvas-image-picker";
-import { ChatInput } from "./chat-input";
+import { ChatInput } from "./chat-input"; import { AddAssetPicker } from "./chat/add-asset-picker";
 import { ChatMessage } from "./chat-message";
 import { ChatSkills } from "./chat-skills";
 import { CreditInsufficientDialog } from "./credits/credit-insufficient-dialog";
@@ -1134,6 +1134,7 @@ export function ChatSidebar({
             onClose={() => setSlashQuery(null)}
           />
         )}
+        <AddAssetPicker items={brandKitMentionItems} onSelect={handleMentionSelect} disabled={streaming || sessionsLoading} />
         <ChatInput
           ref={chatInputRef}
           onSend={(text, canvasRefs) =>
