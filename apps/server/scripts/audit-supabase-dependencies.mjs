@@ -220,8 +220,8 @@ const ANCHORS = [
   { label: "sql.rlsTables", value: 37, key: "sql.rlsEnabledTables" },
   { label: "config.envFamily", value: 8, key: "config.supabaseEnvVariableFamily" },
   { label: "manifests", value: 3, key: "manifests.withSupabaseSdk" },
-  // 31A: +1 migration (pricing_rules); 33D: +1 (deduct_credits SQLSTATE); 33F: +1 (asset provenance); 33X: +1 (asset display name); 34T: +1 (job client_request_id); 36C: +1 (asset source_job fk); 36D: +1 (refund once per job); 37N: +1 (deduct_from_pools); 37O: +2 (credit cycle types, cycle grants); 37S: +1 (refund_to_pools); 37U: +1 (admin credit adjust); 37W: +1 (member cap settings); 38N: +1 (set_team_pool_limit)
-  { label: "sql.migrations", value: 52, key: "sql.migrationsActive" },
+  // 31A: +1 migration (pricing_rules); 33D: +1 (deduct_credits SQLSTATE); 33F: +1 (asset provenance); 33X: +1 (asset display name); 34T: +1 (job client_request_id); 36C: +1 (asset source_job fk); 36D: +1 (refund once per job); 37N: +1 (deduct_from_pools); 37O: +2 (credit cycle types, cycle grants); 37S: +1 (refund_to_pools); 37U: +1 (admin credit adjust); 37W: +1 (member cap settings); 38N: +1 (set_team_pool_limit); 39E: +1 (create_charged_job)
+  { label: "sql.migrations", value: 53, key: "sql.migrationsActive" },
 ];
 
 function parseArgs(argv) {

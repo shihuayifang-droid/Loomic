@@ -76,3 +76,21 @@ create function storage.foldername(name text) returns text[] language sql immuta
 grant execute on function storage.foldername(text) to anon, authenticated, service_role;
 
 create function pgmq.create(queue_name text) returns void language sql as $$ select $$;
+
+-- 39E: test double for pgmq.send (same signature as the real extension).
+-- Records every message; a queue named fail_queue simulates an enqueue failure.
+create table pgmq.test_sent (
+  queue_name text,
+  message jsonb,
+  sent_at timestamptz default now()
+);
+
+create function pgmq.send(queue_name text, msg jsonb, delay integer default 0)
+returns setof bigint language plpgsql as $$
+begin
+  if queue_name = 'fail_queue' then
+    raise exception 'pgmq send failed' using errcode = 'XX000';
+  end if;
+  insert into pgmq.test_sent (queue_name, message) values (queue_name, msg);
+  return next 1::bigint;
+end $$;
