@@ -718,3 +718,106 @@ describe("processJobMessage: the execution budget (工单36H / GN-31)", () => {
     expect(executorTimeoutMs("video_generation", 0)).toBe(300 * 1000);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Workorder 39W — a success that could not be WRITTEN (T-15 / GN-38).
+//
+// Before this ticket `markSucceeded` lived inside the executor's try, so a
+// database hiccup while recording a finished generation fell into the failure
+// arm: `markRetrying` with attempts left (the executor runs again — the model is
+// paid twice and a second image may be delivered) or `markFailed` on the last
+// attempt (a job that produced its result is failed and refunded). The cases
+// below pin the split: the write is retried on its own, never by re-running the
+// executor, and its exhaustion leaves the row `running` for the reaper.
+//
+// The retry budget is the exported `MARK_SUCCEEDED_ATTEMPTS`; it is written out
+// as 3 here because this file is append-only for this ticket.
+// ---------------------------------------------------------------------------
+
+describe("processJobMessage: recording a success (工单39W / T-15)", () => {
+  it("T-15: a failed success write is retried and then recorded", async () => {
+    let writes = 0;
+    const h = makeHarness({
+      markSucceeded: async () => {
+        writes += 1;
+        // The first write is the one a dropped connection eats: the executor has
+        // already answered, so nothing about the generation is wrong.
+        if (writes === 1) throw new Error("connection reset while writing succeeded");
+        return true;
+      },
+    });
+
+    await h.run();
+
+    expect(h.calls.filter((call) => call === "markSucceeded")).toHaveLength(2);
+    expect(h.calls.filter((call) => call === "deleteMsg")).toHaveLength(1);
+    expect(h.calls.filter((call) => call === "markRetrying")).toHaveLength(0);
+    expect(h.calls.filter((call) => call === "markFailed")).toHaveLength(0);
+    // The whole point: the retry is the write's, not the generation's.
+    expect(h.calls.filter((call) => call === "executor")).toHaveLength(1);
+    expect(h.calls).not.toContain("archive");
+    expect(h.refunds()).toBe(0);
+    expect(h.logs.join(" ")).toContain("succeeded");
+  });
+
+  it("T-15: a success write that keeps failing does not re-run the generation", async () => {
+    const h = makeHarness({
+      markSucceeded: async () => {
+        throw new Error("db is down");
+      },
+    });
+
+    await h.run();
+
+    // Exactly the budget, no more: 3.
+    expect(h.calls.filter((call) => call === "markSucceeded")).toHaveLength(3);
+    // None of the failure arm's writes, and the message is NOT dropped: the row
+    // stays `running` so the stuck-job reaper (GN-31) owns the outcome.
+    expect(h.calls.filter((call) => call === "markRetrying")).toHaveLength(0);
+    expect(h.calls.filter((call) => call === "markFailed")).toHaveLength(0);
+    expect(h.calls.filter((call) => call === "deleteMsg")).toHaveLength(0);
+    expect(h.calls).not.toContain("archive");
+    expect(h.calls.filter((call) => call === "executor")).toHaveLength(1);
+    expect(h.refunds()).toBe(0);
+    expect(h.logs.join(" ")).toContain("leaving it running for the stuck-job reaper");
+    // And the re-delivery really is inert: `markRunning` answers false for a row
+    // that is not queued/retrying, so the message is archived unexecuted.
+    expect(h.logs.join(" ")).not.toContain("will retry");
+  });
+
+  it("T-15: on the last attempt a failed success write still does not fail the job", async () => {
+    // Last attempt of the budget: the OLD code took the `attemptCount >=
+    // maxAttempts` branch here and wrote `failed` + refunded a job that worked.
+    const h = makeHarness({
+      increment: async () => ({ attempt_count: 3, max_attempts: 3 }),
+      markSucceeded: async () => {
+        throw new Error("db is down");
+      },
+    });
+
+    await h.run();
+
+    expect(h.calls.filter((call) => call === "markFailed")).toHaveLength(0);
+    expect(h.refunds()).toBe(0);
+    expect(h.calls).not.toContain("archive");
+    expect(h.calls.filter((call) => call === "markSucceeded")).toHaveLength(3);
+    expect(h.calls.filter((call) => call === "executor")).toHaveLength(1);
+  });
+
+  it("T-15: an executor failure still retries as before", async () => {
+    // The other half of the split: a generation that genuinely failed keeps the
+    // original behaviour, and never touches the success write.
+    const h = makeHarness({
+      increment: async () => ({ attempt_count: 1, max_attempts: 3 }),
+      executorThrows: { message: "provider hiccup" },
+    });
+
+    await h.run();
+
+    expect(h.calls.filter((call) => call === "markRetrying")).toHaveLength(1);
+    expect(h.calls.filter((call) => call === "markSucceeded")).toHaveLength(0);
+    expect(h.calls.filter((call) => call === "deleteMsg")).toHaveLength(0);
+    expect(h.failures).toEqual([]);
+    expect(h.logs.join(" ")).toContain("will retry (attempt 1/3)");
+  });
+});

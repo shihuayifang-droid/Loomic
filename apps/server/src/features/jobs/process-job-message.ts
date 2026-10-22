@@ -92,6 +92,22 @@ const NON_RETRYABLE_CODES = new Set([
 export const BILLING_CONFIRM_TIMEOUT_SECONDS = 600;
 
 /**
+ * T-15 / GN-38: how many times the worker tries to record a success it has
+ * already produced.
+ *
+ * The generation is done and paid for at this point, so the only mistake left to
+ * make is running it a second time. A transient write failure (a connection
+ * dropped between the executor answering and the UPDATE landing) must therefore
+ * be retried HERE, a couple of times, and never by re-running the executor: that
+ * would call the model again and could deliver a second image for one charge.
+ * The attempts are immediate — the write is one statement against a live pool,
+ * so waiting only delays the message's visibility timeout arithmetic — and if
+ * all of them fail the job is left `running` for the stuck-job reaper (GN-31)
+ * instead of being failed and refunded for work that actually succeeded.
+ */
+export const MARK_SUCCEEDED_ATTEMPTS = 3;
+
+/**
  * How long a message is made invisible while the job waits for its charge.
  *
  * Short on purpose: the wait is bounded by a database round trip, so the message
@@ -387,6 +403,14 @@ export async function processJobMessage(
     return;
   }
 
+  // T-15: only the EXECUTION is inside this try. Producing a result and
+  // recording it are separate concerns, and the `catch` below is the executor's
+  // failure path — it writes `retrying` (so the executor runs again) or fails the
+  // job terminally. A success write that throws must reach neither of those: the
+  // generation already happened, and retrying would call the model a second time
+  // for work that is finished (GN-38).
+  let result: Record<string, unknown>;
+
   try {
     const executorCtx: ExecutorContext =
       typeof gate?.creditsCost === "number" ? { ...ctx, creditsCharged: gate.creditsCost } : ctx;
@@ -397,7 +421,7 @@ export async function processJobMessage(
     // it is the only limit the executor cannot push back.
     const budgetMs = (deps.executorTimeoutMs ?? executorTimeoutMs)(jobType, maxAttempts);
 
-    const result = await withExecutionBudget(
+    result = await withExecutionBudget(
       executor(jobId, msg.message as Record<string, unknown>, executorCtx),
       budgetMs,
       () =>
@@ -405,20 +429,6 @@ export async function processJobMessage(
           code: "timeout",
         }),
     );
-
-    // A job whose status is no longer `running` is not overwritten here — that
-    // is what makes a late completion of a timed-out attempt harmless: the
-    // timeout branch below has already written `failed`, and this guard refuses
-    // to turn it back into `succeeded`.
-    const marked = await deps.jobService.markSucceeded(jobId, result);
-
-    if (!marked) {
-      // Cancelled while it was running: keep that status, just drop the message.
-      deps.log(`Job ${jobId} finished but is no longer running — status left as is`);
-    }
-
-    await deps.pgmq.deleteMsg(queue, msg.msg_id);
-    deps.log(`Job ${jobId} succeeded +${Date.now() - startedAt}ms`);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorCode = (error as { code?: string })?.code ?? "executor_error";
@@ -436,5 +446,52 @@ export async function processJobMessage(
     deps.log(
       `Job ${jobId} will retry (attempt ${attemptCount}/${maxAttempts}) +${Date.now() - startedAt}ms: ${errorMessage}`,
     );
+    return;
   }
+
+  // 8. The executor answered: the generation SUCCEEDED. Recording that is a
+  //    write of its own, retried here rather than by re-running the executor
+  //    (T-15). `markSucceeded`'s statement is idempotent — it predicates on
+  //    `status = 'running'` — so retrying it cannot double-write anything.
+  let marked = false;
+  let recorded = false;
+  let recordError: unknown;
+
+  for (let attempt = 1; attempt <= MARK_SUCCEEDED_ATTEMPTS; attempt += 1) {
+    try {
+      // A job whose status is no longer `running` is not overwritten here — that
+      // is what makes a late completion of a timed-out attempt harmless: the
+      // timeout branch above has already written `failed`, and this guard
+      // refuses to turn it back into `succeeded`.
+      marked = await deps.jobService.markSucceeded(jobId, result);
+      recorded = true;
+      break;
+    } catch (error) {
+      // Only the LAST failure is reported: earlier ones were transient.
+      recordError = error;
+    }
+  }
+
+  if (!recorded) {
+    // Every attempt threw. Do NOT `markRetrying` (that re-runs the executor),
+    // do NOT `terminalFail` (that fails and refunds a generation that worked)
+    // and do NOT delete the message. The row stays `running` and the stuck-job
+    // reaper (GN-31) retires it; when this message is re-delivered its
+    // `markRunning` answers false (the row is not queued/retrying) and it is
+    // archived without touching the executor again.
+    deps.log(
+      `Job ${jobId} produced a result but its success could not be recorded; leaving it running for the stuck-job reaper: ${
+        recordError instanceof Error ? recordError.message : String(recordError)
+      }`,
+    );
+    return;
+  }
+
+  if (!marked) {
+    // Cancelled while it was running: keep that status, just drop the message.
+    deps.log(`Job ${jobId} finished but is no longer running — status left as is`);
+  }
+
+  await deps.pgmq.deleteMsg(queue, msg.msg_id);
+  deps.log(`Job ${jobId} succeeded +${Date.now() - startedAt}ms`);
 }
