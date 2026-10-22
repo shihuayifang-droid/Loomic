@@ -13,20 +13,20 @@ const geist = Geist({ subsets: ["latin"], variable: "--font-sans" });
 
 export const metadata: Metadata = {
   title: "HaHart",
-  description: "AI-powered creative workspace",
+  description: "HaHart · AI 创意画布",
   icons: {
     icon: "/favicon.svg",
     apple: "/apple-touch-icon.png",
   },
   openGraph: {
     title: "HaHart",
-    description: "AI-powered creative workspace",
+    description: "HaHart · AI 创意画布",
     images: [{ url: "/og-image.png", width: 1200, height: 630 }],
   },
   twitter: {
     card: "summary_large_image",
     title: "HaHart",
-    description: "AI-powered creative workspace",
+    description: "HaHart · AI 创意画布",
     images: ["/og-image.png"],
   },
 };

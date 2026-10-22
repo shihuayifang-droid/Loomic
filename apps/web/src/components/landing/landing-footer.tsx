@@ -124,12 +124,12 @@ export function LandingFooter() {
             <Link href="/" className="inline-flex items-center gap-2">
               <LogoMark />
               <span className="text-base font-semibold text-foreground tracking-tight">
-                Loomic
+                HaHart
               </span>
             </Link>
 
             <p className="mt-2 text-sm text-muted-foreground leading-relaxed">
-              AI 驱动的创意设计平台
+              对话即可出图、改图的 AI 设计画布
             </p>
 
             {/* Social links */}
@@ -189,7 +189,7 @@ export function LandingFooter() {
         {/* Bottom bar */}
         <div className="mt-12 pt-6 border-t border-border flex flex-col sm:flex-row justify-between items-center gap-3">
           <p className="text-sm text-muted-foreground">
-            &copy; {currentYear} Loomic. All rights reserved.
+            &copy; {currentYear} HaHart. All rights reserved.
           </p>
           <span className="text-sm text-muted-foreground">简体中文</span>
         </div>
