@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 
 import { AgentSection } from "@/components/agent-section";
-import { BillingSection } from "@/components/billing-section";
 import {
   TeamCreditsAdmin,
   type TeamCreditsAdminProps,
@@ -25,12 +24,11 @@ import {
   updateWorkspaceSettings,
 } from "@/lib/server-api";
 
-type SettingsTab = "profile" | "agent" | "billing" | "usage" | "team-credits";
+type SettingsTab = "profile" | "agent" | "usage" | "team-credits";
 
 const tabs: Array<{ id: SettingsTab; label: string }> = [
   { id: "profile", label: "Profile" },
   { id: "agent", label: "Agent" },
-  { id: "billing", label: "Billing" },
   { id: "usage", label: "Usage" },
 ];
 
@@ -50,7 +48,6 @@ function isSettingsTab(value: string): value is SettingsTab {
   return (
     value === "profile" ||
     value === "agent" ||
-    value === "billing" ||
     value === "usage" ||
     value === "team-credits"
   );
@@ -60,7 +57,11 @@ export default function SettingsPage() {
   const { session } = useAuth();
   const searchParams = useSearchParams();
 
-  const initialTab = (searchParams.get("tab") as SettingsTab) ?? "profile";
+  // BL-40: the subscription tab is gone, so an old `?tab=billing` deep link
+  // lands on the usage tab (where the credit pools are visible).
+  const requestedTab = searchParams.get("tab");
+  const initialTab: SettingsTab =
+    requestedTab === "billing" ? "usage" : ((requestedTab as SettingsTab) ?? "profile");
   const [activeTab, setActiveTab] = useState<SettingsTab>(
     isSettingsTab(initialTab) ? initialTab : "profile",
   );
@@ -221,13 +222,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="max-w-xl">
-        {activeTab === "profile" ? (
-          <ProfileSection
-            displayName={profile.displayName}
-            email={profile.email}
-            onSave={handleProfileSave}
-          />
-        ) : activeTab === "agent" ? (
+        {activeTab === "agent" ? (
           <AgentSection
             defaultModel={defaultModel}
             onSave={handleAgentSave}
@@ -241,7 +236,11 @@ export default function SettingsPage() {
             <CreditUsageHistory />
           </>
         ) : (
-          <BillingSection />
+          <ProfileSection
+            displayName={profile.displayName}
+            email={profile.email}
+            onSave={handleProfileSave}
+          />
         )}
       </div>
     </div>

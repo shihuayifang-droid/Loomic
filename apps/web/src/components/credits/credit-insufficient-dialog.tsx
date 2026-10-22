@@ -128,7 +128,7 @@ export function CreditInsufficientDialog({
                 </button>
               )}
               <a data-testid="credits-insufficient-topup"
-                href="/settings?tab=billing"
+                href="/settings?tab=usage"
                 className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
               >
                 去充值

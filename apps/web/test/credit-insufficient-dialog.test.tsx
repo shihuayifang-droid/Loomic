@@ -50,7 +50,7 @@ describe("CreditInsufficientDialog", () => {
     );
 
     const topup = screen.getByTestId("credits-insufficient-topup");
-    expect(topup).toHaveAttribute("href", "/settings?tab=billing");
+    expect(topup).toHaveAttribute("href", "/settings?tab=usage");
     expect(topup).toHaveTextContent("去充值");
     expect(topup.tagName).toBe("A");
 
