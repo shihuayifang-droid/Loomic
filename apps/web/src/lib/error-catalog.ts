@@ -121,6 +121,12 @@ export const APP_ERROR_CATALOG: Record<ApplicationErrorCode, ErrorEntry> = {
   quote_mismatch: fixable("价格已经变化，请重新确认后再试。"),
   tool_disabled: fixable("这个工具暂不可用，请取消勾选后重试。"),
 
+  // MD-03 / workorder 40B: the six models whose reference-image cap is
+  // unverified declare `"unbounded"`, so nothing is blocked on the client and the
+  // upstream's refusal is the only moment the cap shows. It is the user's
+  // request that has to change, not a service problem: edit the images and retry.
+  reference_image_limit: fixable("该模型参考图数量超限，请减少参考图后重试。"),
+
   // policy — account-level, so there is nothing to retry
   account_suspended: policy("账号已被暂停，无法继续生成。"),
 

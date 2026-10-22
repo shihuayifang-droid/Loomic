@@ -218,6 +218,10 @@ export const applicationErrorCodeSchema = z.enum([
   "timeout",
   "upstream_busy",
   "canvas_unavailable",
+  // MD-03 / workorder 40B: the upstream refused the request because it carried
+  // too many reference images. A separate code so the client says 「该模型参考图
+  // 数量超限」 and offers an edit-parameters action instead of the generic line.
+  "reference_image_limit",
 ]);
 
 export const applicationErrorResponseSchema = z.object({

@@ -222,3 +222,22 @@ describe("useGenerationErrorHandler（X-40 一期接线）", () => {
     expect(mocks.showErrorToast).not.toHaveBeenCalledWith(OLD_GENERIC);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 工单40B / MD-03：参考图数量超限
+//
+// 六个未核实上限的模型声明 `"unbounded"`，前端不做拦截，所以上游真的拒了的时候
+// 用户必须看到「参考图数量超限」这句，而不是 X-40 要消灭的那句通用文案；能改的是
+// 请求里的参考图，所以入口是「修改参数」。
+// ---------------------------------------------------------------------------
+
+describe("MD-03: 参考图数量超限（工单40B）", () => {
+  it("MD-03: reference_image_limit reads 参考图数量超限", () => {
+    expect(lookupError("reference_image_limit")).toMatchObject({
+      category: "user_fixable",
+      action: "edit_params",
+    });
+    expect(APP_ERROR_CATALOG.reference_image_limit.message).toContain("参考图数量超限");
+    expect(APP_ERROR_CATALOG.reference_image_limit.message).not.toBe(OLD_GENERIC);
+  });
+});

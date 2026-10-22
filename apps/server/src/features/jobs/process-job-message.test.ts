@@ -923,3 +923,39 @@ describe("processJobMessage: counting keeps failing (工单39X / T-16)", () => {
     expect(h.calls.filter((call) => call === "executor")).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Workorder 40B — MD-03: the upstream refused the request for having too many
+// reference images.
+//
+// The six models with an unverified cap declare `"unbounded"`, so nothing is
+// stopped on the client and the upstream's refusal is the first and only signal.
+// `apps/server/src/generation/image-generation.ts` translates it into the
+// `reference_image_limit` code; this case pins what the worker does with that
+// code on the FIRST attempt, because the refusal depends only on the request
+// that was sent: a retry re-sends the same request and is refused identically,
+// so it must fail terminally and be refunded exactly once instead of writing
+// `retrying`.
+// ---------------------------------------------------------------------------
+
+describe("processJobMessage: a reference image limit (工单40B / MD-03)", () => {
+  it("MD-03: a reference image limit fails the job at once and refunds it", async () => {
+    const h = makeHarness({
+      increment: async () => ({ attempt_count: 1, max_attempts: 3 }),
+      executorThrows: {
+        code: "reference_image_limit",
+        message: "该模型参考图数量超限",
+      },
+    });
+
+    await h.run();
+
+    expect(h.calls.filter((call) => call === "markFailed")).toHaveLength(1);
+    expect(h.failures).toEqual([
+      { code: "reference_image_limit", message: "该模型参考图数量超限" },
+    ]);
+    expect(h.calls.filter((call) => call === "markRetrying")).toHaveLength(0);
+    expect(h.refunds()).toBe(1);
+    expect(h.calls).toContain("archive");
+  });
+});

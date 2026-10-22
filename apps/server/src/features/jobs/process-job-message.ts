@@ -77,6 +77,13 @@ const NON_RETRYABLE_CODES = new Set([
   // finish in time. The job goes terminal (`failed` + `timeout`) and is
   // refunded exactly once, like every other non-retryable failure.
   "timeout",
+  // MD-03 / workorder 40B. The upstream refused the request because it carried
+  // too many reference images. That answer depends only on what the user sent,
+  // so the same request would be refused again: retrying would spend the job's
+  // attempts on a request that cannot succeed and would tell the user the
+  // generation is still in progress. It fails terminally at once and is
+  // refunded exactly once, like every other non-retryable failure.
+  "reference_image_limit",
 ]);
 
 /**
