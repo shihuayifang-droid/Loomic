@@ -481,3 +481,16 @@ describe("refund-job: BL-41 a failed refund is recorded for compensation", () =>
     expect(harness.logError.mock.calls[0]?.[1]).toBe(readFailure);
   });
 });
+
+// BL-41 / workorder 39M：取消退款的描述逐字不变。它现在由 shared 的前缀拼出，
+// 两边（shared 的判定与 server 的写入）因此不会各自漂移。
+// 追加在这里而不是改写顶部 import：本单对测试文件只允许追加。
+import { CANCEL_REFUND_DESCRIPTION } from "./refund-job.js";
+
+describe("BL-41 the cancel refund description", () => {
+  it("BL-41: the cancel description keeps its exact text", () => {
+    expect(CANCEL_REFUND_DESCRIPTION).toBe(
+      "Auto-refund: job canceled before start",
+    );
+  });
+});

@@ -39,6 +39,8 @@
  * relies on it (archiving the message afterwards) must keep working.
  */
 
+import { CANCELED_REFUND_DESCRIPTION_PREFIX } from "@loomic/shared";
+
 import type { JobRefundBasisRow } from "../../db/job-refund-basis-repository.js";
 import type { CreditService } from "../credits/credit-service.js";
 
@@ -56,8 +58,7 @@ export const REFUND_DESCRIPTION = "Auto-refund: job failed";
  * `REFUND_DESCRIPTION` rather than in the route: whoever assembles the refund
  * picks the sentence, and the sentence is data the caller can assert on.
  */
-export const CANCEL_REFUND_DESCRIPTION =
-  "Auto-refund: job canceled before start";
+export const CANCEL_REFUND_DESCRIPTION = `${CANCELED_REFUND_DESCRIPTION_PREFIX} before start`;
 
 /**
  * The read this module needs, narrowed to the one call it makes. Declared

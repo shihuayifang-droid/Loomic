@@ -59,3 +59,18 @@ describe("BL-06 · ledger entry labels", () => {
     expect(filterByEntryTypes(rows, new Set<LedgerEntryType>(["trial"]))).toHaveLength(0);
   });
 });
+
+// BL-41 第 2 条 / 工单 39M：服务端没给 `entry_type` 时，取消退款回落也要落到
+// 「取消退款」而不是「失败退款」——两者落库类型相同，只有描述能区分。
+describe("BL-41 · a canceled refund reads as 取消退款", () => {
+  it("BL-41: a canceled refund shows 取消退款", () => {
+    const canceled = {
+      transaction_type: "generation_refund" as const,
+      amount: 12,
+      description: "Auto-refund: job canceled before start",
+    };
+
+    expect(entryTypeOf(canceled)).toBe("refund_canceled");
+    expect(LEDGER_ENTRY_LABELS[entryTypeOf(canceled)]).toBe("取消退款");
+  });
+});

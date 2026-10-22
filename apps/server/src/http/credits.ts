@@ -152,7 +152,13 @@ export async function registerCreditRoutes(
         creditTransactionsResponseSchema.parse({
           transactions: transactions.map((t) => ({
             ...t,
-            entry_type: ledgerEntryTypeOf(t.transaction_type, t.amount),
+            // BL-41 / workorder 39M: the description is what splits a cancel
+            // refund from a failed one — the stored type is the same for both.
+            entry_type: ledgerEntryTypeOf(
+              t.transaction_type,
+              t.amount,
+              t.description,
+            ),
           })),
         }),
       );

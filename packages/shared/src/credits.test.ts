@@ -122,3 +122,30 @@ describe("BL-06 database transaction types, ten of them", () => {
     ).not.toThrow();
   });
 });
+
+// BL-41 第 2 条 / 工单 39M：取消退款与失败退款在对外口径（`entry_type`）上分开，
+// 落库类型仍是 `generation_refund`，所以唯一的区分依据是流水描述。
+describe("BL-41 canceled and failed refunds", () => {
+  it("BL-41: a canceled refund is refund_canceled", () => {
+    expect(
+      ledgerEntryTypeOf(
+        "generation_refund",
+        12,
+        "Auto-refund: job canceled before start",
+      ),
+    ).toBe("refund_canceled");
+  });
+
+  it("BL-41: a failed refund stays refund_failed", () => {
+    expect(
+      ledgerEntryTypeOf("generation_refund", 12, "Auto-refund: job failed"),
+    ).toBe("refund_failed");
+  });
+
+  it("BL-41: no description is refund_failed", () => {
+    expect(ledgerEntryTypeOf("generation_refund", 12, null)).toBe(
+      "refund_failed",
+    );
+    expect(ledgerEntryTypeOf("generation_refund", 12)).toBe("refund_failed");
+  });
+});

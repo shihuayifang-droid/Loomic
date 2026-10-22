@@ -65,10 +65,32 @@ const LEDGER_ENTRY_TYPE_BY_TRANSACTION_TYPE = {
   daily_expire: "daily_expire",
 } as const satisfies Record<CreditTransactionType, LedgerEntryType>;
 
+/**
+ * BL-41 / workorder 39M: the opening of the sentence a cancel refund carries. The
+ * stored transaction type stays `generation_refund` (workorder 37S: one type, one
+ * unique index), so the DESCRIPTION is the only thing that tells a cancel apart
+ * from a failure — and it must be the same prefix on both sides of the wire.
+ * `CANCEL_REFUND_DESCRIPTION` in the server builds its sentence from this.
+ */
+export const CANCELED_REFUND_DESCRIPTION_PREFIX = "Auto-refund: job canceled";
+
+/**
+ * The entry type one transaction shows as. `description` is read ONLY to split a
+ * cancel refund from a failed one; every other mapping is unchanged, and a caller
+ * that passes no description keeps the pre-39M answer (`refund_failed`).
+ */
 export function ledgerEntryTypeOf(
   transactionType: CreditTransactionType,
   _amount?: number,
+  description?: string | null,
 ): LedgerEntryType {
+  if (
+    transactionType === "generation_refund" &&
+    typeof description === "string" &&
+    description.startsWith(CANCELED_REFUND_DESCRIPTION_PREFIX)
+  ) {
+    return "refund_canceled";
+  }
   return LEDGER_ENTRY_TYPE_BY_TRANSACTION_TYPE[transactionType];
 }
 
