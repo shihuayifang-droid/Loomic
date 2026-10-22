@@ -13,6 +13,7 @@ import {
   installFromMarketplace,
   MarketplaceError,
 } from "../features/skills/marketplace-service.js";
+import { generateSkillSlug } from "../features/skills/skill-slug.js";
 
 import { SkillRepositoryError } from "../db/skill-repository.js";
 
@@ -93,15 +94,6 @@ function mapSkillFileRow(row: SkillFileRow) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
-}
-
-function generateSlug(name: string): string {
-  return name
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 100);
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +177,7 @@ export async function registerMarketplaceRoutes(
 
       // Download and parse from npm registry
       const { imported, packageName: pkgName } = await installFromMarketplace(packageName);
-      const slug = generateSlug(imported.manifest.name);
+      const slug = generateSkillSlug(imported.manifest.name);
 
       // Insert skill. The `source_url` / `package_name` columns are still NOT written
       // — they keep going into `metadata` (frozen T-61 behaviour).

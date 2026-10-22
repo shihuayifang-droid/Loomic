@@ -1415,3 +1415,48 @@ describe("POST /api/skills/marketplace/install", () => {
     expect(repositoryCalls).toEqual([]);
   });
 });
+
+describe("POST /api/skills with a Chinese-only name (T-61)", () => {
+  it("T-61: creating a skill with a Chinese-only name answers 201 with a usable slug", async () => {
+    buildAppWith({
+      // The double echoes back what the route derived, so the published response
+      // is the route's own slug and not a fixture's.
+      insertOwnSkill: async (_actorId, fields) => ({
+        ...SKILL_ROW,
+        name: fields.name,
+        slug: fields.slug,
+        icon_name: null,
+      }),
+    });
+
+    const response = await inject({
+      method: "POST",
+      url: "/api/skills",
+      payload: {
+        name: "海报设计",
+        description: "Poster design",
+        category: "custom",
+        skillContent: "# poster",
+      },
+    });
+
+    expect(response.statusCode).toBe(201);
+
+    const slug = response.json().skill.slug as string;
+    expect(slug.startsWith("skill-")).toBe(true);
+    expect(repositoryCalls[0]).toEqual({
+      method: "insertOwnSkill",
+      args: [
+        MEMBER_ID,
+        {
+          name: "海报设计",
+          slug,
+          description: "Poster design",
+          category: "custom",
+          skillContent: "# poster",
+          iconName: null,
+        },
+      ],
+    });
+  });
+});

@@ -12,6 +12,7 @@ import {
 } from "@loomic/shared";
 
 import { SkillRepositoryError } from "../db/skill-repository.js";
+import { generateSkillSlug } from "../features/skills/skill-slug.js";
 
 import type {
   SkillFileRecord,
@@ -140,7 +141,7 @@ export async function registerSkillRoutes(
       if (!user) return sendUnauthenticated(reply);
 
       const payload = skillCreateRequestSchema.parse(request.body);
-      const slug = generateSlug(payload.name);
+      const slug = generateSkillSlug(payload.name);
 
       let data: SkillRow;
       try {
@@ -237,7 +238,7 @@ export async function registerSkillRoutes(
       const patch: SkillPatch = {};
       if (payload.name !== undefined) {
         patch.name = payload.name;
-        patch.slug = generateSlug(payload.name);
+        patch.slug = generateSkillSlug(payload.name);
       }
       if (payload.description !== undefined) patch.description = payload.description;
       if (payload.category !== undefined) patch.category = payload.category;
@@ -605,15 +606,6 @@ function mapSkillDetailRow(row: SkillRow) {
     sourceUrl: row.source_url ?? null,
     packageName: row.package_name ?? null,
   };
-}
-
-function generateSlug(name: string): string {
-  return name
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 100);
 }
 
 function sendUnauthenticated(reply: FastifyReply) {
