@@ -101,6 +101,46 @@ export type ServerEnv = {
   workerMaxBatchSize?: number;
 };
 
+/**
+ * OP-13: the ServerEnv fields production cannot start without, in report order.
+ *
+ * The check below reads the RESOLVED ServerEnv, not the process environment, so
+ * an `overrides` entry satisfies it exactly like an env var does. Field names
+ * rather than variable names keep this list free of configuration literals that
+ * the dependency audit counts.
+ */
+export const PRODUCTION_REQUIRED_FIELDS = [
+  "databaseUrl",
+  "supabaseUrl",
+  "supabaseServiceRoleKey",
+  "supabaseJwtSecret",
+] as const satisfies readonly (keyof ServerEnv)[];
+
+/** OP-13: production needs at least one of these image-provider credentials. */
+export const PRODUCTION_IMAGE_PROVIDER_FIELDS = [
+  "openAIApiKey",
+  "googleApiKey",
+  "googleVertexProject",
+  "replicateApiToken",
+  "volcesApiKey",
+] as const satisfies readonly (keyof ServerEnv)[];
+
+/**
+ * OP-13 start-up self-check: the NAMES of the fields that are missing, and
+ * never their values, so the thrown message stays safe to log verbatim.
+ */
+export function missingProductionKeys(resolved: ServerEnv): string[] {
+  const missing: string[] = PRODUCTION_REQUIRED_FIELDS.filter(
+    (field) => !resolved[field],
+  );
+
+  if (!PRODUCTION_IMAGE_PROVIDER_FIELDS.some((field) => resolved[field])) {
+    missing.push(`one of ${PRODUCTION_IMAGE_PROVIDER_FIELDS.join("|")}`);
+  }
+
+  return missing;
+}
+
 export function loadServerEnv(
   overrides: Partial<ServerEnv> = {},
   source: NodeJS.ProcessEnv = process.env,
@@ -248,7 +288,7 @@ export function loadServerEnv(
     );
   }
 
-  return {
+  const env: ServerEnv = {
     agentBackendMode,
     agentModel: resolvedAgentModel,
     port: overrides.port ?? parsePort(source.LOOMIC_SERVER_PORT ?? source.PORT),
@@ -308,6 +348,21 @@ export function loadServerEnv(
     ...(workerPollIntervalMs ? { workerPollIntervalMs } : {}),
     ...(workerMaxBatchSize ? { workerMaxBatchSize } : {}),
   };
+
+  // OP-13: production must refuse to start with a material configuration gap.
+  // Runs on the RESOLVED env (so overrides count) and AFTER the filesystem
+  // backend check, which keeps its own error priority (AG-39). The message
+  // carries key names only - a value must never reach a log line.
+  if (isProductionEnv(source)) {
+    const missing = missingProductionKeys(env);
+    if (missing.length > 0) {
+      throw new Error(
+        `Missing required configuration in production (OP-13): ${missing.join(", ")}`,
+      );
+    }
+  }
+
+  return env;
 }
 
 function parseAgentBackendMode(rawMode: string | undefined): AgentBackendMode {
