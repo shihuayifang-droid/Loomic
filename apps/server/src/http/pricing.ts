@@ -17,6 +17,7 @@ import {
   type PricingQuoteRequest,
 } from "@loomic/shared";
 
+import type { PoolBalanceReadRepository } from "../db/pool-balance-read-repository.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import { toCreditBalanceResponse } from "../features/credits/balance-response.js";
 import {
@@ -63,6 +64,16 @@ export async function registerPricingRoutes(
      * change" can be proved without editing the table the site ships.
      */
     tools?: typeof TOOL_DEFINITIONS;
+    /**
+     * BL-45 / workorder 39D: optional on purpose, exactly as on
+     * `registerCreditRoutes`. Omitted → the quote's balance is the pre-pools
+     * payload with no `pools` key at all. Injected (workorder 38I wires it only
+     * while `LOOMIC_CREDIT_POOLS=on`) → the balance carries the caller's three
+     * pools, read from the same repository `GET /api/credits` reads them from,
+     * so "询价返回的余额与 GET /api/credits 同结构" (ruling 7) holds for the
+     * pools too.
+     */
+    poolBalanceReadRepository?: PoolBalanceReadRepository;
   },
 ) {
   // POST /api/pricing/quote — quote a batch, no side effects
@@ -96,6 +107,29 @@ export async function registerPricingRoutes(
         viewer.workspace.id,
       );
 
+      // BL-45 / workorder 39D: the same three branches `http/credits.ts` uses,
+      // so the quote's `balance` and `GET /api/credits` cannot disagree about the
+      // pools any more than they can about the four fields above.
+      //
+      // - no reader (switch off) → `undefined`, i.e. no `pools` key at all;
+      // - reader but no team workspace → `null`, because the pools are bookkept
+      //   per TEAM workspace (37M / 37N) and an all-zero pool would be a lie;
+      // - otherwise → this member's pools of that team workspace.
+      //
+      // A failed read is NOT swallowed: it falls into the catch below and answers
+      // the existing 500, because a balance with half its pools is worse than no
+      // balance at all. The QUOTE (the items) is untouched by all of this.
+      const poolBalanceReadRepository = options.poolBalanceReadRepository;
+      const pools =
+        poolBalanceReadRepository === undefined
+          ? undefined
+          : viewer.teamWorkspace
+            ? await poolBalanceReadRepository.readPoolBalances({
+                workspaceId: viewer.teamWorkspace.id,
+                userId: user.id,
+              })
+            : null;
+
       // ONE clock reading for the whole batch: `at` decides which rules are in
       // force, so reading it per item could price two lines of the same response
       // against two different rule versions across an activation boundary.
@@ -118,8 +152,9 @@ export async function registerPricingRoutes(
         pricingQuoteResponseSchema.parse({
           items,
           // Same helper, same schema as GET /api/credits: "与 GET /api/credits
-          // 同结构" is a shared function, not a coincidence (ruling 7).
-          balance: toCreditBalanceResponse(balanceInfo),
+          // 同结构" is a shared function, not a coincidence (ruling 7). The pools
+          // ride through the very same second argument (workorder 39D).
+          balance: toCreditBalanceResponse(balanceInfo, pools),
         }),
       );
     } catch (error) {

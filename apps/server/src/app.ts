@@ -1042,6 +1042,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     creditService,
     priceQuoter,
     viewerService,
+    // BL-45 / workorder 39D: the balance a quote carries includes the same three
+    // pools `GET /api/credits` reports, from the same repository. Workorder 38I:
+    // only while `LOOMIC_CREDIT_POOLS=on`; with it off the quote is registered
+    // with the pre-pools arguments and its balance has no `pools` key at all.
+    ...(creditPools ? { poolBalanceReadRepository } : {}),
   });
   if (jobService) {
     // GN-32 / workorder 36E-v2: refunding a cancel that happened BEFORE the job

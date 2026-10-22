@@ -25,6 +25,7 @@ import type {
   RequestAuthenticator,
   UserSupabaseClient,
 } from "../supabase/user.js";
+import type { PoolBalanceReadRepository } from "../db/pool-balance-read-repository.js";
 
 /**
  * GN-01 / 工单31D —— `POST /api/pricing/quote` 的接线用例。
@@ -577,5 +578,119 @@ describe("POST /api/pricing/quote — GN-05：工具的执行模型由配置决�
 
     expect(item).toBeDefined();
     expect(item && "model" in item).toBe(false);
+  });
+});
+
+/**
+ * BL-45 / 工单39D —— 开关打开时询价返回的余额带三池。
+ *
+ * 这一层钉的不是「pools 长什么样」（那是 `features/credits/balance-response`
+ * 与 `@loomic/shared` 的事），而是「询价这条路用哪两个 id 问三池，以及三种接线
+ * 各自的响应形状」：
+ *
+ * 1. 注入仓储 + 有团队工作区 → `balance.pools` 在，`available` 走同一个
+ *    `availableCredits` 口径（与 `GET /api/credits` 同一函数）；
+ * 2. 注入仓储 + 无团队工作区 → `pools: null`（不是一个假的零池）；
+ * 3. 不注入（开关关）→ `balance` 里根本没有 `pools` 键，逐字等于开关之前的负载。
+ */
+describe("POST /api/pricing/quote — BL-45：开关打开时余额带三池", () => {
+  const TEAM_WORKSPACE_ID = "00000000-0000-0000-0000-0000000000d3";
+
+  /** 五池读数：`availableCredits` 对它算出 50 + (20000-5000) + 200 = 15250。 */
+  const POOLS = {
+    daily: 50,
+    teamRemaining: 30000,
+    personalTeamUsed: 5000,
+    personalCap: 20000,
+    topup: 200,
+  };
+
+  /** 有团队工作区的 viewer：三池按团队工作区记账（37M / 37N）。 */
+  const teamViewerService = {
+    async ensureViewer() {
+      return {
+        workspace: {
+          id: WORKSPACE_ID,
+          name: "Personal",
+          type: "personal" as const,
+          ownerUserId: USER.id,
+        },
+        teamWorkspace: {
+          id: TEAM_WORKSPACE_ID,
+          name: "HaHart 团队",
+          type: "team" as const,
+          ownerUserId: USER.id,
+        },
+      };
+    },
+  } as unknown as ViewerService;
+
+  /** 只注册这一条路由，好让「注入了什么」就是这条用例唯一改变的东西。 */
+  async function quoteBalance(args: {
+    viewerService: ViewerService;
+    poolBalanceReadRepository?: PoolBalanceReadRepository;
+  }) {
+    const instance = Fastify();
+    await registerPricingRoutes(instance, {
+      auth,
+      creditService,
+      priceQuoter,
+      viewerService: args.viewerService,
+      ...(args.poolBalanceReadRepository === undefined
+        ? {}
+        : { poolBalanceReadRepository: args.poolBalanceReadRepository }),
+    });
+    await instance.ready();
+
+    try {
+      const response = await instance.inject({
+        method: "POST",
+        url: "/api/pricing/quote",
+        headers: { authorization: `Bearer ${TOKEN}` },
+        payload: {
+          items: [{ kind: "image_generation", request: { prompt: "a red panda" } }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      return pricingQuoteResponseSchema.parse(response.json()).balance;
+    } finally {
+      await instance.close();
+    }
+  }
+
+  it("BL-45: with pools on, the quote balance carries the pools", async () => {
+    const readPoolBalances = vi.fn(async () => POOLS);
+    const balance = await quoteBalance({
+      viewerService: teamViewerService,
+      poolBalanceReadRepository: { readPoolBalances },
+    });
+
+    expect(balance.pools?.balances).toEqual(POOLS);
+    expect(balance.pools?.available).toBe(15250);
+
+    // 读的是「这个团队工作区 + 这个已认证用户」，不是客户端能指定的任何值。
+    expect(readPoolBalances).toHaveBeenCalledWith({
+      workspaceId: TEAM_WORKSPACE_ID,
+      userId: USER.id,
+    });
+  });
+
+  it("BL-45: without a team the quote balance has pools null", async () => {
+    const readPoolBalances = vi.fn(async () => POOLS);
+    const balance = await quoteBalance({
+      viewerService,
+      poolBalanceReadRepository: { readPoolBalances },
+    });
+
+    expect(balance.pools).toBeNull();
+    // 没有团队工作区就没有可读的池：不去读，也就读不出一个假的零池。
+    expect(readPoolBalances).toHaveBeenCalledTimes(0);
+  });
+
+  it("BL-45: without the repository the quote balance has no pools key", async () => {
+    const balance = await quoteBalance({ viewerService: teamViewerService });
+
+    expect("pools" in balance).toBe(false);
   });
 });
