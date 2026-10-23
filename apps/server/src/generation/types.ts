@@ -249,6 +249,12 @@ export interface VideoModelInfo extends ModelInfo {
     imageToVideo: boolean;
     videoToVideo: boolean;
     audio: boolean;
+    /**
+     * AG-07 — whether the model accepts a first frame and a last frame
+     * (`images[0]` / `images[1]`). Absent means false: the option disappears
+     * from the panel for every model that does not declare it.
+     */
+    firstLastFrame?: boolean;
   };
   limits: {
     maxDuration: number;

@@ -28,6 +28,7 @@ const METASO_VIDEO_MODELS: readonly VideoModelInfo[] = [
       imageToVideo: true,
       videoToVideo: false,
       audio: false,
+      firstLastFrame: true,
     },
     limits: {
       maxDuration: 15,

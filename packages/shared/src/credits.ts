@@ -3,6 +3,7 @@
 // and is asked for at charge time by the price quoter.
 import { z } from "zod";
 
+import { generatorParamsSchema } from "./generator-params.js";
 import { IMAGE_MODEL_CATALOG, VIDEO_MODEL_CATALOG } from "./model-catalog.js";
 
 // ── Plan types ───────────────────────────────────────────────
@@ -429,6 +430,8 @@ export const annotatedModelSchema = z.object({
       imageToVideo: z.boolean(),
       videoToVideo: z.boolean(),
       audio: z.boolean(),
+      /** AG-07 — present only when the model accepts a first and a last frame. */
+      firstLastFrame: z.boolean().optional(),
     })
     .optional(),
   limits: z
@@ -439,6 +442,8 @@ export const annotatedModelSchema = z.object({
       maxInputImages: z.number().int().nonnegative(),
     })
     .optional(),
+  /** AG-07 — the schema-driven generator parameters (slider range, defaults…). */
+  params: generatorParamsSchema.optional(),
   pricing: z
     .object({
       currency: z.literal("CNY"),
