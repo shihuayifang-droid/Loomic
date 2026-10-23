@@ -17,6 +17,9 @@ import {
   setMemberGenerationPaused,
 } from "@/lib/admin-credits-api";
 import { useAuth } from "@/lib/auth-context";
+import { authProvider } from "@/lib/self-auth-client";
+
+import { AdminPasswordReset } from "./admin-password-reset";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -552,6 +555,10 @@ export function TeamCreditsAdmin(props: TeamCreditsAdminProps) {
           </tbody>
         </table>
       </div>
+
+      {authProvider() === "self" && accessTokenRef.current ? (
+        <AdminPasswordReset accessToken={accessTokenRef.current} />
+      ) : null}
 
       {/* BL-01: cap templates */}
       <div data-testid="credits-admin-templates" className="space-y-3 rounded-lg border p-4">

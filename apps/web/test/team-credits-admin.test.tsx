@@ -360,3 +360,23 @@ describe("TeamCreditsAdmin · AD-01 pause / resume", () => {
     });
   });
 });
+
+describe("TeamCreditsAdmin · 42H 重置成员密码挂载", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("42H: the reset panel appears when the self-hosted auth provider is on", async () => {
+    vi.stubEnv("NEXT_PUBLIC_HAHART_AUTH_PROVIDER", "self");
+
+    await renderPanel();
+
+    expect(screen.getByTestId("credits-admin-reset-email")).toBeInTheDocument();
+  });
+
+  it("42H: the reset panel stays out on the default (Supabase) provider", async () => {
+    await renderPanel();
+
+    expect(screen.queryByTestId("credits-admin-reset-email")).toBeNull();
+  });
+});
