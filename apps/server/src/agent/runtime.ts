@@ -48,7 +48,7 @@ import type { SubmitVideoJobFn } from "./tools/video-generate.js";
 import type { CreditService } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
 import { withBilling } from "../features/credits/with-billing.js";
-import { generationLedgerDescription } from "../features/credits/ledger-description.js";
+import { agentLedgerDescription } from "../features/credits/ledger-description.js";
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import {
@@ -1171,7 +1171,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 jobType: "image_generation",
                 quality: billedQuality,
               },
-              description: generationLedgerDescription("image", input.model),
+              description: agentLedgerDescription(run.prompt, "image", input.model),
               job: {
                 payload: {
                   prompt: input.prompt,
@@ -1521,7 +1521,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   ? { resolution: input.resolution as VideoResolution }
                   : {}),
               },
-              description: generationLedgerDescription("video", input.model),
+              description: agentLedgerDescription(run.prompt, "video", input.model),
               job: {
                 payload: {
                   prompt: input.prompt,

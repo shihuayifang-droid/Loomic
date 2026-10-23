@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { generationLedgerDescription } from "./ledger-description.js";
+import { agentLedgerDescription, generationLedgerDescription } from "./ledger-description.js";
 
 /**
  * BL-06 pins the wording of a generation charge on the credit ledger: the
@@ -45,6 +45,49 @@ describe("generationLedgerDescription", () => {
     for (const source of ROUTE_SOURCES) {
       expect(source).not.toContain("`Image generation: ");
       expect(source).not.toContain("`Video generation: ");
+    }
+  });
+});
+
+/**
+ * BL-06: an Agent charge carries the user's request, not the serialised prompt
+ * the model receives — the ledger is read by the person who typed the words.
+ */
+describe("agentLedgerDescription", () => {
+  it("BL-06: an Agent charge reads the user's words, not the serialized prompt", () => {
+    expect(
+      agentLedgerDescription("把这张图 [@image:#1] 改成蓝色背景", "image", "kwjm/gpt-image-2"),
+    ).toBe("「把这张图 改成蓝色背景」 · 图像生成 · kwjm/gpt-image-2");
+  });
+
+  it("BL-06: the reference tail never reaches the ledger", () => {
+    const serialized =
+      "把这张图改成蓝色背景\n\n<references>Image #1: asset-1</references>";
+    const description = agentLedgerDescription(serialized, "image", "kwjm/gpt-image-2");
+
+    expect(description).not.toContain("<");
+    expect(description).not.toContain("Image #1");
+    expect(description).not.toContain("asset-1");
+  });
+
+  it("BL-06: a long request is cut to 30 characters", () => {
+    const longRequest = "一二三四五六七八九十".repeat(4);
+    expect([...longRequest]).toHaveLength(40);
+
+    const description = agentLedgerDescription(longRequest, "image", "m");
+    expect(description).toBe(`「${longRequest.slice(0, 30)}…」 · 图像生成 · m`);
+
+    const quoted = description.slice(1, description.indexOf("」"));
+    // 30 characters plus the ellipsis.
+    expect([...quoted]).toHaveLength(31);
+  });
+
+  it("BL-06: an empty request falls back to the generator line", () => {
+    const modelId = "kwjm/gpt-image-2";
+    const fallback = generationLedgerDescription("image", modelId);
+
+    for (const empty of ["", null, "   ", "[@image:#1]", "[/skill:#2]"]) {
+      expect(agentLedgerDescription(empty, "image", modelId)).toBe(fallback);
     }
   });
 });
