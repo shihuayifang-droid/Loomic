@@ -184,6 +184,7 @@ export function createCanvasService(options: {
       // Extract base64 files to Storage, replacing dataURLs with oss:// markers
       const leanContent = await extractFilesToStorage(
         client,
+        options.canvasReadRepository,
         options.assetRecordRepository,
         canvasId,
         content,
@@ -385,33 +386,35 @@ const canvasWorkspaceCache = new Map<string, string>();
  * carry multi-MB base64 forever.
  */
 async function resolveWorkspaceId(
-  client: UserSupabaseClient,
+  repository: CanvasReadRepository | undefined,
+  actorId: string,
   canvasId: string,
 ): Promise<string | null> {
   const cached = canvasWorkspaceCache.get(canvasId);
   if (cached) return cached;
+  if (!repository) return null;
 
-  const { data: canvasRow, error: canvasError } = await client
-    .from("canvases")
-    .select("project_id")
-    .eq("id", canvasId)
-    .single();
-  if (canvasError || !canvasRow?.project_id) return null;
+  let link: Awaited<
+    ReturnType<CanvasReadRepository["findReadableCanvasProjectLink"]>
+  >;
+  try {
+    link = await repository.findReadableCanvasProjectLink({
+      actorId,
+      canvasId,
+    });
+  } catch {
+    return null;
+  }
+  if (!link?.workspace_id) return null;
 
-  const { data: projectRow, error: projectError } = await client
-    .from("projects")
-    .select("workspace_id")
-    .eq("id", canvasRow.project_id)
-    .single();
-  if (projectError || !projectRow?.workspace_id) return null;
-
-  const workspaceId = String(projectRow.workspace_id);
+  const workspaceId = String(link.workspace_id);
   canvasWorkspaceCache.set(canvasId, workspaceId);
   return workspaceId;
 }
 
 async function extractFilesToStorage(
   client: UserSupabaseClient,
+  canvasReadRepository: CanvasReadRepository | undefined,
   assetRecordRepository:
     | Pick<AssetRecordRepository, "recordProjectAsset">
     | undefined,
@@ -431,7 +434,7 @@ async function extractFilesToStorage(
     return typeof dataURL === "string" && dataURL.startsWith("data:");
   });
   const workspaceId = needsUpload
-    ? await resolveWorkspaceId(client, canvasId)
+    ? await resolveWorkspaceId(canvasReadRepository, createdBy, canvasId)
     : null;
 
   const updatedFiles: CanvasFileRecord = {};

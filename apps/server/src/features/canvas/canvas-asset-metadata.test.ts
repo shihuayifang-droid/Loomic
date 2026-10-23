@@ -59,6 +59,10 @@ function makeStubs(options: {
   /** Omit the asset record repository entirely. */
   withoutRepository?: boolean;
   uploadError?: { message: string } | null;
+  /** Omit the canvas read repository entirely (workspace cannot be resolved). */
+  withoutCanvasReadRepository?: boolean;
+  /** The canvas read repository answers null (canvas not readable by the actor). */
+  canvasLinkNull?: boolean;
   /** Distinguishes cases: resolveWorkspaceId caches per canvas id. */
   canvasId: string;
 }) {
@@ -66,19 +70,8 @@ function makeStubs(options: {
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
 
   const userClient = {
-    from(table: string) {
-      const chain = {
-        select: () => chain,
-        eq: () => chain,
-        single: async () => {
-          if (table === "canvases") return { data: { project_id: PROJECT }, error: null };
-          if (table === "projects") return { data: { workspace_id: WORKSPACE }, error: null };
-          return { data: null, error: null };
-        },
-      };
-      return chain;
-    },
     storage: {
+
       from(bucket: string) {
         return {
           upload: async (path: string, buffer: { length: number }) => {
@@ -106,12 +99,40 @@ function makeStubs(options: {
     },
   };
 
+  const canvasLinkCalls: Array<{ actorId: string; canvasId: string }> = [];
+  const canvasReadRepository = {
+    async findReadableCanvasProjectLink(input: {
+      actorId: string;
+      canvasId: string;
+    }) {
+      canvasLinkCalls.push({ ...input });
+      if (options.canvasLinkNull) return null;
+      return {
+        project_id: PROJECT,
+        workspace_id: WORKSPACE,
+        brand_kit_id: null,
+      };
+    },
+  };
+
   const service = createCanvasService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
     ...(options.withoutRepository ? {} : { assetRecordRepository }),
+    ...(options.withoutCanvasReadRepository
+      ? {}
+      : {
+          canvasReadRepository:
+            canvasReadRepository as unknown as CanvasReadRepository,
+        }),
   });
 
-  return { service, records, uploads, canvasId: options.canvasId };
+  return {
+    service,
+    records,
+    uploads,
+    canvasLinkCalls,
+    canvasId: options.canvasId,
+  };
 }
 
 function contentWithFiles(files: Record<string, unknown>): CanvasContent {
@@ -244,6 +265,39 @@ describe("canvas file extraction records asset metadata", () => {
     expect(files["file-1"]?.dataURL).toBe(PNG_BASE64);
   });
 
+  it("case 7: a canvas the repository cannot resolve keeps base64 and uploads nothing", async () => {
+    const stub = makeStubs({ canvasId: "canvas-g", canvasLinkNull: true });
+    const content = contentWithFiles({
+      "file-1": { id: "file-1", dataURL: PNG_BASE64 },
+    });
+
+    await stub.service.saveCanvasContent(USER, "canvas-g", content, 1);
+
+    expect(stub.canvasLinkCalls).toEqual([
+      { actorId: "user-1", canvasId: "canvas-g" },
+    ]);
+    expect(stub.uploads).toHaveLength(0);
+    expect(stub.records).toHaveLength(0);
+    const files = savedFiles();
+    expect(files["file-1"]?.dataURL).toBe(PNG_BASE64);
+  });
+
+  it("case 8: without a canvas read repository base64 is kept and nothing is uploaded", async () => {
+    const stub = makeStubs({
+      canvasId: "canvas-h",
+      withoutCanvasReadRepository: true,
+    });
+    const content = contentWithFiles({
+      "file-1": { id: "file-1", dataURL: PNG_BASE64 },
+    });
+
+    await stub.service.saveCanvasContent(USER, "canvas-h", content, 1);
+
+    expect(stub.uploads).toHaveLength(0);
+    expect(stub.records).toHaveLength(0);
+    const files = savedFiles();
+    expect(files["file-1"]?.dataURL).toBe(PNG_BASE64);
+  });
   it("case 6: non-image data URLs and plain strings are left alone", async () => {
     const stub = makeStubs({ canvasId: "canvas-f" });
     const content = contentWithFiles({
