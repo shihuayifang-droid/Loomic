@@ -228,7 +228,7 @@ import { registerFontsRoutes } from "./http/fonts.js";
 import { registerJobRoutes } from "./http/jobs.js";
 import { createObjectStore } from "./features/storage/object-store-factory.js";
 import { objectUrlSecretFrom } from "./features/storage/object-url-signature.js";
-import type { SupabaseStorageLike } from "./features/storage/supabase-object-store.js";
+import { createObjectStoreStorageClient } from "./features/storage/object-store-storage-client.js";
 import { registerAdminTeamRoutes } from "./http/admin-team.js";
 import { registerObjectRoutes } from "./http/object-routes.js";
 import { registerBrandKitRoutes } from "./http/brand-kits.js";
@@ -401,12 +401,35 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       viewerService,
     });
   });
+  // Workorder 45C: with the file volume as the storage backend there is no
+  // hosted storage client at all, so the services get an adapter that sends every
+  // bucket call to the volume. The same store also serves the `/objects` route.
+  const fsStore =
+    env.storageProvider === "fs"
+      ? createObjectStore(env, {
+          supabaseClient: () => {
+            throw new Error("unused in fs mode");
+          },
+        })
+      : undefined;
+  const fsStorageClient = fsStore
+    ? createObjectStoreStorageClient(fsStore)
+    : undefined;
   const createUserClient =
-    options.createUserClient ?? createUserSupabaseClientFactory(env);
+    options.createUserClient ??
+    (fsStorageClient
+      ? (_accessToken: string) =>
+          fsStorageClient as unknown as UserSupabaseClient
+      : createUserSupabaseClientFactory(env));
   let adminClient:
     | ReturnType<typeof createAdminSupabaseClient>
     | undefined;
   const getAdminClient = () => {
+    if (fsStorageClient) {
+      return fsStorageClient as unknown as ReturnType<
+        typeof createAdminSupabaseClient
+      >;
+    }
     adminClient ??= createAdminSupabaseClient(env);
     return adminClient;
   };
@@ -1064,9 +1087,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // so the route is registered only when the volume is the chosen backend.
   if (env.storageProvider === "fs") {
     void registerObjectRoutes(app, {
-      store: createObjectStore(env, {
-        supabaseClient: () => getAdminClient() as unknown as SupabaseStorageLike,
-      }),
+      store: fsStore!,
       secret: objectUrlSecretFrom(env.objectUrlSecret!),
     });
   }

@@ -35,7 +35,12 @@ import {
   type JobTypeConfig,
 } from "./features/jobs/job-registry.js";
 import { createAdminSupabaseClient } from "./supabase/admin.js";
-import { createUserSupabaseClientFactory } from "./supabase/user.js";
+import {
+  createUserSupabaseClientFactory,
+  type UserSupabaseClient,
+} from "./supabase/user.js";
+import { createObjectStore } from "./features/storage/object-store-factory.js";
+import { createObjectStoreStorageClient } from "./features/storage/object-store-storage-client.js";
 
 // Import executors to trigger registration via side effects
 import "./features/jobs/executors/image-generation.js";
@@ -70,10 +75,29 @@ async function main() {
   registerToolRunners(env);
 
   const pgmq = createQueueClient(env)!;
-  const createUserClient = createUserSupabaseClientFactory(env);
+  // Workorder 45C: in fs mode both clients are the volume adapter (no hosted
+  // storage exists), the same wiring app.ts uses.
+  const fsStorageClient =
+    env.storageProvider === "fs"
+      ? createObjectStoreStorageClient(
+          createObjectStore(env, {
+            supabaseClient: () => {
+              throw new Error("unused in fs mode");
+            },
+          }),
+        )
+      : undefined;
+  const createUserClient = fsStorageClient
+    ? (_accessToken: string) => fsStorageClient as unknown as UserSupabaseClient
+    : createUserSupabaseClientFactory(env);
 
   let adminClient: ReturnType<typeof createAdminSupabaseClient> | undefined;
   const getAdminClient = () => {
+    if (fsStorageClient) {
+      return fsStorageClient as unknown as ReturnType<
+        typeof createAdminSupabaseClient
+      >;
+    }
     adminClient ??= createAdminSupabaseClient(env);
     return adminClient;
   };
