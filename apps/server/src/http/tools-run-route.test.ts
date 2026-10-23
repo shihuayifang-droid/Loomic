@@ -75,9 +75,9 @@ if (!quickEdit) throw new Error("quick_edit is missing from the tool table");
 
 /** The real `quick_edit` row, with a configured execution model (GN-05). */
 const TOOL_WITH_MODEL: ToolDefinition = { ...quickEdit, execution_model: "m-x" };
-/** The real `remove_background` row: `availability: "unavailable"`. */
+/** A real row that is still `availability: "unavailable"` (upscale). */
 const UNAVAILABLE_TOOL = TOOL_DEFINITIONS.find(
-  (tool) => tool.id === "remove_background",
+  (tool) => tool.id === "upscale",
 ) as ToolDefinition;
 
 const PRICE = 5;
@@ -329,7 +329,7 @@ describe("POST /api/tools/:toolId/run", () => {
     const unknown = await run("no_such_tool", BODY);
     expect(unknown.statusCode).toBe(404);
 
-    const unavailable = await run("remove_background", BODY);
+    const unavailable = await run("upscale", BODY);
     expect(unavailable.statusCode).toBe(409);
     expect(unavailable.json().error.code).toBe("tool_disabled");
 

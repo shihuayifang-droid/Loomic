@@ -994,6 +994,48 @@ export async function fetchToolDefinitions(
   return toolListResponseSchema.parse(body).tools;
 }
 
+// --- Server tool execution API ---
+
+/** The body of `POST /api/tools/:toolId/run` (40Q). `client_request_id` is the caller's dedupe token. */
+export type RunToolBody = {
+  artifact_id: string;
+  client_request_id: string;
+  project_id?: string;
+  canvas_id?: string;
+  params?: Record<string, unknown>;
+};
+
+export type RunToolResponse = {
+  jobId: string;
+  status: string;
+  model: string | null;
+};
+
+/**
+ * `POST /api/tools/:toolId/run` — ED-00m / GN-05: hand an artifact to a server-side
+ * ("direct execution") tool and get back the job to wait on.
+ *
+ * GN-24: the output is produced server-side and landed in storage, so the client
+ * never downloads it only to upload it again — it reads `result.asset_id` off the
+ * finished job and asks for a signed URL, nothing more.
+ */
+export async function runTool(
+  accessToken: string,
+  toolId: string,
+  body: RunToolBody,
+): Promise<RunToolResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/tools/${encodeURIComponent(toolId)}/run`,
+    {
+      method: "POST",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify(body),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  return (await response.json()) as RunToolResponse;
+}
+
 // --- Pricing API ---
 
 /**

@@ -10,7 +10,13 @@ export type ToolOutputReplacement = {
   fileId: string;
   assetId: string;
   parentAssetId: string;
-  source: "tool:adjust" | "tool:crop";
+  /**
+   * Provenance tag on `customData.toolSource`。
+   *
+   * 40T 起放宽成 `tool:<任意工具 id>`：服务端执行类工具（去背景等）也走同一条原位替换，
+   * 给每个新工具再改一次这个联合类型没有意义，而前缀仍然保证「这个值是工具产物」。
+   */
+  source: `tool:${string}`;
   /** A crop changes the pixel size; an adjustment keeps it. Omitted = keep. */
   width?: number;
   height?: number;

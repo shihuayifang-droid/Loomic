@@ -12,6 +12,8 @@ import { elementScreenRect, imageToolbarPosition } from "@/lib/toolbar-position"
 import { fetchAsDataURL } from "@/lib/canvas-elements";
 import { browserRenderCrop, commitCropOutput } from "@/lib/crop-commit";
 import { replaceImageInPlace } from "@/lib/tool-output-replace";
+import { createServerToolRunner } from "@/lib/server-tool-run";
+import { awaitJobCompletion } from "@/lib/await-job";
 import { browserDecode, browserEncode, commitAdjustOutput } from "@/lib/adjust-commit";
 import type { AutoAdjustResult } from "@/lib/adjust-auto";
 import { autoAdjust } from "@/lib/adjust-auto";
@@ -25,6 +27,7 @@ import {
   downloadAssetsZip,
   getAssetDownloadUrl,
   getAssetUrl,
+  runTool,
   uploadToolOutput,
 } from "@/lib/server-api";
 
@@ -181,6 +184,19 @@ function defaultReadImageSize(dataUrl: string): Promise<Size> {
 
 function newCropFileId(): string {
   return `crop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * ED-00m：每次**真正发出**的服务端工具运行一个去重 id（`client_request_id`）。
+ *
+ * 单调不撞比密码学强度重要得多；`crypto.randomUUID` 不在时（老浏览器 / jsdom）退回
+ * 时间戳 + 随机串，这个值只要求在途的这些请求之间不重复。
+ */
+function newToolRequestId(): string {
+  const source = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  const make = source?.randomUUID;
+  if (typeof make === "function") return make.call(source);
+  return `tool-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 /** ED-05 的默认「打开下载地址」：造一个带 `download` 的 anchor 直接点。 */
@@ -436,6 +452,34 @@ export function ImageToolbarLayer({
   // ED-00f：「更多」菜单里直接执行类菜单项的标价，一次询价覆盖全部可询价工具。
   const prices = useToolPrices(accessToken, definitions.tools);
 
+  /**
+   * ED-07 / ED-00m：服务端执行类工具（`form === "direct"` 且计价）的运行器。
+   *
+   * `useMemo` 不是优化而是语义：`runOnce` 的「在途去重表」要活过重渲染，否则连点 3 次会发
+   * 3 个请求、扣 3 次积分。依赖只有 token 与被注入的原图读取函数。
+   */
+  const toolRunner = useMemo(
+    () =>
+      createServerToolRunner({
+        run: (toolId, body) => {
+          if (accessToken === null || accessToken === "") {
+            return Promise.reject(new Error(DOWNLOAD_FAILED_MESSAGE));
+          }
+          return runTool(accessToken, toolId, body);
+        },
+        wait: (jobId) => {
+          if (accessToken === null || accessToken === "") {
+            return Promise.reject(new Error(DOWNLOAD_FAILED_MESSAGE));
+          }
+          // 本组件没有 ws：等待走 `awaitJobCompletion` 的 REST 轮询兜底。
+          return awaitJobCompletion(accessToken, jobId);
+        },
+        loadAsDataUrl: (url) => (loadOriginal ?? fetchAsDataURL)(url),
+        newRequestId: newToolRequestId,
+      }),
+    [accessToken, loadOriginal],
+  );
+
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [mode, setMode] = useState<Mode>({ kind: "toolbar" });
   /** 最近 150ms 内滚 / 缩过没有。`true` = 已经停下来，可以显示。 */
@@ -479,6 +523,11 @@ export function ImageToolbarLayer({
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const snapshotKeyRef = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * ED-00m：正在跑的「元素 id + 工具 id」。`createServerToolRunner` 的在途表保证连点只发**一个**
+   * 请求，但每次点击都会在**同一个** Promise 上继续，替换动作必须只做一次 —— 所以这一层再挡一次。
+   */
+  const activeToolRunsRef = useRef(new Set<string>());
 
   const handleChange = useCallback((elements: unknown[], appState: unknown) => {
     elementsRef.current = Array.isArray(elements) ? elements : [];
@@ -996,6 +1045,82 @@ export function ImageToolbarLayer({
 
   const exitCrop = useCallback(() => setMode({ kind: "toolbar" }), []);
 
+  /**
+   * ED-07 / ED-00m：直接执行类工具（去背景等）→ 服务端跑 → 产物**原位替换**原图。
+   *
+   * 与裁剪 / 调整同一套写法（`replaceImageInPlace` + `addFiles` + `updateScene`），差别只有：
+   * 像素不是这台浏览器算的，产物已经是存储里的一个 asset（GN-24：**不下载再上传**），
+   * 前端只是把签名地址的字节读进 `files[fileId].dataURL` 让画布能画出来。
+   *
+   * 占位期间只给一句 loading（本单不新增组件，ED-07 允许的最小做法）；失败只提示、不替换。
+   */
+  const runServerTool = useCallback(
+    async (toolId: string, label: string) => {
+      const el = snapshot?.element as ElementLike | null | undefined;
+      if (!el || typeof el.id !== "string") return;
+      const files = excalidrawApi.getFiles?.() ?? {};
+      const fileId = typeof el.fileId === "string" ? el.fileId : "";
+      const file = fileId === "" ? undefined : files[fileId];
+      const assetId = file?.assetId;
+      if (
+        typeof assetId !== "string" ||
+        assetId === "" ||
+        accessToken === null ||
+        accessToken === ""
+      ) {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return;
+      }
+
+      const elementId = el.id;
+      // ED-00m：连点期间这一次已经在跑 —— 不发第二次请求，也不做第二次替换。
+      const runKey = `${elementId}:${toolId}`;
+      if (activeToolRunsRef.current.has(runKey)) return;
+      activeToolRunsRef.current.add(runKey);
+
+      toast(`${label}处理中…`);
+      try {
+        // ED-00m：key = 元素 + 工具，在途期间重复点击复用同一个请求。
+        const output = await toolRunner.runOnce(runKey, toolId, {
+          artifactId: assetId,
+        });
+        const outputFileId = newCropFileId();
+        excalidrawApi.addFiles?.([
+          {
+            id: outputFileId,
+            dataURL: output.dataUrl,
+            mimeType: output.mimeType,
+            created: Date.now(),
+            // 后续工具还要拿这个 assetId 当源，所以它必须跟着文件记录走。
+            assetId: output.assetId,
+          },
+        ]);
+        const scene =
+          elementsRef.current.length > 0
+            ? elementsRef.current
+            : Array.from(excalidrawApi.getSceneElements?.() ?? []);
+        if (scene.length === 0) return;
+        excalidrawApi.updateScene?.({
+          elements: replaceImageInPlace(scene, elementId, {
+            fileId: outputFileId,
+            assetId: output.assetId,
+            parentAssetId: assetId,
+            source: `tool:${toolId}`,
+            ...(output.width === undefined ? {} : { width: output.width }),
+            ...(output.height === undefined ? {} : { height: output.height }),
+          }),
+          captureUpdate: "IMMEDIATELY",
+        });
+      } catch (err) {
+        toast(err instanceof Error && err.message !== "" ? err.message : DOWNLOAD_FAILED_MESSAGE);
+      } finally {
+        // 无论成功失败，这个「元素 + 工具」重新可以点。
+        activeToolRunsRef.current.delete(runKey);
+      }
+    },
+    [snapshot, excalidrawApi, accessToken, toast, toolRunner],
+  );
+
   const handleToolSelect = useCallback(
     (toolId: string) => {
       if (toolId === CROP_TOOL_ID) {
@@ -1015,10 +1140,24 @@ export function ImageToolbarLayer({
         void handleDownloadOriginal();
         return;
       }
+      // ED-07：定义里是「直接执行」且计价的服务端工具 → 直接执行，不进面板、不确认。
+      const tool = definitions.tools.find((candidate) => candidate.id === toolId);
+      if (tool !== undefined && tool.form === "direct" && tool.pricing !== null) {
+        void runServerTool(tool.id, tool.label);
+        return;
+      }
       // 其余工具本单都不接（工单 §3 裁决 6）。
       toast(TOOL_PENDING_MESSAGE);
     },
-    [enterFlipRotate, enterCrop, enterAdjust, handleDownloadOriginal, toast],
+    [
+      enterFlipRotate,
+      enterCrop,
+      enterAdjust,
+      handleDownloadOriginal,
+      definitions.tools,
+      runServerTool,
+      toast,
+    ],
   );
 
   /**

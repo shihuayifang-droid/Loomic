@@ -115,6 +115,26 @@ const toolDefinitions = vi.hoisted(() => [
     agent_callable: false,
     availability: "enabled",
   },
+  // 工单40T（ED-07）：服务端执行类工具 —— `form: "direct"` 且计价，点了直接跑、不进面板。
+  {
+    id: "remove_background",
+    label: "去背景",
+    icon: "remove_background",
+    testid: "image-toolbar-remove-background",
+    form: "direct",
+    default_slot: "main",
+    removable: true,
+    consumes: true,
+    pricing: { generator: "remove_background", tiers: [] },
+    output_kind: "image",
+    output_format: "png",
+    file_prefix: "remove_background",
+    event_type: null,
+    disabled_rules: [],
+    eta_seconds: 12,
+    agent_callable: true,
+    availability: "enabled",
+  },
   // ED-05：主工具条的「下载」（服务端定义见 `apps/server/.../tool-definitions.ts` L120）。
   {
     id: "download",
@@ -161,6 +181,9 @@ const getAssetUrlMock = vi.hoisted(() => vi.fn());
  * 一次都不看价格；结算反而会在与断言无关的位置多推一轮异步重渲染。
  */
 const fetchPriceQuoteMock = vi.hoisted(() => vi.fn(() => new Promise(() => {})));
+// 工单40T（ED-07）：服务端执行类工具链路 —— 发起运行与等待任务完成都走替身。
+const runToolMock = vi.hoisted(() => vi.fn());
+const awaitJobCompletionMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/server-api", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   getAssetDownloadUrl: getAssetDownloadUrlMock,
@@ -168,6 +191,11 @@ vi.mock("@/lib/server-api", async (importOriginal) => ({
   downloadAssetsZip: downloadAssetsZipMock,
   uploadToolOutput: uploadToolOutputMock,
   fetchPriceQuote: fetchPriceQuoteMock,
+  runTool: runToolMock,
+}));
+vi.mock("@/lib/await-job", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  awaitJobCompletion: awaitJobCompletionMock,
 }));
 vi.mock("@/lib/canvas-elements", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -1192,5 +1220,104 @@ describe("ED-00d：面板按「右 → 左 → 下」定位（工单 35Y）", ()
     const left = Number.parseFloat(layer.style.left);
     expect(left).toBeGreaterThanOrEqual(0);
     expect(left + 300).toBeLessThanOrEqual(1280);
+  });
+});
+
+describe("ED-07：去背景直接执行并原位替换（工单 40T）", () => {
+  /** 服务端文件记录上的 assetId 就是 `artifact_id` 的来源（同裁剪 / 调整的取法）。 */
+  const sourceFiles = {
+    "file-1": {
+      dataURL: "data:image/png;base64,AAAA",
+      mimeType: "image/png",
+      assetId: "a-src",
+    },
+  };
+
+  /** 任务结果的形状（40P）：产物已经在存储里，前端只按 asset 取签名地址。 */
+  const jobResult = {
+    id: "job-1",
+    status: "succeeded",
+    result: {
+      asset_id: "a-out",
+      signed_url: "https://x/out.png",
+      width: 1254,
+      height: 1254,
+      mime_type: "image/png",
+    },
+  };
+
+  beforeEach(() => {
+    runToolMock.mockReset();
+    awaitJobCompletionMock.mockReset();
+    fetchAsDataURLMock.mockReset();
+    uploadToolOutputMock.mockReset();
+
+    runToolMock.mockResolvedValue({
+      jobId: "job-1",
+      status: "queued",
+      model: "replicate/851-labs/background-remover",
+    });
+    awaitJobCompletionMock.mockResolvedValue(jobResult);
+    fetchAsDataURLMock.mockResolvedValue("data:image/png;base64,OUT");
+  });
+
+  it("ED-00m: three clicks send one request and the output replaces the image in place", async () => {
+    // 运行必须「还在途」才谈得上连点：`runTool` 挂住，三次点击都要落在同一个请求上。
+    let releaseRun: (value: { jobId: string; status: string; model: string | null }) => void =
+      () => {};
+    runToolMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseRun = resolve;
+        }),
+    );
+    const { api } = setupSelectedImage({ files: sourceFiles });
+
+    const button = screen.getByTestId("image-toolbar-remove-background");
+    fireEvent.click(button);
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    // 连点期间一个替换都还没发生
+    expect(api.updateScene).toHaveBeenCalledTimes(0);
+
+    await act(async () => {
+      releaseRun({ jobId: "job-1", status: "queued", model: null });
+    });
+
+    await waitFor(() => expect(api.updateScene).toHaveBeenCalledTimes(1));
+
+    // ED-00m 验收 3：连点 3 次只产生 1 个任务
+    expect(runToolMock).toHaveBeenCalledTimes(1);
+    expect(runToolMock.mock.calls[0]?.[1]).toBe("remove_background");
+    expect(runToolMock.mock.calls[0]?.[2]).toMatchObject({ artifact_id: "a-src" });
+    expect(awaitJobCompletionMock).toHaveBeenCalledTimes(1);
+
+    const call = api.updateScene.mock.calls[0]?.[0] as {
+      elements: Array<Record<string, any>>;
+      captureUpdate: string;
+    };
+    const replaced = call.elements.find((el) => el["id"] === "img-1");
+    expect(replaced?.["customData"].toolSource).toBe("tool:remove_background");
+    expect(replaced?.["customData"].assetId).toBe("a-out");
+    expect(replaced?.["customData"].parentAssetId).toBe("a-src");
+    expect(replaced?.["fileId"]).toBe(api.addFiles.mock.calls[0]?.[0]?.[0]?.id);
+    expect(replaced?.["width"]).toBe(1254);
+    expect(call.captureUpdate).toBe("IMMEDIATELY");
+
+    // GN-24：产物按 asset 取签名地址显示，前端不上传模型产物
+    expect(fetchAsDataURLMock).toHaveBeenCalledWith("https://x/out.png");
+    expect(uploadToolOutputMock).toHaveBeenCalledTimes(0);
+  });
+
+  it("ED-07: a source without an asset id only gets a notice", async () => {
+    setupSelectedImage({
+      files: { "file-1": { dataURL: "data:image/png;base64,AAAA", mimeType: "image/png" } },
+    });
+
+    fireEvent.click(screen.getByTestId("image-toolbar-remove-background"));
+
+    await waitFor(() => expect(toastMock.toast).toHaveBeenCalledWith(DOWNLOAD_FAILED_MESSAGE));
+    expect(runToolMock).toHaveBeenCalledTimes(0);
   });
 });

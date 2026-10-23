@@ -206,7 +206,8 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   },
   // ED-07 去背景 — direct execution; true transparent PNG at source size,
   // `remove_background_<id>.png` (ED-05 file-name rule). Lovart measured ~12 s.
-  // availability stays `unavailable`: the capability gap T-ED4 is open.
+  // availability is `enabled`: 40S registered the Replicate executor, so the row
+  // is no longer a capability gap.
   {
     id: "remove_background",
     label: "去背景",
@@ -224,7 +225,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     disabled_rules: [],
     eta_seconds: 12,
     agent_callable: true,
-    availability: "unavailable",
+    availability: "enabled",
     // GN-05 / ED-07: Replicate's background remover (U-21 still holds the token).
     execution_model: "replicate/851-labs/background-remover",
   },

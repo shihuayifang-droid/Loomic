@@ -71,8 +71,8 @@ const ED_00F_DEFAULT_MORE = [
   "flip_rotate",
 ];
 
-/** ED-00k / Kiro's ruling: exactly these five are usable today. */
-const ENABLED = ["adjust", "crop", "flip_rotate", "download", "quick_edit"];
+/** ED-00k / Kiro's ruling, extended by 40S: exactly these six are usable today. */
+const ENABLED = ["adjust", "crop", "flip_rotate", "download", "quick_edit", "remove_background"];
 
 /** ED-00g: 快捷编辑和下载固定不可移除. */
 const NOT_REMOVABLE = ["quick_edit", "download"];
@@ -156,10 +156,10 @@ describe("ED-00k tool table: identifiers", () => {
 });
 
 describe("ED-00k tool table: the spec's rulings", () => {
-  it("case 6: exactly the five ruled tools are enabled, and everything else ships unavailable", () => {
+  it("case 6: exactly the six ruled tools are enabled, and everything else ships unavailable", () => {
     expect(ids((tool) => tool.availability === "enabled")).toEqual(sorted(ENABLED));
-    // 去背景 is P0 but still unavailable: the capability gap T-ED4 is open.
-    expect(byId("remove_background").availability).toBe("unavailable");
+    // 去背景 is open now: 40S wired the Replicate executor.
+    expect(byId("remove_background").availability).toBe("enabled");
     expect(ids((tool) => tool.availability === "unavailable")).toHaveLength(
       TOOL_DEFINITIONS.length - ENABLED.length,
     );

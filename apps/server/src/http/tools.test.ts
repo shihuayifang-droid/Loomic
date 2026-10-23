@@ -199,8 +199,8 @@ describe("GET /api/tools: the table on the wire", () => {
     const body = toolListResponseSchema.parse(response.json());
     const shipped = new Set(body.tools.map((tool) => tool.id));
 
-    // 去背景 is P0 and still unavailable (capability gap T-ED4): it must travel
-    // with the table, because the definition carries the switch (ED-00k).
+    // 去背景 was opened in 40T; every tool that is still unavailable must
+    // travel with the table, because the definition carries the switch (ED-00k).
     for (const id of [
       "remove_background",
       "upscale",
@@ -219,7 +219,7 @@ describe("GET /api/tools: the table on the wire", () => {
     );
 
     expect(unavailable).toHaveLength(sent.size);
-    expect(unavailable).toHaveLength(12);
+    expect(unavailable).toHaveLength(11);
     for (const tool of unavailable) {
       expect(sent.has(tool.id)).toBe(true);
     }
