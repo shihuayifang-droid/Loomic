@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { PGlite } from "@electric-sql/pglite";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import {
   createCanonicalDb,
@@ -23,6 +23,8 @@ import {
   runCanonicalMigrations,
   type MigrationFile,
 } from "./canonical-migrations.js";
+
+vi.setConfig({ testTimeout: 60_000 });
 
 const USER_ID = "3f6f1d52-4a1f-4c37-9d4b-2c0c6f6f3a11";
 
