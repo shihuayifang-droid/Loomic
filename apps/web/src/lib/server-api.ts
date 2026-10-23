@@ -806,6 +806,10 @@ export type SubmitImageResponse = {
   jobId: string;
   status: string;
   prompt: string;
+  /** AG-07: one id per image when the request asked for `count > 1` (jobIds[0] === jobId). */
+  jobIds?: string[];
+  /** AG-07: fewer jobs than requested were created; the rest were not submitted. */
+  partial?: { requested: number; created: number; error: string };
 };
 
 /**
@@ -820,7 +824,13 @@ export type SubmitImageResponse = {
 export async function submitImageJob(
   accessToken: string,
   prompt: string,
-  options?: { model?: string; aspectRatio?: string; quality?: string; size?: string },
+  options?: {
+    model?: string;
+    aspectRatio?: string;
+    quality?: string;
+    size?: string;
+    count?: number;
+  },
 ): Promise<SubmitImageResponse> {
   const response = await fetch(
     `${getServerBaseUrl()}/api/agent/generate-image-job`,
@@ -835,6 +845,8 @@ export async function submitImageJob(
         // AG-07: the catalogue size option (e.g. "16:9-4k"), only sent by models
         // that publish a size parameter — otherwise the request keeps its old shape.
         ...(options?.size ? { size: options.size } : {}),
+        // AG-07: how many images; only sent above 1 so the single-job body is unchanged.
+        ...(options?.count !== undefined && options.count > 1 ? { count: options.count } : {}),
       }),
     },
   );

@@ -344,3 +344,134 @@ describe("AG-07 图像生成面板按服务端参数渲染（工单 41D）", () 
     expect(screen.queryAllByTestId(/^generator-/)).toHaveLength(0);
   });
 });
+
+
+describe("AG-07 张数控件与多占位（工单 41G）", () => {
+  /** GPT Image 2 offering 10 images; Flux stays at 1; the plain model has no params. */
+  function withTenImages(): ImageModelInfo[] {
+    return MODELS.map((model) =>
+      model.id === GPT_MODEL && model.params
+        ? { ...model, params: { ...model.params, maxCount: 10 } }
+        : model,
+    );
+  }
+
+  /** A scene that actually stores what updateScene gives it. */
+  function sceneApi() {
+    let elements: any[] = [
+      {
+        id: "el-1",
+        type: "rectangle",
+        x: 0,
+        y: 0,
+        width: 300,
+        height: 200,
+        isDeleted: false,
+        customData: {
+          type: "image-generator",
+          status: "idle",
+          prompt: "cat",
+          model: GPT_MODEL,
+          aspectRatio: "1:1",
+          quality: "hd",
+        },
+      },
+    ];
+    const updateScene = vi.fn((scene: { elements: any[] }) => {
+      elements = scene.elements;
+    });
+    return {
+      api: { getSceneElements: () => elements, updateScene, addFiles: () => {} },
+      updateScene,
+      placeholders: () =>
+        elements.filter((el) => el.customData?.type === "image-generator" && !el.isDeleted),
+    };
+  }
+
+  function renderWithApi(api: unknown) {
+    const props = {
+      elementId: "el-1",
+      elementBounds: BOUNDS,
+      data: {
+        type: "image-generator" as const,
+        status: "idle" as const,
+        prompt: "cat",
+        model: GPT_MODEL,
+        aspectRatio: "1:1",
+        quality: "hd",
+      },
+      excalidrawApi: api,
+      accessToken: "token",
+      canvasScrollZoom: SCROLL_ZOOM,
+      onClose: () => {},
+      availableCredits: 100,
+    };
+    return render(
+      <ToastProvider>
+        <ImageGeneratorPanel {...props} />
+      </ToastProvider>,
+    );
+  }
+
+  it("AG-07: GPT Image 2 offers 1 to 10 images", async () => {
+    apiMock.fetchImageModels.mockResolvedValue({ models: withTenImages() });
+    renderPanel({ availableCredits: 100 });
+
+    const options = await screen.findAllByTestId(/^generator-count-option-/);
+    expect(options).toHaveLength(10);
+    for (let n = 1; n <= 10; n++) {
+      expect(screen.getByTestId(`generator-count-option-${n}`)).toBeInTheDocument();
+    }
+  });
+
+  it("AG-07: a model without params has no count control", async () => {
+    apiMock.fetchImageModels.mockResolvedValue({ models: withTenImages() });
+    renderPanel({ model: PLAIN_MODEL, availableCredits: 100 });
+
+    await screen.findByTestId("canvas-image-generator-ratio-trigger");
+    expect(screen.queryAllByTestId(/^generator-count-/)).toHaveLength(0);
+  });
+
+  it("AG-07 acceptance 2: choosing 10 quotes with count 10", async () => {
+    apiMock.fetchImageModels.mockResolvedValue({ models: withTenImages() });
+    renderPanel({ availableCredits: 100 });
+
+    fireEvent.click(await screen.findByTestId("generator-count-option-10"));
+
+    const request = (lastQuoteCall()?.input as { request: Record<string, unknown> }).request;
+    expect(request.count).toBe(10);
+  });
+
+  it("AG-07: ten images draw ten placeholders", async () => {
+    apiMock.fetchImageModels.mockResolvedValue({ models: withTenImages() });
+    const jobIds = Array.from({ length: 10 }, (_, i) => `job-${i}`);
+    apiMock.submitImageJob.mockResolvedValue({ jobId: "job-0", jobIds });
+    const scene = sceneApi();
+    renderWithApi(scene.api);
+
+    fireEvent.click(await screen.findByTestId("generator-count-option-10"));
+    fireEvent.click(screen.getByTestId("canvas-image-generator-submit"));
+
+    await waitFor(() => expect(apiMock.submitImageJob).toHaveBeenCalledTimes(1));
+    expect(apiMock.submitImageJob.mock.calls[0]?.[2]).toMatchObject({ count: 10 });
+    await waitFor(() => expect(scene.placeholders()).toHaveLength(10));
+  });
+
+  it("count 1 keeps the single-job path", async () => {
+    apiMock.fetchImageModels.mockResolvedValue({ models: withTenImages() });
+    const scene = sceneApi();
+    renderWithApi(scene.api);
+
+    await screen.findByTestId("generator-count-option-1");
+    expect(
+      (lastQuoteCall()?.input as { request: Record<string, unknown> }).request,
+    ).not.toHaveProperty("count");
+
+    fireEvent.click(screen.getByTestId("canvas-image-generator-submit"));
+    await waitFor(() => expect(apiMock.submitImageJob).toHaveBeenCalledTimes(1));
+
+    const submitted = apiMock.submitImageJob.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect("count" in submitted).toBe(false);
+    expect(scene.placeholders()).toHaveLength(1);
+  });
+});

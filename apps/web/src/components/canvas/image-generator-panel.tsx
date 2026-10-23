@@ -11,6 +11,7 @@ import { qualityOptionsFor } from "../../lib/image-quality-options";
 import { awaitJobCompletion } from "../../lib/await-job";
 import { imageResultFromJob } from "../../lib/image-job-result";
 import { fitResultIntoSlot } from "../../lib/fit-result";
+import { addBatchPlaceholders } from "../../lib/batch-slots";
 import { useCompletionTitle } from "../../hooks/use-completion-title";
 import { useGenerationErrorHandler } from "../../hooks/use-generation-error-handler";
 import type { WebSocketHandle } from "../../hooks/use-websocket";
@@ -31,6 +32,7 @@ import {
   type GeneratorParamValue,
 } from "@/components/canvas/generator-param-controls";
 import { PriceTag } from "@/components/ui/price-tag";
+import { useToast } from "@/components/toast";
 import {
   useGenerationQuote,
   type GenerationQuoteInput,
@@ -114,6 +116,9 @@ export function ImageGeneratorPanel({
    * `quality` above).
    */
   const [paramValues, setParamValues] = useState<ParamValues>({});
+  /** AG-07: how many images to generate (1 = the old single-job path). */
+  const [count, setCount] = useState(1);
+  const { toast } = useToast();
   const [loading, setLoading] = useState(data.status === "generating");
   const [error, setError] = useState<string | null>(data.errorMessage ?? null);
   /**
@@ -231,6 +236,36 @@ export function ImageGeneratorPanel({
     setParamValues(paramDefaults);
   }, [paramDefaults]);
   /**
+   * AG-07: the count control exists only for a model that allows more than one
+   * image; switching models always goes back to 1.
+   */
+  const maxCount = currentModel?.params?.maxCount ?? 1;
+  const countParams = useMemo<GeneratorParam[]>(
+    () =>
+      maxCount > 1
+        ? [
+            {
+              type: "discrete",
+              id: "count",
+              label: "张数",
+              options: Array.from({ length: maxCount }, (_, i) => ({
+                value: String(i + 1),
+                label: String(i + 1),
+              })),
+              default: "1",
+            },
+          ]
+        : [],
+    [maxCount],
+  );
+  useEffect(() => {
+    setCount(1);
+  }, [model]);
+  const effectiveCount = maxCount > 1 ? Math.min(count, maxCount) : 1;
+  const handleCountChange = useCallback((_id: string, value: GeneratorParamValue) => {
+    setCount(Number(value) || 1);
+  }, []);
+  /**
    * 渲染 / 询价 / 提交一律读这份合并值：某个参数还没有值（首帧、或换了模型而
    * effect 尚未落地）就当场回落默认值，不会出现「未选中任何项」的空档。
    */
@@ -315,6 +350,7 @@ export function ImageGeneratorPanel({
                     ? { quality: quality as NonNullable<GenerateImageRequest["quality"]> }
                     : {}),
                 }),
+            ...(effectiveCount > 1 ? { count: effectiveCount } : {}),
           },
         }
       : null;
@@ -366,6 +402,64 @@ export function ImageGeneratorPanel({
     setParamValues((prev) => ({ ...prev, [id]: value }));
   }, []);
 
+  /**
+   * AG-07: waits for one extra batch job and puts its picture into the placeholder
+   * `slotId` (or marks that placeholder as failed). Not tied to this panel's abort
+   * controller: these jobs are already billed and finish even if the panel closes.
+   */
+  const fillBatchSlot = useCallback(
+    async (slotId: string, batchJobId: string): Promise<void> => {
+      const promptText = prompt.trim();
+      begin(batchJobId);
+      try {
+        const job = await awaitJobCompletion(accessTokenRef.current, batchJobId, {
+          ...(ws ? { ws } : {}),
+        });
+        const result = imageResultFromJob(job);
+        const dataURL = await fetchAsDataURL(result.url);
+        const slot = excalidrawApi
+          .getSceneElements()
+          .find((el: any) => el.id === slotId);
+        if (!slot) {
+          end(batchJobId, true);
+          return;
+        }
+        const fileId = generateId();
+        excalidrawApi.addFiles([
+          { id: fileId, dataURL, mimeType: result.mimeType, created: Date.now() },
+        ]);
+        const placed = fitResultIntoSlot(
+          { x: slot.x, y: slot.y, width: slot.width, height: slot.height },
+          result,
+        );
+        const imageElement = createExcalidrawImageElement({
+          fileId,
+          x: placed.x,
+          y: placed.y,
+          width: placed.width,
+          height: placed.height,
+          title: promptText.slice(0, 60),
+        });
+        const elements = excalidrawApi
+          .getSceneElements()
+          .map((el: any) => (el.id === slotId ? { ...el, isDeleted: true } : el));
+        excalidrawApi.updateScene({
+          elements: [...elements, imageElement],
+          captureUpdate: "IMMEDIATELY",
+        });
+        end(batchJobId, true);
+      } catch (err) {
+        end(batchJobId, false);
+        console.error("[image-gen] Batch slot error:", err);
+        updateImageGeneratorElement(excalidrawApi, slotId, {
+          status: "error",
+          errorMessage: lookupError(errorCodeOf(err)).message,
+        });
+      }
+    },
+    [prompt, begin, end, ws, excalidrawApi],
+  );
+
   const handleGenerate = useCallback(async () => {
     if (!prompt.trim() || loading) return;
     // T-109：键盘 Enter 走的也是这条路径，光把按钮 disabled 挡不住回车，
@@ -411,6 +505,7 @@ export function ImageGeneratorPanel({
               ...(paramRequest.aspectRatio ? { aspectRatio: paramRequest.aspectRatio } : {}),
               ...(paramRequest.quality ? { quality: paramRequest.quality } : {}),
               ...(paramRequest.size ? { size: paramRequest.size } : {}),
+              ...(effectiveCount > 1 ? { count: effectiveCount } : {}),
             }
           : { model, aspectRatio, ...(qualityOptions ? { quality } : {}) },
       );
@@ -423,6 +518,25 @@ export function ImageGeneratorPanel({
       if (controller.signal.aborted) {
         settleJob(false);
         return;
+      }
+
+      // AG-07: N images = N independent jobs. jobIds[0] fills this slot through the
+      // path below (unchanged); the rest get their own placeholders and run on their
+      // own — cancelling or closing this panel only touches the current slot's job,
+      // the others are already billed and keep going in the background.
+      const batchIds = submitted.jobIds;
+      if (batchIds && batchIds.length > 1) {
+        const extraSlotIds = addBatchPlaceholders(excalidrawApi, elementId, batchIds.length);
+        extraSlotIds.forEach((slotId, i) => {
+          const extraJobId = batchIds[i + 1];
+          if (extraJobId !== undefined) void fillBatchSlot(slotId, extraJobId);
+        });
+      }
+      if (submitted.partial) {
+        toast(
+          `已创建 ${submitted.partial.created} 张，剩余 ${submitted.partial.requested - submitted.partial.created} 张未能提交`,
+          "info",
+        );
       }
 
       const job = await awaitJobCompletion(
@@ -524,6 +638,9 @@ export function ImageGeneratorPanel({
     end,
     ws,
     precheck,
+    effectiveCount,
+    fillBatchSlot,
+    toast,
   ]);
 
   /**
@@ -655,6 +772,15 @@ export function ImageGeneratorPanel({
             values={effectiveParamValues}
             onChange={handleParamChange}
           />
+          {countParams.length > 0 && (
+            <div className="mt-2">
+              <GeneratorParamControls
+                params={countParams}
+                values={{ count: String(effectiveCount) }}
+                onChange={handleCountChange}
+              />
+            </div>
+          )}
         </div>
       )}
 
