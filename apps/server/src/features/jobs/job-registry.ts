@@ -54,6 +54,12 @@ export const JOB_TYPE_REGISTRY = {
     visibilityTimeoutSeconds: 300,
     concurrency: (env) => env.workerVideoConcurrency ?? 2,
   },
+  tool_execution: {
+    queue: "tool_execution_jobs",
+    // Replicate / gateway image edits take 10-120s; executors renew VT while working.
+    visibilityTimeoutSeconds: 180,
+    concurrency: (env) => env.workerImageConcurrency ?? 3,
+  },
 } as const satisfies Record<BackgroundJobType, JobTypeConfig>;
 
 /** Every queue the worker should poll, derived from the registry. */

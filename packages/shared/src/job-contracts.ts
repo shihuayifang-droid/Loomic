@@ -23,6 +23,9 @@ export type BackgroundJobStatus = z.infer<typeof backgroundJobStatusSchema>;
 export const backgroundJobTypeSchema = z.enum([
   "image_generation",
   "video_generation",
+  // Every server-side tool (remove background, quick edit, ...) is one job
+  // type; the payload's tool_id picks the tool.
+  "tool_execution",
 ]);
 export type BackgroundJobType = z.infer<typeof backgroundJobTypeSchema>;
 

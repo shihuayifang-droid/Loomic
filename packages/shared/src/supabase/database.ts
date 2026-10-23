@@ -1103,7 +1103,7 @@ export type Database = {
         | "failed"
         | "canceled"
         | "dead_letter"
-      background_job_type: "image_generation" | "video_generation"
+      background_job_type: "image_generation" | "video_generation" | "tool_execution"
       billing_period: "monthly" | "yearly"
       brand_kit_asset_type: "color" | "font" | "logo" | "image"
       credit_transaction_type:
@@ -1253,7 +1253,7 @@ export const Constants = {
         "canceled",
         "dead_letter",
       ],
-      background_job_type: ["image_generation", "video_generation"],
+      background_job_type: ["image_generation", "video_generation", "tool_execution"],
       billing_period: ["monthly", "yearly"],
       brand_kit_asset_type: ["color", "font", "logo", "image"],
       credit_transaction_type: [
