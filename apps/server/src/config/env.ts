@@ -27,6 +27,9 @@ export function resolveDefaultAgentModel(env: {
 
 export type AgentBackendMode = "filesystem" | "state";
 
+/** S-A3 / ADR-0001: which request authenticator validates access tokens. */
+export type AuthProvider = "supabase" | "self";
+
 /**
  * OP-13: the one place that decides "this is production". NODE_ENV=production.
  *
@@ -105,9 +108,32 @@ export type ServerEnv = {
    * compiling; `loadServerEnv` always fills it (default 50).
    */
   agentConfirmThreshold?: number;
+  /**
+   * S-A3 / ADR-0001: which authenticator checks access tokens. Optional on the
+   * type so existing literals keep compiling; `loadServerEnv` always fills it
+   * (default "supabase", so an unset variable keeps the pre-42 behaviour).
+   */
+  authProvider?: AuthProvider;
+  /**
+   * S-A3: HS256 secret for the self-hosted access tokens (42A). Only consulted
+   * when `authProvider` is "self", where it is mandatory and must be at least
+   * 32 bytes. The value never appears in an error message.
+   */
+  authJwtSecret?: string;
+  /** S-A3: `iss` of the self-hosted access tokens (default "hahart"). */
+  authJwtIssuer?: string;
+  /** S-A3: `aud` of the self-hosted access tokens (default "hahart-api"). */
+  authJwtAudience?: string;
 };
 
 export const DEFAULT_AGENT_CONFIRM_THRESHOLD = 50;
+
+export const DEFAULT_AUTH_PROVIDER: AuthProvider = "supabase";
+export const DEFAULT_AUTH_JWT_ISSUER = "hahart";
+export const DEFAULT_AUTH_JWT_AUDIENCE = "hahart-api";
+
+/** HS256 key material below this many UTF-8 bytes is a configuration error. */
+const MIN_AUTH_JWT_SECRET_BYTES = 32;
 
 function parseAgentConfirmThreshold(raw: string | undefined): number {
   const trimmed = raw?.trim();
@@ -118,6 +144,35 @@ function parseAgentConfirmThreshold(raw: string | undefined): number {
     throw new Error(`Invalid HAHART_AGENT_CONFIRM_THRESHOLD value: ${raw}`);
   }
   return Number.parseInt(trimmed, 10);
+}
+
+function parseAuthProvider(raw: string | undefined): AuthProvider {
+  const trimmed = normalizeOptionalString(raw);
+  if (!trimmed) {
+    return DEFAULT_AUTH_PROVIDER;
+  }
+  if (trimmed === "supabase" || trimmed === "self") {
+    return trimmed;
+  }
+  throw new Error(`Invalid HAHART_AUTH_PROVIDER value: ${raw}`);
+}
+
+/**
+ * S-A3: the self-hosted mode signs its own tokens, so it needs key material of
+ * its own. The message names the variables and never their values, so it stays
+ * safe to log verbatim.
+ */
+function authJwtSecretError(): Error {
+  return new Error(
+    "HAHART_AUTH_JWT_SECRET must be at least 32 bytes when HAHART_AUTH_PROVIDER=self",
+  );
+}
+
+function hasEnoughAuthJwtSecret(secret: string | undefined): boolean {
+  if (!secret) {
+    return false;
+  }
+  return new TextEncoder().encode(secret).byteLength >= MIN_AUTH_JWT_SECRET_BYTES;
 }
 
 /**
@@ -284,6 +339,25 @@ export function loadServerEnv(
   const agentConfirmThreshold = parseAgentConfirmThreshold(
     source.HAHART_AGENT_CONFIRM_THRESHOLD,
   );
+  const authProvider =
+    overrides.authProvider ?? parseAuthProvider(source.HAHART_AUTH_PROVIDER);
+  const authJwtSecret =
+    overrides.authJwtSecret ??
+    normalizeOptionalString(source.HAHART_AUTH_JWT_SECRET);
+  const authJwtIssuer =
+    overrides.authJwtIssuer ??
+    normalizeOptionalString(source.HAHART_AUTH_JWT_ISSUER) ??
+    DEFAULT_AUTH_JWT_ISSUER;
+  const authJwtAudience =
+    overrides.authJwtAudience ??
+    normalizeOptionalString(source.HAHART_AUTH_JWT_AUDIENCE) ??
+    DEFAULT_AUTH_JWT_AUDIENCE;
+
+  // S-A3: the self-hosted mode is unusable without its own signing key, so it
+  // fails at load time instead of at the first request.
+  if (authProvider === "self" && !hasEnoughAuthJwtSecret(authJwtSecret)) {
+    throw authJwtSecretError();
+  }
 
   // Resolve default agent model based on available provider keys.
   // Explicit LOOMIC_AGENT_MODEL always takes precedence; otherwise fall back
@@ -370,6 +444,10 @@ export function loadServerEnv(
     ...(workerPollIntervalMs ? { workerPollIntervalMs } : {}),
     ...(workerMaxBatchSize ? { workerMaxBatchSize } : {}),
     agentConfirmThreshold,
+    authProvider,
+    authJwtIssuer,
+    authJwtAudience,
+    ...(authJwtSecret ? { authJwtSecret } : {}),
   };
 
   // OP-13: production must refuse to start with a material configuration gap.

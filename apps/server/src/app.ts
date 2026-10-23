@@ -242,6 +242,14 @@ import { registerViewerRoutes } from "./http/viewer.js";
 import { CanvasEventBuffer } from "./ws/event-buffer.js";
 import { ConnectionManager } from "./ws/connection-manager.js";
 import { registerWsRoute } from "./ws/handler.js";
+// S-A3 (ADR-0001): the two authenticators behind the HAHART_AUTH_PROVIDER switch.
+import { createSelfRequestAuthenticator } from "./auth/self-authenticator.js";
+import { selectRequestAuthenticator } from "./auth/select-authenticator.js";
+import {
+  DEFAULT_ACCESS_TTL_SECONDS,
+  accessTokenSecretFrom,
+} from "./auth/tokens.js";
+import { findUserById, isSessionActive } from "./db/auth-repository.js";
 import { createAdminSupabaseClient } from "./supabase/admin.js";
 import {
   createSupabaseRequestAuthenticator,
@@ -380,7 +388,6 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       viewerService,
     });
   });
-  const auth = options.auth ?? createSupabaseRequestAuthenticator(env);
   const createUserClient =
     options.createUserClient ?? createUserSupabaseClientFactory(env);
   let adminClient:
@@ -397,6 +404,28 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const databaseEnv: NodeJS.ProcessEnv = env.databaseUrl
     ? { [DATABASE_URL_ENV_KEY]: env.databaseUrl }
     : {};
+  // S-A3 (ADR-0001): HAHART_AUTH_PROVIDER picks the access-token verifier.
+  // Unset (or "supabase") keeps the pre-42 behaviour; "self" builds the
+  // self-hosted verifier against the same lazily resolved pool, so `buildApp`
+  // still never connects. Both factories are thunks, so only the selected one
+  // is ever constructed.
+  const auth =
+    options.auth ??
+    selectRequestAuthenticator(env, {
+      supabase: () => createSupabaseRequestAuthenticator(env),
+      self: () =>
+        createSelfRequestAuthenticator({
+          token: {
+            secret: accessTokenSecretFrom(env.authJwtSecret ?? ""),
+            issuer: env.authJwtIssuer ?? "hahart",
+            audience: env.authJwtAudience ?? "hahart-api",
+            ttlSeconds: DEFAULT_ACCESS_TTL_SECONDS,
+          },
+          findUserById: (id) => findUserById(getTransactionPool(databaseEnv), id),
+          isSessionActive: (sid, at) =>
+            isSessionActive(getTransactionPool(databaseEnv), sid, at),
+        }),
+    });
   const identityReadRepository =
     options.identityReadRepository ??
     createIdentityReadRepository({

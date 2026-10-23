@@ -176,3 +176,63 @@ describe("AG-10 agent confirmation threshold", () => {
     ).toThrow("HAHART_AGENT_CONFIRM_THRESHOLD");
   });
 });
+
+/**
+ * S-A3 (ADR-0001): the HAHART_AUTH_PROVIDER switch and the self-hosted token
+ * configuration. The values below are obvious placeholders; one case asserts
+ * that a configured secret never reaches the error message.
+ */
+const SELF_SECRET = "self-auth-test-secret-0123456789abcd";
+
+describe("S-A3 auth provider switch", () => {
+  it("S-A3: authProvider defaults to supabase", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, { NODE_ENV: "development" });
+
+    expect(env.authProvider).toBe("supabase");
+  });
+
+  it("S-A3: HAHART_AUTH_PROVIDER=self without a secret refuses to start", () => {
+    expect(() =>
+      loadServerEnv(VERSION_OVERRIDE, {
+        NODE_ENV: "development",
+        HAHART_AUTH_PROVIDER: "self",
+      }),
+    ).toThrow("HAHART_AUTH_JWT_SECRET");
+  });
+
+  it("S-A3: a too-short self-mode secret refuses to start and is never echoed", () => {
+    const message = productionErrorMessage(
+      {
+        NODE_ENV: "development",
+        HAHART_AUTH_PROVIDER: "self",
+        HAHART_AUTH_JWT_SECRET: "too-short-placeholder-secret",
+      },
+      VERSION_OVERRIDE,
+    );
+
+    expect(message).toContain("HAHART_AUTH_JWT_SECRET");
+    expect(message).not.toContain("too-short-placeholder-secret");
+  });
+
+  it("S-A3: self with a 32-byte secret starts and keeps the default issuer / audience", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      HAHART_AUTH_PROVIDER: "self",
+      HAHART_AUTH_JWT_SECRET: SELF_SECRET,
+    });
+
+    expect(env.authProvider).toBe("self");
+    expect(env.authJwtSecret).toBe(SELF_SECRET);
+    expect(env.authJwtIssuer).toBe("hahart");
+    expect(env.authJwtAudience).toBe("hahart-api");
+  });
+
+  it("S-A3: an unknown HAHART_AUTH_PROVIDER refuses to start", () => {
+    expect(() =>
+      loadServerEnv(VERSION_OVERRIDE, {
+        NODE_ENV: "development",
+        HAHART_AUTH_PROVIDER: "oauth",
+      }),
+    ).toThrow("Invalid HAHART_AUTH_PROVIDER value: oauth");
+  });
+});
