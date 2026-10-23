@@ -940,14 +940,31 @@ function main() {
     );
     lines.push(formatTable(metrics));
 
+    // Ticket 44A: the server.runtimeRpc anchor is read from the baseline JSON
+    // metric (fallback: the ANCHORS constant when the file or key is missing).
+    let baselineRuntimeRpc;
+    if (existsSync(options.baseline)) {
+      try {
+        const parsedBaseline = JSON.parse(readText(options.baseline));
+        const candidate = parsedBaseline?.metrics?.["server.rpcCallsRuntime"];
+        if (typeof candidate === "number") baselineRuntimeRpc = candidate;
+      } catch {
+        baselineRuntimeRpc = undefined;
+      }
+    }
+
     for (const anchor of ANCHORS) {
+      const anchorValue =
+        anchor.label === "server.runtimeRpc" && baselineRuntimeRpc !== undefined
+          ? baselineRuntimeRpc
+          : anchor.value;
       const measured = metrics[anchor.key] ?? 0;
       const verdict =
-        measured === anchor.value
+        measured === anchorValue
           ? "match"
-          : `DIFFERS by ${measured - anchor.value}`;
+          : `DIFFERS by ${measured - anchorValue}`;
       lines.push(
-        `[anchor] ${anchor.label}: anchor=${anchor.value} measured[${anchor.key}]=${measured} (${verdict})`,
+        `[anchor] ${anchor.label}: anchor=${anchorValue} measured[${anchor.key}]=${measured} (${verdict})`,
       );
     }
   }

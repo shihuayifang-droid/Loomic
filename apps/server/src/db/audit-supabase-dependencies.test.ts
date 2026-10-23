@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +40,14 @@ const BASELINE = join(
   "scripts",
   "supabase-dependency-baseline.json",
 );
+
+/**
+ * Pinned audit numbers come from the baseline JSON, the single place a reducing
+ * ticket lowers them. The assertions below still mean "measured = baseline".
+ */
+const baseline = JSON.parse(readFileSync(BASELINE, "utf8")) as {
+  metrics: Record<string, number>;
+};
 
 /**
  * Every test in this file copies a mirror of the repository and drives the real
@@ -497,8 +513,12 @@ describe("audit-supabase-dependencies: typed RPC call forms", () => {
     // repository therefore now sits EXACTLY ON the baseline — which is the lower
     // edge of the boundary: equal is not an increase, and the auditor must not
     // report one.
-    expect(metricValue(before.stdout, "server.rpcCallsRuntime")).toBe(17);
-    expect(metricValue(before.stdout, "server.rpcCallsAll")).toBe(21);
+    expect(metricValue(before.stdout, "server.rpcCallsRuntime")).toBe(
+      baseline.metrics["server.rpcCallsRuntime"],
+    );
+    expect(metricValue(before.stdout, "server.rpcCallsAll")).toBe(
+      baseline.metrics["server.rpcCallsAll"],
+    );
 
     // ONE extra type-asserted call is therefore enough to cross the baseline by
     // exactly one, and both counters must be reported as risen. That is the upper
@@ -516,7 +536,9 @@ describe("audit-supabase-dependencies: typed RPC call forms", () => {
     expect(metricValue(injected.stdout, "server.rpcCallsRuntime")).toBe(
       metricValue(before.stdout, "server.rpcCallsRuntime") + 1,
     );
-    expect(metricValue(injected.stdout, "server.rpcCallsAll")).toBe(22);
+    expect(metricValue(injected.stdout, "server.rpcCallsAll")).toBe(
+      Number(baseline.metrics["server.rpcCallsAll"]) + 1,
+    );
 
     rmSync(probePath);
     const restored = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
@@ -555,18 +577,16 @@ describe("audit-supabase-dependencies: untypedFrom wrapper calls", () => {
     // which is the same raw-text treatment the from-call rule already has
     // (T-45 stays open on purpose, it is not fixed here).
     //
-    // Unlike the RPC probes this rise does NOT fail the audit: the frozen
-    // baseline is 163 and the measurement stays far below it, because the rule
-    // counts a coupling the baseline already allowed for. Only a number above
-    // the baseline is a problem, so both runs must keep exiting 0.
+    // Since ticket 44A the baseline equals the measurement, so any rise fails the audit, like the RPC probes.
     expect(metricValue(after.stdout, "server.fromCalls")).toBe(
       metricValue(before.stdout, "server.fromCalls") + 4,
     );
     expect(metricValue(after.stdout, "server.fromCallsIncludingTests")).toBe(
       metricValue(before.stdout, "server.fromCallsIncludingTests") + 4,
     );
-    expect(after.status).toBe(0);
-    expect(problemCount(after.stdout)).toBe(0);
+    expect(after.status).toBe(1);
+    expect(problemCount(after.stdout)).toBeGreaterThanOrEqual(1);
+    expect(after.stdout).toContain("[!] metric server.fromCalls increased");
 
     rmSync(probePath);
     const restored = runAudit([`--root=${root}`, `--baseline=${BASELINE}`]);
@@ -577,6 +597,8 @@ describe("audit-supabase-dependencies: untypedFrom wrapper calls", () => {
     expect(
       metricValue(restored.stdout, "server.fromCallsIncludingTests"),
     ).toBe(metricValue(before.stdout, "server.fromCallsIncludingTests"));
+    expect(restored.status).toBe(0);
+    expect(problemCount(restored.stdout)).toBe(0);
   }, AUDIT_TEST_TIMEOUT_MS);
 
   it("counts a wrapper definition with no call site as exactly one", () => {
@@ -600,7 +622,8 @@ describe("audit-supabase-dependencies: untypedFrom wrapper calls", () => {
     expect(metricValue(after.stdout, "server.fromCallsIncludingTests")).toBe(
       metricValue(before.stdout, "server.fromCallsIncludingTests") + 1,
     );
-    expect(problemCount(after.stdout)).toBe(0);
+    expect(problemCount(after.stdout)).toBeGreaterThanOrEqual(1);
+    expect(after.stdout).toContain("[!] metric server.fromCalls increased");
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 
@@ -989,7 +1012,9 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // modified test files name no client method either, so
     // `fromCallsIncludingTests` follows `fromCalls` down again.
     // 43J: the brand kit goes through the ObjectStore adapter; the rest are one-off CLIs.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(45);
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(
+      baseline.metrics["server.fromCalls"],
+    );
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing. The wrapper
     // fixtures above are assembled the same way (`UNTYPED_FROM_CALL`), so a
@@ -997,7 +1022,9 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // counters below still agree exactly.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
     // 43J: the brand kit goes through the ObjectStore adapter; the rest are one-off CLIs.
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(45);
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(
+      baseline.metrics["server.fromCallsIncludingTests"],
+    );
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
@@ -1015,8 +1042,12 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // site of any form is left in that file. `fromCalls` and every other counter
     // stay exactly where workorder 21E1 left them — workorder 21G moved only the
     // two PostgREST writes counted above, and touched no RPC call site.
-    expect(metricValue(run.stdout, "server.rpcCallsRuntime")).toBe(17);
-    expect(metricValue(run.stdout, "server.rpcCallsAll")).toBe(21);
+    expect(metricValue(run.stdout, "server.rpcCallsRuntime")).toBe(
+      baseline.metrics["server.rpcCallsRuntime"],
+    );
+    expect(metricValue(run.stdout, "server.rpcCallsAll")).toBe(
+      baseline.metrics["server.rpcCallsAll"],
+    );
 
     // The published anchor is a CONSTANT of the audit script
     // (`ANCHORS.server.runtimeRpc`) mirrored by the baseline's
@@ -1030,13 +1061,35 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // This is the exact reverse of workorder 21C-preflight D, which pinned
     // 17 -> 18 (`8308315`) when the anchor was frozen ABOVE the measurement; the
     // anchor now follows the real coupling down instead of being left behind.
+    const runtimeRpc = baseline.metrics["server.rpcCallsRuntime"];
     expect(run.stdout).toMatch(
-      /^\[anchor\] server\.runtimeRpc: anchor=17 measured\[server\.rpcCallsRuntime\]=17 \(match\)$/m,
+      new RegExp(
+        `^\\[anchor\\] server\\.runtimeRpc: anchor=${runtimeRpc} measured\\[server\\.rpcCallsRuntime\\]=${runtimeRpc} \\(match\\)$`,
+        "m",
+      ),
     );
 
     // 43J: the brand kit goes through the ObjectStore adapter; the rest are one-off CLIs.
-    expect(metricValue(run.stdout, "server.storageCalls")).toBe(5);
+    expect(metricValue(run.stdout, "server.storageCalls")).toBe(
+      baseline.metrics["server.storageCalls"],
+    );
     expect(metricValue(run.stdout, "server.authGetUserCalls")).toBe(1);
     expect(metricValue(run.stdout, "server.supabaseSdkImportHits")).toBe(3);
+  }, AUDIT_TEST_TIMEOUT_MS);
+
+  it("baseline fromCalls / rpcCallsRuntime / storageCalls equal the measured values", () => {
+    // Values come from supabase-dependency-baseline.json; a reducing ticket lowers them there.
+    const run = runAudit([`--baseline=${BASELINE}`]);
+    expect(run.status).toBe(0);
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(
+      baseline.metrics["server.fromCalls"],
+    );
+    expect(metricValue(run.stdout, "server.rpcCallsRuntime")).toBe(
+      baseline.metrics["server.rpcCallsRuntime"],
+    );
+    expect(metricValue(run.stdout, "server.storageCalls")).toBe(
+      baseline.metrics["server.storageCalls"],
+    );
+    expect(run.stdout).toMatch(/^\[anchor\] server\.runtimeRpc: .*\(match\)$/m);
   }, AUDIT_TEST_TIMEOUT_MS);
 });
