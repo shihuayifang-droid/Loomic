@@ -6,7 +6,10 @@
 
 import type { CanvasContent } from "@loomic/shared";
 
-import { mutateCanvasContent } from "./canvas-version.js";
+import { mutateCanvasContent, type CanvasStore } from "./canvas-version.js";
+
+/** Legacy Supabase-style client, or a repository-backed CanvasStore. */
+type CanvasWriterTarget = { from: (table: string) => any } | CanvasStore;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -343,7 +346,7 @@ const VIDEO_MAX_SIZE = 800;
  * happening.
  */
 export async function insertImagePlaceholder(
-  client: { from: (table: string) => any },
+  client: CanvasWriterTarget,
   opts: PlaceholderInsertOpts,
   explicitPlacement?: Placement,
 ): Promise<InsertResult> {
@@ -401,7 +404,7 @@ export async function insertImagePlaceholder(
  * canceled), so the canvas is not left with a permanently empty frame.
  */
 export async function removeCanvasElement(
-  client: { from: (table: string) => any },
+  client: CanvasWriterTarget,
   canvasId: string,
   elementId: string,
 ): Promise<void> {
@@ -494,7 +497,7 @@ export function toRetryRequest(
  * delete it. Same best-effort contract as removeCanvasElement: never throws.
  */
 export async function markGenerationSlotFailed(
-  client: { from: (table: string) => any },
+  client: CanvasWriterTarget,
   canvasId: string,
   elementId: string,
   failure: {
@@ -564,7 +567,7 @@ export async function markGenerationSlotFailed(
 }
 
 export async function insertImageElement(
-  client: { from: (table: string) => any; storage: { from: (bucket: string) => any } },
+  client: CanvasWriterTarget,
   opts: ImageInsertOpts,
   explicitPlacement?: Placement,
 ): Promise<InsertResult> {
@@ -681,7 +684,7 @@ export async function insertImageElement(
  * whose lifetime we do not control.
  */
 export async function insertVideoElement(
-  client: { from: (table: string) => any; storage: { from: (bucket: string) => any } },
+  client: CanvasWriterTarget,
   opts: VideoInsertOpts,
   explicitPlacement?: Placement,
 ): Promise<InsertResult> {

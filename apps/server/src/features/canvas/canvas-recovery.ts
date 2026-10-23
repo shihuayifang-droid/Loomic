@@ -32,12 +32,9 @@ import {
   OSS_MARKER_PREFIX,
   insertImageElement,
 } from "./canvas-element-writer.js";
-import { readCanvasSnapshot } from "./canvas-version.js";
+import { type CanvasStore, readCanvasSnapshot } from "./canvas-version.js";
 
-type RecoveryClient = {
-  from: (table: string) => any;
-  storage: { from: (bucket: string) => any };
-};
+type RecoveryClient = { from: (table: string) => any } | CanvasStore;
 
 /**
  * How the job list is authorised (workorder 20C).

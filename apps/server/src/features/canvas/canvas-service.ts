@@ -332,10 +332,19 @@ export function createCanvasService(options: {
     },
 
     async listRecoverableArtifacts(user, canvasId) {
-      const client = options.createUserClient(user.accessToken);
+      const contentRepository = options.canvasContentRepository;
+      if (!contentRepository) {
+        throw asCanvasServiceError(
+          new CanvasUnavailableError(
+            canvasId,
+            new Error("canvas content repository is not configured"),
+          ),
+        );
+      }
+      const store = createRepositoryCanvasStore(contentRepository, user.id);
       try {
         return await listRecoverable(
-          client,
+          store,
           canvasId,
           recoveryAccess(options.canvasReadRepository, user.id),
         );
@@ -345,10 +354,19 @@ export function createCanvasService(options: {
     },
 
     async recoverArtifacts(user, canvasId, jobIds) {
-      const client = options.createUserClient(user.accessToken);
+      const contentRepository = options.canvasContentRepository;
+      if (!contentRepository) {
+        throw asCanvasServiceError(
+          new CanvasUnavailableError(
+            canvasId,
+            new Error("canvas content repository is not configured"),
+          ),
+        );
+      }
+      const store = createRepositoryCanvasStore(contentRepository, user.id);
       try {
         return await restoreArtifacts(
-          client,
+          store,
           canvasId,
           jobIds,
           recoveryAccess(options.canvasReadRepository, user.id),
