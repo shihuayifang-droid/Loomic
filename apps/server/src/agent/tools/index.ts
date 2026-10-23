@@ -5,7 +5,6 @@ import type { AssetRecordRepository } from "../../db/asset-record-repository.js"
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../../db/brand-kit-read-repository.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { ConnectionManager } from "../../ws/connection-manager.js";
 import { createBrandKitTool } from "./brand-kit.js";
 import { createInspectCanvasTool } from "./inspect-canvas.js";
@@ -71,12 +70,6 @@ export function createMainAgentTools(
     /** The canvas → project link behind every persisted asset's workspace (21AC). */
     canvasReadRepository: CanvasReadRepository;
     createUserClient: (accessToken: string) => any;
-    /**
-     * Service-role client getter (X-52). Required so the sandbox-file producer
-     * can record asset ownership through the service_role-only
-     * `record_project_asset`; the user client cannot call it.
-     */
-    getAdminClient?: () => AdminSupabaseClient;
     brandKitId?: string | null;
     connectionManager?: ConnectionManager;
     persistImage?: PersistImageFn;

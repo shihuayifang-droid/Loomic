@@ -33,7 +33,6 @@ import type {
 import type { WorkspaceSkillReadRepository } from "../db/workspace-skill-read-repository.js";
 import type { JobService } from "../features/jobs/job-service.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
-import type { AdminSupabaseClient } from "../supabase/admin.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../supabase/user.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
 import {
@@ -532,13 +531,6 @@ type CreateAgentRuntimeOptions = {
   canvasReadRepository: CanvasReadRepository;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => unknown;
-  /**
-   * Service-role client getter (X-52). Injected from app.ts so Agent-produced
-   * media can record its ownership through `record_project_asset`; without it
-   * the persist path has no way to write metadata and refuses instead of
-   * returning a URL with no owner.
-   */
-  getAdminClient?: () => AdminSupabaseClient;
   creditService?: CreditService;
   env: ServerEnv;
   eventDelayMs?: number;
@@ -888,9 +880,6 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         canvasReadRepository: options.canvasReadRepository,
         ...(options.createUserClient
           ? { createUserClient: options.createUserClient }
-          : {}),
-        ...(options.getAdminClient
-          ? { getAdminClient: options.getAdminClient }
           : {}),
       }));
 
@@ -1976,13 +1965,12 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         let persistImage: PersistImageFn | undefined;
         if (
           options.createUserClient &&
-          options.getAdminClient &&
+          options.assetRecordRepository &&
           run.accessToken &&
           run.canvasId &&
           run.userId
         ) {
           const createClient = options.createUserClient;
-          const getAdminClient = options.getAdminClient;
           const accessToken = run.accessToken;
           const canvasId = run.canvasId;
           const createdBy = run.userId;
@@ -2057,14 +2045,14 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           !persistImage &&
           options.createUserClient &&
           run.accessToken &&
-          (!options.getAdminClient || !run.canvasId || !run.userId)
+          (!options.assetRecordRepository || !run.canvasId || !run.userId)
         ) {
-          // Stated rather than silent: without an admin client, a canvas and the
-          // acting user there is no owner to derive, so generated media cannot be
-          // filed as a project asset at all. `generate_image` says so instead of
-          // returning a URL that would die with the public bucket.
+          // Stated rather than silent: without an asset record repository, a canvas
+          // and the acting user there is no owner to derive, so generated media
+          // cannot be filed as a project asset at all. `generate_image` says so
+          // instead of returning a URL that would die with the public bucket.
           console.warn(
-            "[runtime] persistImage unavailable: needs getAdminClient, canvasId and userId " +
+            "[runtime] persistImage unavailable: needs assetRecordRepository, canvasId and userId " +
               "(X-52: media with no derivable owner is not persisted)",
           );
         }

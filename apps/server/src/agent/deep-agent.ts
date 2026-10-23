@@ -9,7 +9,6 @@ import type { AssetRecordRepository } from "../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../db/brand-kit-read-repository.js";
 import type { CanvasReadRepository } from "../db/canvas-read-repository.js";
-import type { AdminSupabaseClient } from "../supabase/admin.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
 import { createAgentBackend, type AgentBackendResult } from "./backends/index.js";
 import { ChatOpenAIImageUrlCompat } from "./openai-image-url-compat.js";
@@ -38,8 +37,6 @@ export type LoomicAgentFactory = (options: {
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => any;
-  /** Service-role getter for asset ownership recording (X-52). */
-  getAdminClient?: () => AdminSupabaseClient;
   env: ServerEnv;
   model?: BaseLanguageModel | string;
   persistImage?: PersistImageFn;
@@ -61,7 +58,6 @@ export function createLoomicDeepAgent(options: {
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => any;
-  getAdminClient?: () => AdminSupabaseClient;
   env: ServerEnv;
   model?: BaseLanguageModel | string;
   persistImage?: PersistImageFn;
@@ -139,7 +135,6 @@ export function createLoomicDeepAgent(options: {
       brandKitReadRepository: options.brandKitReadRepository,
       canvasReadRepository: options.canvasReadRepository,
       createUserClient,
-      ...(options.getAdminClient ? { getAdminClient: options.getAdminClient } : {}),
       ...(options.brandKitId != null ? { brandKitId: options.brandKitId } : {}),
       ...(options.connectionManager ? { connectionManager: options.connectionManager } : {}),
       ...(options.persistImage ? { persistImage: options.persistImage } : {}),
