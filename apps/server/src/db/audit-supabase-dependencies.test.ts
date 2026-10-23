@@ -988,16 +988,16 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // wrapper of the same shape still has to be counted by hand. The new and
     // modified test files name no client method either, so
     // `fromCallsIncludingTests` follows `fromCalls` down again.
-    // 43B: +1, the ObjectStore adapter's single bucket lookup.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(64);
+    // 43C: the signer goes through the ObjectStore adapter.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(63);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing. The wrapper
     // fixtures above are assembled the same way (`UNTYPED_FROM_CALL`), so a
     // literal token there cannot inflate this counter either - the two server
     // counters below still agree exactly.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    // 43B: +1, the ObjectStore adapter's single bucket lookup.
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(64);
+    // 43C: the signer goes through the ObjectStore adapter.
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(63);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
@@ -1034,8 +1034,8 @@ describe("audit-supabase-dependencies: real repository root", () => {
       /^\[anchor\] server\.runtimeRpc: anchor=17 measured\[server\.rpcCallsRuntime\]=17 \(match\)$/m,
     );
 
-    // 43B: +1 for the ObjectStore adapter; call sites move behind it from 43C on.
-    expect(metricValue(run.stdout, "server.storageCalls")).toBe(24);
+    // 43C: the signer goes through the ObjectStore adapter.
+    expect(metricValue(run.stdout, "server.storageCalls")).toBe(23);
     expect(metricValue(run.stdout, "server.authGetUserCalls")).toBe(1);
     expect(metricValue(run.stdout, "server.supabaseSdkImportHits")).toBe(3);
   }, AUDIT_TEST_TIMEOUT_MS);

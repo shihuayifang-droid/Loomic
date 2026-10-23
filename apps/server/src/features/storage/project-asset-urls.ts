@@ -13,6 +13,13 @@
 // recorded without inventing a second code path.
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
+// OP-05 / 43C: the signature is minted through the ONE object-storage seam. This
+// module stays the single place that hands out an asset URL, but the bytes — and
+// the failure wording — now come from the `ObjectStore` adapter, so a future
+// backend swap does not have to touch the fifteen call sites that trust it.
+import { ObjectStoreError } from "./object-store.js";
+import { createSupabaseObjectStore } from "./supabase-object-store.js";
+import type { SupabaseStorageLike } from "./supabase-object-store.js";
 
 /**
  * Whether Supabase's display projection may be routed through storage's on-the-fly
@@ -139,35 +146,33 @@ export async function signProjectAssetUrl(
   const bucket = options.bucket ?? PROJECT_ASSET_BUCKET;
   const ttl = options.ttlSeconds ?? PROJECT_ASSET_URL_TTL_SECONDS;
 
-  // Only send a third argument when there is something to say in it: a plain
-  // signature must keep reaching the SDK with no options at all.
-  const hasSignOptions = Boolean(options.transform || options.download);
+  // The cast is only about the type: the adapter reaches nothing but the signed
+  // URL call, which is the one method every structural stub of this module has
+  // always had to provide. Making the type name the rest of the SDK surface would
+  // widen the requirement on the callers' clients for no runtime difference.
+  const store = createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
 
-  const { data, error } = await (
-    client as ProjectAssetSigningClient
-  ).storage
-    .from(bucket)
-    .createSignedUrl(
-      objectPath,
-      ttl,
-      hasSignOptions
-        ? {
-            ...(options.transform ? { transform: options.transform } : {}),
-            ...(options.download ? { download: options.download } : {}),
-          }
-        : undefined,
+  try {
+    // Only send the optional parts when the caller asked for them: a plain
+    // signature must keep reaching the backend with no options at all.
+    return await store.signedReadUrl(
+      { bucket, key: objectPath },
+      {
+        ttlSeconds: ttl,
+        ...(options.transform ? { transform: options.transform } : {}),
+        ...(options.download ? { download: options.download } : {}),
+      },
     );
-
-  if (error || !data?.signedUrl) {
-    // Deliberately no URL and no object path in the message: this string ends up
-    // in logs, and a signed URL is a bearer token.
-    throw new ProjectAssetUrlError(
-      "sign_failed",
-      `Could not sign the stored object (${error?.message ?? "no signed url returned"}).`,
-    );
+  } catch (err) {
+    // The adapter words a signing refusal exactly as this module always has, so
+    // reusing its text keeps the log line byte-for-byte what it was — and it
+    // still carries neither the object path nor a URL, because a signed URL is a
+    // bearer token. Anything that is not a store failure is not ours to reword.
+    if (err instanceof ObjectStoreError) {
+      throw new ProjectAssetUrlError("sign_failed", err.message);
+    }
+    throw err;
   }
-
-  return data.signedUrl;
 }
 
 /**

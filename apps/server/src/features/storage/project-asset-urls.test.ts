@@ -219,3 +219,101 @@ describe("GN-14 storage-side display projection", () => {
     expect(storageRenderTransformEnabled()).toBe(true);
   });
 });
+
+// OP-05 / 43C: the ONE signing exit now goes through the ObjectStore seam
+// (`createSupabaseObjectStore(...).signedReadUrl(...)`) instead of reaching the
+// storage SDK itself. Routing it through the seam is only worth anything if a
+// caller cannot tell: this case pins the wire shape the backend receives — the
+// bucket lookup count, and `(path, ttl, options)` down to the absent third
+// argument — plus the failure wording, so a future backend swap still has to
+// answer with exactly what the SDK answered before.
+describe("OP-05 signing through the ObjectStore", () => {
+  type Wire = {
+    bucket: string;
+    path: string;
+    expiresIn: number;
+    options: { transform?: unknown; download?: unknown } | undefined;
+  };
+
+  function makeRecordingClient(error: { message: string } | null = null) {
+    const buckets: string[] = [];
+    const wire: Wire[] = [];
+
+    const client = {
+      storage: {
+        from(bucket: string) {
+          buckets.push(bucket);
+          return {
+            createSignedUrl: async (
+              path: string,
+              expiresIn: number,
+              options?: { transform?: unknown; download?: unknown },
+            ) => {
+              wire.push({ bucket, path, expiresIn, options });
+              if (error) return { data: null, error };
+              return {
+                data: {
+                  signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+                },
+                error: null,
+              };
+            },
+          };
+        },
+      },
+    };
+
+    return {
+      client: client as unknown as ProjectAssetSigningClient,
+      buckets,
+      wire,
+    };
+  }
+
+  it("OP-05: signing goes through the ObjectStore", async () => {
+    const plain = makeRecordingClient();
+
+    const url = await signProjectAssetUrl(plain.client, "ws/p/a.png");
+
+    // The bucket was looked up exactly once, and it is the default one.
+    expect(plain.buckets).toEqual([PROJECT_ASSET_BUCKET]);
+    // A plain signature still reaches the backend with no third argument at all.
+    expect(plain.wire).toEqual([
+      {
+        bucket: PROJECT_ASSET_BUCKET,
+        path: "ws/p/a.png",
+        expiresIn: PROJECT_ASSET_URL_TTL_SECONDS,
+        options: undefined,
+      },
+    ]);
+    expect(url).toContain("token=sig");
+
+    // Transform / download are passed when present, and only then.
+    const withOptions = makeRecordingClient();
+    await signProjectAssetUrl(withOptions.client, "ws/p/a.png", {
+      transform: { width: 512, height: 512, resize: "contain" },
+      download: "角色-小橘.png",
+    });
+
+    expect(withOptions.wire).toEqual([
+      {
+        bucket: PROJECT_ASSET_BUCKET,
+        path: "ws/p/a.png",
+        expiresIn: PROJECT_ASSET_URL_TTL_SECONDS,
+        options: {
+          transform: { width: 512, height: 512, resize: "contain" },
+          download: "角色-小橘.png",
+        },
+      },
+    ]);
+
+    // A refusal keeps the exact message the callers and the logs already knew.
+    const refusing = makeRecordingClient({ message: "boom" });
+    const thrown = await signProjectAssetUrl(refusing.client, "ws/p/a.png")
+      .then(() => null)
+      .catch((error: unknown) => error as ProjectAssetUrlError);
+
+    expect(thrown).toBeInstanceOf(ProjectAssetUrlError);
+    expect(thrown?.message).toBe("Could not sign the stored object (boom).");
+  });
+});
