@@ -23,6 +23,7 @@ import { insertVideoElementForJobResult } from "../../agent/runtime.js";
 import { createCanvasService } from "./canvas-service.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
 import { insertVideoElement } from "./canvas-element-writer.js";
+import { createRepositoryCanvasStore } from "./canvas-version.js";
 
 const USER = { accessToken: "test-token" } as AuthenticatedUser;
 const CANVAS_ID = "canvas-1";
@@ -35,14 +36,12 @@ type CanvasContentLike = {
 };
 
 /**
- * A canvas client good enough for both the writer and the read projection.
- *
- * The read path is `select().eq().maybeSingle()` and the write path is
- * `update().eq("id").eq("version").select().maybeSingle()` — the second `eq` is
- * the optimistic lock, so the fake honours it: a stale version matches no row
- * and the write is dropped, exactly like the real thing.
+ * Fake canvas fixtures for both the writer and the read projection: an in-memory
+ * canvases row behind a CanvasStore (store) and the content repository, plus a
+ * Storage stub (client). The row honours the optimistic lock: a write with a
+ * stale expected version is dropped (null), exactly like the real thing.
  */
-function createFakeCanvasClient(initial: CanvasContentLike | null) {
+function createFakeCanvasFixture(initial: CanvasContentLike | null) {
   const state = {
     content: initial as CanvasContentLike | null,
     version: initial ? 3 : 0,
@@ -56,59 +55,8 @@ function createFakeCanvasClient(initial: CanvasContentLike | null) {
     transform: unknown;
   }> = [];
 
+  // Storage only: the canvases table is served by the content repository below.
   const client = {
-    from(table: string) {
-      if (table !== "canvases") {
-        throw new Error(`fake canvas client: unexpected table ${table}`);
-      }
-
-      let mode: "select" | "update" = "select";
-      let patch: { content?: CanvasContentLike; version?: number } = {};
-      const filters: Array<[string, unknown]> = [];
-
-      const chain = {
-        select: () => chain,
-        update: (next: { content?: CanvasContentLike; version?: number }) => {
-          mode = "update";
-          patch = next;
-          return chain;
-        },
-        eq: (column: string, value: unknown) => {
-          filters.push([column, value]);
-          return chain;
-        },
-        maybeSingle: async () => {
-          if (state.content === null) return { data: null, error: null };
-
-          if (mode === "select") {
-            return {
-              data: {
-                id: CANVAS_ID,
-                name: "Board",
-                project_id: "project-1",
-                content: state.content,
-                version: state.version,
-              },
-              error: null,
-            };
-          }
-
-          const expected = filters.find(([column]) => column === "version");
-          if (expected && expected[1] !== state.version) {
-            // Lost the optimistic lock — PostgREST answers with zero rows, not
-            // an error. Returning data:null is what the real path sees.
-            return { data: null, error: null };
-          }
-
-          state.content = patch.content ?? state.content;
-          state.version = patch.version ?? state.version;
-          writes.push({ content: state.content as CanvasContentLike, version: state.version });
-          return { data: { version: state.version }, error: null };
-        },
-      };
-
-      return chain;
-    },
     storage: {
       from(bucket: string) {
         return {
@@ -139,8 +87,8 @@ function createFakeCanvasClient(initial: CanvasContentLike | null) {
     },
   };
 
-  // Same state as the table branches above, exposed through the repository
-  // surface the canvas service now reads and saves through.
+  // In-memory canvases row, exposed through the repository surface the canvas
+  // service reads and saves through.
   const contentRepository = {
     async readCanvasRow() {
       if (state.content === null) return null;
@@ -169,6 +117,7 @@ function createFakeCanvasClient(initial: CanvasContentLike | null) {
 
   return {
     client: client as unknown as UserSupabaseClient,
+    store: createRepositoryCanvasStore(contentRepository, "user-1"),
     contentRepository,
     writes,
     resolvedUrls,
@@ -203,9 +152,9 @@ function emptyCanvas(): CanvasContentLike {
 
 describe("CV-01 video object keys", () => {
   it("case 1: insertVideoElement persists the oss marker and no URL", async () => {
-    const fake = createFakeCanvasClient(emptyCanvas());
+    const fake = createFakeCanvasFixture(emptyCanvas());
 
-    await insertVideoElement(fake.client, {
+    await insertVideoElement(fake.store, {
       canvasId: CANVAS_ID,
       objectPath: "gen/v1.mp4",
       width: 640,
@@ -224,7 +173,7 @@ describe("CV-01 video object keys", () => {
   });
 
   it("case 2: a canvas read projects the marker and keeps it", async () => {
-    const fake = createFakeCanvasClient({
+    const fake = createFakeCanvasFixture({
       ...emptyCanvas(),
       elements: [
         {
@@ -265,7 +214,7 @@ describe("CV-01 video object keys", () => {
   });
 
   it("case 2b: an image file is projected as a signed display URL plus the signed original", async () => {
-    const fake = createFakeCanvasClient({
+    const fake = createFakeCanvasFixture({
       ...emptyCanvas(),
       files: {
         "file-1": {
@@ -351,7 +300,7 @@ describe("CV-01 video object keys", () => {
       customData: { isVideo: true },
     };
 
-    const fake = createFakeCanvasClient({
+    const fake = createFakeCanvasFixture({
       ...emptyCanvas(),
       elements: [legacy, nonVideo, emptyObjectPath, emptyBucket, noSlash, good],
     });
@@ -385,7 +334,7 @@ describe("CV-01 video object keys", () => {
       link: "oss://project-assets/ws-other/gen/secret.mp4",
       customData: { isVideo: true },
     };
-    const fake = createFakeCanvasClient({
+    const fake = createFakeCanvasFixture({
       ...emptyCanvas(),
       elements: [foreign],
     });
@@ -404,7 +353,7 @@ describe("CV-01 video object keys", () => {
   });
 
   it("case 3c: a video with an asset row is signed even outside the workspace prefix (45D)", async () => {
-    const fake = createFakeCanvasClient({
+    const fake = createFakeCanvasFixture({
       ...emptyCanvas(),
       elements: [
         {
@@ -432,11 +381,11 @@ describe("CV-01 video object keys", () => {
   });
 
   it("case 4: a succeeded job keys the canvas element on object_path", async () => {
-    const fake = createFakeCanvasClient(emptyCanvas());
+    const fake = createFakeCanvasFixture(emptyCanvas());
     const signedUrl = "https://provider.test/signed/abc.mp4?token=xyz";
 
     const elementId = await insertVideoElementForJobResult({
-      client: fake.client,
+      client: fake.store,
       canvasId: CANVAS_ID,
       jobId: "job-1",
       objectPath: "gen/job-1.mp4",
@@ -462,10 +411,10 @@ describe("CV-01 video object keys", () => {
   });
 
   it("case 5: a job with no object_path writes nothing at all", async () => {
-    const fake = createFakeCanvasClient(emptyCanvas());
+    const fake = createFakeCanvasFixture(emptyCanvas());
 
     const elementId = await insertVideoElementForJobResult({
-      client: fake.client,
+      client: fake.store,
       canvasId: CANVAS_ID,
       jobId: "job-2",
       objectPath: undefined,

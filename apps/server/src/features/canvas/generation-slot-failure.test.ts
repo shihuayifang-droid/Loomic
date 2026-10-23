@@ -15,12 +15,12 @@
 //   5. the marked slot is a NEW element version (so a client can merge it).
 import { describe, expect, it } from "vitest";
 
-import type { UserSupabaseClient } from "../../supabase/user.js";
 import {
   insertImagePlaceholder,
   markGenerationSlotFailed,
   toRetryRequest,
 } from "./canvas-element-writer.js";
+import type { CanvasStore } from "./canvas-version.js";
 
 const CANVAS_ID = "canvas-1";
 
@@ -31,14 +31,14 @@ type CanvasContentLike = {
 };
 
 /**
- * Canvas client that honours the optimistic version lock, same shape as the
- * fixture in canvas-media-storage.test.ts: a write whose expected version is
- * stale matches no row.
+ * In-memory CanvasStore that honours the optimistic version lock, same shape as
+ * the fixture in canvas-media-storage.test.ts: a write whose expected version is
+ * stale matches no row (null).
  *
- * `failWrites` makes every write answer with an error instead of a row, which
- * is how a real RLS denial or timeout reaches the writer.
+ * `failWrites` makes every write throw instead of answering, which is how a real
+ * RLS denial or timeout reaches the writer.
  */
-function createFakeCanvasClient(
+function createFakeCanvasStore(
   initial: CanvasContentLike | null,
   opts: { failWrites?: boolean } = {},
 ) {
@@ -48,73 +48,34 @@ function createFakeCanvasClient(
   };
   const writes: Array<{ content: CanvasContentLike; version: number }> = [];
 
-  const client = {
-    from(table: string) {
-      if (table !== "canvases") {
-        throw new Error(`fake canvas client: unexpected table ${table}`);
-      }
-
-      let mode: "select" | "update" = "select";
-      let patch: { content?: CanvasContentLike; version?: number } = {};
-      const filters: Array<[string, unknown]> = [];
-
-      const chain = {
-        select: () => chain,
-        update: (next: { content?: CanvasContentLike; version?: number }) => {
-          mode = "update";
-          patch = next;
-          return chain;
-        },
-        eq: (column: string, value: unknown) => {
-          filters.push([column, value]);
-          return chain;
-        },
-        maybeSingle: async () => {
-          if (state.content === null) return { data: null, error: null };
-
-          if (mode === "select") {
-            return {
-              data: {
-                id: CANVAS_ID,
-                name: "Board",
-                project_id: "project-1",
-                content: state.content,
-                version: state.version,
-              },
-              error: null,
-            };
-          }
-
-          if (opts.failWrites) {
-            return { data: null, error: { message: "permission denied" } };
-          }
-
-          const expected = filters.find(([column]) => column === "version");
-          if (expected && expected[1] !== state.version) {
-            return { data: null, error: null };
-          }
-
-          state.content = patch.content ?? state.content;
-          state.version = patch.version ?? state.version;
-          writes.push({
-            content: state.content as CanvasContentLike,
-            version: state.version,
-          });
-          return { data: { version: state.version }, error: null };
-        },
+  const store: CanvasStore = {
+    readRow: async (canvasId) => {
+      if (state.content === null) return null;
+      return {
+        id: canvasId,
+        name: "Board",
+        project_id: "project-1",
+        content: state.content,
+        version: state.version,
       };
+    },
+    writeIfUnchanged: async (_canvasId, content, expectedVersion) => {
+      if (state.content === null) return null;
+      if (opts.failWrites) throw { message: "permission denied" };
+      if (expectedVersion !== state.version) return null;
 
-      return chain;
+      state.content = content as unknown as CanvasContentLike;
+      state.version = expectedVersion + 1;
+      writes.push({
+        content: state.content as CanvasContentLike,
+        version: state.version,
+      });
+      return { version: state.version };
     },
   };
 
-  return {
-    client: client as unknown as UserSupabaseClient,
-    writes,
-    state,
-  };
+  return { store, writes, state };
 }
-
 function emptyCanvas(): CanvasContentLike {
   return { elements: [], appState: {}, files: {} };
 }
@@ -143,7 +104,7 @@ function slotElement(id: string, customData: Record<string, unknown>): Record<st
 }
 
 function findElement(
-  fake: ReturnType<typeof createFakeCanvasClient>,
+  fake: ReturnType<typeof createFakeCanvasStore>,
   elementId: string,
 ): Record<string, any> | undefined {
   return fake.state.content?.elements.find((el) => el.id === elementId);
@@ -151,11 +112,11 @@ function findElement(
 
 describe("GN-19 failed generation slots", () => {
   it("GN-19: a failed slot keeps its place and size and is marked failed with the reason and job id", async () => {
-    const fake = createFakeCanvasClient(emptyCanvas());
+    const fake = createFakeCanvasStore(emptyCanvas());
     const placement = { x: 10, y: 20, width: 512, height: 512 };
 
     const { elementId } = await insertImagePlaceholder(
-      fake.client,
+      fake.store,
       { canvasId: CANVAS_ID, width: 512, height: 512, kind: "image" },
       placement,
     );
@@ -163,7 +124,7 @@ describe("GN-19 failed generation slots", () => {
     const before = findElement(fake, elementId);
     expect(before).toBeDefined();
 
-    await markGenerationSlotFailed(fake.client, CANVAS_ID, elementId, {
+    await markGenerationSlotFailed(fake.store, CANVAS_ID, elementId, {
       message: "图片生成失败，请重试",
       jobId: "job-1",
     });
@@ -182,9 +143,9 @@ describe("GN-19 failed generation slots", () => {
   });
 
   it("GN-19: marking a slot that is already gone writes nothing", async () => {
-    const fake = createFakeCanvasClient(emptyCanvas());
+    const fake = createFakeCanvasStore(emptyCanvas());
 
-    await markGenerationSlotFailed(fake.client, CANVAS_ID, "slot-does-not-exist", {
+    await markGenerationSlotFailed(fake.store, CANVAS_ID, "slot-does-not-exist", {
       message: "图片生成失败，请重试",
       jobId: "job-2",
     });
@@ -193,11 +154,11 @@ describe("GN-19 failed generation slots", () => {
   });
 
   it("GN-19: a slot that already holds an image is not turned into a failure", async () => {
-    const fake = createFakeCanvasClient(
+    const fake = createFakeCanvasStore(
       canvasWith([slotElement("slot-1", { generating: false, source: "generated" })]),
     );
 
-    await markGenerationSlotFailed(fake.client, CANVAS_ID, "slot-1", {
+    await markGenerationSlotFailed(fake.store, CANVAS_ID, "slot-1", {
       message: "图片生成失败，请重试",
       jobId: "job-3",
     });
@@ -206,13 +167,13 @@ describe("GN-19 failed generation slots", () => {
   });
 
   it("GN-19: marking never throws when the canvas cannot be written", async () => {
-    const fake = createFakeCanvasClient(
+    const fake = createFakeCanvasStore(
       canvasWith([slotElement("slot-1", { generating: true, kind: "image" })]),
       { failWrites: true },
     );
 
     await expect(
-      markGenerationSlotFailed(fake.client, CANVAS_ID, "slot-1", {
+      markGenerationSlotFailed(fake.store, CANVAS_ID, "slot-1", {
         message: "生成超时，请重试",
         jobId: "job-4",
       }),
@@ -220,12 +181,12 @@ describe("GN-19 failed generation slots", () => {
   });
 
   it("GN-19: the failed slot is a new element version", async () => {
-    const fake = createFakeCanvasClient(
+    const fake = createFakeCanvasStore(
       canvasWith([slotElement("slot-1", { generating: true, kind: "image" })]),
     );
     const versionBefore = findElement(fake, "slot-1")?.version;
 
-    await markGenerationSlotFailed(fake.client, CANVAS_ID, "slot-1", {
+    await markGenerationSlotFailed(fake.store, CANVAS_ID, "slot-1", {
       message: "图片生成失败，请重试",
       jobId: "job-5",
     });
@@ -236,11 +197,11 @@ describe("GN-19 failed generation slots", () => {
   });
 
   it("GN-19: a failed slot keeps the request it can be retried with", async () => {
-    const fake = createFakeCanvasClient(
+    const fake = createFakeCanvasStore(
       canvasWith([slotElement("slot-1", { generating: true, kind: "image" })]),
     );
 
-    await markGenerationSlotFailed(fake.client, CANVAS_ID, "slot-1", {
+    await markGenerationSlotFailed(fake.store, CANVAS_ID, "slot-1", {
       message: "图片生成失败，请重试",
       jobId: "job-6",
       retryRequest: {
@@ -313,9 +274,9 @@ describe("GN-19 failed generation slots", () => {
 // client cannot tell which `job.progress` / `job.retrying` events belong to it.
 describe("GN-30 generating slots carry their job", () => {
   it("GN-30: a generating slot carries the job it is waiting for", async () => {
-    const fake = createFakeCanvasClient(emptyCanvas());
+    const fake = createFakeCanvasStore(emptyCanvas());
 
-    const { elementId } = await insertImagePlaceholder(fake.client, {
+    const { elementId } = await insertImagePlaceholder(fake.store, {
       canvasId: CANVAS_ID,
       width: 512,
       height: 512,
@@ -329,9 +290,9 @@ describe("GN-30 generating slots carry their job", () => {
   });
 
   it("GN-30: without a job id the slot has no jobId key", async () => {
-    const fake = createFakeCanvasClient(emptyCanvas());
+    const fake = createFakeCanvasStore(emptyCanvas());
 
-    const { elementId } = await insertImagePlaceholder(fake.client, {
+    const { elementId } = await insertImagePlaceholder(fake.store, {
       canvasId: CANVAS_ID,
       width: 512,
       height: 512,

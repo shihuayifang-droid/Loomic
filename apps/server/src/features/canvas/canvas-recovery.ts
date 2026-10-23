@@ -34,8 +34,6 @@ import {
 } from "./canvas-element-writer.js";
 import { type CanvasStore, readCanvasSnapshot } from "./canvas-version.js";
 
-type RecoveryClient = { from: (table: string) => any } | CanvasStore;
-
 /**
  * How the job list is authorised (workorder 20C).
  *
@@ -177,7 +175,7 @@ async function fetchSucceededImageJobs(
  * Read-only.
  */
 export async function listRecoverableArtifacts(
-  client: RecoveryClient,
+  client: CanvasStore,
   canvasId: string,
   access?: RecoveryReadAccess,
 ): Promise<RecoverableArtifact[]> {
@@ -227,7 +225,7 @@ export async function listRecoverableArtifacts(
  * concurrency that made these losses impossible in the first place.
  */
 export async function recoverArtifacts(
-  client: RecoveryClient,
+  client: CanvasStore,
   canvasId: string,
   jobIds: string[],
   access?: RecoveryReadAccess,

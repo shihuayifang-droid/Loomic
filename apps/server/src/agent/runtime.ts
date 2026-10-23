@@ -820,7 +820,7 @@ type VideoPlacementInput = {
  * function.
  */
 export async function insertVideoElementForJobResult(args: {
-  client: { from: (table: string) => any } | CanvasStore;
+  client: CanvasStore;
   canvasId: string;
   jobId: string;
   objectPath: string | undefined;

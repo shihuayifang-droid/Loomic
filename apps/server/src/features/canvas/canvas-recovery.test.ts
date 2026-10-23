@@ -10,11 +10,6 @@
 //        `mutateCanvasContent` → `readCanvasSnapshot`/`writeIfUnchanged`. This
 //        ticket does not migrate it, and these cases would fail if someone
 //        rerouted the write through the read repository.
-//
-// The fake canvas client below is written with method-shorthand `from(...)` and
-// never as a dotted `<client> from(...)` call: the repository audit counts that
-// text literally, comments included, so a PostgREST call spelled out here would
-// raise `server.fromCallsIncludingTests` — the very number this ticket lowers.
 import { describe, expect, it } from "vitest";
 
 import type { CanvasContent } from "@loomic/shared";
@@ -28,6 +23,7 @@ import {
   recoverArtifacts,
   type RecoveryReadAccess,
 } from "./canvas-recovery.js";
+import type { CanvasStore } from "./canvas-version.js";
 
 const CANVAS_ID = "canvas-1";
 const ACTOR_ID = "user-1";
@@ -45,82 +41,41 @@ type CanvasContentLike = {
 };
 
 /**
- * A canvas client good enough for the shared read/CAS path: `select().eq()`
- * reads and `update().eq("version")` writes, with the optimistic lock honoured
- * (a stale version matches no row, exactly like PostgREST).
+ * An in-memory CanvasStore for the shared read/CAS path, with the optimistic
+ * lock honoured (a stale expected version matches no row and returns null).
  */
-function createFakeCanvasClient(initial: CanvasContentLike) {
+function createFakeCanvasStore(initial: CanvasContentLike) {
   const state = { content: initial, version: 3 };
   const writes: Array<{ version: number; elements: number; files: number }> = [];
   const reads: number[] = [];
 
-  const client = {
-    from(table: string) {
-      if (table !== "canvases") {
-        throw new Error(`fake canvas client: unexpected table ${table}`);
-      }
-
-      let mode: "select" | "update" = "select";
-      let patch: { content?: CanvasContentLike; version?: number } = {};
-      const filters: Array<[string, unknown]> = [];
-
-      const chain = {
-        select: () => chain,
-        update: (next: { content?: CanvasContentLike; version?: number }) => {
-          mode = "update";
-          patch = next;
-          return chain;
-        },
-        eq: (column: string, value: unknown) => {
-          filters.push([column, value]);
-          return chain;
-        },
-        maybeSingle: async () => {
-          if (mode === "select") {
-            reads.push(state.version);
-            return {
-              data: {
-                id: CANVAS_ID,
-                content: state.content,
-                version: state.version,
-              },
-              error: null,
-            };
-          }
-
-          const expected = filters.find(([column]) => column === "version");
-          if (expected && expected[1] !== state.version) {
-            return { data: null, error: null };
-          }
-
-          state.content = patch.content ?? state.content;
-          state.version = patch.version ?? state.version;
-          writes.push({
-            version: state.version,
-            elements: state.content.elements.length,
-            files: Object.keys(state.content.files).length,
-          });
-          return { data: { version: state.version }, error: null };
-        },
+  const store: CanvasStore = {
+    readRow: async () => {
+      reads.push(state.version);
+      return {
+        id: CANVAS_ID,
+        name: "Board",
+        project_id: "project-1",
+        content: state.content,
+        version: state.version,
       };
-
-      return chain;
     },
-    storage: {
-      from(bucket: string) {
-        return {
-          createSignedUrl: async () => ({
-            data: { signedUrl: `https://proj.test/${bucket}/signed?token=sig` },
-            error: null,
-          }),
-        };
-      },
+    writeIfUnchanged: async (_canvasId, content, expectedVersion) => {
+      if (expectedVersion !== state.version) return null;
+
+      state.content = content as unknown as CanvasContentLike;
+      state.version = expectedVersion + 1;
+      writes.push({
+        version: state.version,
+        elements: state.content.elements.length,
+        files: Object.keys(state.content.files).length,
+      });
+      return { version: state.version };
     },
   };
 
-  return { client, writes, reads, state };
+  return { store, writes, reads, state };
 }
-
 type JobOverrides = Partial<CanvasRecoveryJobRow> & { id: string };
 
 function job(overrides: JobOverrides): CanvasRecoveryJobRow {
@@ -196,7 +151,7 @@ function canvasWithOneReferencedImage(): CanvasContentLike {
 
 describe("canvas-recovery: GET reads through the canvas repository", () => {
   it("case 1: offers exactly the succeeded images nothing on the canvas references", async () => {
-    const { client } = createFakeCanvasClient(canvasWithOneReferencedImage());
+    const { store } = createFakeCanvasStore(canvasWithOneReferencedImage());
     const { repository } = makeRepository([
       job({
         id: "job-kept",
@@ -231,7 +186,7 @@ describe("canvas-recovery: GET reads through the canvas repository", () => {
     ]);
 
     const artifacts = await listRecoverableArtifacts(
-      client as never,
+      store,
       CANVAS_ID,
       accessFor(repository),
     );
@@ -256,11 +211,11 @@ describe("canvas-recovery: GET reads through the canvas repository", () => {
   });
 
   it("case 2: the repository is asked with the real actor id and canvas id", async () => {
-    const { client } = createFakeCanvasClient({ elements: [], appState: {}, files: {} });
+    const { store } = createFakeCanvasStore({ elements: [], appState: {}, files: {} });
     const { repository, calls } = makeRepository([]);
 
     await listRecoverableArtifacts(
-      client as never,
+      store,
       CANVAS_ID,
       accessFor(repository, OTHER_ACTOR_ID),
     );
@@ -269,35 +224,35 @@ describe("canvas-recovery: GET reads through the canvas repository", () => {
   });
 
   it("case 3: a repository failure is not swallowed into an empty list", async () => {
-    const { client } = createFakeCanvasClient({ elements: [], appState: {}, files: {} });
+    const { store } = createFakeCanvasStore({ elements: [], appState: {}, files: {} });
     const failure = new Error("canvas read failed (listReadableSucceededImageJobs)");
     const { repository } = makeRepository([], { error: failure });
 
     // "nothing to recover" and "the database could not be asked" must not look
     // the same to the route, which audits a successful read.
     await expect(
-      listRecoverableArtifacts(client as never, CANVAS_ID, accessFor(repository)),
+      listRecoverableArtifacts(store, CANVAS_ID, accessFor(repository)),
     ).rejects.toBe(failure);
   });
 
   it("case 4: without an access the read refuses instead of answering []", async () => {
-    const { client } = createFakeCanvasClient({ elements: [], appState: {}, files: {} });
+    const { store } = createFakeCanvasStore({ elements: [], appState: {}, files: {} });
 
     // The two-argument form stays legal for the legacy manual verifier; it must
     // fail loud rather than report that there is nothing to recover.
     await expect(
-      listRecoverableArtifacts(client as never, CANVAS_ID),
+      listRecoverableArtifacts(store, CANVAS_ID),
     ).rejects.toThrow(/canvas read failed \(listReadableSucceededImageJobs\)/);
   });
 });
 
 describe("canvas-recovery: POST still writes through the shared CAS path", () => {
   it("case 5: restores one image, re-reads the version and returns the post-write one", async () => {
-    const fake = createFakeCanvasClient({ elements: [], appState: {}, files: {} });
+    const fake = createFakeCanvasStore({ elements: [], appState: {}, files: {} });
     const { repository } = makeRepository([job({ id: "job-lost" })]);
 
     const outcome = await recoverArtifacts(
-      fake.client as never,
+      fake.store,
       CANVAS_ID,
       ["job-lost"],
       accessFor(repository),
@@ -315,14 +270,14 @@ describe("canvas-recovery: POST still writes through the shared CAS path", () =>
   });
 
   it("case 6: a second identical call recovers nothing and writes nothing", async () => {
-    const fake = createFakeCanvasClient({ elements: [], appState: {}, files: {} });
+    const fake = createFakeCanvasStore({ elements: [], appState: {}, files: {} });
     const { repository } = makeRepository([job({ id: "job-lost" })]);
 
-    await recoverArtifacts(fake.client as never, CANVAS_ID, ["job-lost"], accessFor(repository));
+    await recoverArtifacts(fake.store, CANVAS_ID, ["job-lost"], accessFor(repository));
     const writesAfterFirst = fake.writes.length;
 
     const second = await recoverArtifacts(
-      fake.client as never,
+      fake.store,
       CANVAS_ID,
       ["job-lost"],
       accessFor(repository),
@@ -336,7 +291,7 @@ describe("canvas-recovery: POST still writes through the shared CAS path", () =>
   });
 
   it("case 7: ids that are not available are skipped and nothing is written", async () => {
-    const fake = createFakeCanvasClient(canvasWithOneReferencedImage());
+    const fake = createFakeCanvasStore(canvasWithOneReferencedImage());
     const { repository } = makeRepository([
       // Already referenced by the canvas, so it is not recoverable any more.
       job({
@@ -346,7 +301,7 @@ describe("canvas-recovery: POST still writes through the shared CAS path", () =>
     ]);
 
     const outcome = await recoverArtifacts(
-      fake.client as never,
+      fake.store,
       CANVAS_ID,
       ["job-kept", "job-unknown"],
       accessFor(repository),
@@ -364,11 +319,11 @@ describe("canvas-recovery: POST still writes through the shared CAS path", () =>
   });
 
   it("case 8: the restore path carries the actor into every repository read", async () => {
-    const fake = createFakeCanvasClient({ elements: [], appState: {}, files: {} });
+    const fake = createFakeCanvasStore({ elements: [], appState: {}, files: {} });
     const { repository, calls } = makeRepository([job({ id: "job-lost" })]);
 
     await recoverArtifacts(
-      fake.client as never,
+      fake.store,
       CANVAS_ID,
       ["job-lost"],
       accessFor(repository, OTHER_ACTOR_ID),
@@ -378,10 +333,10 @@ describe("canvas-recovery: POST still writes through the shared CAS path", () =>
   });
 
   it("case 9: the restored canvas content is a real document, not a stub", async () => {
-    const fake = createFakeCanvasClient({ elements: [], appState: {}, files: {} });
+    const fake = createFakeCanvasStore({ elements: [], appState: {}, files: {} });
     const { repository } = makeRepository([job({ id: "job-lost" })]);
 
-    await recoverArtifacts(fake.client as never, CANVAS_ID, ["job-lost"], accessFor(repository));
+    await recoverArtifacts(fake.store, CANVAS_ID, ["job-lost"], accessFor(repository));
 
     const content = fake.state.content as unknown as CanvasContent;
     const element = content.elements[0] as unknown as Record<string, unknown>;

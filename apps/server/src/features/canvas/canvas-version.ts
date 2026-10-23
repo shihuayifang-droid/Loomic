@@ -28,16 +28,13 @@
 //
 // Getting this distinction wrong is how "optimistic concurrency" turns into the
 // same data loss with extra steps.
-import type { CanvasContent, Json } from "@loomic/shared";
+import type { CanvasContent } from "@loomic/shared";
 
 // One definition of "safe to replay", shared with the agent-run, chat and project
 // paths that hit the same proxy. It used to live in this file, back when the canvas
 // was the only caller.
 import { isTransportFailure } from "../../supabase/transport-retry.js";
 import type { CanvasContentRepository } from "../../db/canvas-content-repository.js";
-
-/** Minimal shape needed from a Supabase client, so tests can pass a fake. */
-type CanvasClient = { from: (table: string) => any };
 
 export type CanvasStoreRow = {
   id: string;
@@ -47,10 +44,7 @@ export type CanvasStoreRow = {
   version: number;
 };
 
-/**
- * Repository-backed storage. Accepted by the four exported functions below
- * beside the legacy client, so callers can migrate one at a time.
- */
+/** Repository-backed storage; the only thing the exported functions accept. */
 export type CanvasStore = {
   readRow(canvasId: string): Promise<CanvasStoreRow | null>;
   writeIfUnchanged(
@@ -75,10 +69,6 @@ export function createRepositoryCanvasStore(
         expectedVersion,
       }),
   };
-}
-
-function isCanvasStore(x: CanvasClient | CanvasStore): x is CanvasStore {
-  return typeof (x as CanvasStore).readRow === "function";
 }
 
 export class CanvasVersionConflictError extends Error {
@@ -157,69 +147,38 @@ const READ_MAX_ATTEMPTS = 3;
  * need.
  */
 export async function readCanvasRow<T>(
-  client: CanvasClient | CanvasStore,
+  client: CanvasStore,
   canvasId: string,
   columns: string,
 ): Promise<T> {
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= READ_MAX_ATTEMPTS; attempt++) {
-    if (isCanvasStore(client)) {
-      // Store path: same classification, retry and logging as the legacy path.
-      let row: CanvasStoreRow | null;
-      try {
-        row = await client.readRow(canvasId);
-      } catch (err) {
-        lastError = err;
-        if (!isTransportFailure(err) || attempt >= READ_MAX_ATTEMPTS) break;
-        const storeBackoffMs = attempt * 400;
-        console.log(
-          `[canvas-version] transport failure on read, retrying canvasId=${canvasId} ` +
-            `attempt=${attempt} in=${storeBackoffMs}ms ` +
-            `message=${(err as { message?: string }).message}`,
-        );
-        await new Promise((r) => setTimeout(r, storeBackoffMs));
-        continue;
-      }
-      if (!row) throw new CanvasNotFoundError(canvasId);
-      // Hand back only the columns the caller asked for, like `select(columns)`.
-      const picked: Record<string, unknown> = {};
-      for (const key of columns.split(",").map((c) => c.trim())) {
-        if (key) picked[key] = (row as Record<string, unknown>)[key];
-      }
-      return picked as T;
+    let row: CanvasStoreRow | null;
+    try {
+      row = await client.readRow(canvasId);
+    } catch (err) {
+      lastError = err;
+      if (!isTransportFailure(err) || attempt >= READ_MAX_ATTEMPTS) break;
+      // One proxy blip must not be able to tell the user their canvas is gone.
+      const backoffMs = attempt * 400;
+      console.log(
+        `[canvas-version] transport failure on read, retrying canvasId=${canvasId} ` +
+          `attempt=${attempt} in=${backoffMs}ms ` +
+          `message=${(err as { message?: string }).message}`,
+      );
+      await new Promise((r) => setTimeout(r, backoffMs));
+      continue;
     }
-    // maybeSingle, NOT single. With `.single()` PostgREST reports "0 rows" as an
-    // ERROR (code PGRST116) — so "this canvas does not exist" and "the
-    // connection died" arrive in the same variable, and the only way to tell them
-    // apart is to parse the message. That is precisely why the original code gave
-    // up and treated both as 404. `.maybeSingle()` puts "no such row" in
-    // `data === null` and leaves `error` meaning what it says.
-    const { data, error } = await client
-      .from("canvases")
-      .select(columns)
-      .eq("id", canvasId)
-      .maybeSingle();
-
-    if (!error) {
-      if (!data) throw new CanvasNotFoundError(canvasId);
-      return data as T;
+    // "No such row" is a null result and is final (404); errors never mean 404.
+    if (!row) throw new CanvasNotFoundError(canvasId);
+    // Hand back only the columns the caller asked for.
+    const picked: Record<string, unknown> = {};
+    for (const key of columns.split(",").map((c) => c.trim())) {
+      if (key) picked[key] = (row as Record<string, unknown>)[key];
     }
-
-    lastError = error;
-    if (!isTransportFailure(error) || attempt >= READ_MAX_ATTEMPTS) break;
-
-    // Same rationale as the save path: one proxy blip must not be able to tell
-    // the user their canvas is gone.
-    const backoffMs = attempt * 400;
-    console.log(
-      `[canvas-version] transport failure on read, retrying canvasId=${canvasId} ` +
-        `attempt=${attempt} in=${backoffMs}ms ` +
-        `message=${(error as { message?: string }).message}`,
-    );
-    await new Promise((r) => setTimeout(r, backoffMs));
+    return picked as T;
   }
-
   const e = lastError as { code?: string; message?: string; details?: string } | null;
   // console.log, not console.error: stderr goes through PowerShell's error record
   // formatting in the tee'd dev log, which wraps and TRUNCATES the line.
@@ -249,7 +208,7 @@ export interface CanvasSnapshot {
  * readCanvasRow.
  */
 export async function readCanvasSnapshot(
-  client: CanvasClient | CanvasStore,
+  client: CanvasStore,
   canvasId: string,
 ): Promise<CanvasSnapshot> {
   const row = await readCanvasRow<{ content?: unknown; version?: unknown }>(
@@ -276,7 +235,7 @@ export async function readCanvasSnapshot(
  * incremental; see the note at the top of this file before adding a caller.
  */
 export async function mutateCanvasContent(
-  client: CanvasClient | CanvasStore,
+  client: CanvasStore,
   canvasId: string,
   mutate: (content: CanvasContent) => CanvasContent | null,
   opts: { maxAttempts?: number; label?: string } = {},
@@ -328,7 +287,7 @@ export async function mutateCanvasContent(
  * Callers should log that case so it does not become permanent.
  */
 export async function replaceCanvasContent(
-  client: CanvasClient | CanvasStore,
+  client: CanvasStore,
   canvasId: string,
   content: CanvasContent,
   baseVersion: number | undefined,
@@ -366,48 +325,21 @@ export async function replaceCanvasContent(
 
 /**
  * The conditional update itself. Returns null when the version moved, which is
- * how a conflict is detected: `.eq("version", expected)` matches no row, so the
- * `select` comes back empty. PostgREST reports no error for that — an update
- * that matches nothing is a successful update of zero rows — which is why the
- * returned row, not `error`, is what we test.
+ * how a conflict is detected: the store matches no row for the expected
+ * version, so nothing comes back. A real database error is thrown as-is; the
+ * caller's own error handling decides what to do with it.
  */
 async function writeIfUnchanged(
-  client: CanvasClient | CanvasStore,
+  client: CanvasStore,
   canvasId: string,
   content: CanvasContent,
   expectedVersion: number,
 ): Promise<CanvasSnapshot | null> {
-  const nextVersion = expectedVersion + 1;
-
-  if (isCanvasStore(client)) {
-    // Errors surface as-is; null means the version moved (or no write right).
-    const result = await client.writeIfUnchanged(
-      canvasId,
-      content,
-      expectedVersion,
-    );
-    if (!result) return null;
-    return { content, version: result.version ?? nextVersion };
-  }
-  const { data, error } = await client
-    .from("canvases")
-    .update({
-      content: content as unknown as Json,
-      version: nextVersion,
-    })
-    .eq("id", canvasId)
-    .eq("version", expectedVersion)
-    .select("version")
-    .maybeSingle();
-
-  if (error) {
-    // A real database answer (RLS, timeout, constraint). Let it surface; the
-    // caller's own error handling and the transport retry in canvas-service
-    // decide what to do.
-    throw error;
-  }
-
-  if (!data) return null;
-
-  return { content, version: (data.version as number) ?? nextVersion };
+  const result = await client.writeIfUnchanged(
+    canvasId,
+    content,
+    expectedVersion,
+  );
+  if (!result) return null;
+  return { content, version: result.version ?? expectedVersion + 1 };
 }

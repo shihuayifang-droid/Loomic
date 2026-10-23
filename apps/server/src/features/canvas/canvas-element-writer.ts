@@ -8,9 +8,6 @@ import type { CanvasContent } from "@loomic/shared";
 
 import { mutateCanvasContent, type CanvasStore } from "./canvas-version.js";
 
-/** Legacy Supabase-style client, or a repository-backed CanvasStore. */
-type CanvasWriterTarget = { from: (table: string) => any } | CanvasStore;
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -346,7 +343,7 @@ const VIDEO_MAX_SIZE = 800;
  * happening.
  */
 export async function insertImagePlaceholder(
-  client: CanvasWriterTarget,
+  client: CanvasStore,
   opts: PlaceholderInsertOpts,
   explicitPlacement?: Placement,
 ): Promise<InsertResult> {
@@ -404,7 +401,7 @@ export async function insertImagePlaceholder(
  * canceled), so the canvas is not left with a permanently empty frame.
  */
 export async function removeCanvasElement(
-  client: CanvasWriterTarget,
+  client: CanvasStore,
   canvasId: string,
   elementId: string,
 ): Promise<void> {
@@ -497,7 +494,7 @@ export function toRetryRequest(
  * delete it. Same best-effort contract as removeCanvasElement: never throws.
  */
 export async function markGenerationSlotFailed(
-  client: CanvasWriterTarget,
+  client: CanvasStore,
   canvasId: string,
   elementId: string,
   failure: {
@@ -567,7 +564,7 @@ export async function markGenerationSlotFailed(
 }
 
 export async function insertImageElement(
-  client: CanvasWriterTarget,
+  client: CanvasStore,
   opts: ImageInsertOpts,
   explicitPlacement?: Placement,
 ): Promise<InsertResult> {
@@ -684,7 +681,7 @@ export async function insertImageElement(
  * whose lifetime we do not control.
  */
 export async function insertVideoElement(
-  client: CanvasWriterTarget,
+  client: CanvasStore,
   opts: VideoInsertOpts,
   explicitPlacement?: Placement,
 ): Promise<InsertResult> {

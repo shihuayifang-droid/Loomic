@@ -6,8 +6,8 @@
 // data loss, on a product whose history includes actually losing canvas content.
 //
 // The distinction is invisible in a type signature and cheap to undo by accident
-// (one `.single()` instead of `.maybeSingle()` puts it straight back, because
-// PostgREST reports "0 rows" as an ERROR). So it is pinned here.
+// (a store that throws for "no such row" instead of returning null would put it
+// straight back). So it is pinned here.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CanvasContent } from "@loomic/shared";
@@ -27,32 +27,35 @@ import {
 } from "./canvas-version.js";
 
 /**
- * A client whose read returns each queued result in turn.
- *
- * Asserts `.maybeSingle()` is the terminator: if production reverts to
- * `.single()` the fake has no such method and the test fails loudly, instead of
- * quietly passing against an API that reports missing rows as errors.
+ * A CanvasStore whose read returns each queued result in turn (the last one
+ * repeats). `data: null` is an absent row; `error` is thrown by the store, the
+ * way the repository surfaces a driver failure.
  */
-function fakeClient(
-  results: Array<{ data?: unknown; error?: unknown }>,
-): { client: { from: (t: string) => any }; calls: () => number } {
+function scriptedStore(
+  results: Array<{ data?: Record<string, unknown> | null; error?: unknown }>,
+): { store: CanvasStore; calls: () => number } {
   let calls = 0;
-  const client = {
-    from: () => ({
-      select: () => ({
-        eq: () => ({
-          maybeSingle: async () => {
-            const next = results[Math.min(calls, results.length - 1)];
-            calls++;
-            return { data: next?.data ?? null, error: next?.error ?? null };
-          },
-        }),
-      }),
-    }),
+  const store: CanvasStore = {
+    readRow: async (canvasId): Promise<CanvasStoreRow | null> => {
+      const next = results[Math.min(calls, results.length - 1)];
+      calls++;
+      if (next?.error) throw next.error;
+      if (!next?.data) return null;
+      return {
+        id: canvasId,
+        name: "n",
+        project_id: "p1",
+        content: undefined,
+        version: 0,
+        ...next.data,
+      } as CanvasStoreRow;
+    },
+    writeIfUnchanged: async () => {
+      throw new Error("scriptedStore does not write");
+    },
   };
-  return { client, calls: () => calls };
+  return { store, calls: () => calls };
 }
-
 const TRANSPORT = { code: "", message: "TypeError: fetch failed" };
 const PG_TIMEOUT = {
   code: "57014",
@@ -61,24 +64,24 @@ const PG_TIMEOUT = {
 
 describe("readCanvasRow classification", () => {
   it("absent row is not_found", async () => {
-    const { client } = fakeClient([{ data: null }]);
-    await expect(readCanvasRow(client, "c1", "content")).rejects.toBeInstanceOf(
+    const { store } = scriptedStore([{ data: null }]);
+    await expect(readCanvasRow(store, "c1", "content")).rejects.toBeInstanceOf(
       CanvasNotFoundError,
     );
   });
 
   it("driver error is unavailable, NOT not_found", async () => {
     // The whole point. Before the fix this produced CanvasNotFoundError.
-    const { client } = fakeClient([{ error: PG_TIMEOUT }]);
-    const err = await readCanvasRow(client, "c1", "content").catch((e) => e);
+    const { store } = scriptedStore([{ error: PG_TIMEOUT }]);
+    const err = await readCanvasRow(store, "c1", "content").catch((e) => e);
     expect(err).toBeInstanceOf(CanvasUnavailableError);
     expect(err).not.toBeInstanceOf(CanvasNotFoundError);
     expect((err as CanvasUnavailableError).statusCode).toBe(503);
   });
 
   it("a present row is returned as-is", async () => {
-    const { client } = fakeClient([{ data: { content: { elements: [1] } } }]);
-    await expect(readCanvasRow(client, "c1", "content")).resolves.toEqual({
+    const { store } = scriptedStore([{ data: { content: { elements: [1] } } }]);
+    await expect(readCanvasRow(store, "c1", "content")).resolves.toEqual({
       content: { elements: [1] },
     });
   });
@@ -87,11 +90,11 @@ describe("readCanvasRow classification", () => {
 describe("readCanvasRow retry", () => {
   it("recovers when a transport blip is followed by success", async () => {
     vi.useFakeTimers();
-    const { client, calls } = fakeClient([
+    const { store, calls } = scriptedStore([
       { error: TRANSPORT },
       { data: { content: {}, version: 7 } },
     ]);
-    const promise = readCanvasRow(client, "c1", "content, version");
+    const promise = readCanvasRow(store, "c1", "content, version");
     await vi.runAllTimersAsync();
     await expect(promise).resolves.toMatchObject({ version: 7 });
     expect(calls()).toBe(2);
@@ -100,17 +103,17 @@ describe("readCanvasRow retry", () => {
 
   it("does NOT retry an error Postgres actually answered with", async () => {
     // Replaying a statement timeout or an RLS denial just multiplies the wait.
-    const { client, calls } = fakeClient([{ error: PG_TIMEOUT }]);
+    const { store, calls } = scriptedStore([{ error: PG_TIMEOUT }]);
     await expect(
-      readCanvasRow(client, "c1", "content"),
+      readCanvasRow(store, "c1", "content"),
     ).rejects.toBeInstanceOf(CanvasUnavailableError);
     expect(calls()).toBe(1);
   });
 
   it("gives up after a bounded number of transport failures", async () => {
     vi.useFakeTimers();
-    const { client, calls } = fakeClient([{ error: TRANSPORT }]);
-    const promise = readCanvasRow(client, "c1", "content");
+    const { store, calls } = scriptedStore([{ error: TRANSPORT }]);
+    const promise = readCanvasRow(store, "c1", "content");
     const settled = expect(promise).rejects.toBeInstanceOf(
       CanvasUnavailableError,
     );
@@ -123,22 +126,22 @@ describe("readCanvasRow retry", () => {
 
 describe("readCanvasSnapshot", () => {
   it("defaults a null content column instead of throwing", async () => {
-    const { client } = fakeClient([{ data: { content: null, version: null } }]);
-    await expect(readCanvasSnapshot(client, "c1")).resolves.toEqual({
+    const { store } = scriptedStore([{ data: { content: null, version: null } }]);
+    await expect(readCanvasSnapshot(store, "c1")).resolves.toEqual({
       content: { elements: [], appState: {}, files: {} },
       version: 0,
     });
   });
 
   it("propagates the unavailable/not-found distinction", async () => {
-    const missing = fakeClient([{ data: null }]);
+    const missing = scriptedStore([{ data: null }]);
     await expect(
-      readCanvasSnapshot(missing.client, "c1"),
+      readCanvasSnapshot(missing.store, "c1"),
     ).rejects.toBeInstanceOf(CanvasNotFoundError);
 
-    const broken = fakeClient([{ error: PG_TIMEOUT }]);
+    const broken = scriptedStore([{ error: PG_TIMEOUT }]);
     await expect(
-      readCanvasSnapshot(broken.client, "c1"),
+      readCanvasSnapshot(broken.store, "c1"),
     ).rejects.toBeInstanceOf(CanvasUnavailableError);
   });
 });
@@ -167,67 +170,6 @@ describe("isTransportFailure", () => {
 
 type Row = { content: CanvasContent; version: number };
 
-/**
- * CV-03: a canvases row with a real version column.
- *
- * The guarded update only matches while the version it was handed is still the
- * row's version, exactly like the SQL predicate, and a non-matching update
- * returns no row rather than an error — that difference is what the production
- * code keys the conflict detection off.
- *
- * `beforeWrite` registers a one-shot callback that runs against the row just
- * before the predicate is evaluated, i.e. in the window between a read and its
- * write. Re-registering from inside the callback makes it persistent.
- */
-function versionedCanvas(initial: { content: CanvasContent; version: number }) {
-  const row: Row = { content: initial.content, version: initial.version };
-  let successes = 0;
-  let updates = 0;
-  let hook: ((row: Row) => void) | null = null;
-
-  const client = {
-    from: () => ({
-      select: () => ({
-        eq: () => ({
-          maybeSingle: async () => ({
-            data: { content: row.content, version: row.version },
-            error: null,
-          }),
-        }),
-      }),
-      update: (patch: Row) => ({
-        eq: () => ({
-          eq: (_column: string, expected: number) => ({
-            select: () => ({
-              maybeSingle: async () => {
-                updates++;
-                const concurrent = hook;
-                hook = null;
-                if (concurrent) concurrent(row);
-                if (expected !== row.version) return { data: null, error: null };
-                row.content = patch.content;
-                row.version = patch.version;
-                successes++;
-                return { data: { version: patch.version }, error: null };
-              },
-            }),
-          }),
-        }),
-      }),
-    }),
-  };
-
-  return {
-    client,
-    row: () => row,
-    writes: () => successes,
-    attempts: () => updates,
-    beforeWrite: (fn: (row: Row) => void) => {
-      hook = fn;
-    },
-  };
-}
-
 const element = (id: string) => ({ id });
 const ids = (row: Row) => row.content.elements.map((e) => e.id);
 const canvas = (elements: Array<Record<string, unknown>>): CanvasContent => ({
@@ -251,7 +193,7 @@ describe("CV-03 optimistic concurrency", () => {
     const B = element("b");
     const C = element("c");
 
-    const db = versionedCanvas({ content: canvas([A]), version: 1 });
+    const db = memoryStore({ content: canvas([A]), version: 1 });
 
     // The other writer's row lands between our read (v1) and our update.
     db.beforeWrite((other) => {
@@ -259,7 +201,7 @@ describe("CV-03 optimistic concurrency", () => {
       other.version = 2;
     });
 
-    const result = await mutateCanvasContent(db.client, "c1", (content) => ({
+    const result = await mutateCanvasContent(db.store, "c1", (content) => ({
       ...content,
       elements: [...content.elements, C],
     }));
@@ -268,22 +210,22 @@ describe("CV-03 optimistic concurrency", () => {
     // writers' work. Before the fix this returned v2 holding [A, C].
     expect(result?.version).toBe(3);
     expect(ids(db.row())).toEqual(["a", "b", "c"]);
-    expect(db.attempts()).toBe(2);
+    expect(db.writeAttempts()).toBe(2);
     expect(db.writes()).toBe(1);
   });
 
   it("CV-03: a mutation that returns null writes nothing", async () => {
-    const db = versionedCanvas({ content: canvas([element("a")]), version: 1 });
+    const db = memoryStore({ content: canvas([element("a")]), version: 1 });
 
-    const result = await mutateCanvasContent(db.client, "c1", () => null);
+    const result = await mutateCanvasContent(db.store, "c1", () => null);
 
     expect(result).toBeNull();
-    expect(db.attempts()).toBe(0);
+    expect(db.writeAttempts()).toBe(0);
     expect(db.writes()).toBe(0);
   });
 
   it("CV-03: a canvas written continuously gives up with a 409 carrying the current state", async () => {
-    const db = versionedCanvas({ content: canvas([element("ours")]), version: 1 });
+    const db = memoryStore({ content: canvas([element("ours")]), version: 1 });
 
     // Somebody else wins the race before every single attempt.
     const foreign = (other: Row) => {
@@ -294,7 +236,7 @@ describe("CV-03 optimistic concurrency", () => {
     db.beforeWrite(foreign);
 
     const err = await mutateCanvasContent(
-      db.client,
+      db.store,
       "c1",
       (content) => ({
         ...content,
@@ -308,28 +250,28 @@ describe("CV-03 optimistic concurrency", () => {
     expect((err as CanvasVersionConflictError).currentVersion).toBe(
       db.row().version,
     );
-    expect(db.attempts()).toBe(3);
+    expect(db.writeAttempts()).toBe(3);
     expect(db.writes()).toBe(0);
   });
 
   it("CV-03: a whole-content save with the current baseVersion succeeds and bumps the version", async () => {
     const X = canvas([element("x")]);
-    const db = versionedCanvas({ content: canvas([]), version: 4 });
+    const db = memoryStore({ content: canvas([]), version: 4 });
 
-    const result = await replaceCanvasContent(db.client, "c1", X, 4);
+    const result = await replaceCanvasContent(db.store, "c1", X, 4);
 
     expect(result.version).toBe(5);
     expect(db.row().content).toEqual(X);
     expect(db.row().version).toBe(5);
-    expect(db.attempts()).toBe(1);
+    expect(db.writeAttempts()).toBe(1);
   });
 
   it("CV-03: a whole-content save with a stale baseVersion is a 409 and is NOT retried", async () => {
     const current = canvas([element("current")]);
-    const db = versionedCanvas({ content: current, version: 5 });
+    const db = memoryStore({ content: current, version: 5 });
 
     const err = await replaceCanvasContent(
-      db.client,
+      db.store,
       "c1",
       canvas([element("mine")]),
       4,
@@ -339,7 +281,7 @@ describe("CV-03 optimistic concurrency", () => {
     // which is precisely the overwrite the lock exists to prevent.
     expect(err).toBeInstanceOf(CanvasVersionConflictError);
     expect((err as CanvasVersionConflictError).statusCode).toBe(409);
-    expect(db.attempts()).toBe(1);
+    expect(db.writeAttempts()).toBe(1);
     expect(db.writes()).toBe(0);
     expect(db.row().content).toEqual(current);
     expect(db.row().version).toBe(5);
@@ -347,9 +289,9 @@ describe("CV-03 optimistic concurrency", () => {
   });
 
   it("CV-03: the first save after load carries its baseVersion and is checked", async () => {
-    const db = versionedCanvas({ content: canvas([element("loaded")]), version: 7 });
+    const db = memoryStore({ content: canvas([element("loaded")]), version: 7 });
 
-    const loaded = await readCanvasSnapshot(db.client, "c1");
+    const loaded = await readCanvasSnapshot(db.store, "c1");
     expect(loaded.version).toBe(7);
 
     // Another tab saves while this one is still editing what it loaded.
@@ -359,7 +301,7 @@ describe("CV-03 optimistic concurrency", () => {
     });
 
     const err = await replaceCanvasContent(
-      db.client,
+      db.store,
       "c1",
       canvas([element("stale")]),
       loaded.version,
@@ -367,13 +309,13 @@ describe("CV-03 optimistic concurrency", () => {
 
     expect(err).toBeInstanceOf(CanvasVersionConflictError);
     expect((err as CanvasVersionConflictError).statusCode).toBe(409);
-    expect(db.attempts()).toBe(1);
+    expect(db.writeAttempts()).toBe(1);
     expect(db.row().version).toBe(8);
     expect(ids(db.row())).toEqual(["other-tab"]);
   });
 
   it("CV-03: a save without baseVersion still never writes over a version that moved mid-save", async () => {
-    const db = versionedCanvas({ content: canvas([element("loaded")]), version: 3 });
+    const db = memoryStore({ content: canvas([element("loaded")]), version: 3 });
 
     db.beforeWrite((other) => {
       other.content = canvas([element("racing")]);
@@ -381,7 +323,7 @@ describe("CV-03 optimistic concurrency", () => {
     });
 
     const err = await replaceCanvasContent(
-      db.client,
+      db.store,
       "c1",
       canvas([element("mine")]),
       undefined,
@@ -397,13 +339,19 @@ describe("CV-03 optimistic concurrency", () => {
   });
 });
 
-// Repository-backed store (ticket 44U): the same behaviour must hold when the
-// first argument is a CanvasStore instead of a Supabase-style client.
-
+// In-memory CanvasStore with a real version column (tickets 44U / 45F).
+//
+// The guarded write only matches while the version it was handed is still the
+// row's version, and a non-matching write returns null rather than throwing -
+// that difference is what the production code keys conflict detection off.
+// `beforeWrite` registers a one-shot callback that runs against the row just
+// before the version check, i.e. in the window between a read and its write.
+// Re-registering from inside the callback makes it persistent.
 function memoryStore(initial: { content: CanvasContent; version: number }) {
   const row: Row = { content: initial.content, version: initial.version };
   let reads = 0;
   let writeAttempts = 0;
+  let successes = 0;
   const failures: unknown[] = [];
   let writeError: unknown = null;
   let hook: ((row: Row) => void) | null = null;
@@ -431,6 +379,7 @@ function memoryStore(initial: { content: CanvasContent; version: number }) {
       if (expectedVersion !== row.version) return null;
       row.content = content;
       row.version = expectedVersion + 1;
+      successes++;
       return { version: row.version };
     },
   };
@@ -440,6 +389,7 @@ function memoryStore(initial: { content: CanvasContent; version: number }) {
     row: () => row,
     reads: () => reads,
     writeAttempts: () => writeAttempts,
+    writes: () => successes,
     failNextReads: (...errs: unknown[]) => failures.push(...errs),
     failWrites: (err: unknown) => {
       writeError = err;
