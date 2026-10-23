@@ -298,3 +298,56 @@ describe("deduct_from_pools (37N)", () => {
     expect(code).toBe("42501");
   });
 });
+
+/**
+ * 工单40K · 《三池计费测试环境验收清单》3.1 / 3.2 —— 37N 已有用例没覆盖的两条。
+ *
+ * 个人月上限默认 20000（见上一条「a missing usage row is created at the default
+ * cap」），所以 `setMemberUsage(actor, 19997)` 之后只剩 3 点团队额度。PGlite 是单
+ * 连接，真行锁并发测不出来：3.2 这里只能验证连续两次扣费各池不为负、两条
+ * breakdown 之和等于实扣总额。
+ */
+describe("deduct_from_pools: three-pool acceptance gaps (40K)", () => {
+  it("BL-04: a cap of 3 left splits 12 as daily 5, team 3, top-up 4", async () => {
+    const actor = await newActor();
+    await setPool(actor, 20000, 0);
+    await setMemberUsage(actor, 19997);
+    await setWallet(actor, 5, 100);
+
+    const id = await deduct(actor, 12);
+    if (!id) throw new Error("expected a transaction id");
+
+    expect(await txRows(actor)).toBe(1);
+    const tx = await txById(id);
+    expect(tx.pool_breakdown).toEqual({ daily: 5, team: 3, topup: 4 });
+    expect(tx.amount).toBe(-12);
+    expect(await wallet(actor)).toEqual({ daily_balance: 0, topup_balance: 96 });
+    expect(await poolUsed(actor)).toBe(3);
+    expect((await memberUsage(actor))?.used).toBe(20000);
+  });
+
+  it("BL-04: two charges in a row never drive a pool negative and add up", async () => {
+    const actor = await newActor();
+    await setPool(actor, 20000, 0);
+    await setWallet(actor, 5, 10);
+
+    const ids = await Promise.all([deduct(actor, 8), deduct(actor, 8)]);
+    expect(ids[0]).not.toBeNull();
+    expect(ids[1]).not.toBeNull();
+
+    const remaining = await wallet(actor);
+    expect(remaining.daily_balance).toBeGreaterThanOrEqual(0);
+    expect(remaining.topup_balance).toBeGreaterThanOrEqual(0);
+
+    let summed = 0;
+    for (const id of ids) {
+      if (!id) throw new Error("expected two transaction ids");
+      const tx = await txById(id);
+      expect(Object.keys(tx.pool_breakdown).sort()).toEqual(["daily", "team", "topup"]);
+      summed += Object.values(tx.pool_breakdown).reduce((a, b) => a + b, 0);
+    }
+    expect(summed).toBe(16);
+
+    expect(await txRows(actor)).toBe(2);
+  });
+});

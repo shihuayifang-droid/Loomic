@@ -299,3 +299,40 @@ describe("credit cycle grants (37O)", () => {
     expect(dailyCode).toBe("42501");
   });
 });
+
+/**
+ * 工单40K · 《三池计费测试环境验收清单》2.1（BL-42）—— 新加入成员的第一笔流水。
+ *
+ * 造数照上面 `makeThreeMemberTeam` 插 `workspace_members` 的写法，只是把新成员的
+ * id 留下来：给这个刚加入的成员发每日赠送，它的流水里除了这一条 `daily_grant +100`
+ * 之外不该有任何东西（它没有历史钱包，所以也没有作废行）。
+ */
+describe("credit cycle grants: newly joined member (40K)", () => {
+  it("BL-42: a newly joined member's ledger starts with one daily grant and nothing else", async () => {
+    const actor = await newActor();
+    userSeq += 1;
+    const memberId = `00000000-0000-0000-0000-000000037e${String(userSeq).padStart(2, "0")}`;
+    await createUser(db, memberId, `member-40k-${userSeq}@hahart.test`);
+    await db.query(
+      "insert into public.workspace_members (workspace_id, user_id, role) values ($1, $2, 'member')",
+      [actor.workspaceId, memberId],
+    );
+
+    const joined: Actor = { userId: memberId, workspaceId: actor.workspaceId };
+    expect(await grantDaily(joined)).toBe(true);
+
+    const rows = await db.query<{ transaction_type: string; amount: number }>(
+      `select transaction_type::text as transaction_type, amount
+         from public.credit_transactions where user_id = $1::uuid`,
+      [memberId],
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]?.transaction_type).toBe("daily_grant");
+    expect(rows.rows[0]?.amount).toBe(100);
+    expect(await walletRow(joined)).toEqual({
+      daily_balance: 100,
+      topup_balance: 0,
+      is_today: true,
+    });
+  });
+});
