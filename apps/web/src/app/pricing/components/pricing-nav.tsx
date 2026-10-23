@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { LoomicLogo } from "@/components/icons/loomic-logo";
+import { HaHartLogo } from "@/components/icons/hahart-logo";
 import { buttonVariants } from "@/components/ui/button";
 
 export function PricingNav() {
@@ -15,7 +15,7 @@ export function PricingNav() {
     >
       <nav className="mx-auto flex h-14 max-w-7xl items-center justify-between px-6 py-3">
         <Link href="/" className="flex items-center gap-2">
-          <LoomicLogo className="size-7 text-foreground" />
+          <HaHartLogo className="size-7 text-foreground" />
           <span className="text-base font-semibold tracking-tight">
             Loomic
           </span>

@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
-import { LoomicLogo } from "@/components/icons/loomic-logo";
+import { HaHartLogo } from "@/components/icons/hahart-logo";
 import { CreditBalance } from "@/components/credits/credit-balance";
 import { useAuth } from "@/lib/auth-context";
 import { cn } from "@/lib/utils";
@@ -207,7 +207,7 @@ export function AppSidebar() {
             whileTap={{ scale: 0.9 }}
             transition={{ type: "spring", stiffness: 400, damping: 17 }}
           >
-            <LoomicLogo className="size-7 text-foreground" />
+            <HaHartLogo className="size-7 text-foreground" />
           </motion.div>
         </Link>
 

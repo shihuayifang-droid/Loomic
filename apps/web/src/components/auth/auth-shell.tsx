@@ -3,7 +3,7 @@
 import { motion } from "framer-motion";
 import type { ReactNode } from "react";
 
-import { LoomicLogoInverted } from "../icons/loomic-logo";
+import { HaHartLogoInverted } from "../icons/hahart-logo";
 
 const fadeUp = {
   hidden: { opacity: 0, y: 20 },
@@ -38,7 +38,7 @@ export function AuthShell({
             custom={0}
             className="mb-4 flex items-center gap-4"
           >
-            <LoomicLogoInverted className="size-14" />
+            <HaHartLogoInverted className="size-14" />
             <h1 className="text-4xl font-bold tracking-tight">HaHart</h1>
           </motion.div>
 
