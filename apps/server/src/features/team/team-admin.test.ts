@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { TeamMember } from "@loomic/shared";
 
 import type { TeamAdminReadRepository } from "../../db/team-admin-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type { TeamAdminWriteRepository } from "../../db/team-admin-write-repository.js";
 import type { TeamMembershipService } from "./team-membership.js";
 import {
   TeamAdminError,
@@ -11,67 +11,39 @@ import {
   type TeamAdminService,
 } from "./team-admin.js";
 
-const TEAM_ID = "11111111-1111-1111-1111-111111111111";
 const ACTOR_ID = "00000000-0000-0000-0000-00000000000e";
 const TARGET_ID = "00000000-0000-0000-0000-00000000000b";
 
-type RpcCall = { name: string; params: Record<string, unknown> };
+type WriteCall = { name: string; params: Record<string, unknown> };
+
+type RemoveResult = {
+  removed: number;
+  projects: number;
+  assets: number;
+  objects: number;
+};
 
 type StubOptions = {
   profile?: { id: string; email?: string } | null;
   /** What the repository's email lookup answers; throws when it is an Error. */
   profileLookupError?: Error;
-  rpcError?: { message: string } | null;
-  rpcData?: unknown;
+  /** When set, every write repository method throws an Error with this message. */
+  writeErrorMessage?: string;
+  /** What addMember / setRole answer. Defaults to true. */
+  writeResult?: boolean;
+  /** What removeMember answers. */
+  removeResult?: RemoveResult;
   /** What the roster repository answers; throws when it is an Error. */
   members?: TeamMember[];
   memberError?: Error;
   /** Build the service without the roster repository (wiring-bug path). */
   withoutReadRepository?: boolean;
+  /** Build the service without the write repository (wiring-bug path). */
+  withoutWriteRepository?: boolean;
 };
 
-function makeAdminStub(options: StubOptions = {}) {
-  const rpcs: RpcCall[] = [];
-  const tables: string[] = [];
-
-  const client = {
-    from(table: string) {
-      tables.push(table);
-      const builder = {
-        select: () => builder,
-        eq: () => builder,
-        in: () => builder,
-        order: () => builder,
-        limit: () => builder,
-        maybeSingle: async () => {
-          if (table === "profiles") {
-            return { data: options.profile ?? null, error: null };
-          }
-          if (table === "workspaces") {
-            return { data: { id: TEAM_ID }, error: null };
-          }
-          return { data: null, error: null };
-        },
-        then: (resolve: (value: unknown) => unknown) =>
-          Promise.resolve({ data: [], error: null }).then(resolve),
-      };
-
-      return builder;
-    },
-    rpc: async (name: string, params: Record<string, unknown>) => {
-      rpcs.push({ name, params });
-      if (options.rpcError) {
-        return { data: null, error: options.rpcError };
-      }
-      return { data: options.rpcData ?? true, error: null };
-    },
-  };
-
-  return { client: client as unknown as AdminSupabaseClient, rpcs, tables };
-}
-
 function makeHarness(options: StubOptions = {}) {
-  const { client, rpcs, tables } = makeAdminStub(options);
+  const writes: WriteCall[] = [];
   const invalidated: string[] = [];
   const actorIds: string[] = [];
   const lookedUpEmails: string[] = [];
@@ -99,18 +71,62 @@ function makeHarness(options: StubOptions = {}) {
     },
   };
 
+  function record(name: string, params: Record<string, unknown>) {
+    writes.push({ name, params });
+    if (options.writeErrorMessage !== undefined) {
+      throw new Error(options.writeErrorMessage);
+    }
+  }
+
+  const writeRepository: TeamAdminWriteRepository = {
+    async addMember({ actorId, userId, role }) {
+      record("addMember", { actorId, userId, role });
+      return options.writeResult ?? true;
+    },
+    async setRole({ actorId, userId, role }) {
+      record("setRole", { actorId, userId, role });
+      return options.writeResult ?? true;
+    },
+    async removeMember({ actorId, userId }) {
+      record("removeMember", { actorId, userId });
+      return (
+        options.removeResult ?? {
+          removed: 1,
+          projects: 0,
+          assets: 0,
+          objects: 0,
+        }
+      );
+    },
+    async recordForeignRead({ actorId, via, projectId, canvasId, sessionId }) {
+      record("recordForeignRead", {
+        actorId,
+        via,
+        projectId,
+        canvasId,
+        sessionId,
+      });
+      return true;
+    },
+    async recordForeignAssetRead({ actorId, assetId }) {
+      record("recordForeignAssetRead", { actorId, assetId });
+      return true;
+    },
+  };
+
   const service: TeamAdminService = createTeamAdminService({
-    getAdminClient: () => client,
     teamMembership,
     ...(options.withoutReadRepository
       ? {}
       : { teamAdminReadRepository: readRepository }),
+    ...(options.withoutWriteRepository
+      ? {}
+      : { teamAdminWriteRepository: writeRepository }),
   });
 
   return {
     service,
-    rpcs,
-    tables,
+    writes,
     invalidated,
     actorIds,
     lookedUpEmails,
@@ -129,11 +145,11 @@ async function capture(run: () => Promise<unknown>): Promise<TeamAdminError> {
 }
 
 describe("createTeamAdminService", () => {
-  it("case 1: addMember resolves the email then calls the audited RPC", async () => {
-    const { service, rpcs, invalidated, lookedUpEmails, lookupActorIds, tables } =
+  it("case 1: addMember resolves the email then calls the audited write", async () => {
+    const { service, writes, invalidated, lookedUpEmails, lookupActorIds } =
       makeHarness({
         profile: { id: TARGET_ID },
-        rpcData: true,
+        writeResult: true,
       });
 
     const result = await service.addMember(ACTOR_ID, {
@@ -142,22 +158,21 @@ describe("createTeamAdminService", () => {
     });
 
     expect(result).toEqual({ added: true });
-    // The lookup is the repository's read now, and it carries the trimmed email
-    // and the real actor — not a PostgREST table read.
+    // The lookup is the repository's read, and it carries the trimmed email
+    // and the real actor.
     expect(lookedUpEmails).toEqual(["b@hahart.test"]);
     expect(lookupActorIds).toEqual([ACTOR_ID]);
-    expect(tables).toEqual([]);
-    expect(rpcs).toEqual([
+    expect(writes).toEqual([
       {
-        name: "admin_add_team_member",
-        params: { p_actor: ACTOR_ID, p_user_id: TARGET_ID, p_role: "admin" },
+        name: "addMember",
+        params: { actorId: ACTOR_ID, userId: TARGET_ID, role: "admin" },
       },
     ]);
     expect(invalidated).toEqual([TARGET_ID]);
   });
 
-  it("case 2: an unknown email is a 404 with no RPC call and no invalidation", async () => {
-    const { service, rpcs, invalidated, lookedUpEmails, tables } = makeHarness({
+  it("case 2: an unknown email is a 404 with no write call and no invalidation", async () => {
+    const { service, writes, invalidated, lookedUpEmails } = makeHarness({
       profile: null,
     });
 
@@ -169,42 +184,41 @@ describe("createTeamAdminService", () => {
     expect(error.code).toBe("user_not_found");
     expect(error.message).toBe("No user with email nobody@hahart.test.");
     expect(lookedUpEmails).toEqual(["nobody@hahart.test"]);
-    expect(tables).toEqual([]);
-    expect(rpcs.length).toBe(0);
+    expect(writes.length).toBe(0);
     expect(invalidated.length).toBe(0);
   });
 
-  it("case 3: setRole calls the audited RPC and invalidates the target", async () => {
-    const { service, rpcs, invalidated } = makeHarness({ rpcData: true });
+  it("case 3: setRole calls the audited write and invalidates the target", async () => {
+    const { service, writes, invalidated } = makeHarness({ writeResult: true });
 
     const result = await service.setRole(ACTOR_ID, TARGET_ID, "admin");
 
     expect(result).toEqual({ changed: true });
-    expect(rpcs).toEqual([
+    expect(writes).toEqual([
       {
-        name: "admin_set_team_member_role",
-        params: { p_actor: ACTOR_ID, p_user_id: TARGET_ID, p_role: "admin" },
+        name: "setRole",
+        params: { actorId: ACTOR_ID, userId: TARGET_ID, role: "admin" },
       },
     ]);
     expect(invalidated).toEqual([TARGET_ID]);
   });
 
   it("case 4: removeMember with removed = 0 is a 404 and invalidates nothing", async () => {
-    const { service, rpcs, invalidated } = makeHarness({
-      rpcData: { projects: 0, assets: 0, objects: 0, removed: 0 },
+    const { service, writes, invalidated } = makeHarness({
+      removeResult: { projects: 0, assets: 0, objects: 0, removed: 0 },
     });
 
     const error = await capture(() => service.removeMember(ACTOR_ID, TARGET_ID));
 
     expect(error.statusCode).toBe(404);
     expect(error.code).toBe("user_not_found");
-    expect(rpcs.length).toBe(1);
+    expect(writes.length).toBe(1);
     expect(invalidated.length).toBe(0);
   });
 
   it("case 4b: removeMember passes the transfer counts through", async () => {
     const { service, invalidated } = makeHarness({
-      rpcData: { projects: 2, assets: 3, objects: 1, removed: 1 },
+      removeResult: { projects: 2, assets: 3, objects: 1, removed: 1 },
     });
 
     const result = await service.removeMember(ACTOR_ID, TARGET_ID);
@@ -229,7 +243,7 @@ describe("createTeamAdminService", () => {
     ];
 
     for (const [message, statusCode, code] of mappings) {
-      const { service } = makeHarness({ rpcError: { message } });
+      const { service } = makeHarness({ writeErrorMessage: message });
       const error = await capture(() =>
         service.setRole(ACTOR_ID, TARGET_ID, "member"),
       );
@@ -240,62 +254,62 @@ describe("createTeamAdminService", () => {
   });
 
   it("case 6: recordForeignRead sends exactly one target and the via value", async () => {
-    const { service, rpcs } = makeHarness();
+    const { service, writes } = makeHarness();
 
     await service.recordForeignRead(ACTOR_ID, "project", { projectId: "p-1" });
     await service.recordForeignRead(ACTOR_ID, "canvas", { canvasId: "c-1" });
     await service.recordForeignRead(ACTOR_ID, "messages", { sessionId: "s-1" });
 
-    expect(rpcs).toEqual([
+    expect(writes).toEqual([
       {
-        name: "record_foreign_read",
+        name: "recordForeignRead",
         params: {
-          p_actor: ACTOR_ID,
-          p_via: "project",
-          p_project_id: "p-1",
-          p_canvas_id: null,
-          p_session_id: null,
+          actorId: ACTOR_ID,
+          via: "project",
+          projectId: "p-1",
+          canvasId: null,
+          sessionId: null,
         },
       },
       {
-        name: "record_foreign_read",
+        name: "recordForeignRead",
         params: {
-          p_actor: ACTOR_ID,
-          p_via: "canvas",
-          p_project_id: null,
-          p_canvas_id: "c-1",
-          p_session_id: null,
+          actorId: ACTOR_ID,
+          via: "canvas",
+          projectId: null,
+          canvasId: "c-1",
+          sessionId: null,
         },
       },
       {
-        name: "record_foreign_read",
+        name: "recordForeignRead",
         params: {
-          p_actor: ACTOR_ID,
-          p_via: "messages",
-          p_project_id: null,
-          p_canvas_id: null,
-          p_session_id: "s-1",
+          actorId: ACTOR_ID,
+          via: "messages",
+          projectId: null,
+          canvasId: null,
+          sessionId: "s-1",
         },
       },
     ]);
   });
 
-  it("case 6b: an asset target goes through record_foreign_asset_read", async () => {
-    const { service, rpcs } = makeHarness();
+  it("case 6b: an asset target goes through recordForeignAssetRead", async () => {
+    const { service, writes } = makeHarness();
 
     await service.recordForeignRead(ACTOR_ID, "asset", { assetId: "asset-1" });
 
-    expect(rpcs).toEqual([
+    expect(writes).toEqual([
       {
-        name: "record_foreign_asset_read",
-        params: { p_actor: ACTOR_ID, p_asset_id: "asset-1" },
+        name: "recordForeignAssetRead",
+        params: { actorId: ACTOR_ID, assetId: "asset-1" },
       },
     ]);
   });
 
   it("case 7: a failing recordForeignRead throws instead of being swallowed", async () => {
     const { service } = makeHarness({
-      rpcError: { message: "connection terminated unexpectedly" },
+      writeErrorMessage: "connection terminated unexpectedly",
     });
 
     await expect(
@@ -330,15 +344,14 @@ describe("createTeamAdminService", () => {
     expect(result).toEqual(members);
   });
 
-  it("case 9: listMembers reads no PostgREST table, calls no RPC and invalidates no cache", async () => {
-    const { service, tables, rpcs, invalidated, actorIds } = makeHarness({
+  it("case 9: listMembers writes nothing and invalidates no cache", async () => {
+    const { service, writes, invalidated, actorIds } = makeHarness({
       members: [],
     });
 
     await service.listMembers(ACTOR_ID);
 
-    expect(tables).toEqual([]);
-    expect(rpcs).toEqual([]);
+    expect(writes).toEqual([]);
     expect(invalidated).toEqual([]);
     expect(actorIds).toEqual([ACTOR_ID]);
   });
@@ -359,8 +372,8 @@ describe("createTeamAdminService", () => {
     expect(error.message).not.toContain("postgres://");
   });
 
-  it("case 11: without a repository the read is a 503 — never a PostgREST fallback", async () => {
-    const { service, tables, rpcs } = makeHarness({
+  it("case 11: without a repository the read is a 503 — never a fallback", async () => {
+    const { service, writes } = makeHarness({
       withoutReadRepository: true,
       profile: { id: TARGET_ID },
     });
@@ -370,8 +383,7 @@ describe("createTeamAdminService", () => {
     expect(error.statusCode).toBe(503);
     expect(error.code).toBe("application_error");
     expect(error.message).toBe("Unable to load team members.");
-    expect(tables).toEqual([]);
-    expect(rpcs).toEqual([]);
+    expect(writes).toEqual([]);
   });
 
   it("case 12: an empty roster is an empty list, not an error", async () => {
@@ -390,8 +402,8 @@ describe("createTeamAdminService", () => {
     expect(actorIds).toEqual([ACTOR_ID, TARGET_ID]);
   });
 
-  it("case 14: the lookup gets the trimmed email and the actor, and its id is what the RPC receives", async () => {
-    const { service, rpcs, invalidated, lookedUpEmails, lookupActorIds } =
+  it("case 14: the lookup gets the trimmed email and the actor, and its id is what the write receives", async () => {
+    const { service, writes, invalidated, lookedUpEmails, lookupActorIds } =
       makeHarness({ profile: { id: TARGET_ID } });
 
     const result = await service.addMember(ACTOR_ID, {
@@ -404,19 +416,19 @@ describe("createTeamAdminService", () => {
     // lookup is an exact equality and lowercasing it would change who is found.
     expect(lookedUpEmails).toEqual(["Mixed.Case@Hahart.test"]);
     expect(lookupActorIds).toEqual([ACTOR_ID]);
-    expect(rpcs).toEqual([
+    expect(writes).toEqual([
       {
-        name: "admin_add_team_member",
-        params: { p_actor: ACTOR_ID, p_user_id: TARGET_ID, p_role: "member" },
+        name: "addMember",
+        params: { actorId: ACTOR_ID, userId: TARGET_ID, role: "member" },
       },
     ]);
     expect(invalidated).toEqual([TARGET_ID]);
   });
 
-  it("case 15: an idempotent add still runs the RPC once and invalidates the target once", async () => {
-    const { service, rpcs, invalidated, lookedUpEmails } = makeHarness({
+  it("case 15: an idempotent add still runs the write once and invalidates the target once", async () => {
+    const { service, writes, invalidated, lookedUpEmails } = makeHarness({
       profile: { id: TARGET_ID },
-      rpcData: false,
+      writeResult: false,
     });
 
     await expect(
@@ -424,12 +436,12 @@ describe("createTeamAdminService", () => {
     ).resolves.toEqual({ added: false });
 
     expect(lookedUpEmails).toEqual(["b@hahart.test"]);
-    expect(rpcs).toHaveLength(1);
+    expect(writes).toHaveLength(1);
     expect(invalidated).toEqual([TARGET_ID]);
   });
 
-  it("case 16: a repository failure is a fixed 503 that leaks no driver detail, with no RPC and no invalidation", async () => {
-    const { service, rpcs, invalidated, lookedUpEmails } = makeHarness({
+  it("case 16: a lookup failure is a fixed 503 that leaks no driver detail, with no write and no invalidation", async () => {
+    const { service, writes, invalidated, lookedUpEmails } = makeHarness({
       profileLookupError: new Error(
         "connect ECONNREFUSED 10.210.134.37:5432 for postgres://user:pw@host/db",
       ),
@@ -447,12 +459,12 @@ describe("createTeamAdminService", () => {
     expect(error.message).not.toContain("team admin read failed");
     // One attempt, and the write never happened.
     expect(lookedUpEmails).toEqual(["b@hahart.test"]);
-    expect(rpcs).toEqual([]);
+    expect(writes).toEqual([]);
     expect(invalidated).toEqual([]);
   });
 
-  it("case 17: without a repository the add is a 503 — never a PostgREST fallback", async () => {
-    const { service, rpcs, invalidated, tables } = makeHarness({
+  it("case 17: without a read repository the add is a 503 — never a fallback", async () => {
+    const { service, writes, invalidated } = makeHarness({
       withoutReadRepository: true,
       profile: { id: TARGET_ID },
     });
@@ -464,15 +476,14 @@ describe("createTeamAdminService", () => {
     expect(error.statusCode).toBe(503);
     expect(error.code).toBe("application_error");
     expect(error.message).toBe("Unable to add the team member.");
-    expect(tables).toEqual([]);
-    expect(rpcs).toEqual([]);
+    expect(writes).toEqual([]);
     expect(invalidated).toEqual([]);
   });
 
   it("case 18: a refused add keeps the existing mapping and invalidates nothing", async () => {
-    const { service, rpcs, invalidated } = makeHarness({
+    const { service, writes, invalidated } = makeHarness({
       profile: { id: TARGET_ID },
-      rpcError: { message: "actor is not a team admin" },
+      writeErrorMessage: "actor is not a team admin",
     });
 
     const error = await capture(() =>
@@ -481,14 +492,14 @@ describe("createTeamAdminService", () => {
 
     expect(error.statusCode).toBe(403);
     expect(error.code).toBe("forbidden");
-    expect(rpcs).toHaveLength(1);
+    expect(writes).toHaveLength(1);
     expect(invalidated).toEqual([]);
   });
 
-  it("case 19: an unrecognised RPC failure stays a 503 with the cache left alone", async () => {
-    const { service, rpcs, invalidated } = makeHarness({
+  it("case 19: an unrecognised write failure stays a 503 with the cache left alone", async () => {
+    const { service, writes, invalidated } = makeHarness({
       profile: { id: TARGET_ID },
-      rpcError: { message: "connection terminated unexpectedly" },
+      writeErrorMessage: "connection terminated unexpectedly",
     });
 
     const error = await capture(() =>
@@ -498,18 +509,35 @@ describe("createTeamAdminService", () => {
     expect(error.statusCode).toBe(503);
     expect(error.code).toBe("application_error");
     expect(error.message).toBe("connection terminated unexpectedly");
-    expect(rpcs).toHaveLength(1);
+    expect(writes).toHaveLength(1);
     expect(invalidated).toEqual([]);
   });
 
-  it("case 20: the happy path reads no PostgREST table — the lookup is the repository's, the write is the RPC", async () => {
-    const { service, tables, rpcs } = makeHarness({ profile: { id: TARGET_ID } });
+  it("case 20: the happy path's only write is the repository's addMember", async () => {
+    const { service, writes } = makeHarness({ profile: { id: TARGET_ID } });
 
     await service.addMember(ACTOR_ID, { email: "b@hahart.test", role: "member" });
 
     // The service's only database calls are the repository's read and the
-    // audited RPC: it opens no table of its own and writes no audit row.
-    expect(tables).toEqual([]);
-    expect(rpcs.map((call) => call.name)).toEqual(["admin_add_team_member"]);
+    // audited write: it writes no audit row of its own.
+    expect(writes.map((call) => call.name)).toEqual(["addMember"]);
+  });
+
+  it("case 21: without a write repository the add is a 503 — never a fallback", async () => {
+    const { service, writes, invalidated, lookedUpEmails } = makeHarness({
+      withoutWriteRepository: true,
+      profile: { id: TARGET_ID },
+    });
+
+    const error = await capture(() =>
+      service.addMember(ACTOR_ID, { email: "b@hahart.test", role: "member" }),
+    );
+
+    expect(error.statusCode).toBe(503);
+    expect(error.code).toBe("application_error");
+    expect(error.message).toBe("Team administration is unavailable.");
+    expect(lookedUpEmails).toEqual(["b@hahart.test"]);
+    expect(writes).toEqual([]);
+    expect(invalidated).toEqual([]);
   });
 });

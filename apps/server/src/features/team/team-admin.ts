@@ -1,7 +1,7 @@
 import type { TeamMember } from "@loomic/shared";
 
 import type { TeamAdminReadRepository } from "../../db/team-admin-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type { TeamAdminWriteRepository } from "../../db/team-admin-write-repository.js";
 import type { TeamMembershipService } from "./team-membership.js";
 
 export type ForeignReadTarget =
@@ -63,8 +63,6 @@ export class TeamAdminError extends Error {
   }
 }
 
-type RpcError = { message?: string } | null;
-
 /**
  * The one answer a failed roster read gives. Fixed text on purpose: the
  * repository's own error carries driver detail (and, one level down, the
@@ -83,13 +81,41 @@ const TEAM_MEMBER_LIST_FAILED_MESSAGE = "Unable to load team members.";
 const TEAM_MEMBER_ADD_FAILED_MESSAGE = "Unable to add the team member.";
 
 /**
+ * The answer a write gives when the service was built without the write
+ * repository. That is a wiring bug, and it fails closed with a 503 instead of
+ * reaching for any other backend.
+ */
+const TEAM_ADMIN_UNAVAILABLE_MESSAGE = "Team administration is unavailable.";
+
+function requireWriteRepository(
+  repository: TeamAdminWriteRepository | undefined,
+): TeamAdminWriteRepository {
+  if (!repository) {
+    throw new TeamAdminError(
+      "application_error",
+      TEAM_ADMIN_UNAVAILABLE_MESSAGE,
+      503,
+    );
+  }
+
+  return repository;
+}
+
+/**
  * Every mutation runs inside a single database function that also writes the
  * audit row, so this service never writes the audit table itself. The mapping
  * below turns the database's exception text into an HTTP answer; anything not
  * recognised is a 503 rather than a guess.
  */
-function mapDatabaseError(error: RpcError): TeamAdminError {
-  const message = error?.message ?? "Unknown database error";
+function mapDatabaseError(error: unknown): TeamAdminError {
+  const rawMessage =
+    typeof error === "object" && error !== null
+      ? (error as { message?: unknown }).message
+      : undefined;
+  const message =
+    typeof rawMessage === "string" && rawMessage.length > 0
+      ? rawMessage
+      : "Unknown database error";
 
   if (message.includes("actor is not a team admin")) {
     return new TeamAdminError("forbidden", message, 403);
@@ -113,7 +139,6 @@ function mapDatabaseError(error: RpcError): TeamAdminError {
 }
 
 export function createTeamAdminService(options: {
-  getAdminClient: () => AdminSupabaseClient;
   teamMembership: TeamMembershipService;
   /**
    * ADR-0001 / workorder 20F-A: the member list is the PostgreSQL repository's
@@ -129,6 +154,15 @@ export function createTeamAdminService(options: {
    * member and the roster, nor between a plain member and an email lookup.
    */
   teamAdminReadRepository?: TeamAdminReadRepository;
+  /**
+   * Workorder 44M: the member and foreign-read writes are the PostgreSQL write
+   * repository's statements. Optional only because unrelated call sites build
+   * this service without one; calling a write without it answers 503
+   * `application_error` instead of falling back to anything else. The
+   * repository throws the database error as it came; `mapDatabaseError` turns
+   * its text into the HTTP answer.
+   */
+  teamAdminWriteRepository?: TeamAdminWriteRepository;
 }): TeamAdminService {
   return {
     async listMembers(actorId) {
@@ -156,7 +190,6 @@ export function createTeamAdminService(options: {
     },
 
     async addMember(actorId, input) {
-      const admin = options.getAdminClient();
       const email = input.email.trim();
 
       // Workorder 20F-B: the profile behind the email is the repository's read.
@@ -200,57 +233,59 @@ export function createTeamAdminService(options: {
         );
       }
 
-      const { data, error } = await admin.rpc("admin_add_team_member", {
-        p_actor: actorId,
-        p_user_id: profile.id,
-        p_role: input.role,
-      });
+      const writeRepository = requireWriteRepository(
+        options.teamAdminWriteRepository,
+      );
+      let added: boolean;
 
-      if (error) {
+      try {
+        added = await writeRepository.addMember({
+          actorId,
+          userId: profile.id,
+          role: input.role,
+        });
+      } catch (error) {
         throw mapDatabaseError(error);
       }
 
       options.teamMembership.invalidate(profile.id);
 
-      return { added: Boolean(data) };
+      return { added: Boolean(added) };
     },
 
     async setRole(actorId, userId, role) {
-      const admin = options.getAdminClient();
+      const writeRepository = requireWriteRepository(
+        options.teamAdminWriteRepository,
+      );
+      let changed: boolean;
 
-      const { data, error } = await admin.rpc("admin_set_team_member_role", {
-        p_actor: actorId,
-        p_user_id: userId,
-        p_role: role,
-      });
-
-      if (error) {
+      try {
+        changed = await writeRepository.setRole({ actorId, userId, role });
+      } catch (error) {
         throw mapDatabaseError(error);
       }
 
       options.teamMembership.invalidate(userId);
 
-      return { changed: Boolean(data) };
+      return { changed: Boolean(changed) };
     },
 
     async removeMember(actorId, userId) {
-      const admin = options.getAdminClient();
-
-      const { data, error } = await admin.rpc("admin_remove_team_member", {
-        p_actor: actorId,
-        p_user_id: userId,
-      });
-
-      if (error) {
-        throw mapDatabaseError(error);
-      }
-
-      const result = (data ?? {}) as {
+      const writeRepository = requireWriteRepository(
+        options.teamAdminWriteRepository,
+      );
+      let result: {
         projects?: number;
         assets?: number;
         objects?: number;
         removed?: number;
       };
+
+      try {
+        result = await writeRepository.removeMember({ actorId, userId });
+      } catch (error) {
+        throw mapDatabaseError(error);
+      }
 
       if (result.removed !== 1) {
         throw new TeamAdminError(
@@ -273,26 +308,29 @@ export function createTeamAdminService(options: {
     },
 
     async recordForeignRead(actorId, via, target) {
-      const admin = options.getAdminClient();
+      const writeRepository = requireWriteRepository(
+        options.teamAdminWriteRepository,
+      );
 
       // Assets are addressed by their own id (GET /api/uploads/:assetId/url) and
       // that id does not resolve to a project for project-less assets, so they
       // go through a dedicated function. Everything else shares one.
-      const { error } =
-        "assetId" in target
-          ? await admin.rpc("record_foreign_asset_read", {
-              p_actor: actorId,
-              p_asset_id: target.assetId,
-            })
-          : await admin.rpc("record_foreign_read", {
-              p_actor: actorId,
-              p_via: via,
-              p_project_id: "projectId" in target ? target.projectId : null,
-              p_canvas_id: "canvasId" in target ? target.canvasId : null,
-              p_session_id: "sessionId" in target ? target.sessionId : null,
-            });
-
-      if (error) {
+      try {
+        if ("assetId" in target) {
+          await writeRepository.recordForeignAssetRead({
+            actorId,
+            assetId: target.assetId,
+          });
+        } else {
+          await writeRepository.recordForeignRead({
+            actorId,
+            via,
+            projectId: "projectId" in target ? target.projectId : null,
+            canvasId: "canvasId" in target ? target.canvasId : null,
+            sessionId: "sessionId" in target ? target.sessionId : null,
+          });
+        }
+      } catch (error) {
         throw mapDatabaseError(error);
       }
     },

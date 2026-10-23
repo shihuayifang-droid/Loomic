@@ -107,6 +107,7 @@ import {
   createTeamAdminReadRepository,
   type TeamAdminReadRepository,
 } from "./db/team-admin-read-repository.js";
+import { createTeamAdminWriteRepository } from "./db/team-admin-write-repository.js";
 import {
   createWorkspaceSettingsReadRepository,
 } from "./db/workspace-settings-read-repository.js";
@@ -579,9 +580,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const teamAdminService =
     options.teamAdminService ??
     createTeamAdminService({
-      getAdminClient,
       teamMembership: teamMembershipService,
       teamAdminReadRepository,
+      teamAdminWriteRepository: createTeamAdminWriteRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
     });
   // BL-12 / BL-01 / workorder 37V: the admin credit writes sit beside the member
   // administration they serve. The factory takes the pool GETTER, not a pool, so
