@@ -20,6 +20,7 @@ import { useAuth } from "@/lib/auth-context";
 import { authProvider } from "@/lib/self-auth-client";
 
 import { AdminPasswordReset } from "./admin-password-reset";
+import { TeamMemberAdmin } from "./team-member-admin";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -68,6 +69,8 @@ function parseDeltaInput(raw: string): number | null {
 
 export function TeamCreditsAdmin(props: TeamCreditsAdminProps) {
   const { session } = useAuth();
+  // AD-08: the member panel needs the admin's own id to lock their row.
+  const { user } = useAuth();
   const accessTokenRef = useRef(session?.access_token);
   accessTokenRef.current = session?.access_token;
 
@@ -555,6 +558,14 @@ export function TeamCreditsAdmin(props: TeamCreditsAdminProps) {
           </tbody>
         </table>
       </div>
+
+      {/* AD-08 §3: the member administration panel (join / role / remove) */}
+      {accessTokenRef.current ? (
+        <TeamMemberAdmin
+          accessToken={accessTokenRef.current}
+          currentUserId={user?.id ?? null}
+        />
+      ) : null}
 
       {authProvider() === "self" && accessTokenRef.current ? (
         <AdminPasswordReset accessToken={accessTokenRef.current} />

@@ -4,6 +4,9 @@ import type {
   CreditCapTemplate,
   MemberCreditSummary,
   TeamMember,
+  TeamMemberAddResponse,
+  TeamMemberRemoveResponse,
+  TeamMemberRoleResponse,
 } from "@loomic/shared";
 
 import {
@@ -14,7 +17,10 @@ import {
   creditCapTemplateListResponseSchema,
   creditCapTemplateSchema,
   memberCreditSummaryListResponseSchema,
+  teamMemberAddResponseSchema,
   teamMemberListResponseSchema,
+  teamMemberRemoveResponseSchema,
+  teamMemberRoleResponseSchema,
 } from "@loomic/shared";
 
 import { getServerBaseUrl } from "./env";
@@ -222,4 +228,78 @@ export async function setMemberGenerationPaused(
   );
   if (!parsed.success) return invalidResponse();
   return { paused: parsed.data.paused, changed: parsed.data.changed };
+}
+
+// ── AD-08 §3: team membership — add / change role / remove ───
+
+/**
+ * `POST /api/admin/team/members`.
+ *
+ * A 200 with `added: false` is not a failure: the address already belongs to the
+ * team, so the caller should say so instead of pretending a row was created.
+ */
+export async function addTeamMember(
+  accessToken: string,
+  input: { email: string; role: "member" | "admin" },
+): Promise<TeamMemberAddResponse> {
+  const response = await fetch(`${getServerBaseUrl()}/api/admin/team/members`, {
+    method: "POST",
+    headers: authJsonHeaders(accessToken),
+    body: JSON.stringify({ email: input.email, role: input.role }),
+  });
+  if (!response.ok) return handleErrorResponse(response);
+  const parsed = teamMemberAddResponseSchema.safeParse(
+    await response.json().catch(() => null),
+  );
+  if (!parsed.success) return invalidResponse();
+  return parsed.data;
+}
+
+/**
+ * `PATCH /api/admin/team/members/:userId`.
+ *
+ * Only `member` / `admin` travel on the wire — the owner's role is fixed — and
+ * `changed: false` means the member already held that role.
+ */
+export async function setTeamMemberRole(
+  accessToken: string,
+  userId: string,
+  role: "member" | "admin",
+): Promise<TeamMemberRoleResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/admin/team/members/${encodeURIComponent(userId)}`,
+    {
+      method: "PATCH",
+      headers: authJsonHeaders(accessToken),
+      body: JSON.stringify({ role }),
+    },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  const parsed = teamMemberRoleResponseSchema.safeParse(
+    await response.json().catch(() => null),
+  );
+  if (!parsed.success) return invalidResponse();
+  return parsed.data;
+}
+
+/**
+ * `DELETE /api/admin/team/members/:userId`.
+ *
+ * The server hands the removed member's projects to the admin who asked, so the
+ * `transferred` counts are what the panel reports back.
+ */
+export async function removeTeamMember(
+  accessToken: string,
+  userId: string,
+): Promise<TeamMemberRemoveResponse> {
+  const response = await fetch(
+    `${getServerBaseUrl()}/api/admin/team/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE", headers: authHeaders(accessToken) },
+  );
+  if (!response.ok) return handleErrorResponse(response);
+  const parsed = teamMemberRemoveResponseSchema.safeParse(
+    await response.json().catch(() => null),
+  );
+  if (!parsed.success) return invalidResponse();
+  return parsed.data;
 }

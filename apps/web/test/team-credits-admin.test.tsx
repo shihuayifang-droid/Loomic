@@ -380,3 +380,12 @@ describe("TeamCreditsAdmin · 42H 重置成员密码挂载", () => {
     expect(screen.queryByTestId("credits-admin-reset-email")).toBeNull();
   });
 });
+
+describe("TeamCreditsAdmin · 42I 成员管理挂载", () => {
+  it("42I: the member administration panel sits on the same page as the credits table", async () => {
+    await renderPanel();
+
+    expect(screen.getByText("成员管理")).toBeInTheDocument();
+    expect(screen.getByTestId("credits-member-add-email")).toBeInTheDocument();
+  });
+});
