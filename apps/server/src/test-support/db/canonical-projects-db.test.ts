@@ -145,7 +145,7 @@ describe("canonical 0004 projects: schema", () => {
     ]);
   });
 
-  it("0004 itself adds no foreign key on brand_kit_id; source_job_id's comes with 0006", async () => {
+  it("projects and asset_objects carry the same foreign keys as the old schema", async () => {
     const result = await db.query<{ conname: string }>(
       `select conname from pg_constraint
         where contype = 'f'
@@ -153,9 +153,12 @@ describe("canonical 0004 projects: schema", () => {
           and conname in ('asset_objects_source_job_fkey', 'projects_brand_kit_id_fkey')
         order by conname`,
     );
-    // brand_kits only arrives in a later canonical file, so 0004 leaves the FK out;
-    // the source_job_id FK is appended by 0006 and must be present once every file ran.
-    expect(result.rows.map((row) => row.conname)).toEqual(["asset_objects_source_job_fkey"]);
+    // Final state once every canonical file ran: the source_job_id FK (0006) and the
+    // brand_kit_id FK (0012) are both present.
+    expect(result.rows.map((row) => row.conname)).toEqual([
+      "asset_objects_source_job_fkey",
+      "projects_brand_kit_id_fkey",
+    ]);
   });
 
   it("deleting a hahart_auth user sets created_by to null", async () => {
