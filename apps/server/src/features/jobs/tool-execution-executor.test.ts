@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BackgroundJob } from "@loomic/shared";
 
+import type { RecordProjectAssetInput } from "../../db/asset-record-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { getExecutor, type ExecutorContext } from "./job-executor.js";
 import {
@@ -35,7 +36,7 @@ async function makePng(width: number, height: number): Promise<Buffer> {
 
 function makeAdmin() {
   const uploads: Array<{ bucket: string; path: string; bytes: Buffer }> = [];
-  const rpcs: Array<{ name: string; params: Record<string, unknown> }> = [];
+  const records: RecordProjectAssetInput[] = [];
 
   const client = {
     storage: {
@@ -52,13 +53,9 @@ function makeAdmin() {
         };
       },
     },
-    rpc: async (name: string, params: Record<string, unknown>) => {
-      rpcs.push({ name, params });
-      return { data: { asset_id: "asset-9" }, error: null };
-    },
   };
 
-  return { client: client as unknown as AdminSupabaseClient, uploads, rpcs };
+  return { client: client as unknown as AdminSupabaseClient, uploads, records };
 }
 
 type ProvenanceInput = Parameters<
@@ -94,6 +91,12 @@ function makeContext(options: {
     queue: "tool_execution_jobs",
     msgId: 1,
     renewVt: async () => {},
+    assetRecordRepository: {
+      recordProjectAsset: async (input: RecordProjectAssetInput) => {
+        admin.records.push(input);
+        return { assetId: "asset-9", workspaceId: input.fallbackWorkspaceId, projectId: input.projectId ?? null };
+      },
+    },
     assetReadRepository: {
       findReadableAsset: async (input: { actorId: string; assetId: string }) => {
         readCalls.push(input);
@@ -165,7 +168,15 @@ describe("tool_execution executor", () => {
     expect(upload.path.startsWith(`${WORKSPACE}/tool/fake_tool/`)).toBe(true);
     expect(upload.path.endsWith(`-${JOB_ID}.png`)).toBe(true);
 
-    expect(admin.rpcs.filter((r) => r.name === "record_project_asset")).toHaveLength(1);
+    expect(admin.records).toHaveLength(1);
+    expect(admin.records[0]).toMatchObject({
+      bucket: "project-assets",
+      objectPath: upload.path,
+      createdBy: CREATED_BY,
+      canvasId: "canvas-1",
+      projectId: "project-1",
+      mimeType: "image/png",
+    });
 
     expect(provenanceCalls).toHaveLength(1);
     const provenance = provenanceCalls[0]!.provenance;

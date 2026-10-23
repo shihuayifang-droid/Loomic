@@ -164,7 +164,7 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
     // Upload to storage and record ownership (shared with the tool executor).
     const timestamp = Date.now();
-    const { assetId, objectPath } = await storeJobOutput(admin, {
+    const { assetId, objectPath } = await storeJobOutput(admin, ctx.assetRecordRepository, {
       objectPath: `${workspaceId}/generated/${timestamp}-${jobId}.png`,
       bytes: buffer,
       mimeType: generated.mimeType ?? "image/png",

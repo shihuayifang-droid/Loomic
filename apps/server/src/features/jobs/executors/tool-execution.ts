@@ -120,7 +120,7 @@ registerExecutor("tool_execution", async (jobId, _rawPayload, ctx: ExecutorConte
       );
     }
 
-    const { assetId, objectPath } = await storeJobOutput(admin, {
+    const { assetId, objectPath } = await storeJobOutput(admin, ctx.assetRecordRepository, {
       objectPath: `${workspaceId}/tool/${toolId}/${Date.now()}-${jobId}.png`,
       bytes: png,
       mimeType: "image/png",

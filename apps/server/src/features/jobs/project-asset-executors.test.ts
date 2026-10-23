@@ -49,6 +49,7 @@ vi.mock("../credits/watermark.js", () => ({
 import type { BackgroundJob, SubscriptionPlan } from "@loomic/shared";
 import { jobArtifactSchema } from "@loomic/shared";
 
+import type { AssetRecordRepository, RecordProjectAssetInput } from "../../db/asset-record-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { SubscriptionReadRow } from "../../db/credit-read-repository.js";
 import { getExecutor, type ExecutorContext } from "./job-executor.js";
@@ -62,10 +63,11 @@ const TEAM_PROJECT = "project-team-1";
 const CANVAS = "canvas-1";
 const CREATED_BY = "user-1";
 
-type RpcCall = { name: string; params: Record<string, unknown> };
+/** The fake asset record repository the context hands the executors, keyed by the admin it was made with. */
+const recorderByClient = new WeakMap<object, Pick<AssetRecordRepository, "recordProjectAsset">>();
 
-function makeAdmin(options: { rpcError?: { message: string } | null } = {}) {
-  const rpcs: RpcCall[] = [];
+function makeAdmin(options: { recordError?: { message: string } | null } = {}) {
+  const records: RecordProjectAssetInput[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
   const signCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
   const jobRowReads: string[] = [];
@@ -119,16 +121,19 @@ function makeAdmin(options: { rpcError?: { message: string } | null } = {}) {
         };
       },
     },
-    rpc: async (name: string, params: Record<string, unknown>) => {
-      rpcs.push({ name, params });
-      if (options.rpcError) return { data: null, error: options.rpcError };
-      return { data: { asset_id: "asset-1" }, error: null };
-    },
   };
+
+  recorderByClient.set(client, {
+    async recordProjectAsset(input) {
+      records.push(input);
+      if (options.recordError) throw new Error(options.recordError.message);
+      return { assetId: "asset-1", workspaceId: input.fallbackWorkspaceId, projectId: input.projectId ?? null };
+    },
+  });
 
   return {
     client: client as unknown as AdminSupabaseClient,
-    rpcs,
+    records,
     uploads,
     signCalls,
     jobRowReads,
@@ -211,7 +216,12 @@ function makeContext(
   job: ExecutorJobFixture,
   creditRead: ReturnType<typeof makeCreditRead> | null = makeCreditRead(),
   provenance: ReturnType<typeof makeProvenance> | null = null,
+  // Default: the repository the admin was made with. `null` leaves the field off
+  // the context entirely (the "worker forgot to wire it" shape).
+  recorder: Pick<AssetRecordRepository, "recordProjectAsset"> | null | undefined = undefined,
 ): TestExecutorContext {
+  const assetRecordRepository =
+    recorder === undefined ? recorderByClient.get(client) : recorder;
   const jobReads: string[] = [];
 
   return {
@@ -251,6 +261,7 @@ function makeContext(
     ...(creditRead ? { creditReadRepository: creditRead.repository } : {}),
     // GN-11: same conditional-spread rule; absent unless a case asks for it.
     ...(provenance ? { assetProvenanceRepository: provenance.repository } : {}),
+    ...(assetRecordRepository ? { assetRecordRepository } : {}),
     jobReads,
   };
 }
@@ -307,26 +318,25 @@ beforeEach(() => {
 });
 
 describe("generation executors record project asset ownership", () => {
-  it("case 1: the image executor passes canvas, project and object path to the RPC", async () => {
+  it("case 1: the image executor passes canvas, project and object path to the asset record repository", async () => {
     const admin = makeAdmin();
     const executor = getExecutor("image_generation");
     expect(executor).toBeDefined();
 
     const result = await executor!("job-1", {}, makeContext(admin.client, jobRow()));
 
-    expect(admin.rpcs).toHaveLength(1);
-    expect(admin.rpcs[0]?.name).toBe("record_project_asset");
-    expect(admin.rpcs[0]?.params).toMatchObject({
-      p_bucket: "project-assets",
-      p_created_by: CREATED_BY,
-      p_canvas_id: CANVAS,
-      p_project_id: TEAM_PROJECT,
-      p_mime_type: "image/png",
+    expect(admin.records).toHaveLength(1);
+    expect(admin.records[0]).toMatchObject({
+      bucket: "project-assets",
+      createdBy: CREATED_BY,
+      canvasId: CANVAS,
+      projectId: TEAM_PROJECT,
+      mimeType: "image/png",
     });
 
     // The object path is what the row is keyed by, so it has to be the uploaded one.
     expect(admin.uploads).toHaveLength(1);
-    expect(admin.rpcs[0]?.params.p_object_path).toBe(admin.uploads[0]?.path);
+    expect(admin.records[0]?.objectPath).toBe(admin.uploads[0]?.path);
     expect(result.asset_id).toBe("asset-1");
     expect(result.object_path).toBe(admin.uploads[0]?.path);
   });
@@ -357,15 +367,15 @@ describe("generation executors record project asset ownership", () => {
 
     const result = await executor!("job-2", {}, makeContext(admin.client, job));
 
-    expect(admin.rpcs).toHaveLength(1);
-    expect(admin.rpcs[0]?.params).toMatchObject({
-      p_bucket: "project-assets",
-      p_created_by: CREATED_BY,
-      p_canvas_id: CANVAS,
-      p_project_id: TEAM_PROJECT,
-      p_mime_type: "video/mp4",
+    expect(admin.records).toHaveLength(1);
+    expect(admin.records[0]).toMatchObject({
+      bucket: "project-assets",
+      createdBy: CREATED_BY,
+      canvasId: CANVAS,
+      projectId: TEAM_PROJECT,
+      mimeType: "video/mp4",
     });
-    expect(admin.rpcs[0]?.params.p_object_path).toBe(admin.uploads[0]?.path);
+    expect(admin.records[0]?.objectPath).toBe(admin.uploads[0]?.path);
 
     // X-52: the video's job result is signed too — same rule as the image.
     expect(String(result.signed_url)).toContain("token=sig");
@@ -380,11 +390,11 @@ describe("generation executors record project asset ownership", () => {
 
     await getExecutor("image_generation")!("job-3", {}, makeContext(admin.client, jobRow()));
 
-    const params = admin.rpcs[0]?.params ?? {};
+    const params = admin.records[0] ?? ({} as Partial<RecordProjectAssetInput>);
     // The fallback is the ONLY workspace the worker may name, and it is the
-    // billing one — the project's workspace is derived by the RPC, never sent.
-    expect(params.p_fallback_workspace_id).toBe(PERSONAL_WORKSPACE);
-    expect(params.p_project_id).toBe(TEAM_PROJECT);
+    // billing one — the project's workspace is derived by the database, never sent.
+    expect(params.fallbackWorkspaceId).toBe(PERSONAL_WORKSPACE);
+    expect(params.projectId).toBe(TEAM_PROJECT);
     expect(Object.values(params)).not.toContain("ws-team");
   });
 
@@ -397,16 +407,16 @@ describe("generation executors record project asset ownership", () => {
       makeContext(admin.client, jobRow({ canvas_id: null, project_id: null })),
     );
 
-    expect(admin.rpcs[0]?.params).toMatchObject({
-      p_project_id: null,
-      p_canvas_id: null,
-      p_fallback_workspace_id: PERSONAL_WORKSPACE,
+    expect(admin.records[0]).toMatchObject({
+      projectId: null,
+      canvasId: null,
+      fallbackWorkspaceId: PERSONAL_WORKSPACE,
     });
   });
 
   it("case 5: a metadata failure fails the job instead of succeeding silently", async () => {
     const admin = makeAdmin({
-      rpcError: { message: "record_project_asset exploded" },
+      recordError: { message: "record_project_asset exploded" },
     });
 
     await expect(
@@ -417,9 +427,23 @@ describe("generation executors record project asset ownership", () => {
     expect(admin.uploads).toHaveLength(1);
   });
 
+  it("case 5b: a context without the asset record repository fails the image job", async () => {
+    const admin = makeAdmin();
+
+    await expect(
+      getExecutor("image_generation")!(
+        "job-5b",
+        {},
+        makeContext(admin.client, jobRow(), makeCreditRead(), null, null),
+      ),
+    ).rejects.toThrow(/no asset record repository/i);
+
+    expect(admin.records).toHaveLength(0);
+  });
+
   it("case 6: a video metadata failure fails the job too", async () => {
     const admin = makeAdmin({
-      rpcError: { message: "record_project_asset exploded" },
+      recordError: { message: "record_project_asset exploded" },
     });
     const job = jobRow({ payload: { prompt: "a clip", model: "test/video" } });
 

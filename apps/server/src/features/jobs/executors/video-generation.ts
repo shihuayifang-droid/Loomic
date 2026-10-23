@@ -112,22 +112,26 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
     // See the image executor: ownership goes through record_project_asset, and a
     // failure here must fail the job rather than leave an unowned object.
-    const { data: assetData, error: assetError } = await admin.rpc("record_project_asset", {
-      p_bucket: "project-assets",
-      p_object_path: objectPath,
-      p_created_by: createdBy,
-      p_fallback_workspace_id: workspaceId,
-      p_project_id: projectId,
-      p_canvas_id: canvasId,
-      p_mime_type: generated.mimeType ?? "video/mp4",
-      p_byte_size: buffer.length,
-    });
-
-    if (assetError) {
-      throw new Error(`Failed to record asset ownership: ${assetError.message}`);
+    if (!ctx.assetRecordRepository) {
+      throw new Error("Failed to record asset ownership: no asset record repository");
     }
-
-    const assetId = (assetData as { asset_id?: string } | null)?.asset_id;
+    let assetId: string;
+    try {
+      const recorded = await ctx.assetRecordRepository.recordProjectAsset({
+        bucket: "project-assets",
+        objectPath,
+        createdBy,
+        fallbackWorkspaceId: workspaceId,
+        projectId,
+        canvasId,
+        mimeType: generated.mimeType ?? "video/mp4",
+        byteSize: buffer.length,
+      });
+      assetId = recorded.assetId;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to record asset ownership: ${message}`);
+    }
     if (!assetId) {
       throw new Error("Failed to record asset ownership: no asset id returned");
     }
