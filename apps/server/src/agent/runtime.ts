@@ -85,6 +85,10 @@ import {
   removeCanvasElement,
   toRetryRequest,
 } from "../features/canvas/canvas-element-writer.js";
+import {
+  createRepositoryCanvasStore,
+  type CanvasStore,
+} from "../features/canvas/canvas-version.js";
 import { aspectRatioToDimensions } from "../generation/utils.js";
 import { slotOutcomeForStop, SLOT_TIMEOUT_MESSAGE } from "../features/canvas/generation-slot-outcome.js";
 import { fitIntoBox } from "../features/canvas/fit-into-box.js";
@@ -816,7 +820,7 @@ type VideoPlacementInput = {
  * function.
  */
 export async function insertVideoElementForJobResult(args: {
-  client: UserSupabaseClient;
+  client: { from: (table: string) => any } | CanvasStore;
   canvasId: string;
   jobId: string;
   objectPath: string | undefined;
@@ -1130,9 +1134,18 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
       let submitVideoJob: SubmitVideoJobFn | undefined;
       if (options.jobService && options.createUserClient && run.accessToken && run.userId) {
         const jobSvc = options.jobService;
-        const createClient = options.createUserClient;
         const accessToken = run.accessToken;
         const userId = run.userId;
+        // Canvas element writes go through the content store. A missing
+        // repository throws here, inside each call site's existing try, so it
+        // takes that site's normal failure branch instead of escaping the run.
+        const canvasStore = (): CanvasStore => {
+          const repo = options.canvasContentRepository;
+          if (!repo) {
+            throw new Error("canvas content repository is not configured");
+          }
+          return createRepositoryCanvasStore(repo, userId);
+        };
         const canvasId = run.canvasId;
         const sessionId = run.sessionId;
         const runId = run.runId;
@@ -1333,7 +1346,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 input.aspectRatio ?? "1:1",
               );
               const slot = await insertImagePlaceholder(
-                createClient(accessToken) as UserSupabaseClient,
+                canvasStore(),
                 {
                   canvasId,
                   width: slotW,
@@ -1391,10 +1404,8 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               let elementId: string | undefined;
               if (canvasId && result.object_path) {
                 try {
-                  const writerClient = createClient(accessToken) as UserSupabaseClient;
-
                   const insertResult = await insertImageElement(
-                    writerClient,
+                    canvasStore(),
                     {
                       canvasId,
                       objectPath: result.object_path,
@@ -1487,7 +1498,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                     input as Record<string, unknown>,
                   );
                   await markGenerationSlotFailed(
-                    createClient(accessToken) as UserSupabaseClient,
+                    canvasStore(),
                     canvasId,
                     placeholderElementId,
                     { ...slotFailure, ...(retry ? { retryRequest: retry } : {}) },
@@ -1503,7 +1514,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   });
                 } else {
                   await removeCanvasElement(
-                    createClient(accessToken) as UserSupabaseClient,
+                    canvasStore(),
                     canvasId,
                     placeholderElementId,
                   );
@@ -1719,7 +1730,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               // still wins, unchanged.
               const slotSize = videoSlotSize(input.aspectRatio);
               const slot = await insertImagePlaceholder(
-                createClient(accessToken) as UserSupabaseClient,
+                canvasStore(),
                 {
                   canvasId,
                   width: explicitPlacement?.width ?? slotSize.width,
@@ -1789,19 +1800,19 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               let elementId: string | undefined;
               if (canvasId) {
                 try {
-                  const writerClient = createClient(accessToken) as UserSupabaseClient;
+                  const store = canvasStore();
                   // GN-19: the reserved slot goes away before the video lands, so
                   // the canvas holds one element for this job, not two.
                   if (placeholderElementId) {
                     await removeCanvasElement(
-                      writerClient,
+                      store,
                       canvasId,
                       placeholderElementId,
                     );
                     placeholderElementId = undefined;
                   }
                   elementId = await insertVideoElementForJobResult({
-                    client: writerClient,
+                    client: store,
                     canvasId,
                     jobId: job.id,
                     objectPath,
@@ -1891,7 +1902,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               );
               if (outcome.kind !== "filled") {
                 try {
-                  const cleanupClient = createClient(accessToken) as UserSupabaseClient;
+                  const store = canvasStore();
                   if (outcome.kind === "failed") {
                     // GN-19: same as the image path — keep the request so the
                     // failed slot can be retried with the original parameters.
@@ -1900,7 +1911,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                       input as Record<string, unknown>,
                     );
                     await markGenerationSlotFailed(
-                      cleanupClient,
+                      store,
                       canvasId,
                       placeholderElementId,
                       {
@@ -1920,7 +1931,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                     });
                   } else {
                     await removeCanvasElement(
-                      cleanupClient,
+                      store,
                       canvasId,
                       placeholderElementId,
                     );
