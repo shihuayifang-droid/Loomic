@@ -16,13 +16,10 @@ import { createPgmqClient } from "./queue/pgmq-client.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
 import { reapStuckJobs } from "./features/jobs/reap-stuck-jobs.js";
-import { startStuckJobReaper } from "./features/jobs/stuck-job-reaper-schedule.js";
-import {
-  shouldStartTeamCycleGrant,
-  startTeamCycleGrant,
-} from "./features/credits/team-cycle-grant-schedule.js";
+import { shouldStartTeamCycleGrant } from "./features/credits/team-cycle-grant-schedule.js";
 import { compensateRefunds } from "./features/credits/compensate-refunds.js";
-import { startRefundCompensator } from "./features/credits/refund-compensation-schedule.js";
+import { SCHEDULE_CATALOG } from "./features/schedules/schedule-catalog.js";
+import { startSchedules } from "./features/schedules/schedule-runner.js";
 import { createJobCreditsLinkRepository } from "./db/job-credits-link-repository.js";
 import { createRefundCompensationRepository } from "./db/refund-compensation-repository.js";
 import { createJobStuckReaderRepository } from "./db/job-stuck-reader-repository.js";
@@ -114,92 +111,90 @@ async function main() {
 
   let running = true;
 
-  // GN-31 step 3 (workorder 36J): the periodic reclaim of jobs whose worker died
-  // while they were `running`. One pass lives in `reap-stuck-jobs.ts`; this is
-  // only the wiring plus the timer that repeats it. It starts NOW, before the
-  // poll loop, because the rows it collects are the ones this process's previous
-  // life left behind.
+  // OP-11 (workorder 43A): one timer drives every periodic task, and the sheet
+  // of what runs, how often, who owns it and whether a failure alerts lives in
+  // `features/schedules/schedule-catalog.ts`. The three that are wired up keep
+  // the exact cadences the three hand-written timers had (GN-31 reaper 5 min,
+  // BL-41 refund compensator 5 min, BL-44 team cycle grant 10 min), and `every`
+  // tasks still run immediately at start — a worker that restarts reclaims what
+  // its previous life left behind instead of waiting a whole interval.
   //
   // `failedAt` is not passed on: `jobService.markFailed` stamps the time itself,
-  // so the instant this pass read is never used for the write.
+  // so the instant this pass reads is never used for the write.
+  //
+  // The repositories are still built here, lazily, against the same pool getter as
+  // everything else in this file — resolving lazily means a pass that never runs
+  // never connects. `creditService` comes from the composition above, so the
+  // refund payout goes through the same `LOOMIC_CREDIT_POOLS` switch as the
+  // charge and the refund that queued the row.
+  //
+  // Workorder 38I: the team cycle grant is three-pool bookkeeping, so it belongs
+  // to the `LOOMIC_CREDIT_POOLS=on` side of the switch, like the charge and the
+  // daily grant do. With the switch off the task is not wired at all, so the
+  // catalog entry simply has nothing to run — no `cycle_grant` ledger line and no
+  // pool row.
+  //
+  // OP-18: the alert channel is not decided yet, so `onAlert` only logs for now.
+  // The runner has already printed the structured `ALERT schedule_failed` line;
+  // connecting the real channel replaces this callback and nothing else.
   const stuckReader = createJobStuckReaderRepository({ getTransactionPool: getPool });
-  const reaper = startStuckJobReaper({
-    reap: () =>
-      reapStuckJobs({
-        listRunningStartedBefore: (i) => stuckReader.listRunningStartedBefore(i),
-        markFailed: ({ jobId, errorCode, errorMessage }) =>
-          jobService.markFailed(jobId, errorCode, errorMessage),
-        refundJob: (jobId) => refundJob(jobId, `${tag} [reaper]`),
-        now: () => new Date(),
-        log: (m) => console.log(`${tag} ${m}`),
-      }),
-    log: (m) => console.log(`${tag} ${m}`),
-  });
-
-  // BL-41 step 4 (workorder 39L): the refund compensation queue. A refund that
-  // failed was recorded in `refund_compensations` (39K); this schedule beside the
-  // reaper retries it every five minutes, twelve times, and prints the alert line
-  // when it gives up. Both repositories are built here, lazily, against the same
-  // pool getter as everything else in this file — resolving lazily means a pass
-  // that never runs never connects, exactly like the ones above. `creditService`
-  // comes from the composition above, so the payout goes through the same
-  // `LOOMIC_CREDIT_POOLS` switch as the charge and the refund that queued the row.
   const refundCompensations = createRefundCompensationRepository({
     getTransactionPool: getPool,
   });
   const creditsLink = createJobCreditsLinkRepository({
     getTransactionPool: getPool,
   });
-  const refundCompensator = startRefundCompensator({
-    compensate: () =>
-      compensateRefunds({
-        claimDue: (limit) => refundCompensations.claimDue(limit),
-        refund: (input) =>
-          creditService.refundCredits(
-            input.workspaceId,
-            input.userId,
-            input.amount,
-            input.jobId,
-            input.description,
-          ),
-        markLinkRefunded: (input) => creditsLink.markChargeRefunded(input),
-        finish: (input) => refundCompensations.finish(input),
-        log: (m) => console.log(`${tag} [refund-compensator] ${m}`),
-      }),
-    log: (m) => console.log(`${tag} [refund-compensator] ${m}`),
-  });
 
-  // BL-44 step 7 (workorder 37R): this month's team pool. `grant_team_cycle`
-  // (37O) is idempotent per month, so the coarse ten-minute period only decides
-  // how many minutes after 00:00 on the 1st the grant lands — not whether it
-  // lands twice. It starts here, beside the reaper, because until the pool row
-  // exists every member's team spend is refused, and a worker that restarts on
-  // the 1st must not wait a whole interval. The repository is built per pass
-  // against the same pool getter as everything else in this file — it resolves
-  // lazily, so a pass that never runs never connects.
-  //
-  // Workorder 38I: this grant is three-pool bookkeeping, so it belongs to the
-  // `LOOMIC_CREDIT_POOLS=on` side of the switch, like the charge and the daily
-  // grant do. With the switch off the schedule is not started at all — no
-  // `cycle_grant` ledger line and no pool row — and the shutdown below stays
-  // safe against the handle that does not exist.
-  const teamCycleGrant = shouldStartTeamCycleGrant()
-    ? startTeamCycleGrant({
-        grant: () =>
-          createPoolGrantWriteRepository({
-            getTransactionPool: getPool,
-          }).grantTeamCycle(),
-        log: (m) => console.log(`${tag} ${m}`),
-      })
-    : null;
+  const schedules = startSchedules({
+    entries: SCHEDULE_CATALOG,
+    tasks: {
+      stuck_job_reaper: async () => {
+        await reapStuckJobs({
+          listRunningStartedBefore: (i) => stuckReader.listRunningStartedBefore(i),
+          markFailed: ({ jobId, errorCode, errorMessage }) =>
+            jobService.markFailed(jobId, errorCode, errorMessage),
+          refundJob: (jobId) => refundJob(jobId, `${tag} [reaper]`),
+          now: () => new Date(),
+          log: (m) => console.log(`${tag} ${m}`),
+        });
+      },
+      refund_compensation: async () => {
+        await compensateRefunds({
+          claimDue: (limit) => refundCompensations.claimDue(limit),
+          refund: (input) =>
+            creditService.refundCredits(
+              input.workspaceId,
+              input.userId,
+              input.amount,
+              input.jobId,
+              input.description,
+            ),
+          markLinkRefunded: (input) => creditsLink.markChargeRefunded(input),
+          finish: (input) => refundCompensations.finish(input),
+          log: (m) => console.log(`${tag} [refund-compensator] ${m}`),
+        });
+      },
+      ...(shouldStartTeamCycleGrant()
+        ? {
+            team_cycle_grant: async () => {
+              await createPoolGrantWriteRepository({
+                getTransactionPool: getPool,
+              }).grantTeamCycle();
+            },
+          }
+        : {}),
+    },
+    onAlert: (alert) =>
+      console.log(`${tag} schedule alert ${alert.name}: ${alert.error}`),
+    log: (m) => console.log(`${tag} ${m}`),
+  });
 
   // Graceful shutdown — wait for in-flight jobs then exit
   const shutdown = async () => {
-    // Stop the timers first: the in-flight jobs waited for below are the ones
-    // that matter, and a tick landing mid-shutdown has nothing left to do.
-    reaper.stop();
-    refundCompensator.stop();
-    teamCycleGrant?.stop();
+    // Stop the timer first: the in-flight jobs waited for below are the ones
+    // that matter, and a tick landing mid-shutdown has nothing left to do. One
+    // handle now covers every entry in the catalog (OP-11 / workorder 43A).
+    schedules.stop();
     const totalInFlight = [...inFlightByQueue.values()].reduce((n, s) => n + s.size, 0);
     console.log(`${tag} Shutting down, waiting for ${totalInFlight} in-flight jobs...`);
     running = false;
