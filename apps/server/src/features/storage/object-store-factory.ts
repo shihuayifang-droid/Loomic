@@ -67,6 +67,14 @@ class LazyObjectStore implements ObjectStore {
   ): ReturnType<ObjectStore["signedReadUrl"]> {
     return this.target().signedReadUrl(ref, options);
   }
+
+  signedReadUrls(
+    bucket: Parameters<ObjectStore["signedReadUrls"]>[0],
+    keys: Parameters<ObjectStore["signedReadUrls"]>[1],
+    options: Parameters<ObjectStore["signedReadUrls"]>[2],
+  ): ReturnType<ObjectStore["signedReadUrls"]> {
+    return this.target().signedReadUrls(bucket, keys, options);
+  }
 }
 
 /**

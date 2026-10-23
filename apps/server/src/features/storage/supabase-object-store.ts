@@ -75,6 +75,23 @@ export type SupabaseBucketApi = {
     options?: { transform?: ProjectAssetTransform; download?: string },
   ): PromiseLike<SupabaseResponse<{ signedUrl: string }>>;
   list(prefix: string): PromiseLike<SupabaseResponse<SupabaseListItem[]>>;
+  /**
+   * 43I: the batch spelling of `createSignedUrl`. One entry per requested path,
+   * in the order asked; an entry whose `signedUrl` is null is a key the backend
+   * refused.
+   */
+  createSignedUrls(
+    keys: string[],
+    expiresInSeconds: number,
+  ): PromiseLike<
+    SupabaseResponse<
+      Array<{
+        path: string | null;
+        signedUrl: string | null;
+        error?: string | null;
+      }>
+    >
+  >;
 };
 
 /**
@@ -317,6 +334,41 @@ export function createSupabaseObjectStore(
       }
 
       return data.signedUrl;
+    },
+
+    async signedReadUrls(
+      bucket: string,
+      keys: readonly string[],
+      options: { ttlSeconds: number },
+    ): Promise<Map<string, string>> {
+      const signed = new Map<string, string>();
+      // One request for the whole set, so asking for a key twice must not grow
+      // the request: the backend answers per path, and the map is keyed by path.
+      const unique = [...new Set(keys)];
+      if (unique.length === 0) {
+        return signed;
+      }
+
+      const handle = bucketHandle(client, bucket);
+      const { data, error } = await handle.createSignedUrls(
+        unique,
+        options.ttlSeconds,
+      );
+      // A failed batch is "nothing could be signed", the same answer a call site
+      // got when the SDK handed it null data: the caller keeps its own values.
+      if (error || !data) {
+        return signed;
+      }
+
+      for (const entry of data) {
+        // A path-less or url-less entry is a key the backend refused; leaving it
+        // out is what "not signed" means in this contract.
+        if (entry.path && entry.signedUrl) {
+          signed.set(entry.path, entry.signedUrl);
+        }
+      }
+
+      return signed;
     },
   };
 }

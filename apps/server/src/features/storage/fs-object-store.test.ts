@@ -198,3 +198,40 @@ describe("fs-object-store", () => {
     expect(source.toLowerCase()).not.toContain("supa" + "base");
   });
 });
+
+// 43I: the batch spelling on the volume signs each key on its own, and a key the
+// volume would reject is skipped instead of costing the caller every other URL.
+describe("43I fs-object-store signedReadUrls", () => {
+  it("signs every key so verifyObjectUrl accepts it", async () => {
+    const keys = ["ws/a.png", "ws/b.pdf"];
+    const urls = await store.signedReadUrls("assets", keys, { ttlSeconds: 300 });
+
+    expect([...urls.keys()]).toStrictEqual(keys);
+    for (const key of keys) {
+      const parsed = new URL(urls.get(key) ?? "");
+      expect(parsed.pathname).toBe(`/objects/assets/${key}`);
+      expect(parsed.searchParams.get("exp")).toBe(String(2_000_000_000 + 300));
+
+      const verified = verifyObjectUrl({
+        secret,
+        bucket: "assets",
+        key,
+        exp: parsed.searchParams.get("exp") ?? undefined,
+        disp: parsed.searchParams.get("disp") ?? undefined,
+        sig: parsed.searchParams.get("sig") ?? undefined,
+        now: 2_000_000_000,
+      });
+      expect(verified.ok).toBe(true);
+    }
+  });
+
+  it("skips an invalid key and still signs the valid ones", async () => {
+    const urls = await store.signedReadUrls(
+      "assets",
+      ["../x", "ws/ok.png", "a\\b", ""],
+      { ttlSeconds: 60 },
+    );
+
+    expect([...urls.keys()]).toStrictEqual(["ws/ok.png"]);
+  });
+});

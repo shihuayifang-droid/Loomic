@@ -361,5 +361,40 @@ export function createFsObjectStore(options: FsObjectStoreOptions): ObjectStore 
         ...(urlOptions.download ? { download: urlOptions.download } : {}),
       });
     },
+
+    async signedReadUrls(
+      bucket: string,
+      keys: readonly string[],
+      urlOptions: { ttlSeconds: number },
+    ): Promise<Map<string, string>> {
+      const signed = new Map<string, string>();
+      const expiresAt =
+        Math.floor(now().getTime() / 1000) + urlOptions.ttlSeconds;
+
+      // The volume has no batch endpoint, so each key is signed on its own: the
+      // round trip a hosted backend saves by signing a list is not there to save.
+      for (const key of keys) {
+        const target = { bucket, key };
+        try {
+          resolveRef(target);
+        } catch {
+          // An address this volume would reject is skipped, not thrown: one bad
+          // key must not cost the caller the URLs of the others.
+          continue;
+        }
+        signed.set(
+          key,
+          signObjectUrl({
+            secret: options.secret,
+            publicBase: options.publicBase,
+            bucket,
+            key,
+            expiresAt,
+          }),
+        );
+      }
+
+      return signed;
+    },
   };
 }

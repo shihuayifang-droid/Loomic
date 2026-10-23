@@ -31,6 +31,12 @@ export type FakeObjectStoreCall =
       method: "signedReadUrl";
       ref: ObjectRef;
       options: SignedReadUrlOptions & { transform?: ProjectAssetTransform };
+    }
+  | {
+      method: "signedReadUrls";
+      bucket: string;
+      keys: readonly string[];
+      options: { ttlSeconds: number };
     };
 
 export type FakeObjectStore = ObjectStore & {
@@ -202,6 +208,22 @@ export function createFakeObjectStore(): FakeObjectStore {
       }
 
       return `fake://${ref.bucket}/${ref.key}?${query.join("&")}`;
+    },
+
+    async signedReadUrls(
+      bucket: string,
+      keys: readonly string[],
+      urlOptions: { ttlSeconds: number },
+    ): Promise<Map<string, string>> {
+      // One recorded call for the whole set, mirroring the real backend's one
+      // round trip; the keys travel verbatim so a test can assert them.
+      calls.push({ method: "signedReadUrls", bucket, keys, options: urlOptions });
+
+      const signed = new Map<string, string>();
+      for (const key of keys) {
+        signed.set(key, `fake://${bucket}/${key}?ttl=${urlOptions.ttlSeconds}`);
+      }
+      return signed;
     },
   };
 }

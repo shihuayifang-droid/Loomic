@@ -527,3 +527,135 @@ describe("43B createObjectStore factory", () => {
     }
   });
 });
+
+/**
+ * 43I: the batch signing path, for the call sites that sign a whole list today
+ * (brand kit). One request for the set; anything the backend refuses is absent
+ * from the map instead of an error, because the caller keeps its own values.
+ */
+describe("43I Supabase object store: signedReadUrls", () => {
+  type BatchAnswer = {
+    data: Array<{ path: string | null; signedUrl: string | null }> | null;
+    error: { message: string } | null;
+  };
+
+  function batchBucket(
+    recorded: Recorded[],
+    answer: (keys: string[]) => BatchAnswer,
+  ) {
+    return {
+      ...recordingBucket(recorded),
+      createSignedUrls(keys: string[], expiresInSeconds: number) {
+        recorded.push({
+          method: "createSignedUrls",
+          args: [keys, expiresInSeconds],
+        });
+        return answer(keys);
+      },
+    };
+  }
+
+  const batchCalls = (recorded: Recorded[]) =>
+    recorded.filter((call) => call.method === "createSignedUrls");
+
+  it("43I: signs a whole list in one request, with duplicate keys deduped", async () => {
+    const recorded: Recorded[] = [];
+    const { store } = storeWith(
+      recorded,
+      {},
+      batchBucket(recorded, (keys) => ({
+        data: keys.map((path) => ({
+          path,
+          signedUrl: `https://signed.invalid/${path}`,
+        })),
+        error: null,
+      })),
+    );
+
+    const urls = await store.signedReadUrls(
+      BUCKET,
+      ["a.png", "b.png", "a.png"],
+      { ttlSeconds: 3600 },
+    );
+
+    expect(batchCalls(recorded)).toHaveLength(1);
+    expect(batchCalls(recorded)[0]?.args).toStrictEqual([
+      ["a.png", "b.png"],
+      3600,
+    ]);
+    expect([...urls.keys()]).toStrictEqual(["a.png", "b.png"]);
+    expect(urls.get("a.png")).toBe("https://signed.invalid/a.png");
+    expect(urls.get("b.png")).toBe("https://signed.invalid/b.png");
+  });
+
+  it("43I: entries with a null signed url or a null path are left out", async () => {
+    const recorded: Recorded[] = [];
+    const { store } = storeWith(
+      recorded,
+      {},
+      batchBucket(recorded, () => ({
+        data: [
+          { path: "a.png", signedUrl: "https://signed.invalid/a.png" },
+          { path: "b.png", signedUrl: null },
+          { path: null, signedUrl: "https://signed.invalid/orphan" },
+        ],
+        error: null,
+      })),
+    );
+
+    const urls = await store.signedReadUrls(BUCKET, ["a.png", "b.png"], {
+      ttlSeconds: 60,
+    });
+
+    expect([...urls.keys()]).toStrictEqual(["a.png"]);
+    expect(urls.has("b.png")).toBe(false);
+  });
+
+  it("43I: a failed batch answers an empty map instead of throwing", async () => {
+    const recorded: Recorded[] = [];
+    const { store } = storeWith(
+      recorded,
+      {},
+      batchBucket(recorded, () => ({
+        data: null,
+        error: { message: "permission denied" },
+      })),
+    );
+
+    const urls = await store.signedReadUrls(BUCKET, ["a.png"], {
+      ttlSeconds: 60,
+    });
+
+    expect(urls.size).toBe(0);
+    expect(batchCalls(recorded)).toHaveLength(1);
+  });
+
+  it("43I: null data without an error answers an empty map", async () => {
+    const recorded: Recorded[] = [];
+    const { store } = storeWith(
+      recorded,
+      {},
+      batchBucket(recorded, () => ({ data: null, error: null })),
+    );
+
+    const urls = await store.signedReadUrls(BUCKET, ["a.png"], {
+      ttlSeconds: 60,
+    });
+
+    expect(urls.size).toBe(0);
+  });
+
+  it("43I: an empty key list sends no request at all", async () => {
+    const recorded: Recorded[] = [];
+    const { store } = storeWith(
+      recorded,
+      {},
+      batchBucket(recorded, () => ({ data: [], error: null })),
+    );
+
+    const urls = await store.signedReadUrls(BUCKET, [], { ttlSeconds: 60 });
+
+    expect(urls.size).toBe(0);
+    expect(recorded).toStrictEqual([]);
+  });
+});

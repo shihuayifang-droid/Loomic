@@ -194,3 +194,28 @@ describe("43B fake object store", () => {
     expect(store.has(ref("a.bin"))).toBe(false);
   });
 });
+
+// 43I: the batch signing path of the double: one recorded call for the whole
+// set, a URL per key in the order asked, so a migrated call site can assert it
+// signed everything in ONE call rather than one call per key.
+describe("43I fake object store signedReadUrls", () => {
+  it("returns a URL per key and records one batch call", async () => {
+    const store = createFakeObjectStore();
+    const keys = ["a/b.png", "c.pdf"];
+
+    const urls = await store.signedReadUrls(BUCKET, keys, { ttlSeconds: 60 });
+
+    expect([...urls.entries()]).toStrictEqual([
+      ["a/b.png", "fake://project-assets/a/b.png?ttl=60"],
+      ["c.pdf", "fake://project-assets/c.pdf?ttl=60"],
+    ]);
+    expect(store.calls).toStrictEqual([
+      {
+        method: "signedReadUrls",
+        bucket: BUCKET,
+        keys,
+        options: { ttlSeconds: 60 },
+      },
+    ]);
+  });
+});

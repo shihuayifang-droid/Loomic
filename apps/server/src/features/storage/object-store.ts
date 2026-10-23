@@ -107,4 +107,17 @@ export interface ObjectStore {
   copy(from: ObjectRef, to: ObjectRef): Promise<void>;
 
   signedReadUrl(ref: ObjectRef, options: SignedReadUrlOptions): Promise<string>;
+
+  /**
+   * 43I: sign many objects of ONE bucket in a single round trip where the backend
+   * has such a call. Answers key -> URL; a key the backend could not sign is
+   * simply absent from the map instead of an error, and an empty `keys` list
+   * sends no request at all. Call sites that batch today keep the unsigned value
+   * for anything missing, so "nothing came back" is a normal answer here.
+   */
+  signedReadUrls(
+    bucket: string,
+    keys: readonly string[],
+    options: { ttlSeconds: number },
+  ): Promise<Map<string, string>>;
 }
