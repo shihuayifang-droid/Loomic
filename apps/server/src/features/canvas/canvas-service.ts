@@ -8,6 +8,9 @@ import {
   CanvasReadError,
   type CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
+import { ObjectStoreError } from "../storage/object-store.js";
+import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 import {
   signProjectAssetUrl,
   storageRenderTransformEnabled,
@@ -453,19 +456,28 @@ async function extractFilesToStorage(
         const ext = mimeToExt(mimeType);
         const objectPath = `${workspaceId}/canvas-files/${canvasId}/${fileId}.${ext}`;
 
-        // Upsert: the same file ID may be re-saved
-        const { error: uploadError } = await client.storage
-          .from(CANVAS_FILES_BUCKET)
-          .upload(objectPath, buffer, { contentType: mimeType, upsert: true });
-
-        if (uploadError) {
+        // Upsert: the same file ID may be re-saved. 43H: the write goes through
+        // the `ObjectStore` seam instead of the raw SDK.
+        try {
+          await createSupabaseObjectStore(
+            client as unknown as SupabaseStorageLike,
+          ).put(
+            { bucket: CANVAS_FILES_BUCKET, key: objectPath },
+            buffer,
+            { contentType: mimeType, upsert: true },
+          );
+        } catch (err) {
+          const detail =
+            err instanceof ObjectStoreError
+              ? (err.detail ?? err.message)
+              : String(err);
           // Graceful degradation is right, but upstream did it SILENTLY: the
           // canvas kept carrying multi-MB base64 with no hint why, and the only
           // symptom was a slow, bloated document. Log the reason.
           console.log(
             `[canvas-service] file upload failed, keeping base64 fileId=${fileId} ` +
               `bucket=${CANVAS_FILES_BUCKET} path=${objectPath} ` +
-              `bytes=${buffer.length} error=${uploadError.message}`,
+              `bytes=${buffer.length} error=${detail}`,
           );
           updatedFiles[fileId] = fileData;
           return;

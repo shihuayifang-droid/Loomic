@@ -24,6 +24,7 @@ import {
   withTransportRetry,
 } from "../../supabase/transport-retry.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import { ObjectStoreError } from "../storage/object-store.js";
 import {
   ProjectAssetUrlError,
   signProjectAssetUrl,
@@ -31,6 +32,8 @@ import {
   storageRenderTransformEnabled,
   withWebpFormat,
 } from "../storage/project-asset-urls.js";
+import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -449,14 +452,24 @@ export function createProjectService(options: {
       const ext = mimeType === "image/webp" ? "webp" : "png";
       const objectPath = `${proj.workspace_id}/${projectId}/thumbnail.${ext}`;
 
-      const { error: uploadError } = await client.storage
-        .from(THUMBNAIL_BUCKET)
-        .upload(objectPath, buffer, { contentType: mimeType, upsert: true });
-
-      if (uploadError) {
+      // 43H: the thumbnail write goes through the `ObjectStore` seam instead of
+      // the raw SDK.
+      try {
+        await createSupabaseObjectStore(
+          client as unknown as SupabaseStorageLike,
+        ).put(
+          { bucket: THUMBNAIL_BUCKET, key: objectPath },
+          buffer,
+          { contentType: mimeType, upsert: true },
+        );
+      } catch (err) {
+        const detail =
+          err instanceof ObjectStoreError
+            ? (err.detail ?? err.message)
+            : String(err);
         throw new ProjectServiceError(
           "project_create_failed",
-          `Thumbnail upload failed: ${uploadError.message}`,
+          `Thumbnail upload failed: ${detail}`,
           500,
         );
       }
