@@ -7,6 +7,8 @@ import type {
   KitDetailRow,
 } from "../../db/brand-kit-read-repository.js";
 import { readSubject } from "./persist-sandbox-file.js";
+import { createSupabaseObjectStore } from "../../features/storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../../features/storage/supabase-object-store.js";
 
 const brandKitSchema = z.object({});
 
@@ -111,23 +113,15 @@ export function createBrandKitTool(
       const fileAssets = safeAssets.filter((a) => a.file_url);
       if (fileAssets.length > 0) {
         const paths = fileAssets.map((a) => a.file_url as string);
-        const { data: signedData } = await client.storage
-          .from("brand-kit-assets")
-          .createSignedUrls(paths, 3600);
+        // OP-05 / 43J: the signature batch goes through the `ObjectStore` seam, so
+        // this tool names no storage client method of its own.
+        const signed = await createSupabaseObjectStore(
+          client as unknown as SupabaseStorageLike,
+        ).signedReadUrls("brand-kit-assets", paths, { ttlSeconds: 3600 });
 
-        if (signedData) {
-          // Typed as <string, string> so the published `file_url` stays a string:
-          // the storage SDK's entry objects are `any`, and a `Map<any, any>` would
-          // let a non-string through into a field the model reads.
-          const urlByPath = new Map<string, string>(
-            signedData
-              .filter((e: any) => e.signedUrl && e.path)
-              .map((e: any) => [e.path as string, e.signedUrl as string] as const),
-          );
-          for (const asset of fileAssets) {
-            const url = urlByPath.get(asset.file_url as string);
-            if (url) asset.file_url = url;
-          }
+        for (const asset of fileAssets) {
+          const url = signed.get(asset.file_url as string);
+          if (url) asset.file_url = url;
         }
       }
 

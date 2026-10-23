@@ -25,6 +25,10 @@ import type {
   BrandKitKitPatch,
   BrandKitWriteRepository,
 } from "../../db/brand-kit-write-repository.js";
+import { ObjectStoreError } from "../storage/object-store.js";
+import type { ObjectRef, ObjectStore } from "../storage/object-store.js";
+import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 
 const BRAND_KIT_BUCKET = "brand-kit-assets";
 const SIGNED_URL_EXPIRY_SECONDS = 3600;
@@ -58,6 +62,31 @@ export class BrandKitServiceError extends Error {
     super(message);
     this.code = code;
     this.statusCode = statusCode;
+  }
+}
+
+/**
+ * OP-05 / 43J: the brand kit reaches object storage through the `ObjectStore`
+ * seam only. The backend is the Supabase wrapper, so every call below maps onto
+ * the exact SDK call this file used to make, in the same order.
+ */
+function storeFor(client: UserSupabaseClient): ObjectStore {
+  return createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
+}
+
+/**
+ * Every delete in this file ignored its storage error before the migration and
+ * still does: a failed remove never decided the outcome of the kit or asset
+ * operation around it. Swallowing here keeps that behaviour in one place.
+ */
+async function removeQuietly(
+  store: ObjectStore,
+  refs: readonly ObjectRef[],
+): Promise<void> {
+  try {
+    await store.delete(refs);
+  } catch {
+    // Swallowed on purpose: see the doc comment above.
   }
 }
 
@@ -189,20 +218,15 @@ export function createBrandKitService(options: {
     if (fileAssets.length > 0) {
       const client = options.createUserClient(user.accessToken);
       const paths = fileAssets.map((a) => a.file_url!);
-      const { data: signedData } = await client.storage
-        .from(BRAND_KIT_BUCKET)
-        .createSignedUrls(paths, SIGNED_URL_EXPIRY_SECONDS);
+      const signed = await storeFor(client).signedReadUrls(
+        BRAND_KIT_BUCKET,
+        paths,
+        { ttlSeconds: SIGNED_URL_EXPIRY_SECONDS },
+      );
 
-      if (signedData) {
-        const urlByPath = new Map(
-          signedData
-            .filter((e) => e.signedUrl && e.path)
-            .map((e) => [e.path, e.signedUrl]),
-        );
-        for (const asset of fileAssets) {
-          const url = urlByPath.get(asset.file_url!);
-          if (url) asset.file_url = url;
-        }
+      for (const asset of fileAssets) {
+        const url = signed.get(asset.file_url!);
+        if (url) asset.file_url = url;
       }
     }
 
@@ -414,7 +438,10 @@ export function createBrandKitService(options: {
 
       if (paths.length > 0) {
         const client = options.createUserClient(user.accessToken);
-        await client.storage.from(BRAND_KIT_BUCKET).remove(paths);
+        await removeQuietly(
+          storeFor(client),
+          paths.map((path) => ({ bucket: BRAND_KIT_BUCKET, key: path })),
+        );
       }
 
       try {
@@ -616,7 +643,9 @@ export function createBrandKitService(options: {
       // on the path that still needs a user-scoped client.
       if (existing.file_url) {
         const client = options.createUserClient(user.accessToken);
-        await client.storage.from(BRAND_KIT_BUCKET).remove([existing.file_url]);
+        await removeQuietly(storeFor(client), [
+          { bucket: BRAND_KIT_BUCKET, key: existing.file_url },
+        ]);
       }
 
       try {
@@ -663,23 +692,31 @@ export function createBrandKitService(options: {
 
       // Storage: the ONLY reason this method still creates a user-scoped client.
       const client = options.createUserClient(user.accessToken);
+      const store = storeFor(client);
 
       // Upload to storage
       const timestamp = Date.now();
       const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
       const objectPath = `${user.id}/${kitId}/${timestamp}-${safeName}`;
 
-      const { error: uploadError } = await client.storage
-        .from(BRAND_KIT_BUCKET)
-        .upload(objectPath, fileBuffer, {
-          contentType: mimeType,
-          upsert: false,
-        });
-
-      if (uploadError) {
+      try {
+        await store.put(
+          { bucket: BRAND_KIT_BUCKET, key: objectPath },
+          fileBuffer,
+          { contentType: mimeType, upsert: false },
+        );
+      } catch (error) {
+        // The published sentence is the backend's own message, so the detail is
+        // read instead of the composed one.
+        const detail =
+          error instanceof ObjectStoreError
+            ? (error.detail ?? error.message)
+            : error instanceof Error
+              ? error.message
+              : String(error);
         throw new BrandKitServiceError(
           "brand_kit_asset_create_failed",
-          `File upload failed: ${uploadError.message}`,
+          `File upload failed: ${detail}`,
           500,
         );
       }
@@ -728,7 +765,9 @@ export function createBrandKitService(options: {
 
       if (!created) {
         // Clean up uploaded file on DB failure
-        await client.storage.from(BRAND_KIT_BUCKET).remove([objectPath]);
+        await removeQuietly(store, [
+          { bucket: BRAND_KIT_BUCKET, key: objectPath },
+        ]);
         throw new BrandKitServiceError(
           "brand_kit_asset_create_failed",
           ASSET_CREATE_FAILED_MESSAGE,
@@ -737,13 +776,14 @@ export function createBrandKitService(options: {
       }
 
       // Generate signed URL for the response
-      const { data: urlData } = await client.storage
-        .from(BRAND_KIT_BUCKET)
-        .createSignedUrl(objectPath, SIGNED_URL_EXPIRY_SECONDS);
-
       const mapped = mapAssetRow(created);
-      if (urlData?.signedUrl) {
-        mapped.file_url = urlData.signedUrl;
+      try {
+        mapped.file_url = await store.signedReadUrl(
+          { bucket: BRAND_KIT_BUCKET, key: objectPath },
+          { ttlSeconds: SIGNED_URL_EXPIRY_SECONDS },
+        );
+      } catch {
+        // Unchanged: no signed URL means the stored path comes back as it is.
       }
       return mapped;
     },
@@ -811,6 +851,7 @@ export function createBrandKitService(options: {
         // Storage is the ONLY reason this path creates a user-scoped client, and
         // it is created only when there is at least one asset to look at.
         const client = options.createUserClient(user.accessToken);
+        const store = storeFor(client);
         const copies: BrandKitAssetCopy[] = [];
 
         for (const asset of assets) {
@@ -820,11 +861,14 @@ export function createBrandKitService(options: {
           if (asset.file_url) {
             const ext = asset.file_url.split(".").pop() ?? "bin";
             const newPath = `${user.id}/${newKit.id}/${Date.now()}-copy.${ext}`;
-            const { error: copyError } = await client.storage
-              .from(BRAND_KIT_BUCKET)
-              .copy(asset.file_url, newPath);
-            if (!copyError) {
+            try {
+              await store.copy(
+                { bucket: BRAND_KIT_BUCKET, key: asset.file_url },
+                { bucket: BRAND_KIT_BUCKET, key: newPath },
+              );
               newFileUrl = newPath;
+            } catch {
+              // Unchanged: a failed copy leaves the duplicate without a file.
             }
           }
 
