@@ -201,6 +201,8 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     eta_seconds: null,
     agent_callable: false,
     availability: "enabled",
+    // GN-05 / ED-06: the gateway's internal sunburst model, swappable here alone.
+    execution_model: "kwjm/gpt-image-2.5-sunburst",
   },
   // ED-07 去背景 — direct execution; true transparent PNG at source size,
   // `remove_background_<id>.png` (ED-05 file-name rule). Lovart measured ~12 s.
@@ -223,6 +225,8 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     eta_seconds: 12,
     agent_callable: true,
     availability: "unavailable",
+    // GN-05 / ED-07: Replicate's background remover (U-21 still holds the token).
+    execution_model: "replicate/851-labs/background-remover",
   },
   // ED-08 放大 — the ED-00k example row: dropdown over 2k/4k/8k, output format
   // 同源图, file prefix upscale, event type upscale, eta 30 s.

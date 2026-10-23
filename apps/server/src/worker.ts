@@ -46,6 +46,8 @@ import type { BackgroundJobType } from "@loomic/shared";
 
 // Register all image/video providers via shared helper (keeps parity with app.ts)
 import { registerAllProviders } from "./generation/providers/register-all.js";
+// Register the concrete tool runners the tool_execution executor resolves by id
+import { registerToolRunners } from "./features/tools/register-tool-runners.js";
 
 // 一期关闭 execute（D-24，AG-39），代码执行不走 PGMQ。
 //
@@ -62,6 +64,9 @@ async function main() {
 
   // Register all generation providers (shared with app.ts)
   registerAllProviders(env);
+  // GN-05 / ED-06 / ED-07: the tools this process can execute. After the
+  // providers, because the quick-edit runner calls the gateway provider.
+  registerToolRunners(env);
 
   const pgmq = createPgmqClient(env.supabaseDbUrl);
   const createUserClient = createUserSupabaseClientFactory(env);
