@@ -21,11 +21,12 @@ import { describe, expect, it } from "vitest";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 import { insertVideoElementForJobResult } from "../../agent/runtime.js";
 import { createCanvasService } from "./canvas-service.js";
+import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
 import { insertVideoElement } from "./canvas-element-writer.js";
 
 const USER = { accessToken: "test-token" } as AuthenticatedUser;
 const CANVAS_ID = "canvas-1";
-const MARKER = "oss://project-assets/gen/v1.mp4";
+const MARKER = "oss://project-assets/ws-team/gen/v1.mp4";
 
 type CanvasContentLike = {
   elements: Array<Record<string, any>>;
@@ -176,6 +177,26 @@ function createFakeCanvasClient(initial: CanvasContentLike | null) {
   };
 }
 
+/**
+ * 45D: ownership is checked before anything is signed. This repository says the
+ * canvas lives in workspace `ws-team` and has no asset rows, so a marker is
+ * signable only when its path starts with `ws-team/`.
+ */
+function makeReadRepository(options?: {
+  rows?: Array<{ id: string; bucket: string; object_path: string }>;
+  workspaceError?: Error;
+}): CanvasReadRepository {
+  return {
+    async findReadableCanvasProjectLink() {
+      if (options?.workspaceError) throw options.workspaceError;
+      return { project_id: "project-1", workspace_id: "ws-team", brand_kit_id: null };
+    },
+    async listReadableCanvasAssets() {
+      return options?.rows ?? [];
+    },
+  } as unknown as CanvasReadRepository;
+}
+
 function emptyCanvas(): CanvasContentLike {
   return { elements: [], appState: {}, files: {} };
 }
@@ -221,6 +242,7 @@ describe("CV-01 video object keys", () => {
     const service = createCanvasService({
       createUserClient: () => fake.client,
       canvasContentRepository: fake.contentRepository,
+      canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
     });
 
@@ -232,10 +254,10 @@ describe("CV-01 video object keys", () => {
     expect(element.customData.resolvedVideoUrl).toContain("token=sig");
     expect(element.customData.resolvedVideoUrl).not.toContain("storage.test");
     expect(fake.signedCalls).toEqual([
-      { bucket: "project-assets", objectPath: "gen/v1.mp4", expiresIn: 3600, transform: undefined },
+      { bucket: "project-assets", objectPath: "ws-team/gen/v1.mp4", expiresIn: 3600, transform: undefined },
     ]);
     expect(fake.resolvedUrls).toEqual([
-      { bucket: "project-assets", objectPath: "gen/v1.mp4" },
+      { bucket: "project-assets", objectPath: "ws-team/gen/v1.mp4" },
     ]);
     // The read is a projection: nothing was written back.
     expect(fake.writes).toHaveLength(0);
@@ -256,6 +278,7 @@ describe("CV-01 video object keys", () => {
     const service = createCanvasService({
       createUserClient: () => fake.client,
       canvasContentRepository: fake.contentRepository,
+      canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
     });
 
@@ -337,6 +360,7 @@ describe("CV-01 video object keys", () => {
     const service = createCanvasService({
       createUserClient: () => fake.client,
       canvasContentRepository: fake.contentRepository,
+      canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
     });
 
@@ -352,6 +376,59 @@ describe("CV-01 video object keys", () => {
     expect(elements[5]?.customData.resolvedVideoUrl).toContain("token=sig");
     // Only the well-formed marker was ever handed to the storage API.
     expect(fake.resolvedUrls).toHaveLength(1);
+  });
+
+  it("case 3b: a video marker outside the workspace with no asset row is not signed (45D)", async () => {
+    const foreign = {
+      type: "embeddable",
+      id: "el-foreign",
+      link: "oss://project-assets/ws-other/gen/secret.mp4",
+      customData: { isVideo: true },
+    };
+    const fake = createFakeCanvasClient({
+      ...emptyCanvas(),
+      elements: [foreign],
+    });
+    const service = createCanvasService({
+      createUserClient: () => fake.client,
+      canvasContentRepository: fake.contentRepository,
+      canvasReadRepository: makeReadRepository(),
+      getAdminClient: () => fake.client as unknown as never,
+    });
+
+    const detail = await service.getCanvas(USER, CANVAS_ID);
+    const elements = (detail.content as unknown as CanvasContentLike).elements;
+
+    expect(elements[0]).toEqual(foreign);
+    expect(fake.signedCalls).toHaveLength(0);
+  });
+
+  it("case 3c: a video with an asset row is signed even outside the workspace prefix (45D)", async () => {
+    const fake = createFakeCanvasClient({
+      ...emptyCanvas(),
+      elements: [
+        {
+          type: "embeddable",
+          id: "el-owned",
+          link: "oss://project-assets/legacy-root/v1.mp4",
+          customData: { isVideo: true },
+        },
+      ],
+    });
+    const service = createCanvasService({
+      createUserClient: () => fake.client,
+      canvasContentRepository: fake.contentRepository,
+      canvasReadRepository: makeReadRepository({
+        rows: [{ id: "asset-v1", bucket: "project-assets", object_path: "legacy-root/v1.mp4" }],
+      }),
+      getAdminClient: () => fake.client as unknown as never,
+    });
+
+    const detail = await service.getCanvas(USER, CANVAS_ID);
+    const element = (detail.content as unknown as CanvasContentLike).elements[0] as Record<string, any>;
+
+    expect(element.customData.resolvedVideoUrl).toContain("token=sig");
+    expect(fake.signedCalls.map((call) => call.objectPath)).toEqual(["legacy-root/v1.mp4"]);
   });
 
   it("case 4: a succeeded job keys the canvas element on object_path", async () => {

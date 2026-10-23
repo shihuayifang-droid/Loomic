@@ -353,17 +353,22 @@ type AssetRef = { bucket: string; objectPath: string };
 type ReadStub = {
   service: ReturnType<typeof createCanvasService>;
   calls: Array<{ actorId: string; canvasId: string; refs: AssetRef[] }>;
+  /** Object paths the storage API was asked to sign (45D). */
+  signed: string[];
 };
 
 function makeReadStub(options: {
   /** What the repository answers, or the failure it raises instead. */
   rows?: Array<{ id: string; bucket: string; object_path: string }>;
   repositoryError?: Error | null;
+  /** The workspace lookup (findReadableCanvasProjectLink) fails (45D). */
+  workspaceError?: Error | null;
   /** Omit the repository entirely, to pin the degraded path. */
   withoutRepository?: boolean;
   files: Record<string, unknown>;
 }): ReadStub {
   const calls: Array<{ actorId: string; canvasId: string; refs: AssetRef[] }> = [];
+  const signed: string[] = [];
 
   const userClient = {
     // The read path reaches storage for signatures and nothing else. A
@@ -375,7 +380,7 @@ function makeReadStub(options: {
     storage: {
       from(bucket: string) {
         return {
-          createSignedUrl: async (path: string) => ({
+          createSignedUrl: async (path: string) => (signed.push(path), {
             data: {
               signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
             },
@@ -392,6 +397,12 @@ function makeReadStub(options: {
     },
     async listReadableSucceededImageJobs() {
       return [];
+    },
+    // 45D: the canvas's own workspace is the second admissible source for a
+    // marker's path, next to the asset rows.
+    async findReadableCanvasProjectLink() {
+      if (options.workspaceError) throw options.workspaceError;
+      return { project_id: PROJECT, workspace_id: WORKSPACE, brand_kit_id: null };
     },
     async listReadableCanvasAssets(input: {
       actorId: string;
@@ -431,7 +442,7 @@ function makeReadStub(options: {
       : { canvasReadRepository: repository as unknown as CanvasReadRepository }),
   });
 
-  return { service, calls };
+  return { service, calls, signed };
 }
 
 function readFiles(result: { content: CanvasContent }): Record<string, Record<string, unknown>> {
@@ -617,6 +628,95 @@ describe("canvas read projects the real assetId (X-52 T3)", () => {
     ]);
     expect(files["el-ok"]?.assetId).toBe("asset-ok");
     expect(files["el-empty-bucket"]?.assetId).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 45D: a marker is signed only if the canvas's project owns the object (asset
+// row) or its path sits under the canvas's workspace id. fs storage has no RLS,
+// so this server-side check is the only thing between a hand-written marker and
+// a readable foreign object.
+// ---------------------------------------------------------------------------
+describe("canvas read signs only owned markers (45D)", () => {
+  it("case 1: a foreign-workspace image marker with no asset row is neither signed nor resolved", async () => {
+    const foreign = "ws-other/canvas-1/secret.png";
+    const stub = makeReadStub({
+      files: {
+        "el-foreign": {
+          id: "el-foreign",
+          dataURL: `oss://project-assets/${foreign}`,
+          mimeType: "image/png",
+        },
+      },
+      rows: [],
+    });
+
+    const result = await stub.service.getCanvas(USER, "canvas-1");
+    const file = readFiles(result)["el-foreign"];
+
+    expect(stub.signed).not.toContain(foreign);
+    expect(stub.signed).toHaveLength(0);
+    expect(file?.dataURL).toBe(`oss://project-assets/${foreign}`);
+    expect(file?.storageUrl).toBeUndefined();
+    expect(file?.storageUrlOriginal).toBeUndefined();
+    expect(file?.assetId).toBeUndefined();
+  });
+
+  it("case 3: an asset row makes the marker signable even outside the workspace prefix", async () => {
+    const path = "legacy-root/pic.png";
+    const stub = makeReadStub({
+      files: {
+        "el-1": { id: "el-1", dataURL: `oss://project-assets/${path}`, mimeType: "image/png" },
+      },
+      rows: [{ id: "asset-legacy", bucket: "project-assets", object_path: path }],
+    });
+
+    const result = await stub.service.getCanvas(USER, "canvas-1");
+    const file = readFiles(result)["el-1"];
+
+    expect(stub.signed).toContain(path);
+    expect(String(file?.storageUrl)).toContain("token=sig");
+    expect(file?.assetId).toBe("asset-legacy");
+  });
+
+  it("case 4: a path under the workspace prefix is signed without an asset row", async () => {
+    const path = "ws-team/canvas-files/canvas-1/file-9.png";
+    const stub = makeReadStub({
+      files: {
+        "el-1": { id: "el-1", dataURL: `oss://project-assets/${path}`, mimeType: "image/png" },
+      },
+      rows: [],
+    });
+
+    const result = await stub.service.getCanvas(USER, "canvas-1");
+    const file = readFiles(result)["el-1"];
+
+    expect(stub.signed).toContain(path);
+    expect(String(file?.storageUrl)).toContain("token=sig");
+    expect(file?.assetId).toBeUndefined();
+  });
+
+  it("case 5: when the workspace lookup fails only the asset rows decide", async () => {
+    const owned = "elsewhere/owned.png";
+    const prefixed = "ws-team/canvas-files/canvas-ws-fail/prefixed.png";
+    const stub = makeReadStub({
+      workspaceError: new Error("workspace lookup is down"),
+      files: {
+        "el-owned": { id: "el-owned", dataURL: `oss://project-assets/${owned}`, mimeType: "image/png" },
+        "el-prefixed": { id: "el-prefixed", dataURL: `oss://project-assets/${prefixed}`, mimeType: "image/png" },
+      },
+      rows: [{ id: "asset-owned", bucket: "project-assets", object_path: owned }],
+    });
+
+    // A canvas id no earlier case used: resolveWorkspaceId caches per canvas id.
+    const result = await stub.service.getCanvas(USER, "canvas-ws-fail");
+    const files = readFiles(result);
+
+    expect(stub.signed).toContain(owned);
+    expect(stub.signed).not.toContain(prefixed);
+    expect(String(files["el-owned"]?.storageUrl)).toContain("token=sig");
+    expect(files["el-prefixed"]?.storageUrl).toBeUndefined();
+    expect(files["el-prefixed"]?.dataURL).toBe(`oss://project-assets/${prefixed}`);
   });
 });
 

@@ -186,6 +186,9 @@ export function createCanvasService(options: {
       const projectedContent = await resolveVideoElementsFromStorage(
         client,
         resolvedContent,
+        options.canvasReadRepository,
+        user.id,
+        canvasId,
       );
 
       return {
@@ -706,6 +709,14 @@ async function resolveFilesFromStorage(
     ossEntries,
   );
 
+  // 45D: ownership is decided BEFORE anything is signed. The workspace prefix is
+  // the second admissible source besides the asset rows (see isMarkerOwned).
+  const workspacePrefix = await resolveWorkspacePrefix(
+    repository,
+    actorId,
+    canvasId,
+  );
+
   // Resolve public URLs instead of downloading each file
   // Group by bucket (normally all in one bucket)
   const byBucket = new Map<string, typeof ossEntries>();
@@ -717,6 +728,17 @@ async function resolveFilesFromStorage(
 
   for (const [bucket, entries] of byBucket) {
     for (const entry of entries) {
+      if (!isMarkerOwned(entry, assetIdByPair, workspacePrefix)) {
+        // Same treatment as a failed signature: keep the marker, give no URL.
+        // The log carries a fixed reason and the ids, never the path.
+        console.log(
+          `[canvas-service] file not signed, marker kept fileId=${entry.fileId} ` +
+            `reason=not_owned`,
+        );
+        updatedFiles[entry.fileId] = { ...entry.fileData };
+        continue;
+      }
+
       const mimeType =
         typeof entry.fileData.mimeType === "string"
           ? entry.fileData.mimeType
@@ -865,27 +887,88 @@ function markerPairKey(bucket: string, objectPath: string): string {
   return `${bucket}\u0000${objectPath}`;
 }
 
+/** `<workspaceId>/` for the workspace this canvas lives in, or null when unknown. */
+async function resolveWorkspacePrefix(
+  repository: CanvasReadRepository | undefined,
+  actorId: string,
+  canvasId: string,
+): Promise<string | null> {
+  const workspaceId = await resolveWorkspaceId(repository, actorId, canvasId);
+  return workspaceId ? `${workspaceId}/` : null;
+}
+
+/**
+ * Whether a canvas marker `(bucket, objectPath)` may be signed (45D).
+ *
+ * Why this exists: a canvas is user-saved JSON, so whoever can write it can point
+ * a marker at any bucket / path. With Supabase the signing request carries the
+ * caller's JWT and Storage RLS rejects a foreign path; the fs storage mode (45C)
+ * has no RLS, so the adapter would sign ANY key — an authorization bypass. This
+ * server-side check does not depend on the storage backend.
+ *
+ * A marker is owned when either:
+ *   1. its exact pair is among `ownedPairs` (the rows `listReadableCanvasAssets`
+ *      returned: object belongs to this canvas's project and is readable by the
+ *      caller), or
+ *   2. its path starts with `workspacePrefix` (`<workspaceId>/` of this canvas's
+ *      project), which covers workspace-scoped objects with no asset row yet.
+ *
+ * Rule 2 refuses paths with `.`/`..`/empty segments or backslashes, so a prefix
+ * cannot be used to climb out of the workspace folder.
+ */
+export function isMarkerOwned(
+  marker: { bucket: string; objectPath: string },
+  ownedPairs: { has(key: string): boolean },
+  workspacePrefix: string | null,
+): boolean {
+  if (ownedPairs.has(markerPairKey(marker.bucket, marker.objectPath))) {
+    return true;
+  }
+  if (!workspacePrefix || workspacePrefix === "/") return false;
+  if (!marker.objectPath.startsWith(workspacePrefix)) return false;
+  if (marker.objectPath.includes("\\")) return false;
+  const rest = marker.objectPath.slice(workspacePrefix.length);
+  if (rest.length === 0) return false;
+  return rest
+    .split("/")
+    .every((segment, index, all) =>
+      segment === "" ? index === all.length - 1 : segment !== "." && segment !== "..",
+    );
+}
+
 async function resolveVideoElementsFromStorage(
   client: UserSupabaseClient,
   content: CanvasContent,
+  repository: CanvasReadRepository | undefined,
+  actorId: string,
+  canvasId: string,
 ): Promise<CanvasContent> {
   const elements = (content as { elements?: unknown }).elements;
   if (!Array.isArray(elements) || elements.length === 0) return content;
 
-  let changed = false;
+  // First pass: collect every well-formed video marker so ownership is looked up
+  // ONCE for the whole canvas (45D), not once per element.
+  const markers = new Map<
+    number,
+    {
+      element: Record<string, unknown>;
+      customData: Record<string, unknown>;
+      bucket: string;
+      objectPath: string;
+    }
+  >();
 
-  const updated = await Promise.all(
-    elements.map(async (raw) => {
-    if (!raw || typeof raw !== "object") return raw;
+  elements.forEach((raw, index) => {
+    if (!raw || typeof raw !== "object") return;
     const element = raw as Record<string, unknown>;
-    if (element.type !== "embeddable") return raw;
+    if (element.type !== "embeddable") return;
 
     const customData = element.customData as Record<string, unknown> | undefined;
-    if (customData?.isVideo !== true) return raw;
+    if (customData?.isVideo !== true) return;
 
     const link = element.link;
     if (typeof link !== "string" || !link.startsWith(OSS_MARKER_PREFIX)) {
-      return raw;
+      return;
     }
 
     const ref = link.slice(OSS_MARKER_PREFIX.length);
@@ -897,11 +980,47 @@ async function resolveVideoElementsFromStorage(
         `[canvas-service] malformed video marker left untouched ` +
           `elementId=${String(element.id)}`,
       );
-      return raw;
+      return;
     }
 
-    const bucket = ref.slice(0, slashIdx);
-    const objectPath = ref.slice(slashIdx + 1);
+    markers.set(index, {
+      element,
+      customData,
+      bucket: ref.slice(0, slashIdx),
+      objectPath: ref.slice(slashIdx + 1),
+    });
+  });
+
+  if (markers.size === 0) return content;
+
+  const ownedPairs = await lookupAssetIds(
+    repository,
+    actorId,
+    canvasId,
+    [...markers.values()],
+  );
+  const workspacePrefix = await resolveWorkspacePrefix(
+    repository,
+    actorId,
+    canvasId,
+  );
+
+  let changed = false;
+
+  const updated = await Promise.all(
+    elements.map(async (raw, index) => {
+    const found = markers.get(index);
+    if (!found) return raw;
+    const { element, customData, bucket, objectPath } = found;
+
+    if (!isMarkerOwned({ bucket, objectPath }, ownedPairs, workspacePrefix)) {
+      // Same as a failed signature: the element is returned untouched.
+      console.log(
+        `[canvas-service] video marker not signed, left untouched ` +
+          `elementId=${String(element.id)} reason=not_owned`,
+      );
+      return raw;
+    }
 
     try {
       // Signed, and nothing else: `resolvedVideoUrl` is a read-time projection
