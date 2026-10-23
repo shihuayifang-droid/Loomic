@@ -1,6 +1,10 @@
 "use client";
 
-import type { GenerateVideoRequest, VideoResolution } from "@loomic/shared";
+import type {
+  GenerateVideoRequest,
+  GeneratorParam,
+  VideoResolution,
+} from "@loomic/shared";
 import { Lock, Plus, Zap } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -17,11 +21,13 @@ import { cancelJob, fetchVideoModels, submitVideoJob } from "../../lib/server-ap
 import { visibleOn } from "../../lib/model-visibility";
 import { awaitJobCompletion, type JobProgress } from "../../lib/await-job";
 import { errorCodeOf, lookupError } from "../../lib/error-catalog";
+import { pickFramesFromSelection } from "../../lib/frame-prefill";
 import { fitResultIntoSlot } from "../../lib/fit-result";
 import { formatRetryLabel } from "../../lib/job-status";
 import type { WebSocketHandle } from "../../hooks/use-websocket";
 
 import { PriceTag } from "@/components/ui/price-tag";
+import { GeneratorParamControls } from "./generator-param-controls";
 import {
   useGenerationQuote,
   type GenerationQuoteInput,
@@ -54,6 +60,73 @@ const ASPECT_RATIOS = ["16:9", "9:16"] as const;
 const DURATIONS = [4, 5, 6, 8] as const;
 const VIDEO_RESOLUTIONS = ["720p", "1080p", "4k"] as const;
 
+/**
+ * AG-07 / 41E：生成方式。不是后端参数表里的东西（没有模型会「下发」它），
+ * 而是本面板自己的模式开关 —— 用同一套 `GeneratorParamControls` 渲染，
+ * 所以外观 / testid / 无障碍口径与 schema 来的参数完全一致。
+ */
+const MODE_PARAM: GeneratorParam = {
+  type: "discrete",
+  id: "mode",
+  label: "生成方式",
+  options: [
+    { value: "reference", label: "参考图" },
+    { value: "first_last", label: "首尾帧" },
+  ],
+  default: "reference",
+};
+
+type FrameMode = "reference" | "first_last";
+
+/**
+ * AG-07 / 41E：首尾帧状态要带 `File`（面板一直是这个形状），而从画布带进来
+ * 的只有 data URL，所以这里把它折回一个 `File`。解不出来就返回 `null`，
+ * 由调用方决定不填 —— 不拿空文件凑数。
+ */
+function fileFromDataUrl(dataUrl: string, name: string): File | null {
+  const comma = dataUrl.indexOf(",");
+  if (comma < 0) return null;
+  const meta = dataUrl.slice(0, comma);
+  const payload = dataUrl.slice(comma + 1);
+  if (!meta.startsWith("data:")) return null;
+  const mime = meta.slice(5).split(";")[0] || "image/png";
+  try {
+    const text = meta.includes(";base64")
+      ? atob(payload)
+      : decodeURIComponent(payload);
+    const bytes = new Uint8Array(text.length);
+    for (let index = 0; index < text.length; index += 1) {
+      bytes[index] = text.charCodeAt(index);
+    }
+    return new File([bytes], name, { type: mime });
+  } catch {
+    return null;
+  }
+}
+
+/** 该模型下发的 `duration` 连续参数（没有就是 `null` → 旧时长 tab 原样保留）。 */
+function durationParamOf(model?: VideoModelInfo): Extract<
+  GeneratorParam,
+  { type: "continuous" }
+> | null {
+  const defs = model?.params?.params;
+  if (!defs) return null;
+  const found = defs.find(
+    (param): param is Extract<GeneratorParam, { type: "continuous" }> =>
+      param.type === "continuous" && param.id === "duration",
+  );
+  return found ?? null;
+}
+
+/** 当前时长在这个参数下是否合法：有 `values` 就只认表里的数，否则看区间。 */
+function durationAllowed(
+  param: Extract<GeneratorParam, { type: "continuous" }>,
+  value: number,
+): boolean {
+  if (param.values) return param.values.includes(value);
+  return value >= param.min && value <= param.max;
+}
+
 function supportedResolutions(
   model?: VideoModelInfo,
 ): readonly VideoResolution[] {
@@ -79,6 +152,12 @@ export function VideoGeneratorPanel({
   const [aspectRatio, setAspectRatio] = useState(data.aspectRatio);
   const [duration, setDuration] = useState(data.duration);
   const [resolution, setResolution] = useState(data.resolution);
+  /**
+   * AG-07 / 41E：生成方式。`reference`（参考图）与改动前的行为一字不变；
+   * `first_last` 才要求首尾帧都填。只有 `capabilities.firstLastFrame` 的模型
+   * 才渲染这个开关，切走时回到 `reference`。
+   */
+  const [mode, setMode] = useState<FrameMode>("reference");
   const [loading, setLoading] = useState(data.status === "generating");
   const [error, setError] = useState<string | null>(data.errorMessage ?? null);
   /**
@@ -204,6 +283,18 @@ export function VideoGeneratorPanel({
 
   const currentModel = models.find((m) => m.id === model);
   const durationOptions = currentModel?.limits?.allowedDurations ?? DURATIONS;
+  /**
+   * AG-07 / 41E：`duration` 由 schema 下发（有 `params`）时用共享滑块，否则沿用
+   * 旧的时长 tab。两种模型的 testid 不同（`generator-slider-duration` vs
+   * `canvas-video-generator-params-duration-*`），不会同时出现。
+   */
+  const durationParam = durationParamOf(currentModel);
+  const supportsFirstLast = currentModel?.capabilities?.firstLastFrame === true;
+  /** `first_last` 模式下只填了一张帧（或一张都没填）—— 提交要先补齐两张。 */
+  const framesMissing =
+    supportsFirstLast &&
+    mode === "first_last" &&
+    (firstFrame === null || lastFrame === null);
   const resolutionOptions = supportedResolutions(currentModel);
   const currentPriceRate = currentModel?.pricing?.rates.find(
     (rate) => rate.resolution === resolution,
@@ -282,11 +373,22 @@ export function VideoGeneratorPanel({
   const handleModelChange = useCallback(
     (m: string) => {
       const selected = models.find((candidate) => candidate.id === m);
-      const nextDurations: readonly number[] =
-        selected?.limits?.allowedDurations ?? DURATIONS;
-      const nextDuration = nextDurations.includes(duration)
-        ? duration
-        : (nextDurations[0] ?? duration);
+      // AG-07 / 41E：新模型有 `duration` 参数时，当前时长必须落在它的取值表 /
+      // 区间里，否则回落到该参数下发 `default`；没有参数就沿用旧口径
+      // （`allowedDurations` 的第一个）。
+      const nextParam = durationParamOf(selected);
+      let nextDuration: number;
+      if (nextParam) {
+        nextDuration = durationAllowed(nextParam, duration)
+          ? duration
+          : nextParam.default;
+      } else {
+        const nextDurations: readonly number[] =
+          selected?.limits?.allowedDurations ?? DURATIONS;
+        nextDuration = nextDurations.includes(duration)
+          ? duration
+          : (nextDurations[0] ?? duration);
+      }
       const nextResolutions = supportedResolutions(selected);
       const nextResolution = nextResolutions.includes(
         resolution as VideoResolution,
@@ -296,6 +398,8 @@ export function VideoGeneratorPanel({
       setModel(m);
       setDuration(nextDuration);
       setResolution(nextResolution);
+      // 目标模型不收首尾帧 → 模式回到「参考图」，那一组也不再渲染。
+      if (selected?.capabilities?.firstLastFrame !== true) setMode("reference");
       setShowModelDropdown(false);
       updateVideoGeneratorElement(excalidrawApi, elementId, {
         model: m,
@@ -304,6 +408,26 @@ export function VideoGeneratorPanel({
       });
     },
     [duration, excalidrawApi, elementId, models, resolution],
+  );
+
+  /**
+   * AG-07 / 41E：切生成方式。选「首尾帧」时顺手从画布带入选中的两张图
+   * （选中顺序 = 首、尾）；`pickFramesFromSelection` 返回 `null`（不足两张 /
+   * 有非图片元素）就什么都不填，让人自己上传。
+   */
+  const handleModeChange = useCallback(
+    (next: string) => {
+      const nextMode: FrameMode = next === "first_last" ? "first_last" : "reference";
+      setMode(nextMode);
+      if (nextMode !== "first_last") return;
+      const picked = pickFramesFromSelection(excalidrawApi ?? {});
+      if (!picked) return;
+      const firstFile = fileFromDataUrl(picked.first, "first-frame.png");
+      const lastFile = fileFromDataUrl(picked.last, "last-frame.png");
+      if (firstFile) setFirstFrame({ dataUrl: picked.first, file: firstFile });
+      if (lastFile) setLastFrame({ dataUrl: picked.last, file: lastFile });
+    },
+    [excalidrawApi],
   );
 
   const handleFrameUpload = useCallback(
@@ -329,6 +453,8 @@ export function VideoGeneratorPanel({
 
   const handleGenerate = useCallback(async () => {
     if (!prompt.trim() || loading) return;
+    // AG-07 / 41E：首尾帧模式缺一张就不提交（按钮 disabled 挡不住回车）。
+    if (framesMissing) return;
     // T-109：键盘 Enter 走的也是这条路径，光把按钮 disabled 挡不住回车，
     // 所以预检在这里再拦一次（与按钮的 disabled 同一个口径）。
     if (!precheck.ok) return;
@@ -532,6 +658,7 @@ export function VideoGeneratorPanel({
     begin,
     end,
     precheck,
+    framesMissing,
   ]);
 
   /**
@@ -605,6 +732,18 @@ export function VideoGeneratorPanel({
       onKeyDown={(e) => e.stopPropagation()}
       onWheel={(e) => e.stopPropagation()}
     >
+      {/* AG-07 / 41E: 生成方式。只有 `capabilities.firstLastFrame` 的模型才渲染；
+          切到不收首尾帧的模型时整组消失（`handleModelChange` 把 mode 收回 reference）。 */}
+      {supportsFirstLast && (
+        <div className="px-2 pt-2" data-testid="canvas-video-generator-mode">
+          <GeneratorParamControls
+            params={[MODE_PARAM]}
+            values={{ mode }}
+            onChange={(_id, value) => handleModeChange(String(value))}
+          />
+        </div>
+      )}
+
       {/* Frame upload area */}
       <div className="flex gap-2 p-2 pb-0">
         {/* First frame */}
@@ -661,6 +800,15 @@ export function VideoGeneratorPanel({
           )}
         </button>
       </div>
+
+      {/* AG-07 / 41E: 首尾帧模式下两张都要有 —— 缺一张就把原因逐字写出来 */}
+      {framesMissing && (
+        <div data-testid="canvas-video-generator-frames-missing"
+          className="px-4 pt-2 text-xs text-destructive"
+        >
+          请补齐首帧和尾帧
+        </div>
+      )}
 
       {/* Prompt textarea */}
       <div className="px-4 py-3">
@@ -795,23 +943,33 @@ export function VideoGeneratorPanel({
                 <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                   Duration
                 </div>
-                <div role="tablist" aria-label="Duration" className="flex flex-wrap gap-1">
-                  {durationOptions.map((d) => (
-                    <button data-testid={`canvas-video-generator-params-duration-${d}`}
-                      role="tab" aria-selected={d === duration}
-                      key={d}
-                      type="button"
-                      onClick={() => handleDurationChange(d)}
-                      className={`rounded-lg px-3 py-1 text-xs transition-colors ${
-                        d === duration
-                          ? "bg-muted text-foreground"
-                          : "text-muted-foreground hover:bg-muted/60"
-                      }`}
-                    >
-                      {d}s
-                    </button>
-                  ))}
-                </div>
+                {durationParam ? (
+                  /* AG-07 / 41E: 服务端下发了 `duration` 参数 → 用共享滑块（aria 契约
+                     与 schema 其它参数一致），旧 tab 不再渲染。 */
+                  <GeneratorParamControls
+                    params={[durationParam]}
+                    values={{ duration }}
+                    onChange={(_id, value) => handleDurationChange(Number(value))}
+                  />
+                ) : (
+                  <div role="tablist" aria-label="Duration" className="flex flex-wrap gap-1">
+                    {durationOptions.map((d) => (
+                      <button data-testid={`canvas-video-generator-params-duration-${d}`}
+                        role="tab" aria-selected={d === duration}
+                        key={d}
+                        type="button"
+                        onClick={() => handleDurationChange(d)}
+                        className={`rounded-lg px-3 py-1 text-xs transition-colors ${
+                          d === duration
+                            ? "bg-muted text-foreground"
+                            : "text-muted-foreground hover:bg-muted/60"
+                        }`}
+                      >
+                        {d}s
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
               {/* Resolution row */}
               <div className="mt-3">
@@ -938,7 +1096,7 @@ export function VideoGeneratorPanel({
           <button data-testid="canvas-video-generator-submit"
             type="button"
             onClick={() => void handleGenerate()}
-            disabled={!prompt.trim() || loading || !precheck.ok}
+            disabled={!prompt.trim() || loading || !precheck.ok || framesMissing}
             title={precheckReason ?? undefined}
             aria-label={precheckReason ?? undefined}
             className="flex h-8 items-center justify-center gap-1 rounded-full bg-primary px-3 text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground"

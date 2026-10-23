@@ -758,6 +758,11 @@ export type VideoModelInfo = {
     imageToVideo: boolean;
     videoToVideo: boolean;
     audio: boolean;
+    /**
+     * AG-07 / 41B: this model takes a first frame and a last frame (the
+     * 「首尾帧」 generation mode). Absent = the mode is not offered at all.
+     */
+    firstLastFrame?: boolean;
   };
   limits?: {
     maxDuration: number;
@@ -777,6 +782,13 @@ export type VideoModelInfo = {
       cnyPerSecond: { min: number; max: number };
     }>;
   };
+  /**
+   * AG-07 / 41B: the parameter schema this model accepts (the video side of
+   * `ImageModelInfo.params`). A `duration` continuous parameter means the panel
+   * renders the shared slider instead of the old duration tabs; absent = the old
+   * tabs, unchanged.
+   */
+  params?: GeneratorParams;
 };
 
 export async function fetchVideoModels(): Promise<{
