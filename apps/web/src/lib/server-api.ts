@@ -38,6 +38,7 @@ import { checkUploadConstraint, toolListResponseSchema } from "@loomic/shared";
 import { publishPoolBalance } from "./credit-balance-events";
 import { dedupeRequest } from "./dedupe-request";
 import { getServerBaseUrl } from "./env";
+import * as selfAuth from "./self-auth-client";
 import { getSupabaseBrowserClient } from "./supabase-browser";
 
 // --- Error types ---
@@ -134,6 +135,20 @@ async function withFreshToken<T>(
     return await run(accessToken);
   } catch (err) {
     if (!(err instanceof ApiAuthError)) throw err;
+
+    // 42F: with the self-hosted provider there is no Supabase client to ask —
+    // rotate our own refresh token instead. No new token means the caller's
+    // error is the honest answer, so it is rethrown unchanged.
+    if (selfAuth.authProvider() === "self") {
+      let fresh: string | null = null;
+      try {
+        fresh = (await selfAuth.refresh())?.access_token ?? null;
+      } catch {
+        fresh = null;
+      }
+      if (!fresh || fresh === accessToken) throw err;
+      return await run(fresh);
+    }
 
     const auth = getSupabaseBrowserClient().auth;
     // getSession refreshes an expired token; if it hands back the same one
