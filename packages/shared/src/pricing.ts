@@ -64,7 +64,7 @@ export const priceDetailSchema = z.object({
   base_price: z.number().int().nonnegative(),
   /** 计价单位名（「次」「秒」…），来自规则行，不在这里换算。 */
   unit_name: z.string().nonempty(),
-  /** 本次计价用掉几个单位。一期恒为 1（一张图 / 一次调用）。 */
+  /** 本次计价用掉几个单位：张数等线性乘数；默认 1。 */
   unit_count: z.number().int().positive(),
   /** 单位价，等于规则价格；待定价时为 0。 */
   unit_price: z.number().int().nonnegative(),

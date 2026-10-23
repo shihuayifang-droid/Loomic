@@ -55,6 +55,6 @@ describe("GPT Image 2 size table", () => {
     if (param.type !== "discrete") return;
     expect(param.options.map((o) => o.value)).toEqual(GPT_IMAGE_2_SIZES.map((s) => s.value));
     expect(param.default).toBe("1:1");
-    expect(model.params!.maxCount).toBe(1);
+    expect(model.params!.maxCount).toBe(10);
   });
 });

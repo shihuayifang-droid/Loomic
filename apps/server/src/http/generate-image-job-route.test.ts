@@ -13,6 +13,10 @@ import type {
   AuthenticatedUser,
   RequestAuthenticator,
 } from "../supabase/user.js";
+import type { CreditService } from "../features/credits/credit-service.js";
+import { CreditServiceError } from "../features/credits/credit-service.js";
+import type { TierGuard } from "../features/credits/tier-guard.js";
+import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import { imageJobBillingRequest, registerGenerateRoutes } from "./generate.js";
 
 /**
@@ -36,6 +40,15 @@ import { imageJobBillingRequest, registerGenerateRoutes } from "./generate.js";
  */
 
 vi.mock("../features/jobs/job-watcher.js");
+
+// AG-07: the max image count comes from the model catalogue. Only gpt-image-2
+// publishes one (10); every other model, the default included, counts as 1.
+vi.mock("../generation/providers/registry.js", () => ({
+  getAvailableImageModels: () => [
+    { id: "kwjm/gpt-image-2", params: { maxCount: 10, params: [] } },
+    { id: "black-forest-labs/flux-kontext-pro" },
+  ],
+}));
 
 const TOKEN = "image-job-token";
 const USER: AuthenticatedUser = {
@@ -235,5 +248,227 @@ describe("POST /api/agent/generate-image-job", () => {
     } finally {
       await bare.close();
     }
+  });
+});
+
+describe("POST /api/agent/generate-image-job - AG-07 count", () => {
+  const GPT = "kwjm/gpt-image-2";
+
+  function jobN(n: number): BackgroundJob {
+    return { ...IMAGE_JOB, id: `job-${n}` };
+  }
+
+  it("count 3 creates 3 jobs, watches each, jobId is the first", async () => {
+    createJob
+      .mockResolvedValueOnce(jobN(1))
+      .mockResolvedValueOnce(jobN(2))
+      .mockResolvedValueOnce(jobN(3));
+
+    const response = await submitImageJob({ prompt: "cat", model: GPT, count: 3 });
+
+    expect(response.statusCode).toBe(202);
+    const body = response.json();
+    expect(body.jobIds).toEqual(["job-1", "job-2", "job-3"]);
+    expect(body.jobIds).toHaveLength(3);
+    expect(body.jobId).toBe(body.jobIds[0]);
+    expect(body.partial).toBeUndefined();
+    expect(createJob).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(watchJob)).toHaveBeenCalledTimes(3);
+  });
+
+  it("count 11 is rejected by the schema with 400", async () => {
+    const response = await submitImageJob({ prompt: "cat", model: GPT, count: 11 });
+    expect(response.statusCode).toBe(400);
+    expect(createJob).toHaveBeenCalledTimes(0);
+  });
+
+  it("count 2 on a model without params.maxCount is 400", async () => {
+    const response = await submitImageJob({ prompt: "cat", count: 2 });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("invalid_request");
+    expect(createJob).toHaveBeenCalledTimes(0);
+  });
+
+  it("no count: one job, jobIds has length 1, other fields unchanged", async () => {
+    const response = await submitImageJob({ prompt: "cat" });
+
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual({
+      jobId: "job-1",
+      status: "queued",
+      prompt: "cat",
+      jobIds: ["job-1"],
+    });
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failure on the 2nd job keeps the 1st and reports partial", async () => {
+    createJob
+      .mockResolvedValueOnce(jobN(1))
+      .mockRejectedValueOnce(
+        new CreditServiceError("insufficient_credits", "not enough credits", 402),
+      );
+
+    const response = await submitImageJob({ prompt: "cat", model: GPT, count: 3 });
+
+    expect(response.statusCode).toBe(202);
+    const body = response.json();
+    expect(body.jobIds).toEqual(["job-1"]);
+    expect(body.partial).toEqual({
+      requested: 3,
+      created: 1,
+      error: "insufficient_credits",
+    });
+    expect(createJob).toHaveBeenCalledTimes(2);
+  });
+
+  it("a failure on the 1st job keeps the old error response", async () => {
+    createJob.mockRejectedValueOnce(
+      new CreditServiceError("insufficient_credits", "not enough credits", 402),
+    );
+
+    const response = await submitImageJob({ prompt: "cat", model: GPT, count: 3 });
+
+    expect(response.statusCode).toBe(402);
+    expect(response.json().error.code).toBe("insufficient_credits");
+    expect(createJob).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("POST /api/agent/generate-image-job - AG-10 batch confirmation", () => {
+  const GPT = "kwjm/gpt-image-2";
+  // One image costs 8 (under the default threshold of 50); ten cost 80 (over it).
+  const UNIT_PRICE = 8;
+
+  const quote = vi.fn(async () => ({
+    ok: true as const,
+    ruleId: "rule-1",
+    detail: {
+      base_price: UNIT_PRICE,
+      unit_name: "x",
+      unit_count: 1,
+      unit_price: UNIT_PRICE,
+      total_price: UNIT_PRICE,
+      search_key: "hd",
+      search_key_matched: "hd",
+      time_variant_period: "normal" as const,
+      disable_unlimited: false,
+      entry_point: "canvas_generator" as const,
+      extras: [],
+      price_status: "active" as const,
+    },
+  }));
+  const creditService = {
+    getSubscription: vi.fn(async () => ({ plan: "pro" })),
+    getBalance: vi.fn(async () => ({ balance: 10000, plan: "pro", dailyClaimed: false })),
+    deductCredits: vi.fn(async () => "tx-1"),
+    refundCredits: vi.fn(async () => "tx-2"),
+  } as unknown as CreditService;
+  const tierGuard = {
+    checkModelAccess: vi.fn(),
+    checkResolution: vi.fn(),
+    checkVideoResolution: vi.fn(),
+    checkConcurrency: vi.fn(async () => {}),
+  } as unknown as TierGuard;
+  const priceQuoter = { quote } as unknown as PriceQuoter;
+
+  it("count 10 whose total is over the threshold asks for confirmation and creates nothing", async () => {
+    const billed = Fastify();
+    await registerGenerateRoutes(billed, {
+      auth,
+      jobService,
+      viewerService,
+      uploadService,
+      creditService,
+      tierGuard,
+      priceQuoter,
+    });
+    await billed.ready();
+
+    try {
+      const response = await billed.inject({
+        method: "POST",
+        url: "/api/agent/generate-image-job",
+        headers: { authorization: `Bearer ${TOKEN}` },
+        payload: { prompt: "cat", model: GPT, count: 10 },
+      });
+
+      expect(response.statusCode).toBe(409);
+      const body = response.json();
+      expect(body.error.code).toBe("confirmation_required");
+      expect(body.confirmation.count).toBe(10);
+      expect(body.confirmation.creditsCost).toBe(UNIT_PRICE * 10);
+      expect(createJob).toHaveBeenCalledTimes(0);
+      expect(vi.mocked(watchJob)).toHaveBeenCalledTimes(0);
+      expect(vi.mocked(creditService.deductCredits)).toHaveBeenCalledTimes(0);
+    } finally {
+      await billed.close();
+    }
+  });
+
+  async function withBilledApp(
+    run: (
+      post: (
+        body: Record<string, unknown>,
+      ) => Promise<{ statusCode: number; json: () => any }>,
+    ) => Promise<void>,
+  ) {
+    const billed = Fastify();
+    await registerGenerateRoutes(billed, {
+      auth,
+      jobService,
+      viewerService,
+      uploadService,
+      creditService,
+      tierGuard,
+      priceQuoter,
+    });
+    await billed.ready();
+    try {
+      await run((body) =>
+        billed.inject({
+          method: "POST",
+          url: "/api/agent/generate-image-job",
+          headers: { authorization: `Bearer ${TOKEN}` },
+          payload: body,
+        }),
+      );
+    } finally {
+      await billed.close();
+    }
+  }
+
+  it("AG-10: a confirmed batch is submitted, not asked again", async () => {
+    let n = 0;
+    createJob.mockImplementation(async () => ({ ...IMAGE_JOB, id: `job-${++n}` }));
+
+    await withBilledApp(async (post) => {
+      const asked = await post({ prompt: "cat", model: GPT, count: 10 });
+      expect(asked.statusCode).toBe(409);
+      expect(createJob).toHaveBeenCalledTimes(0);
+
+      const confirmed = await post({
+        prompt: "cat",
+        model: GPT,
+        count: 10,
+        confirmed: true,
+      });
+      expect(confirmed.statusCode).toBe(202);
+      expect(confirmed.json().jobIds).toHaveLength(10);
+      expect(createJob).toHaveBeenCalledTimes(10);
+    });
+  });
+
+  it("AG-10: the confirmation carries the chosen size", async () => {
+    await withBilledApp(async (post) => {
+      const response = await post({
+        prompt: "cat",
+        model: GPT,
+        size: "16:9-4k",
+        count: 10,
+      });
+      expect(response.statusCode).toBe(409);
+      expect(response.json().confirmation.size).toBe("16:9-4k");
+    });
   });
 });

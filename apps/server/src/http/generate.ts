@@ -8,6 +8,7 @@ import {
   generateImageRequestSchema,
   generateVideoRequestSchema,
   unauthenticatedErrorResponseSchema,
+  type BackgroundJob,
   type GenerateImageRequest,
   type GenerateVideoRequest,
   type VideoResolution,
@@ -17,7 +18,13 @@ import type { CreditService } from "../features/credits/credit-service.js";
 import { CreditServiceError } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
 import { TierGuardError } from "../features/credits/tier-guard.js";
-import { withBilling, type BillingRequest } from "../features/credits/with-billing.js";
+import {
+  ConfirmationRequiredError,
+  withBilling,
+  type BillingRequest,
+} from "../features/credits/with-billing.js";
+import { DEFAULT_AGENT_CONFIRM_THRESHOLD } from "../config/env.js";
+import { getAvailableImageModels } from "../generation/providers/registry.js";
 import { generationLedgerDescription } from "../features/credits/ledger-description.js";
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
@@ -85,6 +92,15 @@ export function isImageSizeAllowed(payload: GenerateImageRequest): boolean {
   return model === "kwjm/gpt-image-2" && gptImage2SizeOption(payload.size) !== undefined;
 }
 
+/**
+ * AG-07: how many images one submit may ask for on this model. A model that
+ * publishes no `params.maxCount` (or is not in the catalogue) counts as 1.
+ */
+export function imageModelMaxCount(modelId: string): number {
+  const model = getAvailableImageModels().find((m) => m.id === modelId);
+  return model?.params?.maxCount ?? 1;
+}
+
 export function imageJobBillingRequest(
   user: AuthenticatedUser,
   workspaceId: string,
@@ -142,6 +158,8 @@ export async function registerGenerateRoutes(
     viewerService: ViewerService;
     /** Needed to push job.progress. Absent = no progress events, jobs still run. */
     connectionManager?: ConnectionManager;
+    /** AG-10: a multi-image submit whose batch total is above this asks for confirmation. */
+    confirmThreshold?: number;
   },
 ) {
   // ── POST /api/agent/generate-image (RETIRED, GN-37) ─────────
@@ -363,6 +381,18 @@ export async function registerGenerateRoutes(
       );
     }
 
+    const count = payload.count ?? 1;
+    if (count > imageModelMaxCount(payload.model ?? DEFAULT_IMAGE_MODEL_ID)) {
+      return reply.code(400).send(
+        applicationErrorResponseSchema.parse({
+          error: {
+            code: "invalid_request",
+            message: "张数超过该模型上限",
+          },
+        }),
+      );
+    }
+
     if (!options.jobService) {
       return reply.code(503).send(
         applicationErrorResponseSchema.parse({
@@ -378,39 +408,91 @@ export async function registerGenerateRoutes(
     try {
       const viewer = await options.viewerService.ensureViewer(user);
 
-      const result = await withBilling(
-        options,
-        imageJobBillingRequest(user, viewer.workspace.id, payload),
-        // The worker owns the outcome from here on, including the dead-letter
-        // refund. Nothing below this line may hold the request open: the whole
-        // point of GN-37 is that the submit answers in about a second.
-        async ({ job }) => job!,
-      );
+      // AG-07: N images = N independent jobs, each billed once. Only the FIRST
+      // call carries the confirmation gate, judged on the batch total.
+      const baseRequest = imageJobBillingRequest(user, viewer.workspace.id, payload);
+      const jobs: BackgroundJob[] = [];
+      let partial:
+        | { requested: number; created: number; error: string }
+        | undefined;
 
-      // Detached watcher: polls the job and pushes `job.progress` over the WS.
-      // Fire-and-forget on purpose — a failed push must not fail the submit.
-      watchJob(
-        {
-          jobService: options.jobService,
-          ...(options.connectionManager
-            ? { connectionManager: options.connectionManager }
-            : {}),
-        },
-        {
-          jobId: result.id,
-          userId: user.id,
-          jobType: "image_generation",
-        },
-      );
+      for (let index = 0; index < count; index += 1) {
+        try {
+          const billingRequest: BillingRequest =
+            index === 0 && count > 1 && payload.confirmed !== true
+              ? {
+                  ...baseRequest,
+                  confirmAbove:
+                    options.confirmThreshold ?? DEFAULT_AGENT_CONFIRM_THRESHOLD,
+                  confirmCount: count,
+                  confirmation: {
+                    jobType: "image_generation",
+                    model: payload.model ?? DEFAULT_IMAGE_MODEL_ID,
+                    count,
+                    ...(payload.aspectRatio ? { aspectRatio: payload.aspectRatio } : {}),
+                    ...(payload.quality ? { quality: payload.quality } : {}),
+                    ...(payload.size ? { size: payload.size } : {}),
+                    prompt: payload.prompt,
+                  },
+                }
+              : baseRequest;
 
+          const created = await withBilling(
+            options,
+            billingRequest,
+            // The worker owns the outcome from here on, including the dead-letter
+            // refund. Nothing below this line may hold the request open: the whole
+            // point of GN-37 is that the submit answers in about a second.
+            async ({ job }) => job!,
+          );
+          jobs.push(created);
+
+          // Detached watcher: polls the job and pushes `job.progress` over the WS.
+          // Fire-and-forget on purpose — a failed push must not fail the submit.
+          watchJob(
+            {
+              jobService: options.jobService,
+              ...(options.connectionManager
+                ? { connectionManager: options.connectionManager }
+                : {}),
+            },
+            {
+              jobId: created.id,
+              userId: user.id,
+              jobType: "image_generation",
+            },
+          );
+        } catch (error) {
+          // The first call failing is the old behaviour. A later failure keeps
+          // the jobs already created (they are charged and will render).
+          if (index === 0) throw error;
+          const code = (error as { code?: unknown }).code;
+          partial = {
+            requested: count,
+            created: jobs.length,
+            error: typeof code === "string" ? code : "generation_failed",
+          };
+          break;
+        }
+      }
+
+      const first = jobs[0]!;
       // 202, not 200: accepted and still running. The client follows
       // job.progress (or GET /api/jobs/:id) instead of waiting here.
       return reply.code(202).send({
-        jobId: result.id,
-        status: result.status,
+        jobId: first.id,
+        status: first.status,
         prompt: payload.prompt,
+        jobIds: jobs.map((job) => job.id),
+        ...(partial ? { partial } : {}),
       });
     } catch (error) {
+      if (error instanceof ConfirmationRequiredError) {
+        return reply.code(409).send({
+          error: { code: error.code, message: error.message },
+          confirmation: error.confirmation,
+        });
+      }
       if (error instanceof TierGuardError) {
         return reply.code(error.statusCode).send(
           applicationErrorResponseSchema.parse({

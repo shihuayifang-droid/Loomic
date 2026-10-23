@@ -12,7 +12,7 @@ const REPLICATE_API_BASE = "https://api.replicate.com/v1";
 
 /** Flux Kontext publishes one parameter group: the aspect ratio (user ruling 2026-10-23). */
 const FLUX_KONTEXT_PARAMS: GeneratorParams = {
-  maxCount: 1,
+  maxCount: 10,
   params: [
     {
       type: "discrete",

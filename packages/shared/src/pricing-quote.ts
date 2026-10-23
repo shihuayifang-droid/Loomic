@@ -37,6 +37,10 @@ export const generateImageRequestSchema = z.object({
   quality: z.enum(["standard", "hd", "ultra"]).optional(),
   /** Catalogue size option value (e.g. "16:9-4k"); only honoured by models that publish size options. */
   size: z.string().min(1).max(32).optional(),
+  /** AG-07: number of images (default 1). The quote multiplies by it; a submit creates this many jobs. */
+  count: z.number().int().min(1).max(10).optional(),
+  /** AG-10: the user already confirmed this batch; the gate is not asked again. */
+  confirmed: z.literal(true).optional(),
 });
 export type GenerateImageRequest = z.infer<typeof generateImageRequestSchema>;
 

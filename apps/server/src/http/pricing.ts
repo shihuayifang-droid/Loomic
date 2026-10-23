@@ -27,6 +27,7 @@ import {
 } from "../features/credits/credit-service.js";
 import type { BillingGuardSpec } from "../features/credits/with-billing.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
+import { withUnitCount } from "../features/pricing/resolve-price.js";
 import { billingSearchKey } from "../features/pricing/search-key.js";
 import { TOOL_DEFINITIONS } from "../features/tools/tool-definitions.js";
 import type { RequestAuthenticator } from "../supabase/user.js";
@@ -247,6 +248,8 @@ async function quoteItem(args: {
         searchKey: billingSearchKey(guard, plan).searchKey,
       },
       at,
+      // AG-07: the image count multiplies the quote; every other branch keeps 1.
+      item.request.count ?? 1,
     );
   }
 
@@ -273,6 +276,7 @@ async function askPriceTable(
   priceQuoter: PriceQuoter,
   target: QuoteTarget,
   at: Date,
+  unitCount?: number,
 ): Promise<PricingQuoteItemResponse> {
   const outcome = await priceQuoter.quote({
     modelId: target.modelId,
@@ -288,7 +292,7 @@ async function askPriceTable(
     );
   }
 
-  return { status: "ok", price_detail: outcome.detail };
+  return { status: "ok", price_detail: withUnitCount(outcome.detail, unitCount) };
 }
 
 function errorItem(

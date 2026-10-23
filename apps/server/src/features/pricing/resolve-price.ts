@@ -1,3 +1,4 @@
+import { generateImageRequestSchema } from "@loomic/shared";
 import type {
   EntryPoint,
   PriceDetail,
@@ -85,6 +86,8 @@ export type ResolvePriceInput = {
   searchKey: string;
   /** GN-09b：一期只有 `normal`。见 `buildMatchOrder`。 */
   timePeriod?: "normal";
+  /** AG-07: image count multiplier. Absent or not an integer in 1..10 = 1. */
+  unitCount?: number;
 };
 
 /**
@@ -135,8 +138,32 @@ function buildMatchOrder(requestedPeriod: TimePeriod): readonly MatchRung[] {
   ];
 }
 
-/** 一期一次询价只有一个计价单位（一张图 / 一次调用）。GN-08 再谈多单位。 */
+/** 默认计价单位数（一张图 / 一次调用）；AG-07 张数乘数可覆盖，见 `normalizeUnitCount`。 */
 const UNIT_COUNT = 1;
+
+/**
+ * AG-07: absent or not an integer in the request schema range means 1. The range
+ * is read from the shared request schema, so it has one source and this file
+ * holds no count constant of its own.
+ */
+export function normalizeUnitCount(unitCount: number | undefined): number {
+  const parsed = generateImageRequestSchema.shape.count.safeParse(unitCount);
+  return parsed.success && parsed.data !== undefined ? parsed.data : UNIT_COUNT;
+}
+
+/**
+ * AG-07: re-state a quoted detail for `unitCount` units. `unit_price` and every
+ * other field stay as quoted; only `unit_count` and `total_price` move.
+ */
+export function withUnitCount(detail: PriceDetail, unitCount: number | undefined): PriceDetail {
+  const count = normalizeUnitCount(unitCount);
+  if (count === 1) return detail;
+  return {
+    ...detail,
+    unit_count: count,
+    total_price: detail.unit_price * count,
+  };
+}
 
 /** 待定价时对外报的金额：`pending` 不是错误，按 0 计价（BL-14 第 3 条）。 */
 const ZERO_PRICE = 0;
@@ -174,7 +201,11 @@ export function resolvePriceFromCandidates(
     );
 
     if (rule !== undefined) {
-      return { ok: true, detail: buildPriceDetail(rule, input.entryPoint), ruleId: rule.id };
+      return {
+        ok: true,
+        detail: withUnitCount(buildPriceDetail(rule, input.entryPoint), input.unitCount),
+        ruleId: rule.id,
+      };
     }
   }
 

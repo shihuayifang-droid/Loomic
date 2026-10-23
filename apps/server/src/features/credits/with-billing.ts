@@ -159,6 +159,7 @@ export interface BillingConfirmationInput {
   count: number;
   aspectRatio?: string;
   quality?: string;
+  size?: string;
   prompt: string;
   title?: string;
 }
@@ -277,6 +278,11 @@ export interface BillingRequest {
    */
   confirmAbove?: number;
   confirmation?: BillingConfirmationInput;
+  /**
+   * AG-07: the confirmation gate judges `quote x confirmCount` (the whole batch)
+   * while this call still charges ONE quote. Absent = 1, the gate is unchanged.
+   */
+  confirmCount?: number;
 }
 
 export interface BillingOutcome {
@@ -492,9 +498,10 @@ export async function withBilling<T>(
 
     // AG-10: above the caller's threshold, stop BEFORE the balance read, the job
     // and the charge. Nothing is created, deducted or written to the ledger.
+    const gateCost = creditsCost * (request.confirmCount ?? 1);
     if (
       request.confirmAbove !== undefined &&
-      creditsCost > request.confirmAbove
+      gateCost > request.confirmAbove
     ) {
       const confirmation: BillingConfirmation = {
         ...(request.confirmation ?? {
@@ -505,17 +512,17 @@ export async function withBilling<T>(
               ? "video_generation"
               : "image_generation",
           model: modelId,
-          count: 1,
+          count: request.confirmCount ?? 1,
           prompt: "",
         }),
-        creditsCost,
+        creditsCost: gateCost,
       };
       request.onRejected?.({
         kind: "confirmation_required",
-        creditsCost,
+        creditsCost: gateCost,
         confirmation,
       });
-      throw new ConfirmationRequiredError(creditsCost, confirmation);
+      throw new ConfirmationRequiredError(gateCost, confirmation);
     }
   }
 

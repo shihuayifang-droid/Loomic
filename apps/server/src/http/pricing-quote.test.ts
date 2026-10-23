@@ -694,3 +694,24 @@ describe("POST /api/pricing/quote — BL-45：开关打开时余额带三池", (
     expect("pools" in balance).toBe(false);
   });
 });
+
+describe("POST /api/pricing/quote - AG-07 acceptance 2: image count multiplies the quote", () => {
+  it("count 10 quotes 10 x the single-image total", async () => {
+    const single = await postQuote({
+      items: [{ kind: "image_generation", request: { prompt: "a red panda" } }],
+    });
+    const ten = await postQuote({
+      items: [{ kind: "image_generation", request: { prompt: "a red panda", count: 10 } }],
+    });
+
+    expect(single.statusCode).toBe(200);
+    expect(ten.statusCode).toBe(200);
+
+    const one = onlyOk(pricingQuoteResponseSchema.parse(single.json()).items)[0]!;
+    const many = onlyOk(pricingQuoteResponseSchema.parse(ten.json()).items)[0]!;
+    expect(one.price_detail.unit_count).toBe(1);
+    expect(many.price_detail.unit_count).toBe(10);
+    expect(many.price_detail.unit_price).toBe(one.price_detail.unit_price);
+    expect(many.price_detail.total_price).toBe(one.price_detail.total_price * 10);
+  });
+});

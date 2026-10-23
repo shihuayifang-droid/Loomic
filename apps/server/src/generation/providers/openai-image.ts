@@ -187,7 +187,7 @@ const OPENAI_IMAGE_MODELS: readonly ImageModelInfo[] = [
     ...KWJM_IMAGE_DEFAULTS,
     ...kwjmQualityTiers(),
     params: {
-      maxCount: 1,
+      maxCount: 10,
       params: [
         {
           type: "discrete",
