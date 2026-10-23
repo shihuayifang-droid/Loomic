@@ -138,8 +138,37 @@ function createFakeCanvasClient(initial: CanvasContentLike | null) {
     },
   };
 
+  // Same state as the table branches above, exposed through the repository
+  // surface the canvas service now reads and saves through.
+  const contentRepository = {
+    async readCanvasRow() {
+      if (state.content === null) return null;
+      return {
+        id: CANVAS_ID,
+        name: "Board",
+        project_id: "project-1",
+        content: state.content,
+        version: state.version,
+      };
+    },
+    async writeIfUnchanged(input: {
+      actorId: string;
+      canvasId: string;
+      content: unknown;
+      expectedVersion: number;
+    }) {
+      if (state.content === null) return null;
+      if (input.expectedVersion !== state.version) return null;
+      state.content = input.content as CanvasContentLike;
+      state.version = input.expectedVersion + 1;
+      writes.push({ content: state.content, version: state.version });
+      return { version: state.version };
+    },
+  };
+
   return {
     client: client as unknown as UserSupabaseClient,
+    contentRepository,
     writes,
     resolvedUrls,
     signedCalls,
@@ -191,6 +220,7 @@ describe("CV-01 video object keys", () => {
     // the SAVE path; these cases read canvases, so it is never called.
     const service = createCanvasService({
       createUserClient: () => fake.client,
+      canvasContentRepository: fake.contentRepository,
       getAdminClient: () => fake.client as unknown as never,
     });
 
@@ -225,6 +255,7 @@ describe("CV-01 video object keys", () => {
     });
     const service = createCanvasService({
       createUserClient: () => fake.client,
+      canvasContentRepository: fake.contentRepository,
       getAdminClient: () => fake.client as unknown as never,
     });
 
@@ -305,6 +336,7 @@ describe("CV-01 video object keys", () => {
     // the SAVE path; these cases read canvases, so it is never called.
     const service = createCanvasService({
       createUserClient: () => fake.client,
+      canvasContentRepository: fake.contentRepository,
       getAdminClient: () => fake.client as unknown as never,
     });
 

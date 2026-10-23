@@ -71,6 +71,7 @@ import {
   createCanvasReadRepository,
   type CanvasReadRepository,
 } from "./db/canvas-read-repository.js";
+import { createCanvasContentRepository } from "./db/canvas-content-repository.js";
 import {
   createChatReadRepository,
   type ChatReadRepository,
@@ -668,6 +669,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       createUserClient,
       assetRecordRepository,
       canvasReadRepository,
+      canvasContentRepository: createCanvasContentRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
     });
   const threadService =
     options.threadService ?? createThreadService({ chatReadRepository });

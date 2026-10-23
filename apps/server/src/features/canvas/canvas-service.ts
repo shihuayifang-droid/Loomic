@@ -29,10 +29,12 @@ import {
   OSS_MARKER_PREFIX,
 } from "./canvas-element-writer.js";
 import { isTransportFailure } from "../../supabase/transport-retry.js";
+import type { CanvasContentRepository } from "../../db/canvas-content-repository.js";
 import {
   CanvasNotFoundError,
   CanvasUnavailableError,
   CanvasVersionConflictError,
+  createRepositoryCanvasStore,
   readCanvasRow,
   replaceCanvasContent,
 } from "./canvas-version.js";
@@ -124,10 +126,29 @@ export function createCanvasService(options: {
    * object with no metadata row) while "no recoverable images" is not.
    */
   canvasReadRepository?: CanvasReadRepository;
+  /**
+   * Canvas content repository (ticket 44V). The canvas row read and the whole
+   * content save go through it. When absent both fail with the same 503 as an
+   * unreachable database; there is no fallback to the user client. The client
+   * stays only for Storage signing and uploads.
+   */
+  canvasContentRepository?: Pick<
+    CanvasContentRepository,
+    "readCanvasRow" | "writeIfUnchanged"
+  >;
 }): CanvasService {
   return {
     async getCanvas(user, canvasId) {
       const client = options.createUserClient(user.accessToken);
+      const contentRepository = options.canvasContentRepository;
+      if (!contentRepository) {
+        throw asCanvasServiceError(
+          new CanvasUnavailableError(
+            canvasId,
+            new Error("canvas content repository is not configured"),
+          ),
+        );
+      }
       // Reads go through readCanvasRow so a dead connection cannot arrive as
       // "canvas not found" — see canvas-version.ts. It also retries the transport
       // failures the local proxy produces, which is why loading a canvas no longer
@@ -141,7 +162,7 @@ export function createCanvasService(options: {
       };
       try {
         data = await readCanvasRow(
-          client,
+          createRepositoryCanvasStore(contentRepository, user.id),
           canvasId,
           "id, name, project_id, content, version",
         );
@@ -180,6 +201,16 @@ export function createCanvasService(options: {
 
     async saveCanvasContent(user, canvasId, content, baseVersion) {
       const client = options.createUserClient(user.accessToken);
+      const contentRepository = options.canvasContentRepository;
+      if (!contentRepository) {
+        throw asCanvasServiceError(
+          new CanvasUnavailableError(
+            canvasId,
+            new Error("canvas content repository is not configured"),
+          ),
+        );
+      }
+      const contentStore = createRepositoryCanvasStore(contentRepository, user.id);
 
       // Extract base64 files to Storage, replacing dataURLs with oss:// markers
       const leanContent = await extractFilesToStorage(
@@ -226,7 +257,12 @@ export function createCanvasService(options: {
       for (let attempt = 1; ; attempt++) {
         error = null;
         try {
-          saved = await replaceCanvasContent(client, canvasId, leanContent, baseVersion);
+          saved = await replaceCanvasContent(
+            contentStore,
+            canvasId,
+            leanContent,
+            baseVersion,
+          );
           break;
         } catch (e) {
           if (e instanceof CanvasVersionConflictError) throw e;

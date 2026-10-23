@@ -14,6 +14,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("./canvas-version.js", () => ({
   replaceCanvasContent: vi.fn(async () => ({ version: 2 })),
   readCanvasRow: vi.fn(async () => null),
+  createRepositoryCanvasStore: vi.fn(() => ({})),
   CanvasVersionConflictError: class CanvasVersionConflictError extends Error {},
   CanvasNotFoundError: class CanvasNotFoundError extends Error {},
   CanvasUnavailableError: class CanvasUnavailableError extends Error {},
@@ -36,6 +37,17 @@ const USER = {
   email: "a@t",
   userMetadata: {},
 } as AuthenticatedUser;
+
+// canvas-version is mocked in this file, so the content does not matter; the
+// service only needs a repository to be present.
+const fakeContentRepository = {
+  async readCanvasRow() {
+    return null;
+  },
+  async writeIfUnchanged() {
+    return null;
+  },
+};
 
 const WORKSPACE = "ws-team";
 const PROJECT = "project-1";
@@ -117,6 +129,7 @@ function makeStubs(options: {
 
   const service = createCanvasService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
+    canvasContentRepository: fakeContentRepository,
     ...(options.withoutRepository ? {} : { assetRecordRepository }),
     ...(options.withoutCanvasReadRepository
       ? {}
@@ -410,6 +423,7 @@ function makeReadStub(options: {
 
   const service = createCanvasService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
+    canvasContentRepository: fakeContentRepository,
     getAdminClient: () =>
       ({ rpc: async () => ({ data: null, error: null }) }) as unknown as AdminSupabaseClient,
     ...(options.withoutRepository
@@ -603,5 +617,28 @@ describe("canvas read projects the real assetId (X-52 T3)", () => {
     ]);
     expect(files["el-ok"]?.assetId).toBe("asset-ok");
     expect(files["el-empty-bucket"]?.assetId).toBeUndefined();
+  });
+});
+
+describe("canvas content repository is required (44V)", () => {
+  it("case 1: without the content repository getCanvas answers 503 service_unavailable", async () => {
+    const service = createCanvasService({
+      createUserClient: () => ({}) as unknown as UserSupabaseClient,
+    });
+
+    await expect(service.getCanvas(USER, "canvas-1")).rejects.toMatchObject({
+      statusCode: 503,
+      code: "service_unavailable",
+    });
+  });
+
+  it("case 2: without the content repository saveCanvasContent answers 503 service_unavailable", async () => {
+    const service = createCanvasService({
+      createUserClient: () => ({}) as unknown as UserSupabaseClient,
+    });
+
+    await expect(
+      service.saveCanvasContent(USER, "canvas-1", contentWithFiles({}), 1),
+    ).rejects.toMatchObject({ statusCode: 503, code: "service_unavailable" });
   });
 });
