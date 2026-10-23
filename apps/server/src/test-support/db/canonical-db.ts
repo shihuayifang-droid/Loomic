@@ -50,4 +50,5 @@ export async function createCanonicalUser(
     "insert into hahart_auth.users (id, email, status) values ($1, $2, 'active')",
     [id, email],
   );
+  await db.query("select public.bootstrap_viewer($1, $2, '{}'::jsonb)", [id, email]);
 }
