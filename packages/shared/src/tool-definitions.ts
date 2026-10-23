@@ -204,3 +204,29 @@ export const toolListResponseSchema = z
     }
   });
 export type ToolListResponse = z.infer<typeof toolListResponseSchema>;
+
+/**
+ * ED-00m / GN-05 - `POST /api/tools/:toolId/run` body.
+ *
+ * `client_request_id` is REQUIRED (unlike the generators, where it is optional):
+ * a direct-execution tool is one click, and "three clicks make one task" only
+ * holds when the browser names the submission. `search_key` is the same tier the
+ * quote was asked for (`DEFAULT_TOOL_SEARCH_KEY` when omitted).
+ */
+export const runToolRequestSchema = z.object({
+  artifact_id: z.string().min(1),
+  client_request_id: z.string().min(8).max(128),
+  project_id: z.string().optional(),
+  canvas_id: z.string().optional(),
+  search_key: z.string().optional(),
+  params: z.record(z.unknown()).optional(),
+});
+export type RunToolRequest = z.infer<typeof runToolRequestSchema>;
+
+/** 202 answer: the task id, its status and the execution model it carries. */
+export const runToolResponseSchema = z.object({
+  jobId: z.string(),
+  status: z.string(),
+  model: z.string().nullable(),
+});
+export type RunToolResponse = z.infer<typeof runToolResponseSchema>;

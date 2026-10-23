@@ -57,6 +57,10 @@ export function billingSearchKey(
     return { effectiveQuality, searchKey: effectiveQuality };
   }
 
+  if (guard.jobType === "tool_execution") {
+    return { effectiveQuality: null, searchKey: guard.searchKey };
+  }
+
   return {
     effectiveQuality: null,
     searchKey: guard.resolution ?? UNSPECIFIED_RESOLUTION,

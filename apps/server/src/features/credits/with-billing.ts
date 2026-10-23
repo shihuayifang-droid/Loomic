@@ -105,7 +105,11 @@ export type BillingGuardSpec =
       jobType: "video_generation";
       resolution?: VideoResolution;
       duration?: number;
-    };
+    }
+  // ED-00m: a server-side tool run. The tier is the caller's `search_key`, taken
+  // as-is - the same value the quote route is asked about - and there is no
+  // resolution to check.
+  | { jobType: "tool_execution"; searchKey: string };
 
 /** Why the request was rejected before any money moved. */
 export type BillingRejection =
@@ -430,6 +434,8 @@ export async function withBilling<T>(
         const billing = billingSearchKey(guard, sub.plan);
         searchKey = billing.searchKey;
         tierGuard.checkResolution(sub.plan, billing.effectiveQuality);
+      } else if (guard.jobType === "tool_execution") {
+        searchKey = billingSearchKey(guard, sub.plan).searchKey;
       } else {
         searchKey = billingSearchKey(guard, sub.plan).searchKey;
         if (guard.resolution) {
@@ -492,7 +498,12 @@ export async function withBilling<T>(
     ) {
       const confirmation: BillingConfirmation = {
         ...(request.confirmation ?? {
-          jobType: guard.jobType,
+          // A tool run never sets `confirmAbove`, so this fallback is only built
+          // for the two generators; the narrowing keeps the card type unchanged.
+          jobType:
+            guard.jobType === "video_generation"
+              ? "video_generation"
+              : "image_generation",
           model: modelId,
           count: 1,
           prompt: "",

@@ -993,7 +993,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   });
   // ED-00k / workorder 21AB: the per-image tool definition table. It is static
   // configuration, so the registration needs nothing but the authenticator.
-  void registerToolRoutes(app, { auth });
+  void registerToolRoutes(app, {
+    auth,
+    // ED-00m: `POST /api/tools/:toolId/run` bills through the same price table
+    // and tier guard as the generate routes.
+    creditService,
+    viewerService,
+    ...(jobService ? { jobService } : {}),
+    ...(tierGuard ? { tierGuard } : {}),
+    priceQuoter,
+    creditLedgerWriteRepository,
+    ...(connectionManager ? { connectionManager } : {}),
+  });
   void registerAdminTeamRoutes(app, {
     auth,
     teamAdminService,
