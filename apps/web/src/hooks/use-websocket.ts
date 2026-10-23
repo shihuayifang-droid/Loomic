@@ -79,8 +79,13 @@ export function useWebSocket(
     }
 
     const serverBase = getServerBaseUrl();
+    // Same-origin build (NEXT_PUBLIC_SERVER_BASE_URL=same-origin): an empty
+    // base means the socket lives on the current host, behind deploy/nginx.conf.
+    const wsOrigin =
+      serverBase ||
+      `${location.protocol === "https:" ? "wss://" : "ws://"}${location.host}`;
     const wsUrl =
-      serverBase.replace(/^http/, "ws") +
+      wsOrigin.replace(/^http/, "ws") +
       `/api/ws?token=${encodeURIComponent(token)}&connectionId=${encodeURIComponent(connectionIdRef.current)}`;
 
     const ws = new WebSocket(wsUrl);

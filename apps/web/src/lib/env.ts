@@ -1,9 +1,16 @@
 const defaultServerBaseUrl = "http://localhost:3001";
+/** Build-time marker for the containerised same-origin deployment (OP-07). */
+const sameOriginSentinel = "same-origin";
 
 export function getServerBaseUrl() {
   // Must access process.env.NEXT_PUBLIC_* directly — webpack DefinePlugin
   // only replaces direct references, not indirect access via a variable.
   const configuredUrl = process.env.NEXT_PUBLIC_SERVER_BASE_URL?.trim();
+  if (configuredUrl === sameOriginSentinel) {
+    // deploy/nginx.conf proxies /api and /objects on the serving host, so the
+    // API base is an empty string and every request stays a relative URL.
+    return "";
+  }
   return configuredUrl || defaultServerBaseUrl;
 }
 

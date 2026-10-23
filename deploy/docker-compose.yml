@@ -1,0 +1,83 @@
+# HaHart production compose (OP-06 backend / OP-07 web).
+#
+# Compose spec v2: no top-level `version` key.
+# Run from this directory:
+#   cp .env.production.example .env.production   # then fill in the values
+#   docker compose up -d --build
+#
+# Every credential lives in .env.production / the process environment, never here.
+# No legacy hosted-backend keys are allowed in this file (OP-06 acceptance).
+name: hahart
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hahart
+      POSTGRES_USER: hahart
+      # No hard-coded password: the value comes from the environment.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hahart -d hahart"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  server:
+    build:
+      context: ..
+      dockerfile: apps/server/Dockerfile
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      SERVICE_MODE: api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - objects:/data/objects
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    # Intentionally no `ports:` -- the API is only reachable through web's proxy.
+
+  worker:
+    build:
+      context: ..
+      dockerfile: apps/server/Dockerfile
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      SERVICE_MODE: worker
+    depends_on:
+      - postgres
+    volumes:
+      - objects:/data/objects
+
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    # Loopback only; the public entry point is the Cloudflare Tunnel (OP-09).
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - server
+
+volumes:
+  pgdata: {}
+  objects: {}
