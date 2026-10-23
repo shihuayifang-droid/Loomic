@@ -17,6 +17,9 @@ import {
   CanvasNotFoundError,
   CanvasUnavailableError,
   CanvasVersionConflictError,
+  type CanvasStore,
+  type CanvasStoreRow,
+  createRepositoryCanvasStore,
   mutateCanvasContent,
   readCanvasRow,
   readCanvasSnapshot,
@@ -391,5 +394,214 @@ describe("CV-03 optimistic concurrency", () => {
     expect((err as CanvasVersionConflictError).statusCode).toBe(409);
     expect(db.row().version).toBe(4);
     expect(ids(db.row())).toEqual(["racing"]);
+  });
+});
+
+// Repository-backed store (ticket 44U): the same behaviour must hold when the
+// first argument is a CanvasStore instead of a Supabase-style client.
+
+function memoryStore(initial: { content: CanvasContent; version: number }) {
+  const row: Row = { content: initial.content, version: initial.version };
+  let reads = 0;
+  let writeAttempts = 0;
+  const failures: unknown[] = [];
+  let writeError: unknown = null;
+  let hook: ((row: Row) => void) | null = null;
+
+  const store: CanvasStore = {
+    readRow: async (canvasId): Promise<CanvasStoreRow | null> => {
+      reads++;
+      const failure = failures.shift();
+      if (failure !== undefined) throw failure;
+      if (canvasId === "missing") return null;
+      return {
+        id: canvasId,
+        name: "n",
+        project_id: "p1",
+        content: row.content,
+        version: row.version,
+      };
+    },
+    writeIfUnchanged: async (_canvasId, content, expectedVersion) => {
+      writeAttempts++;
+      if (writeError) throw writeError;
+      const concurrent = hook;
+      hook = null;
+      if (concurrent) concurrent(row);
+      if (expectedVersion !== row.version) return null;
+      row.content = content;
+      row.version = expectedVersion + 1;
+      return { version: row.version };
+    },
+  };
+
+  return {
+    store,
+    row: () => row,
+    reads: () => reads,
+    writeAttempts: () => writeAttempts,
+    failNextReads: (...errs: unknown[]) => failures.push(...errs),
+    failWrites: (err: unknown) => {
+      writeError = err;
+    },
+    beforeWrite: (fn: (row: Row) => void) => {
+      hook = fn;
+    },
+  };
+}
+
+describe("repository store", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("absent row is not_found", async () => {
+    const db = memoryStore({ content: canvas([]), version: 1 });
+    await expect(
+      readCanvasRow(db.store, "missing", "content"),
+    ).rejects.toBeInstanceOf(CanvasNotFoundError);
+  });
+
+  it("non-transport error is unavailable and is not retried", async () => {
+    const db = memoryStore({ content: canvas([]), version: 1 });
+    db.failNextReads(PG_TIMEOUT);
+    const err = await readCanvasRow(db.store, "c1", "content").catch((e) => e);
+    expect(err).toBeInstanceOf(CanvasUnavailableError);
+    expect((err as CanvasUnavailableError).statusCode).toBe(503);
+    expect(db.reads()).toBe(1);
+  });
+
+  it("recovers when a transport blip is followed by success", async () => {
+    vi.useFakeTimers();
+    const db = memoryStore({ content: canvas([]), version: 7 });
+    db.failNextReads(TRANSPORT);
+    const promise = readCanvasRow(db.store, "c1", "version");
+    await vi.runAllTimersAsync();
+    await expect(promise).resolves.toEqual({ version: 7 });
+    expect(db.reads()).toBe(2);
+  });
+
+  it("gives up after a bounded number of transport failures", async () => {
+    vi.useFakeTimers();
+    const db = memoryStore({ content: canvas([]), version: 1 });
+    db.failNextReads(TRANSPORT, TRANSPORT, TRANSPORT, TRANSPORT);
+    const promise = readCanvasRow(db.store, "c1", "content");
+    const settled = expect(promise).rejects.toBeInstanceOf(
+      CanvasUnavailableError,
+    );
+    await vi.runAllTimersAsync();
+    await settled;
+    expect(db.reads()).toBe(3);
+  });
+
+  it("columns picks only the keys the caller asked for", async () => {
+    const db = memoryStore({ content: canvas([element("a")]), version: 3 });
+    const row = await readCanvasRow<Record<string, unknown>>(
+      db.store,
+      "c1",
+      "content, version",
+    );
+    expect(Object.keys(row).sort()).toEqual(["content", "version"]);
+    expect(row.version).toBe(3);
+  });
+
+  it("readCanvasSnapshot defaults a null content column", async () => {
+    const db = memoryStore({
+      content: null as unknown as CanvasContent,
+      version: 0,
+    });
+    await expect(readCanvasSnapshot(db.store, "c1")).resolves.toEqual({
+      content: { elements: [], appState: {}, files: {} },
+      version: 0,
+    });
+  });
+
+  it("mutateCanvasContent re-applies on top of a concurrent write", async () => {
+    const A = element("a");
+    const B = element("b");
+    const C = element("c");
+    const db = memoryStore({ content: canvas([A]), version: 1 });
+    db.beforeWrite((other) => {
+      other.content = canvas([A, B]);
+      other.version = 2;
+    });
+
+    const result = await mutateCanvasContent(db.store, "c1", (content) => ({
+      ...content,
+      elements: [...content.elements, C],
+    }));
+
+    expect(result?.version).toBe(3);
+    expect(ids(db.row())).toEqual(["a", "b", "c"]);
+    expect(db.writeAttempts()).toBe(2);
+  });
+
+  it("replaceCanvasContent with a stale baseVersion is a 409 and is not retried", async () => {
+    const current = canvas([element("current")]);
+    const db = memoryStore({ content: current, version: 5 });
+
+    const err = await replaceCanvasContent(
+      db.store,
+      "c1",
+      canvas([element("mine")]),
+      4,
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(CanvasVersionConflictError);
+    expect((err as CanvasVersionConflictError).statusCode).toBe(409);
+    expect((err as CanvasVersionConflictError).currentVersion).toBe(5);
+    expect(db.writeAttempts()).toBe(1);
+    expect(db.row().content).toEqual(current);
+  });
+
+  it("replaceCanvasContent with the current baseVersion bumps the version", async () => {
+    const X = canvas([element("x")]);
+    const db = memoryStore({ content: canvas([]), version: 4 });
+    const result = await replaceCanvasContent(db.store, "c1", X, 4);
+    expect(result.version).toBe(5);
+    expect(db.row().content).toEqual(X);
+  });
+
+  it("a write error is thrown as-is", async () => {
+    const db = memoryStore({ content: canvas([]), version: 1 });
+    const boom = new Error("write boom");
+    db.failWrites(boom);
+    await expect(
+      replaceCanvasContent(db.store, "c1", canvas([]), 1),
+    ).rejects.toBe(boom);
+  });
+
+  it("createRepositoryCanvasStore binds the actor into both calls", async () => {
+    const readCanvasRowFn = vi.fn(async () => ({
+      id: "c1",
+      name: "n",
+      project_id: "p1",
+      content: canvas([]),
+      version: 2,
+    }));
+    const writeFn = vi.fn(async () => ({ version: 3 }));
+    const store = createRepositoryCanvasStore(
+      { readCanvasRow: readCanvasRowFn, writeIfUnchanged: writeFn },
+      "actor-1",
+    );
+
+    await store.readRow("c1");
+    await store.writeIfUnchanged("c1", canvas([]), 2);
+
+    expect(readCanvasRowFn).toHaveBeenCalledWith({
+      actorId: "actor-1",
+      canvasId: "c1",
+    });
+    expect(writeFn).toHaveBeenCalledWith({
+      actorId: "actor-1",
+      canvasId: "c1",
+      content: canvas([]),
+      expectedVersion: 2,
+    });
   });
 });

@@ -3,9 +3,9 @@
 // THE BUG THIS EXISTS TO KILL
 // All six writers of canvases.content did an unguarded read-modify-write:
 //
-//   const { data } = await client.from("canvases").select("content")...
+//   const { data } = <select content from the canvases table via client>...
 //   ...build a new elements array in JS...
-//   await client.from("canvases").update({ content: next })...
+//   await <update canvases set content = next via client>...
 //
 // Two writers reading the same row therefore each held a snapshot, and whoever
 // wrote second replaced the whole array — erasing the other's work with no error
@@ -34,9 +34,52 @@ import type { CanvasContent, Json } from "@loomic/shared";
 // paths that hit the same proxy. It used to live in this file, back when the canvas
 // was the only caller.
 import { isTransportFailure } from "../../supabase/transport-retry.js";
+import type { CanvasContentRepository } from "../../db/canvas-content-repository.js";
 
 /** Minimal shape needed from a Supabase client, so tests can pass a fake. */
 type CanvasClient = { from: (table: string) => any };
+
+export type CanvasStoreRow = {
+  id: string;
+  name: string;
+  project_id: string;
+  content: unknown;
+  version: number;
+};
+
+/**
+ * Repository-backed storage. Accepted by the four exported functions below
+ * beside the legacy client, so callers can migrate one at a time.
+ */
+export type CanvasStore = {
+  readRow(canvasId: string): Promise<CanvasStoreRow | null>;
+  writeIfUnchanged(
+    canvasId: string,
+    content: CanvasContent,
+    expectedVersion: number,
+  ): Promise<{ version: number } | null>;
+};
+
+/** Binds a canvas content repository and an actor into a CanvasStore. */
+export function createRepositoryCanvasStore(
+  repository: Pick<CanvasContentRepository, "readCanvasRow" | "writeIfUnchanged">,
+  actorId: string,
+): CanvasStore {
+  return {
+    readRow: (canvasId) => repository.readCanvasRow({ actorId, canvasId }),
+    writeIfUnchanged: (canvasId, content, expectedVersion) =>
+      repository.writeIfUnchanged({
+        actorId,
+        canvasId,
+        content,
+        expectedVersion,
+      }),
+  };
+}
+
+function isCanvasStore(x: CanvasClient | CanvasStore): x is CanvasStore {
+  return typeof (x as CanvasStore).readRow === "function";
+}
 
 export class CanvasVersionConflictError extends Error {
   readonly code = "canvas_version_conflict";
@@ -73,7 +116,7 @@ export class CanvasNotFoundError extends Error {
  * THE BUG THIS EXISTS TO KILL
  * Every read of the canvases row did this:
  *
- *   const { data, error } = await client.from("canvases")...single();
+ *   const { data, error } = await <select from the canvases table>...single();
  *   if (error || !data) throw new CanvasNotFoundError(canvasId);
  *
  * `error` there covers a dropped TLS connection, a statement timeout, an RLS
@@ -114,13 +157,38 @@ const READ_MAX_ATTEMPTS = 3;
  * need.
  */
 export async function readCanvasRow<T>(
-  client: CanvasClient,
+  client: CanvasClient | CanvasStore,
   canvasId: string,
   columns: string,
 ): Promise<T> {
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= READ_MAX_ATTEMPTS; attempt++) {
+    if (isCanvasStore(client)) {
+      // Store path: same classification, retry and logging as the legacy path.
+      let row: CanvasStoreRow | null;
+      try {
+        row = await client.readRow(canvasId);
+      } catch (err) {
+        lastError = err;
+        if (!isTransportFailure(err) || attempt >= READ_MAX_ATTEMPTS) break;
+        const storeBackoffMs = attempt * 400;
+        console.log(
+          `[canvas-version] transport failure on read, retrying canvasId=${canvasId} ` +
+            `attempt=${attempt} in=${storeBackoffMs}ms ` +
+            `message=${(err as { message?: string }).message}`,
+        );
+        await new Promise((r) => setTimeout(r, storeBackoffMs));
+        continue;
+      }
+      if (!row) throw new CanvasNotFoundError(canvasId);
+      // Hand back only the columns the caller asked for, like `select(columns)`.
+      const picked: Record<string, unknown> = {};
+      for (const key of columns.split(",").map((c) => c.trim())) {
+        if (key) picked[key] = (row as Record<string, unknown>)[key];
+      }
+      return picked as T;
+    }
     // maybeSingle, NOT single. With `.single()` PostgREST reports "0 rows" as an
     // ERROR (code PGRST116) — so "this canvas does not exist" and "the
     // connection died" arrive in the same variable, and the only way to tell them
@@ -181,7 +249,7 @@ export interface CanvasSnapshot {
  * readCanvasRow.
  */
 export async function readCanvasSnapshot(
-  client: CanvasClient,
+  client: CanvasClient | CanvasStore,
   canvasId: string,
 ): Promise<CanvasSnapshot> {
   const row = await readCanvasRow<{ content?: unknown; version?: unknown }>(
@@ -208,7 +276,7 @@ export async function readCanvasSnapshot(
  * incremental; see the note at the top of this file before adding a caller.
  */
 export async function mutateCanvasContent(
-  client: CanvasClient,
+  client: CanvasClient | CanvasStore,
   canvasId: string,
   mutate: (content: CanvasContent) => CanvasContent | null,
   opts: { maxAttempts?: number; label?: string } = {},
@@ -260,7 +328,7 @@ export async function mutateCanvasContent(
  * Callers should log that case so it does not become permanent.
  */
 export async function replaceCanvasContent(
-  client: CanvasClient,
+  client: CanvasClient | CanvasStore,
   canvasId: string,
   content: CanvasContent,
   baseVersion: number | undefined,
@@ -304,13 +372,23 @@ export async function replaceCanvasContent(
  * returned row, not `error`, is what we test.
  */
 async function writeIfUnchanged(
-  client: CanvasClient,
+  client: CanvasClient | CanvasStore,
   canvasId: string,
   content: CanvasContent,
   expectedVersion: number,
 ): Promise<CanvasSnapshot | null> {
   const nextVersion = expectedVersion + 1;
 
+  if (isCanvasStore(client)) {
+    // Errors surface as-is; null means the version moved (or no write right).
+    const result = await client.writeIfUnchanged(
+      canvasId,
+      content,
+      expectedVersion,
+    );
+    if (!result) return null;
+    return { content, version: result.version ?? nextVersion };
+  }
   const { data, error } = await client
     .from("canvases")
     .update({
