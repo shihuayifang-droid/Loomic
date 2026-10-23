@@ -38,6 +38,13 @@ export type AuthProvider = "supabase" | "self";
 export type StorageProvider = "supabase" | "fs";
 
 /**
+ * 43L: which message-queue client the server and the worker build. `pgmq` is the
+ * Supabase-era extension client; `native` is the plain-table queue of the new
+ * database (43K) and connects through `DATABASE_URL`.
+ */
+export type QueueProvider = "pgmq" | "native";
+
+/**
  * OP-13: the one place that decides "this is production". NODE_ENV=production.
  *
  * Read through the index signature on purpose: the `.env.example` guard in
@@ -138,6 +145,12 @@ export type ServerEnv = {
    */
   storageProvider?: StorageProvider;
   /**
+   * 43L: which queue client to build. Optional on the type so existing literals
+   * keep compiling; `loadServerEnv` always fills it (default "pgmq", so an unset
+   * variable keeps the pre-43L behaviour).
+   */
+  queueProvider?: QueueProvider;
+  /**
    * OP-05 / 43E: the private file volume. `objectRoot` is the directory that
    * holds `<root>/<bucket>/<key>`; `objectUrlSecret` is the HMAC key of the
    * signed read links (at least 32 bytes); `objectPublicBase` is the origin the
@@ -156,6 +169,9 @@ export const DEFAULT_AUTH_JWT_ISSUER = "hahart";
 export const DEFAULT_AUTH_JWT_AUDIENCE = "hahart-api";
 /** OP-05: an unset storage switch means "keep reading and writing objects where we do today". */
 export const DEFAULT_STORAGE_PROVIDER: StorageProvider = "supabase";
+
+/** 43L: an unset queue switch means "keep using the pgmq extension client". */
+export const DEFAULT_QUEUE_PROVIDER: QueueProvider = "pgmq";
 
 /** HS256 key material below this many UTF-8 bytes is a configuration error. */
 const MIN_AUTH_JWT_SECRET_BYTES = 32;
@@ -199,6 +215,22 @@ function parseStorageProvider(raw: string | undefined): StorageProvider {
     return trimmed;
   }
   throw new Error(`Invalid HAHART_STORAGE_PROVIDER value: ${raw}`);
+}
+
+/**
+ * 43L: the message-queue switch. Same rule as the storage switch: an unknown
+ * value is a configuration error rather than a silent fallback, because a worker
+ * polling the wrong queue looks healthy while jobs pile up untouched.
+ */
+function parseQueueProvider(raw: string | undefined): QueueProvider {
+  const trimmed = normalizeOptionalString(raw);
+  if (!trimmed) {
+    return DEFAULT_QUEUE_PROVIDER;
+  }
+  if (trimmed === "pgmq" || trimmed === "native") {
+    return trimmed;
+  }
+  throw new Error(`Invalid HAHART_QUEUE_PROVIDER value: ${raw}`);
 }
 
 /**
@@ -429,6 +461,8 @@ export function loadServerEnv(
     DEFAULT_AUTH_JWT_AUDIENCE;
   const storageProvider =
     overrides.storageProvider ?? parseStorageProvider(source.HAHART_STORAGE_PROVIDER);
+  const queueProvider =
+    overrides.queueProvider ?? parseQueueProvider(source.HAHART_QUEUE_PROVIDER);
   const objectRoot =
     overrides.objectRoot ?? normalizeOptionalString(source.HAHART_OBJECT_ROOT);
   const objectUrlSecret =
@@ -546,6 +580,7 @@ export function loadServerEnv(
     authJwtIssuer,
     authJwtAudience,
     storageProvider,
+    queueProvider,
     ...(objectRoot ? { objectRoot } : {}),
     ...(objectUrlSecret ? { objectUrlSecret } : {}),
     ...(objectPublicBase ? { objectPublicBase } : {}),

@@ -12,7 +12,10 @@ if (process.env.GLOBAL_AGENT_HTTP_PROXY) {
 
 import { randomUUID } from "node:crypto";
 import { loadServerEnv } from "./config/env.js";
-import { createPgmqClient } from "./queue/pgmq-client.js";
+import {
+  createQueueClient,
+  queueConnectionMissingMessage,
+} from "./queue/queue-client-factory.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
 import { processJobMessage } from "./features/jobs/process-job-message.js";
 import { reapStuckJobs } from "./features/jobs/reap-stuck-jobs.js";
@@ -54,8 +57,9 @@ import { registerToolRunners } from "./features/tools/register-tool-runners.js";
 async function main() {
   const env = loadServerEnv();
 
-  if (!env.supabaseDbUrl) {
-    console.error("SUPABASE_DB_URL is required for worker process.");
+  const missing = queueConnectionMissingMessage(env);
+  if (missing) {
+    console.error(missing);
     process.exit(1);
   }
 
@@ -65,7 +69,7 @@ async function main() {
   // providers, because the quick-edit runner calls the gateway provider.
   registerToolRunners(env);
 
-  const pgmq = createPgmqClient(env.supabaseDbUrl);
+  const pgmq = createQueueClient(env)!;
   const createUserClient = createUserSupabaseClientFactory(env);
 
   let adminClient: ReturnType<typeof createAdminSupabaseClient> | undefined;

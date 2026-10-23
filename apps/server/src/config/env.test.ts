@@ -356,3 +356,35 @@ describe("OP-05 file volume configuration", () => {
     expect(env.objectPublicBase).toBeUndefined();
   });
 });
+
+/**
+ * 43L: the message-queue switch. The default keeps the pgmq extension client, so
+ * an unset variable cannot change what the server and the worker connect to;
+ * `native` is the plain-table queue of the new database; an unknown value
+ * refuses to start instead of silently polling the wrong queue.
+ */
+describe("43L queue provider switch", () => {
+  it("43L: queueProvider defaults to pgmq", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, { NODE_ENV: "development" });
+
+    expect(env.queueProvider).toBe("pgmq");
+  });
+
+  it("43L: HAHART_QUEUE_PROVIDER=native parses", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      HAHART_QUEUE_PROVIDER: "native",
+    });
+
+    expect(env.queueProvider).toBe("native");
+  });
+
+  it("43L: an unknown queue provider refuses to start", () => {
+    expect(() =>
+      loadServerEnv(VERSION_OVERRIDE, {
+        NODE_ENV: "development",
+        HAHART_QUEUE_PROVIDER: "rabbit",
+      }),
+    ).toThrow("Invalid HAHART_QUEUE_PROVIDER value: rabbit");
+  });
+});

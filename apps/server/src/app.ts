@@ -181,7 +181,7 @@ import {
 import { createMemberPauseReadRepository } from "./db/member-pause-read-repository.js";
 import { withGenerationPause } from "./features/credits/generation-pause.js";
 import { DATABASE_URL_ENV_KEY, getTransactionPool } from "./db/pool.js";
-import { createPgmqClient } from "./queue/pgmq-client.js";
+import { createQueueClient } from "./queue/queue-client-factory.js";
 import {
   createCreditService,
   type CreditService,
@@ -711,9 +711,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       assetWriteRepository,
       assetProvenanceRepository,
     });
-  const pgmq = env.supabaseDbUrl
-    ? createPgmqClient(env.supabaseDbUrl)
-    : undefined;
+  const pgmq = createQueueClient(env);
   const jobService =
     options.jobService ??
     (pgmq
