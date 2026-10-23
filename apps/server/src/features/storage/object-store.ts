@@ -44,6 +44,12 @@ export class ObjectStoreError extends Error {
   constructor(
     readonly code: ObjectStoreErrorCode,
     message: string,
+    /**
+     * 43F: the raw backend message, kept when the `message` above is a sentence
+     * this module composed. Callers that have to reproduce a previous error text
+     * word for word read this instead of parsing the composed one.
+     */
+    readonly detail?: string,
   ) {
     super(message);
     this.name = "ObjectStoreError";

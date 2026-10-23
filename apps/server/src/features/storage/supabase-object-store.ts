@@ -114,6 +114,7 @@ function backendFailure(
   return new ObjectStoreError(
     "backend_failed",
     `Storage ${action} failed (${detail}).`,
+    detail,
   );
 }
 
@@ -200,6 +201,7 @@ export function createSupabaseObjectStore(
           throw new ObjectStoreError(
             "exists",
             `Object "${ref.key}" already exists (${error.message}).`,
+            error.message,
           );
         }
         throw backendFailure(error, "upload");

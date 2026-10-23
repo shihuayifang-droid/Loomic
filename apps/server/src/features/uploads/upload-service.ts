@@ -20,11 +20,15 @@ import type {
   UserSupabaseClient,
 } from "../../supabase/user.js";
 import { planZipDownload } from "../downloads/zip-download-plan.js";
+import type { ObjectRef, ObjectStore } from "../storage/object-store.js";
+import { ObjectStoreError } from "../storage/object-store.js";
 import {
   ProjectAssetUrlError,
   signProjectAssetUrl,
   signProjectAssetUrls,
 } from "../storage/project-asset-urls.js";
+import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
+import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
 
 export class UploadServiceError extends Error {
   readonly statusCode: number;
@@ -254,17 +258,20 @@ export function createUploadService(options: {
         input.fileName,
       );
 
-      const { error: storageError } = await client.storage
-        .from(input.bucket)
-        .upload(objectPath, input.fileBuffer, {
-          contentType: input.mimeType,
-          upsert: false,
-        });
-
-      if (storageError) {
+      try {
+        await storeFor(client).put(
+          { bucket: input.bucket, key: objectPath },
+          input.fileBuffer,
+          { contentType: input.mimeType, upsert: false },
+        );
+      } catch (err) {
+        const message =
+          err instanceof ObjectStoreError
+            ? (err.detail ?? err.message)
+            : String(err);
         throw new UploadServiceError(
           "upload_failed",
-          `Storage upload failed: ${storageError.message}`,
+          `Storage upload failed: ${message}`,
           500,
         );
       }
@@ -289,7 +296,10 @@ export function createUploadService(options: {
 
       if (recordError || !assetId) {
         // Clean up the uploaded file if its metadata could not be recorded.
-        await client.storage.from(input.bucket).remove([objectPath]);
+        await removeQuietly(storeFor(client), {
+          bucket: input.bucket,
+          key: objectPath,
+        });
         throw new UploadServiceError(
           "upload_failed",
           "Failed to record asset metadata.",
@@ -321,7 +331,10 @@ export function createUploadService(options: {
       }
 
       if (!asset) {
-        await client.storage.from(input.bucket).remove([objectPath]);
+        await removeQuietly(storeFor(client), {
+          bucket: input.bucket,
+          key: objectPath,
+        });
         throw new UploadServiceError(
           "upload_failed",
           "Failed to record asset metadata.",
@@ -724,9 +737,10 @@ export function createUploadService(options: {
       }
 
       // The order is part of the contract: the object first, the row second.
-      await client.storage
-        .from(assetRow.bucket)
-        .remove([assetRow.object_path]);
+      await removeQuietly(storeFor(client), {
+        bucket: assetRow.bucket,
+        key: assetRow.object_path,
+      });
 
       // ADR-0001 / workorder 21AA: the row delete is the write repository's now.
       // Its SQL is `asset_objects_delete_self` translated verbatim, so the caller
@@ -749,6 +763,29 @@ export function createUploadService(options: {
   };
 
   return service;
+}
+
+/**
+ * 43F: every object operation in this file goes through the `ObjectStore` seam,
+ * with the user client wrapped as they were doing before with the raw SDK.
+ */
+const storeFor = (client: UserSupabaseClient): ObjectStore =>
+  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
+
+/**
+ * 43F: the compensation paths (an upload whose row could not be recorded, a
+ * delete) never inspected the backend error before this ticket and still do not:
+ * the object is removed best-effort and the caller sees the existing answer.
+ */
+async function removeQuietly(
+  store: ObjectStore,
+  ref: ObjectRef,
+): Promise<void> {
+  try {
+    await store.delete([ref]);
+  } catch {
+    // Same as before 43F: a failed removal during rollback / delete is ignored.
+  }
 }
 
 function buildObjectPath(

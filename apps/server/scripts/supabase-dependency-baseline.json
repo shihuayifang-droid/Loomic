@@ -40,7 +40,7 @@
     "server.fromCallsIncludingTests": 163,
     "server.rpcCallsRuntime": 17,
     "server.rpcCallsAll": 21,
-    "server.storageCalls": 23,
+    "server.storageCalls": 19,
     "server.authGetUserCalls": 1,
     "server.testSupabaseSdkImportHits": 1,
     "config.supabaseEnvVariableFamily": 8,

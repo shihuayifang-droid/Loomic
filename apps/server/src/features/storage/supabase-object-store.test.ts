@@ -167,6 +167,26 @@ describe("43B Supabase object store: put", () => {
       }),
     ).rejects.toMatchObject({ code: "backend_failed" });
   });
+
+  it("43F: put keeps the raw backend message in ObjectStoreError.detail", async () => {
+    const recorded: Recorded[] = [];
+    const { store } = storeWith(recorded, {
+      upload: () => ({
+        data: null,
+        error: { message: "bucket is gone" },
+      }),
+    });
+
+    const failure = store.put(objectRef("a.png"), Buffer.from("x"), {
+      contentType: "text/plain",
+    });
+
+    await expect(failure).rejects.toBeInstanceOf(ObjectStoreError);
+    await expect(failure).rejects.toMatchObject({
+      code: "backend_failed",
+      detail: "bucket is gone",
+    });
+  });
 });
 
 describe("43B Supabase object store: get", () => {
