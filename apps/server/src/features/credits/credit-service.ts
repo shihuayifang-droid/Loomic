@@ -6,6 +6,7 @@ import type {
 } from "@loomic/shared";
 import { PLAN_CONFIGS } from "@loomic/shared";
 
+import type { CreditLedgerFunctionRepository } from "../../db/credit-ledger-function-repository.js";
 import type { CreditReadRepository } from "../../db/credit-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 
@@ -166,16 +167,18 @@ export const INSUFFICIENT_CREDITS_SQLSTATE = "P0402";
  * it serves FOUR methods through FIVE reads — `getBalance` (balance snapshot),
  * `claimDailyCredits` (subscription row plus the post-claim balance snapshot),
  * `getTransactions` (transaction list) and `getSubscription` (subscription
- * row). Everything else still goes through the admin client: deduct, refund,
- * updatePlan and the claim RPC itself. With the repository absent there is no
- * PostgREST fallback: `getBalance`, `getTransactions` and `getSubscription`
+ * row). Workorder 44K: deduct, refund, the daily claim itself and the plan grant
+ * go through `creditLedgerFunctionRepository`. With the repository absent there
+ * is no PostgREST fallback: `getBalance`, `getTransactions` and `getSubscription`
  * fail closed as their existing `credit_query_failed` 500, while
  * `claimDailyCredits` keeps its own refusal for the subscription read and its
  * post-claim balance read is best effort — fixed log text, balance reported 0.
  */
 export function createCreditService(options: {
-  getAdminClient: () => AdminSupabaseClient;
+  /** 44K: no longer used by this service; T-131 cleans it up. */
+  getAdminClient?: () => AdminSupabaseClient;
   creditReadRepository?: CreditReadRepository;
+  creditLedgerFunctionRepository?: CreditLedgerFunctionRepository;
 }): CreditService {
   return {
     async getBalance(workspaceId) {
@@ -209,18 +212,21 @@ export function createCreditService(options: {
     },
 
     async deductCredits(workspaceId, userId, amount, jobId, description) {
-      const admin = options.getAdminClient();
+      try {
+        const repository = options.creditLedgerFunctionRepository;
+        if (!repository) {
+          throw new Error("no credit ledger function repository");
+        }
 
-      const { data, error } = await admin.rpc("deduct_credits", {
-        p_workspace_id: workspaceId,
-        p_user_id: userId,
-        p_amount: amount,
-        p_job_id: (jobId ?? null) as string,
-        p_description: (description ?? null) as string,
-      });
-
-      if (error) {
-        if (error.code === INSUFFICIENT_CREDITS_SQLSTATE) {
+        return await repository.deductCredits({
+          workspaceId,
+          userId,
+          amount,
+          jobId: jobId ?? null,
+          description: description ?? null,
+        });
+      } catch (error) {
+        if (errorCode(error) === INSUFFICIENT_CREDITS_SQLSTATE) {
           throw new CreditServiceError(
             "insufficient_credits",
             "Not enough credits to perform this action.",
@@ -229,41 +235,36 @@ export function createCreditService(options: {
         }
         throw new CreditServiceError(
           "credit_deduct_failed",
-          `Failed to deduct credits: ${error.message}`,
+          `Failed to deduct credits: ${errorMessage(error)}`,
           500,
         );
       }
-
-      return data as string;
     },
 
     async refundCredits(workspaceId, userId, amount, jobId, description) {
-      const admin = options.getAdminClient();
+      try {
+        const repository = options.creditLedgerFunctionRepository;
+        if (!repository) {
+          throw new Error("no credit ledger function repository");
+        }
 
-      const { data, error } = await admin.rpc("refund_credits", {
-        p_workspace_id: workspaceId,
-        p_user_id: userId,
-        p_amount: amount,
-        // The generated RPC types declare these as non-nullable strings even
-        // though the SQL functions accept NULL. Same cast as deductCredits above.
-        p_job_id: (jobId ?? null) as string,
-        p_description: (description ?? null) as string,
-      });
-
-      if (error) {
+        return await repository.refundCredits({
+          workspaceId,
+          userId,
+          amount,
+          jobId: jobId ?? null,
+          description: description ?? null,
+        });
+      } catch (error) {
         throw new CreditServiceError(
           "credit_refund_failed",
-          `Failed to refund credits: ${error.message}`,
+          `Failed to refund credits: ${errorMessage(error)}`,
           500,
         );
       }
-
-      return data as string;
     },
 
     async claimDailyCredits(workspaceId) {
-      const admin = options.getAdminClient();
-
       // Determine the workspace's plan. The subscription row now comes from the
       // read repository: a workspace without one is still the `free` plan, and a
       // missing repository or a failed read is still this method's existing
@@ -291,18 +292,21 @@ export function createCreditService(options: {
         return { success: false };
       }
 
-      const { data: claimed, error: claimError } = await admin.rpc(
-        "claim_daily_credits",
-        {
-          p_workspace_id: workspaceId,
-          p_amount: config.dailyCredits,
-        },
-      );
+      let claimed: boolean;
+      try {
+        const ledger = options.creditLedgerFunctionRepository;
+        if (!ledger) {
+          throw new Error("no credit ledger function repository");
+        }
 
-      if (claimError) {
+        claimed = await ledger.claimDailyCredits({
+          workspaceId,
+          amount: config.dailyCredits,
+        });
+      } catch (claimError) {
         throw new CreditServiceError(
           "credit_claim_failed",
-          `Failed to claim daily credits: ${claimError.message}`,
+          `Failed to claim daily credits: ${errorMessage(claimError)}`,
           500,
         );
       }
@@ -394,25 +398,40 @@ export function createCreditService(options: {
     },
 
     async updatePlan(workspaceId, plan) {
-      const admin = options.getAdminClient();
       const config = PLAN_CONFIGS[plan];
 
-      // Atomic plan update + credit grant via RPC to avoid read-then-write race condition.
-      // The RPC uses FOR UPDATE row locking so concurrent deductions cannot be overwritten.
-      // TODO: Remove `as any` after running `supabase gen types` to regenerate database.ts
-      const { error } = await (admin.rpc as any)("grant_plan_credits", {
-        p_workspace_id: workspaceId,
-        p_plan: plan,
-        p_credits: config.monthlyCredits,
-      });
+      // Atomic plan update + credit grant in one SQL function (row-locked), so
+      // concurrent deductions cannot be overwritten.
+      try {
+        const repository = options.creditLedgerFunctionRepository;
+        if (!repository) {
+          throw new Error("no credit ledger function repository");
+        }
 
-      if (error) {
+        await repository.grantPlanCredits({
+          workspaceId,
+          plan,
+          credits: config.monthlyCredits,
+        });
+      } catch (error) {
         throw new CreditServiceError(
           "credit_plan_update_failed",
-          `Failed to update plan: ${error.message}`,
+          `Failed to update plan: ${errorMessage(error)}`,
           500,
         );
       }
     },
   };
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

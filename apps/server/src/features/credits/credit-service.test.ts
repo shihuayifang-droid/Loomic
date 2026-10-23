@@ -9,6 +9,7 @@ import {
   type CreditTransactionReadRow,
   type SubscriptionReadRow,
 } from "../../db/credit-read-repository.js";
+import type { CreditLedgerFunctionRepository } from "../../db/credit-ledger-function-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import {
   CreditServiceError,
@@ -723,45 +724,46 @@ describe("credit-service getBalance: the snapshot, its date and its defaults", (
 
 // ── claimDailyCredits (workorder 21Q) ────────────────────────────────────────
 
-/** One RPC the admin stand-in was asked to make, with its arguments. */
-type ClaimRpcCall = { fn: string; args: Record<string, unknown> };
+/** One call the ledger-function stand-in was asked to make, with its arguments. */
+type ClaimLedgerCall = { method: string; args: Record<string, unknown> };
 
 /** The daily amount `PLAN_CONFIGS.free` grants — the one plan that grants any. */
 const FREE_DAILY_CREDITS = 50;
 
 /**
- * The admin stand-in of `claimDailyCredits`. The ONE method it answers is the
- * RPC that grants the day's credits; every other property is recorded in
- * `forbiddenReads` and, were it ever CALLED, throws. So a read left behind on
- * the admin client cannot pass quietly, and `forbiddenReads` staying empty is
- * the measurement behind "this method no longer reads through the client".
+ * The credit ledger function repository stand-in of `claimDailyCredits`
+ * (workorder 44K). The ONE method it answers is `claimDailyCredits`; every other
+ * property is recorded in `forbiddenReads` and, were it ever CALLED, throws. So
+ * a call left behind on another ledger function cannot pass quietly, and
+ * `forbiddenReads` staying empty is the measurement behind "this method touches
+ * the claim function only".
  */
-function createClaimAdmin(
+function createClaimLedger(
   options: { claimed?: boolean; error?: { message: string } } = {},
 ): {
-  admin: AdminSupabaseClient;
-  rpcCalls: ClaimRpcCall[];
+  repository: CreditLedgerFunctionRepository;
+  calls: ClaimLedgerCall[];
   forbiddenReads: string[];
 } {
-  const rpcCalls: ClaimRpcCall[] = [];
+  const calls: ClaimLedgerCall[] = [];
   const forbiddenReads: string[] = [];
 
-  const admin = new Proxy(
+  const repository = new Proxy(
     {},
     {
       get(_target, property) {
         // Symbols and `then` are the runtime's own probes (inspection, awaiting):
-        // they are not client methods and must not be recorded as reads.
+        // they are not repository methods and must not be recorded as reads.
         if (typeof property === "symbol" || property === "then") {
           return undefined;
         }
 
-        if (property === "rpc") {
-          return async (fn: string, args: Record<string, unknown>) => {
-            rpcCalls.push({ fn, args });
-            if (options.error) return { data: null, error: options.error };
+        if (property === "claimDailyCredits") {
+          return async (args: Record<string, unknown>) => {
+            calls.push({ method: "claimDailyCredits", args });
+            if (options.error) throw new Error(options.error.message);
 
-            return { data: options.claimed ?? true, error: null };
+            return options.claimed ?? true;
           };
         }
 
@@ -769,14 +771,14 @@ function createClaimAdmin(
 
         return () => {
           throw new Error(
-            `claimDailyCredits reached the admin client's "${String(property)}"`,
+            `claimDailyCredits reached the ledger repository's "${String(property)}"`,
           );
         };
       },
     },
-  ) as unknown as AdminSupabaseClient;
+  ) as unknown as CreditLedgerFunctionRepository;
 
-  return { admin, rpcCalls, forbiddenReads };
+  return { repository, calls, forbiddenReads };
 }
 
 /**
@@ -834,14 +836,16 @@ function createClaimRepository(
   };
 }
 
-/** The claim path's service: the repository is optional, the admin is not. */
+/** The claim path's service: both repositories are optional. */
 function buildClaimService(options: {
   repository?: CreditReadRepository;
-  admin: AdminSupabaseClient;
+  ledger?: CreditLedgerFunctionRepository;
 }): CreditService {
   return createCreditService({
-    getAdminClient: () => options.admin,
     ...(options.repository ? { creditReadRepository: options.repository } : {}),
+    ...(options.ledger
+      ? { creditLedgerFunctionRepository: options.ledger }
+      : {}),
   });
 }
 
@@ -863,14 +867,14 @@ describe("credit-service claimDailyCredits: the plan read", () => {
     // amount, and it is the amount the RPC must be asked for.
     expect(PLAN_CONFIGS.free.dailyCredits).toBe(FREE_DAILY_CREDITS);
 
-    const admin = createClaimAdmin({ claimed: true });
+    const ledger = createClaimLedger({ claimed: true });
     const fake = createClaimRepository({
       subscription: null,
       snapshot: { balance: 12, plan: "free", daily_claimed: true },
     });
     const service = buildClaimService({
       repository: fake.repository,
-      admin: admin.admin,
+      ledger: ledger.repository,
     });
 
     await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
@@ -879,17 +883,17 @@ describe("credit-service claimDailyCredits: the plan read", () => {
     });
 
     expect(fake.subscriptionCalls).toEqual([WORKSPACE_ID]);
-    expect(admin.rpcCalls).toEqual([
+    expect(ledger.calls).toEqual([
       {
-        fn: "claim_daily_credits",
-        args: { p_workspace_id: WORKSPACE_ID, p_amount: FREE_DAILY_CREDITS },
+        method: "claimDailyCredits",
+        args: { workspaceId: WORKSPACE_ID, amount: FREE_DAILY_CREDITS },
       },
     ]);
-    expect(admin.forbiddenReads).toEqual([]);
+    expect(ledger.forbiddenReads).toEqual([]);
   });
 
   it("case 28: a failed plan read is the existing credit_claim_failed 500 and no RPC", async () => {
-    const admin = createClaimAdmin({ claimed: true });
+    const ledger = createClaimLedger({ claimed: true });
     const fake = createClaimRepository({
       subscriptionFails: new Error(
         "connect ECONNREFUSED 203.0.113.9:5432 postgres://loomic:secret@db.example/db",
@@ -897,7 +901,7 @@ describe("credit-service claimDailyCredits: the plan read", () => {
     });
     const service = buildClaimService({
       repository: fake.repository,
-      admin: admin.admin,
+      ledger: ledger.repository,
     });
 
     const error = await refusal(() => service.claimDailyCredits(WORKSPACE_ID));
@@ -909,35 +913,35 @@ describe("credit-service claimDailyCredits: the plan read", () => {
     // response; the repository already reduced it to a fixed text plus `cause`.
     expect(error.message).not.toMatch(/ECONNREFUSED|203\.0\.113\.9|secret/i);
     // The claim was never attempted, and neither was the balance read.
-    expect(admin.rpcCalls).toEqual([]);
+    expect(ledger.calls).toEqual([]);
     expect(fake.snapshotCalls).toEqual([]);
-    expect(admin.forbiddenReads).toEqual([]);
+    expect(ledger.forbiddenReads).toEqual([]);
   });
 
   it("case 29: with no repository the claim fails closed instead of falling back", async () => {
-    const admin = createClaimAdmin({ claimed: true });
-    const service = buildClaimService({ admin: admin.admin });
+    const ledger = createClaimLedger({ claimed: true });
+    const service = buildClaimService({ ledger: ledger.repository });
 
     const error = await refusal(() => service.claimDailyCredits(WORKSPACE_ID));
 
     expect(error.code).toBe("credit_claim_failed");
     expect(error.statusCode).toBe(500);
     expect(error.message).toBe("Failed to query subscription.");
-    expect(admin.rpcCalls).toEqual([]);
+    expect(ledger.calls).toEqual([]);
     // Measured, not assumed: the client it used to read the plan through was
     // never reached.
-    expect(admin.forbiddenReads).toEqual([]);
+    expect(ledger.forbiddenReads).toEqual([]);
   });
 
   it("case 30: a stored plan of free is read as free and still claims", async () => {
-    const admin = createClaimAdmin({ claimed: true });
+    const ledger = createClaimLedger({ claimed: true });
     const fake = createClaimRepository({
       subscription: { ...SUBSCRIPTION_ROW, plan: "free" },
       snapshot: { balance: 3, plan: "free", daily_claimed: true },
     });
     const service = buildClaimService({
       repository: fake.repository,
-      admin: admin.admin,
+      ledger: ledger.repository,
     });
 
     await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
@@ -947,8 +951,8 @@ describe("credit-service claimDailyCredits: the plan read", () => {
 
     expect(fake.subscriptionCalls).toEqual([WORKSPACE_ID]);
     expect(fake.snapshotCalls).toHaveLength(1);
-    expect(admin.rpcCalls.map((call) => call.fn)).toEqual([
-      "claim_daily_credits",
+    expect(ledger.calls.map((call) => call.method)).toEqual([
+      "claimDailyCredits",
     ]);
   });
 });
@@ -964,23 +968,23 @@ describe("credit-service claimDailyCredits: the plans that grant no daily credit
       // meaningful while that plan really grants zero daily credits.
       expect(PLAN_CONFIGS[plan].dailyCredits).toBe(0);
 
-      const admin = createClaimAdmin({ claimed: true });
+      const ledger = createClaimLedger({ claimed: true });
       const fake = createClaimRepository({
         subscription: { ...SUBSCRIPTION_ROW, plan },
         snapshot: { balance: 99, plan, daily_claimed: false },
       });
       const service = buildClaimService({
         repository: fake.repository,
-        admin: admin.admin,
+        ledger: ledger.repository,
       });
 
       await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
         success: false,
       });
-      expect(admin.rpcCalls).toEqual([]);
+      expect(ledger.calls).toEqual([]);
       // Nothing was claimed, so not even the balance was read.
       expect(fake.snapshotCalls).toEqual([]);
-      expect(admin.forbiddenReads).toEqual([]);
+      expect(ledger.forbiddenReads).toEqual([]);
     });
   }
 });
@@ -992,14 +996,14 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
   });
 
   it("case 35: an already-claimed day answers success false and never reads a balance", async () => {
-    const admin = createClaimAdmin({ claimed: false });
+    const ledger = createClaimLedger({ claimed: false });
     const fake = createClaimRepository({
       subscription: null,
       snapshot: { balance: 42, plan: "free", daily_claimed: true },
     });
     const service = buildClaimService({
       repository: fake.repository,
-      admin: admin.admin,
+      ledger: ledger.repository,
     });
 
     const result = await service.claimDailyCredits(WORKSPACE_ID);
@@ -1008,7 +1012,7 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
     // Exactly the published key set on this branch: no `balance` key at all.
     expect(Object.keys(result)).toEqual(["success"]);
     expect(fake.snapshotCalls).toEqual([]);
-    expect(admin.forbiddenReads).toEqual([]);
+    expect(ledger.forbiddenReads).toEqual([]);
   });
 
   it("case 36: a granted claim publishes the snapshot's balance, asked for the JS UTC day", async () => {
@@ -1017,14 +1021,14 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
     // UTC day disagree, so only one of them can be the day asked about.
     vi.setSystemTime(new Date("2026-10-16T23:30:00-08:00"));
 
-    const admin = createClaimAdmin({ claimed: true });
+    const ledger = createClaimLedger({ claimed: true });
     const fake = createClaimRepository({
       subscription: null,
       snapshot: { balance: 37, plan: "free", daily_claimed: true },
     });
     const service = buildClaimService({
       repository: fake.repository,
-      admin: admin.admin,
+      ledger: ledger.repository,
     });
 
     await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
@@ -1035,12 +1039,12 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
     expect(fake.snapshotCalls).toEqual([
       { workspaceId: WORKSPACE_ID, claimDate: "2026-10-17" },
     ]);
-    expect(admin.forbiddenReads).toEqual([]);
+    expect(ledger.forbiddenReads).toEqual([]);
   });
 
   it("case 37: a balance read that FAILS after a granted claim is success true, balance 0, one warn", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const admin = createClaimAdmin({ claimed: true });
+    const ledger = createClaimLedger({ claimed: true });
     const fake = createClaimRepository({
       subscription: null,
       snapshotFails: new Error(
@@ -1049,7 +1053,7 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
     });
     const service = buildClaimService({
       repository: fake.repository,
-      admin: admin.admin,
+      ledger: ledger.repository,
     });
 
     // The credits ARE granted by this point: a 500 here would tell the client the
@@ -1060,8 +1064,8 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
       balance: 0,
     });
 
-    expect(admin.rpcCalls.map((call) => call.fn)).toEqual([
-      "claim_daily_credits",
+    expect(ledger.calls.map((call) => call.method)).toEqual([
+      "claimDailyCredits",
     ]);
     expect(fake.snapshotCalls).toHaveLength(1);
 
@@ -1075,14 +1079,14 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
 
   it("case 38: a workspace with no balance row publishes 0 and warns about nothing", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const admin = createClaimAdmin({ claimed: true });
+    const ledger = createClaimLedger({ claimed: true });
     const fake = createClaimRepository({
       subscription: null,
       snapshot: { balance: null, plan: null, daily_claimed: true },
     });
     const service = buildClaimService({
       repository: fake.repository,
-      admin: admin.admin,
+      ledger: ledger.repository,
     });
 
     await expect(service.claimDailyCredits(WORKSPACE_ID)).resolves.toEqual({
@@ -1095,12 +1099,12 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("case 39: a failing RPC keeps its message verbatim and never reads a balance", async () => {
-    const admin = createClaimAdmin({ error: { message: "deadlock detected" } });
+  it("case 39: a failing claim function keeps its message verbatim and never reads a balance", async () => {
+    const ledger = createClaimLedger({ error: { message: "deadlock detected" } });
     const fake = createClaimRepository({ subscription: null });
     const service = buildClaimService({
       repository: fake.repository,
-      admin: admin.admin,
+      ledger: ledger.repository,
     });
 
     const error = await refusal(() => service.claimDailyCredits(WORKSPACE_ID));
@@ -1115,30 +1119,30 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
     expect(fake.snapshotCalls).toEqual([]);
   });
 
-  it("case 40: every branch leaves the admin client's other methods unread", async () => {
+  it("case 40: every branch leaves the ledger repository's other methods unread", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     const branches: Array<{
-      admin: ReturnType<typeof createClaimAdmin>;
+      ledger: ReturnType<typeof createClaimLedger>;
       call: () => Promise<unknown>;
     }> = [];
 
     const push = (
-      adminOptions: Parameters<typeof createClaimAdmin>[0],
+      ledgerOptions: Parameters<typeof createClaimLedger>[0],
       repositoryOptions: Parameters<typeof createClaimRepository>[0] | null,
     ) => {
-      const admin = createClaimAdmin(adminOptions);
+      const ledger = createClaimLedger(ledgerOptions);
       const fake =
         repositoryOptions === null
           ? null
           : createClaimRepository(repositoryOptions);
       const service = buildClaimService({
         ...(fake ? { repository: fake.repository } : {}),
-        admin: admin.admin,
+        ledger: ledger.repository,
       });
 
       branches.push({
-        admin,
+        ledger,
         call: () => service.claimDailyCredits(WORKSPACE_ID),
       });
     };
@@ -1159,21 +1163,21 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
     for (const branch of branches) {
       await branch.call().catch(() => undefined);
 
-      // The admin client's OTHER methods are read ZERO times on every branch —
+      // The ledger repository's OTHER methods are read ZERO times on every branch —
       // measured on the client itself, not inferred from the repository's calls.
-      expect(branch.admin.forbiddenReads).toEqual([]);
-      expect(branch.admin.forbiddenReads).not.toContain("from");
+      expect(branch.ledger.forbiddenReads).toEqual([]);
+      expect(branch.ledger.forbiddenReads).not.toContain("from");
 
-      for (const rpc of branch.admin.rpcCalls) {
-        expect(rpc.fn).toBe("claim_daily_credits");
+      for (const call of branch.ledger.calls) {
+        expect(call.method).toBe("claimDailyCredits");
       }
     }
 
-    // The spy is not vacuous: the RPC really was reached where it should be, and
+    // The spy is not vacuous: the claim function really was reached where it should be, and
     // not at all where the plan or the repository stopped the call.
-    expect(branches[0]?.admin.rpcCalls).toHaveLength(1);
-    expect(branches[2]?.admin.rpcCalls).toHaveLength(1);
-    expect(branches[5]?.admin.rpcCalls).toEqual([]);
+    expect(branches[0]?.ledger.calls).toHaveLength(1);
+    expect(branches[2]?.ledger.calls).toHaveLength(1);
+    expect(branches[5]?.ledger.calls).toEqual([]);
     // ...and the one failing balance read really did produce its log line.
     expect(warn).toHaveBeenCalledTimes(1);
   });
@@ -1182,15 +1186,15 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
     // A guard for this file's own premise. If the stand-in could not record a
     // forbidden read, case 40 would pass for the wrong reason; this proves that
     // reaching one is both observable and fatal.
-    const admin = createClaimAdmin({ claimed: true });
+    const ledger = createClaimLedger({ claimed: true });
 
-    expect(admin.forbiddenReads).toEqual([]);
+    expect(ledger.forbiddenReads).toEqual([]);
 
     const forbidden = (
-      admin.admin as unknown as Record<string, () => unknown>
+      ledger.repository as unknown as Record<string, () => unknown>
     )["from"];
-    expect(admin.forbiddenReads).toEqual(["from"]);
-    expect(() => forbidden?.()).toThrow(/reached the admin client's "from"/);
+    expect(ledger.forbiddenReads).toEqual(["from"]);
+    expect(() => forbidden?.()).toThrow(/reached the ledger repository's "from"/);
   });
 });
 
@@ -1200,21 +1204,25 @@ describe("credit-service claimDailyCredits: the claim and the balance read", () 
  * 这三个用例钉住的是「认码不认文案」：同一个 `deduct_credits` 调用，回答里
  * 有 `P0402` 就是 402 insufficient_credits（文案随便改也一样），没有这个码
  * 就绝不是余额不足 —— 哪怕 message 里还留着旧的那串 `INSUFFICIENT_CREDITS`。
- * admin 桩只有一个 `rpc`，除这一条 RPC 之外的接触都不可能发生。
+ * 仓储桩只有 `deductCredits` 这一个方法，除这一条函数之外的接触都不可能发生。
  */
 describe("credit-service deductCredits: insufficient balance is recognised by SQLSTATE (X-40 §4)", () => {
   const DEDUCT_USER_ID = "00000000-0000-0000-0000-0000000033d1";
 
-  /** 最小 admin 桩：只有 `deductCredits` 那一次 RPC，原样回答给定的结果。 */
+  /** 最小仓储桩：只有 `deductCredits` 这一个方法，按给定的结果回答（error 则抛出）。 */
   function deductServiceWith(answer: {
     data: unknown;
     error: unknown;
   }): CreditService {
-    const admin = {
-      rpc: async () => answer,
-    } as unknown as AdminSupabaseClient;
+    const ledger = {
+      deductCredits: async () => {
+        if (answer.error) throw answer.error;
 
-    return createCreditService({ getAdminClient: () => admin });
+        return answer.data as string;
+      },
+    } as unknown as CreditLedgerFunctionRepository;
+
+    return createCreditService({ creditLedgerFunctionRepository: ledger });
   }
 
   it("X-40: code P0402 is a 402 insufficient_credits whatever the message says", async () => {
@@ -1254,5 +1262,19 @@ describe("credit-service deductCredits: insufficient balance is recognised by SQ
     await expect(
       service.deductCredits(WORKSPACE_ID, DEDUCT_USER_ID, 5),
     ).resolves.toBe("tx-1");
+  });
+
+  it("44K: with no credit ledger function repository the deduction fails as credit_deduct_failed 500", async () => {
+    const service = createCreditService({});
+
+    const error = await refusal(() =>
+      service.deductCredits(WORKSPACE_ID, DEDUCT_USER_ID, 5),
+    );
+
+    expect(error.code).toBe("credit_deduct_failed");
+    expect(error.statusCode).toBe(500);
+    expect(error.message).toBe(
+      "Failed to deduct credits: no credit ledger function repository",
+    );
   });
 });

@@ -123,6 +123,7 @@ import { createJobOwnerReadRepository } from "./db/job-owner-read-repository.js"
 import { createJobOwnerWriteRepository } from "./db/job-owner-write-repository.js";
 import { createJobConcurrencyRepository } from "./db/job-concurrency-repository.js";
 import { createJobTransitionRepository } from "./db/job-transition-repository.js";
+import { createCreditLedgerFunctionRepository } from "./db/credit-ledger-function-repository.js";
 import { createCreditReadRepository } from "./db/credit-read-repository.js";
 import { createCreditLedgerWriteRepository } from "./db/credit-ledger-write-repository.js";
 import { createPricingRuleRepository } from "./db/pricing-rule-repository.js";
@@ -792,8 +793,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const baseCreditService =
     options.creditService ??
     createCreditService({
-      getAdminClient,
       creditReadRepository: createCreditReadRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
+      creditLedgerFunctionRepository: createCreditLedgerFunctionRepository({
         getTransactionPool: () => getTransactionPool(databaseEnv),
       }),
     });

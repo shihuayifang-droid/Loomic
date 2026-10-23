@@ -58,6 +58,7 @@ import {
 } from "./db/asset-record-repository.js";
 import { createRefundJob, type RefundJob } from "./features/jobs/refund-job.js";
 import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
+import { createCreditLedgerFunctionRepository } from "./db/credit-ledger-function-repository.js";
 import { createCreditPoolWriteRepository } from "./db/credit-pool-write-repository.js";
 import { createPoolBalanceReadRepository } from "./db/pool-balance-read-repository.js";
 import {
@@ -158,7 +159,11 @@ export function buildWorkerComposition(
       getTransactionPool,
     }),
   });
-  const baseCreditService = createCreditService({ getAdminClient });
+  const baseCreditService = createCreditService({
+    creditLedgerFunctionRepository: createCreditLedgerFunctionRepository({
+      getTransactionPool,
+    }),
+  });
   // Workorder 37T: `LOOMIC_CREDIT_POOLS=on` moves the refund (and the charge)
   // onto the three pools; anything else keeps the service exactly as built.
   const creditService: CreditService = creditPoolsEnabled()
