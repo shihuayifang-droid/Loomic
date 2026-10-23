@@ -1,5 +1,8 @@
 import type { MetadataRoute } from "next";
 
+// output: "export" 下元数据路由必须声明为静态，否则 next build 失败——见 45A
+export const dynamic = "force-static";
+
 /**
  * BR-06 PWA 清单（工单 40V）
  *

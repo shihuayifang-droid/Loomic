@@ -93,6 +93,43 @@ describe("BR-06 brand icons", () => {
     }
   });
 
+  it("OP-07: metadata routes are force-static when next.config uses output export", () => {
+    const config = read("next.config.ts");
+
+    if (!/output:\s*["']export["']/.test(config)) {
+      return;
+    }
+
+    const metadataFiles = [
+      "manifest.ts",
+      "manifest.js",
+      "robots.ts",
+      "robots.js",
+      "sitemap.ts",
+      "sitemap.js",
+      "icon.tsx",
+      "icon.ts",
+      "apple-icon.tsx",
+      "apple-icon.ts",
+      "opengraph-image.tsx",
+      "opengraph-image.ts",
+      "twitter-image.tsx",
+      "twitter-image.ts",
+    ];
+
+    for (const name of metadataFiles) {
+      const relPath = `src/app/${name}`;
+
+      if (!fs.existsSync(path.join(WEB_ROOT, relPath))) {
+        continue;
+      }
+
+      expect(read(relPath), `${relPath} 缺 export const dynamic = "force-static"`).toMatch(
+        /export const dynamic\s*=\s*["']force-static["']/,
+      );
+    }
+  });
+
   it("BR-06: the layout points the browser at the icon set", () => {
     const source = read("src/app/layout.tsx");
 
