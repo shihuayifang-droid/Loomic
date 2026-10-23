@@ -9,7 +9,9 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Separator } from "./ui/separator";
+import { errorCodeOf, lookupError } from "../lib/error-catalog";
 import { fetchViewer } from "../lib/server-api";
+import { authProvider, signUp as selfSignUp } from "../lib/self-auth-client";
 import { getSupabaseBrowserClient } from "../lib/supabase-browser";
 
 const stagger = {
@@ -51,6 +53,20 @@ export function RegisterForm() {
 
     setLoading(true);
     setError(null);
+
+    // 42G: self-hosted auth returns an active session straight away — there is
+    // no confirmation e-mail to wait for, so `sent` is never reached here.
+    if (authProvider() === "self") {
+      try {
+        const session = await selfSignUp(trimmed, password);
+        await bootstrapWorkspace(session.access_token);
+      } catch (err) {
+        setError(lookupError(errorCodeOf(err)).message);
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
 
     const supabase = getSupabaseBrowserClient();
     const { data, error: authError } = await supabase.auth.signUp({

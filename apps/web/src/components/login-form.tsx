@@ -9,7 +9,10 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
 import { Separator } from "./ui/separator";
+import { ForcePasswordChange } from "./auth/force-password-change";
+import { errorCodeOf, lookupError } from "../lib/error-catalog";
 import { fetchViewer } from "../lib/server-api";
+import { authProvider, signIn as selfSignIn } from "../lib/self-auth-client";
 import { getSupabaseBrowserClient } from "../lib/supabase-browser";
 
 const stagger = {
@@ -28,12 +31,19 @@ interface LoginFormProps {
 
 export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
   const router = useRouter();
+  // Read per render (never at module scope): the provider is a build-time env
+  // value, but a module-level snapshot would also freeze a stubbed value in tests.
+  const selfMode = authProvider() === "self";
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [mode, setMode] = useState<"magic" | "password">("magic");
+  // Self-hosted auth has no magic link, so the password form is the only mode.
+  const [mode, setMode] = useState<"magic" | "password">(
+    selfMode ? "password" : "magic",
+  );
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
   const [error, setError] = useState<string | null>(initialErrorMessage);
+  const [mustChangePassword, setMustChangePassword] = useState(false);
 
   async function bootstrapWorkspace(accessToken: string) {
     try {
@@ -97,6 +107,52 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
     }
   }
 
+  /** 42G: self-hosted sign-in, with the forced password change in the middle. */
+  async function handleSelfPassword(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const trimmed = email.trim();
+    if (!trimmed || !password) return;
+    setLoading(true);
+    setError(null);
+
+    try {
+      const session = await selfSignIn(trimmed, password);
+      if (session.user.must_change_password) {
+        // Stay on this screen, but show the new-password step instead.
+        setMustChangePassword(true);
+        return;
+      }
+      await bootstrapWorkspace(session.access_token);
+    } catch (err) {
+      setError(lookupError(errorCodeOf(err)).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  /**
+   * 42G: the server revokes every session when the password changes, so the
+   * temporary one is dead — sign in again with the new password before
+   * bootstrapping the workspace.
+   */
+  async function handlePasswordChanged(newPassword: string) {
+    const trimmed = email.trim();
+    setPassword(newPassword);
+    setLoading(true);
+    setError(null);
+
+    try {
+      const session = await selfSignIn(trimmed, newPassword);
+      setMustChangePassword(false);
+      await bootstrapWorkspace(session.access_token);
+    } catch (err) {
+      setMustChangePassword(false);
+      setError(lookupError(errorCodeOf(err)).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleGoogle() {
     setError(null);
     const supabase = getSupabaseBrowserClient();
@@ -109,6 +165,17 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
     if (authError) {
       setError(authError.message);
     }
+  }
+
+  if (selfMode && mustChangePassword) {
+    return (
+      <div className="w-full max-w-sm">
+        <ForcePasswordChange
+          currentPassword={password}
+          onDone={handlePasswordChanged}
+        />
+      </div>
+    );
   }
 
   return (
@@ -178,7 +245,13 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
 
             <motion.form
               variants={fadeIn}
-              onSubmit={mode === "password" ? handlePassword : handleMagicLink}
+              onSubmit={
+                selfMode
+                  ? handleSelfPassword
+                  : mode === "password"
+                    ? handlePassword
+                    : handleMagicLink
+              }
               className="space-y-4"
             >
               <div className="space-y-2">
@@ -192,7 +265,7 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
                   required
                 />
               </div>
-              {mode === "password" && (
+              {(selfMode || mode === "password") && (
                 <div className="space-y-2">
                   <Label htmlFor="password">Password</Label>
                   <Input
@@ -207,37 +280,43 @@ export function LoginForm({ initialErrorMessage = null }: LoginFormProps) {
               )}
               <Button data-testid="account-login-submit" type="submit" className="w-full" disabled={loading}>
                 {loading
-                  ? mode === "password" ? "Signing in..." : "Sending..."
-                  : mode === "password" ? "Sign in" : "Send login link"}
+                  ? selfMode || mode === "password" ? "Signing in..." : "Sending..."
+                  : selfMode || mode === "password" ? "Sign in" : "Send login link"}
               </Button>
-              <button data-testid="account-login-mode-toggle"
-                type="button"
-                onClick={() => {
-                  setMode(mode === "password" ? "magic" : "password");
-                  setError(null);
-                }}
-                className="w-full text-xs text-muted-foreground hover:text-foreground transition-colors"
-              >
-                {mode === "password" ? "Use login link instead" : "Use password instead"}
-              </button>
+              {!selfMode && (
+                <button data-testid="account-login-mode-toggle"
+                  type="button"
+                  onClick={() => {
+                    setMode(mode === "password" ? "magic" : "password");
+                    setError(null);
+                  }}
+                  className="w-full text-xs text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  {mode === "password" ? "Use login link instead" : "Use password instead"}
+                </button>
+              )}
             </motion.form>
 
-            <motion.div variants={fadeIn} className="flex items-center gap-4">
-              <Separator className="flex-1" />
-              <span className="text-xs text-muted-foreground uppercase">or</span>
-              <Separator className="flex-1" />
-            </motion.div>
+            {!selfMode && (
+              <>
+                <motion.div variants={fadeIn} className="flex items-center gap-4">
+                  <Separator className="flex-1" />
+                  <span className="text-xs text-muted-foreground uppercase">or</span>
+                  <Separator className="flex-1" />
+                </motion.div>
 
-            <motion.div variants={fadeIn}>
-              <Button data-testid="account-login-google"
-                variant="outline"
-                className="w-full"
-                onClick={handleGoogle}
-                type="button"
-              >
-                Continue with Google
-              </Button>
-            </motion.div>
+                <motion.div variants={fadeIn}>
+                  <Button data-testid="account-login-google"
+                    variant="outline"
+                    className="w-full"
+                    onClick={handleGoogle}
+                    type="button"
+                  >
+                    Continue with Google
+                  </Button>
+                </motion.div>
+              </>
+            )}
 
             <motion.p variants={fadeIn} className="text-center text-sm text-muted-foreground">
               Need an account?{" "}
