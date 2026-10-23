@@ -6,14 +6,15 @@
 // and nobody would notice until the bucket is private and the real project cannot
 // read its own media.
 //
-// Every metadata write in this file goes through the service_role-only RPC, so the
-// stub asserts on the RPC call rather than on an insert.
+// Every metadata write in this file goes through the asset record repository, so
+// the stub asserts on the repository call rather than on an insert.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import { createProjectService } from "../projects/project-service.js";
 import type { AssetReadRepository } from "../../db/asset-read-repository.js";
 import type { AssetProvenanceRepository } from "../../db/asset-provenance-repository.js";
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import {
   DELETE_OWN_ASSET,
   AssetWriteError,
@@ -21,7 +22,6 @@ import {
 } from "../../db/asset-write-repository.js";
 import type { ProjectReadRepository } from "../../db/project-read-repository.js";
 import type { ProjectWriteRepository } from "../../db/project-write-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 import { createUploadService, UploadServiceError } from "./upload-service.js";
 
@@ -31,7 +31,7 @@ const TEAM_WORKSPACE = "ws-team";
 const OTHER_WORKSPACE = "ws-other";
 const PROJECT = "project-1";
 
-type RpcCall = { name: string; params: Record<string, unknown> };
+type RecordCall = Record<string, unknown>;
 
 /** ED-05: what the signing SDK was told about a download, kept beside `signedCalls`. */
 type SignedOptions = { transform?: unknown; download?: unknown } | undefined;
@@ -40,6 +40,8 @@ function makeStubs(options: {
   project?: { workspace_id: string } | null;
   projectError?: { code?: string; message: string } | null;
   rpcError?: { message: string } | null;
+  /** 44C: build the service without the asset record repository (fail closed). */
+  omitRecordRepository?: boolean;
   uploadError?: { message: string } | null;
   assetRow?: Record<string, unknown> | null;
   assetReadError?: { message: string } | null;
@@ -56,7 +58,7 @@ function makeStubs(options: {
   uploadList?: Array<Record<string, unknown>>;
   uploadListError?: { message: string } | null;
 }) {
-  const rpcs: RpcCall[] = [];
+  const recordCalls: RecordCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
   const removals: string[] = [];
   const signedCalls: Array<{ bucket: string; path: string; expiresIn: number }> = [];
@@ -76,7 +78,7 @@ function makeStubs(options: {
   //
   // ADR-0001 / workorder 21AA: so does the asset row delete, and the `getAssetUrl`
   // read that used to be the last PostgREST call here. The user client below
-  // therefore carries ONLY Storage and the `record_project_asset` RPC; its table
+  // therefore carries ONLY Storage; its table
   // accessor throws, so any regression back to PostgREST explodes here instead of
   // passing quietly.
   const projectLookups: Array<{ actorId: string; projectId: string }> = [];
@@ -215,26 +217,27 @@ function makeStubs(options: {
         };
       },
     },
-    rpc: async (name: string, params: Record<string, unknown>) => {
-      rpcs.push({ name, params });
-      events.push(`rpc:${name}`);
-      if (options.rpcError) return { data: null, error: options.rpcError };
-      return { data: { asset_id: "asset-1", workspace_id: TEAM_WORKSPACE, project_id: PROJECT }, error: null };
-    },
   };
 
-  const adminClient = {
-    rpc: async (name: string, params: Record<string, unknown>) => {
-      rpcs.push({ name, params });
-      events.push(`rpc:${name}`);
-      if (options.rpcError) return { data: null, error: options.rpcError };
-      return { data: { asset_id: "asset-1", workspace_id: TEAM_WORKSPACE, project_id: PROJECT }, error: null };
+  // Workorder 44C: the asset record is the repository's now; the fake records the
+  // camelCase input and can be made to throw. `omitRecordRepository` leaves it out.
+  const assetRecordRepository = {
+    async recordProjectAsset(input: Record<string, unknown>) {
+      recordCalls.push(input);
+      events.push("record");
+      if (options.rpcError) throw options.rpcError;
+      return { assetId: "asset-1", workspaceId: TEAM_WORKSPACE, projectId: PROJECT };
     },
   };
 
   const service = createUploadService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
-    getAdminClient: () => adminClient as unknown as AdminSupabaseClient,
+    ...(options.omitRecordRepository
+      ? {}
+      : {
+          assetRecordRepository:
+            assetRecordRepository as unknown as AssetRecordRepository,
+        }),
     projectReadRepository: projectRepository as unknown as ProjectReadRepository,
     assetReadRepository: assetRepository as unknown as AssetReadRepository,
     assetWriteRepository:
@@ -254,7 +257,7 @@ function makeStubs(options: {
 
   return {
     service,
-    rpcs,
+    recordCalls,
     uploads,
     removals,
     signedCalls,
@@ -288,16 +291,16 @@ describe("uploadFile records project ownership", () => {
       projectId: PROJECT,
     });
 
-    expect(stub.rpcs).toHaveLength(1);
-    expect(stub.rpcs[0]?.name).toBe("record_project_asset");
-    expect(stub.rpcs[0]?.params).toMatchObject({
-      p_bucket: "project-assets",
-      p_created_by: "user-1",
-      p_project_id: PROJECT,
-      p_canvas_id: null,
-      p_fallback_workspace_id: TEAM_WORKSPACE,
+    expect(stub.recordCalls).toHaveLength(1);
+    expect(stub.recordCalls[0]?.bucket).toBe("project-assets");
+    expect(stub.recordCalls[0]).toMatchObject({
+      bucket: "project-assets",
+      createdBy: "user-1",
+      projectId: PROJECT,
+      canvasId: null,
+      fallbackWorkspaceId: TEAM_WORKSPACE,
     });
-    expect(stub.rpcs[0]?.params.p_object_path).toBe(stub.uploads[0]?.path);
+    expect(stub.recordCalls[0]?.objectPath).toBe(stub.uploads[0]?.path);
   });
 
   it("case 2: a workspace that is not the project's is refused before anything is written", async () => {
@@ -315,7 +318,7 @@ describe("uploadFile records project ownership", () => {
     expect(error?.statusCode).toBe(403);
     expect(error?.message).toContain("different workspace");
     expect(stub.uploads).toHaveLength(0);
-    expect(stub.rpcs).toHaveLength(0);
+    expect(stub.recordCalls).toHaveLength(0);
   });
 
   it("case 3: an unreadable project is refused", async () => {
@@ -335,11 +338,11 @@ describe("uploadFile records project ownership", () => {
 
     await stub.service.uploadFile(USER, { ...FILE, workspaceId: TEAM_WORKSPACE });
 
-    expect(stub.rpcs[0]?.params).toMatchObject({
-      p_project_id: null,
-      p_canvas_id: null,
-      p_fallback_workspace_id: TEAM_WORKSPACE,
-      p_created_by: "user-1",
+    expect(stub.recordCalls[0]).toMatchObject({
+      projectId: null,
+      canvasId: null,
+      fallbackWorkspaceId: TEAM_WORKSPACE,
+      createdBy: "user-1",
     });
   });
 
@@ -355,6 +358,25 @@ describe("uploadFile records project ownership", () => {
       .catch((thrown: unknown) => thrown as UploadServiceError);
 
     expect(error?.statusCode).toBe(500);
+    expect(stub.uploads).toHaveLength(1);
+    expect(stub.removals).toEqual([stub.uploads[0]?.path]);
+  });
+
+  it("44C: without an asset record repository the upload fails closed and the object is removed", async () => {
+    const stub = makeStubs({
+      project: { workspace_id: TEAM_WORKSPACE },
+      omitRecordRepository: true,
+    });
+
+    const error = await stub.service
+      .uploadFile(USER, { ...FILE, workspaceId: TEAM_WORKSPACE, projectId: PROJECT })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as UploadServiceError);
+
+    expect(error).toBeInstanceOf(UploadServiceError);
+    expect(error?.code).toBe("upload_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to record asset metadata.");
     expect(stub.uploads).toHaveLength(1);
     expect(stub.removals).toEqual([stub.uploads[0]?.path]);
   });
@@ -395,8 +417,11 @@ describe("uploadFile records project ownership", () => {
 // covered here rather than in a separate file: the subject is "an upload is
 // recorded as a project asset", not which service performed it.
 describe("saveThumbnail records the thumbnail as a project asset", () => {
-  function makeProjectService(options: { rpcError?: { message: string } | null }) {
-    const rpcs: RpcCall[] = [];
+  function makeProjectService(options: {
+    rpcError?: { message: string } | null;
+    omitRecordRepository?: boolean;
+  }) {
+    const recordCalls: RecordCall[] = [];
     const referenceWrites: Array<Record<string, unknown>> = [];
 
     // ADR-0001 / workorder 21AA: the reference write is the project write
@@ -442,17 +467,24 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
       } as unknown as ProjectReadRepository,
       projectWriteRepository:
         projectWriteRepository as unknown as ProjectWriteRepository,
-      getAdminClient: () =>
-        ({
-          rpc: async (name: string, params: Record<string, unknown>) => {
-            rpcs.push({ name, params });
-            if (options.rpcError) return { data: null, error: options.rpcError };
-            return { data: { asset_id: "asset-thumb" }, error: null };
-          },
-        }) as unknown as AdminSupabaseClient,
+      ...(options.omitRecordRepository
+        ? {}
+        : {
+            assetRecordRepository: {
+              async recordProjectAsset(input: Record<string, unknown>) {
+                recordCalls.push(input);
+                if (options.rpcError) throw options.rpcError;
+                return {
+                  assetId: "asset-thumb",
+                  workspaceId: TEAM_WORKSPACE,
+                  projectId: PROJECT,
+                };
+              },
+            },
+          }),
     });
 
-    return { service, rpcs, referenceWrites };
+    return { service, recordCalls, referenceWrites };
   }
 
   it("case 8: the thumbnail is recorded against its project", async () => {
@@ -460,14 +492,14 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
 
     await stub.service.saveThumbnail(USER, PROJECT, Buffer.from("thumb"), "image/png");
 
-    expect(stub.rpcs).toHaveLength(1);
-    expect(stub.rpcs[0]?.params).toMatchObject({
-      p_bucket: "project-assets",
-      p_project_id: PROJECT,
-      p_created_by: "user-1",
-      p_fallback_workspace_id: TEAM_WORKSPACE,
+    expect(stub.recordCalls).toHaveLength(1);
+    expect(stub.recordCalls[0]).toMatchObject({
+      bucket: "project-assets",
+      projectId: PROJECT,
+      createdBy: "user-1",
+      fallbackWorkspaceId: TEAM_WORKSPACE,
     });
-    expect(stub.rpcs[0]?.params.p_object_path).toBe(
+    expect(stub.recordCalls[0]?.objectPath).toBe(
       `${TEAM_WORKSPACE}/${PROJECT}/thumbnail.png`,
     );
     expect(stub.referenceWrites).toEqual([
@@ -477,6 +509,16 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
         thumbnailPath: `${TEAM_WORKSPACE}/${PROJECT}/thumbnail.png`,
       },
     ]);
+  });
+
+  it("44C: without an asset record repository the thumbnail fails closed and the reference is not saved", async () => {
+    const stub = makeProjectService({ omitRecordRepository: true });
+
+    await expect(
+      stub.service.saveThumbnail(USER, PROJECT, Buffer.from("thumb"), "image/png"),
+    ).rejects.toThrow(/thumbnail metadata/i);
+
+    expect(stub.referenceWrites).toHaveLength(0);
   });
 
   it("case 9: a metadata failure is reported and the reference is not saved", async () => {
@@ -562,7 +604,7 @@ describe("the migrated lookups of the upload write flows", () => {
       { actorId: "user-1", projectId: PROJECT },
     ]);
     expect(stub.uploads).toEqual([]);
-    expect(stub.rpcs).toEqual([]);
+    expect(stub.recordCalls).toEqual([]);
     expect(stub.assetLookups).toEqual([]);
     expect(stub.events).toEqual([]);
   });
@@ -577,7 +619,7 @@ describe("the migrated lookups of the upload write flows", () => {
 
     expect(stub.projectLookups).toEqual([]);
     expect(stub.uploads).toHaveLength(1);
-    expect(stub.rpcs).toHaveLength(1);
+    expect(stub.recordCalls).toHaveLength(1);
   });
 
   it("case 13: the DTO comes from the row the asset repository answers, asked with the actor and the RPC's id", async () => {
@@ -643,7 +685,7 @@ describe("the migrated lookups of the upload write flows", () => {
     expect(stub.uploads).toHaveLength(1);
     // Exactly one cleanup, and it is the same one as before the migration.
     expect(stub.removals).toEqual([stub.uploads[0]?.path]);
-    expect(stub.rpcs).toHaveLength(1);
+    expect(stub.recordCalls).toHaveLength(1);
     expect(stub.signedCalls).toEqual([]);
   });
 
@@ -1008,7 +1050,6 @@ function makeZipStubs(options: {
 
   const service = createUploadService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
-    getAdminClient: () => ({}) as unknown as AdminSupabaseClient,
     assetReadRepository: {
       async findReadableAsset(input: { actorId: string; assetId: string }) {
         const row = options.rows[input.assetId];
@@ -1304,8 +1345,8 @@ describe("ED-00i: uploadToolOutput records a tool source", () => {
 
     await stub.service.uploadToolOutput(USER, TOOL_OUTPUT);
 
-    expect(stub.rpcs).toHaveLength(1);
-    expect(stub.rpcs[0]?.params.p_project_id).toBe("project-9");
+    expect(stub.recordCalls).toHaveLength(1);
+    expect(stub.recordCalls[0]?.projectId).toBe("project-9");
     // The object is filed under the parent's project too.
     expect(stub.uploads[0]?.path).toContain("project-9");
   });
@@ -1322,7 +1363,7 @@ describe("ED-00i: uploadToolOutput records a tool source", () => {
     expect(error?.statusCode).toBe(404);
     expect(error?.code).toBe("upload_failed");
     expect(stub.uploads).toEqual([]);
-    expect(stub.rpcs).toEqual([]);
+    expect(stub.recordCalls).toEqual([]);
     expect(stub.provenanceCalls).toEqual([]);
   });
 

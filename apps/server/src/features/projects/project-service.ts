@@ -8,6 +8,7 @@ import {
   BootstrapError,
   type ViewerService,
 } from "../bootstrap/ensure-user-foundation.js";
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import {
   FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
   ProjectReadError,
@@ -23,7 +24,6 @@ import {
   isTransportFailure,
   withTransportRetry,
 } from "../../supabase/transport-retry.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { ObjectStoreError } from "../storage/object-store.js";
 import {
   ProjectAssetUrlError,
@@ -121,7 +121,12 @@ export class ProjectServiceError extends Error {
 export function createProjectService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   viewerService: ViewerService;
-  getAdminClient: () => AdminSupabaseClient;
+  /**
+   * Workorder 44C: the thumbnail's asset row is recorded through the asset record
+   * repository. Optional in the type only; absent fails closed with the existing
+   * "Failed to record thumbnail metadata." 500.
+   */
+  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   /**
    * Workorder 20B / 20E: the project read paths — the two real reads and the
    * read-only lookups the write flows perform before writing — are the PostgreSQL
@@ -478,21 +483,29 @@ export function createProjectService(options: {
       // private, an object with no asset row has no owner to authorise it.
       // Recorded BEFORE the reference is saved, so a metadata failure cannot
       // leave the project pointing at an object nobody owns.
-      const { error: recordError } = await options.getAdminClient().rpc(
-        "record_project_asset",
-        {
-          p_bucket: THUMBNAIL_BUCKET,
-          p_object_path: objectPath,
-          p_created_by: user.id,
-          p_fallback_workspace_id: proj.workspace_id,
-          p_project_id: projectId,
-          p_canvas_id: null,
-          p_mime_type: mimeType,
-          p_byte_size: buffer.length,
-        },
-      );
+      // Fails closed: a missing repository is the same error as a failed write.
+      let recordFailed = false;
 
-      if (recordError) {
+      try {
+        if (!options.assetRecordRepository) {
+          recordFailed = true;
+        } else {
+          await options.assetRecordRepository.recordProjectAsset({
+            bucket: THUMBNAIL_BUCKET,
+            objectPath,
+            createdBy: user.id,
+            fallbackWorkspaceId: proj.workspace_id,
+            projectId,
+            canvasId: null,
+            mimeType,
+            byteSize: buffer.length,
+          });
+        }
+      } catch {
+        recordFailed = true;
+      }
+
+      if (recordFailed) {
         throw new ProjectServiceError(
           "project_create_failed",
           "Failed to record thumbnail metadata.",

@@ -12,9 +12,9 @@ import type {
   AssetProvenance,
   AssetProvenanceRepository,
 } from "../../db/asset-provenance-repository.js";
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { ProjectReadRepository } from "../../db/project-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -157,7 +157,12 @@ export type UploadService = {
 
 export function createUploadService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
-  getAdminClient: () => AdminSupabaseClient;
+  /**
+   * Workorder 44C: the asset row for an uploaded object is recorded through the
+   * repository. Optional in the type only; absent means the upload fails closed
+   * with the existing "Failed to record asset metadata." 500.
+   */
+  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   /**
    * Workorder 20E: the read-only lookup the project branch performs before the
    * object is written. Optional only because unrelated call sites build this
@@ -276,25 +281,30 @@ export function createUploadService(options: {
         );
       }
 
-      // Metadata is written through the ONE service_role-only entry point, which
-      // derives project ownership itself — the user client cannot call it, and
-      // must not insert asset rows directly.
-      const { data: recorded, error: recordError } = await options
-        .getAdminClient()
-        .rpc("record_project_asset", {
-          p_bucket: input.bucket,
-          p_object_path: objectPath,
-          p_created_by: user.id,
-          p_fallback_workspace_id: workspaceId,
-          p_project_id: input.projectId ?? null,
-          p_canvas_id: null,
-          p_mime_type: input.mimeType,
-          p_byte_size: input.fileBuffer.length,
-        });
+      // Metadata is written through the asset record repository, the ONE entry
+      // point that derives project ownership itself — the user client must not
+      // insert asset rows directly. A missing repository fails closed.
+      let assetId: string | undefined;
 
-      const assetId = (recorded as { asset_id?: string } | null)?.asset_id;
+      try {
+        if (options.assetRecordRepository) {
+          const recorded = await options.assetRecordRepository.recordProjectAsset({
+            bucket: input.bucket,
+            objectPath,
+            createdBy: user.id,
+            fallbackWorkspaceId: workspaceId,
+            projectId: input.projectId ?? null,
+            canvasId: null,
+            mimeType: input.mimeType,
+            byteSize: input.fileBuffer.length,
+          });
+          assetId = recorded.assetId;
+        }
+      } catch {
+        assetId = undefined;
+      }
 
-      if (recordError || !assetId) {
+      if (!assetId) {
         // Clean up the uploaded file if its metadata could not be recorded.
         await removeQuietly(storeFor(client), {
           bucket: input.bucket,

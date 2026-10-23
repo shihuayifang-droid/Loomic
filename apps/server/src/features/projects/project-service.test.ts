@@ -17,6 +17,7 @@ import {
   ProjectWriteError,
   type ProjectWriteRepository,
 } from "../../db/project-write-repository.js";
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import type {
   AuthenticatedUser,
@@ -260,10 +261,8 @@ function makeWriteRepositoryStub(
  */
 function makeStorageOnlyClient(options: {
   signedPath?: string;
-  rpcError?: { message: string } | null;
 } = {}) {
   const uploads: string[] = [];
-  const rpcs: string[] = [];
 
   const client = {
     get from(): never {
@@ -288,14 +287,24 @@ function makeStorageOnlyClient(options: {
         };
       },
     },
-    rpc: async (name: string) => {
-      rpcs.push(name);
-      if (options.rpcError) return { data: null, error: options.rpcError };
-      return { data: { asset_id: "asset-thumb" }, error: null };
-    },
   };
 
-  return { client: client as unknown as UserSupabaseClient, uploads, rpcs };
+  return { client: client as unknown as UserSupabaseClient, uploads };
+}
+
+/**
+ * Workorder 44C: the thumbnail's asset row is recorded through the asset record
+ * repository; this fake records the camelCase input.
+ */
+function makeRecordRepositoryStub() {
+  const calls: Array<Record<string, unknown>> = [];
+  const repository = {
+    async recordProjectAsset(input: Record<string, unknown>) {
+      calls.push(input);
+      return { assetId: "asset-thumb", workspaceId: TEAM_ID, projectId: "project-1" };
+    },
+  } as unknown as AssetRecordRepository;
+  return { repository, calls };
 }
 
 function makeViewerStub(teamWorkspace: {
@@ -375,9 +384,7 @@ describe("createProjectService with the team workspace", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      // X-52 工单12: the service now records asset metadata through the admin
-      // client. These cases exercise create/list only, so it is never called.
-      getAdminClient: () => client as unknown as never,
+      // These cases exercise create/list only, so no asset is ever recorded.
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
@@ -411,7 +418,6 @@ describe("createProjectService with the team workspace", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
@@ -443,7 +449,6 @@ describe("createProjectService with the team workspace", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(null),
-      getAdminClient: () => client as unknown as never,
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
@@ -473,7 +478,6 @@ describe("getProject delegating to the project read repository", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
       ...(options.withRepository
         ? { projectReadRepository: stub.repository }
         : {}),
@@ -568,7 +572,6 @@ describe("listProjects delegating to the project read repository", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
@@ -598,7 +601,6 @@ describe("listProjects delegating to the project read repository", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
@@ -617,7 +619,6 @@ describe("listProjects delegating to the project read repository", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
@@ -641,7 +642,6 @@ describe("listProjects delegating to the project read repository", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
@@ -666,7 +666,6 @@ describe("listProjects delegating to the project read repository", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
@@ -686,7 +685,6 @@ describe("listProjects delegating to the project read repository", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
 
@@ -764,7 +762,7 @@ describe("saveThumbnail answers with a signed URL", () => {
     const service = createProjectService({
       createUserClient: () => client as unknown as UserSupabaseClient,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
+      assetRecordRepository: makeRecordRepositoryStub().repository,
       projectReadRepository: repository as unknown as ProjectReadRepository,
       projectWriteRepository: writeStub.repository,
     });
@@ -966,7 +964,6 @@ describe("archiveProject delegating to the project read repository", () => {
     const service = createProjectService({
       createUserClient: () => client.client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client.client as unknown as never,
       ...(config.withRepository === false
         ? {}
         : {
@@ -1101,7 +1098,6 @@ describe("updateProject delegating to the project write repository", () => {
     const service = createProjectService({
       createUserClient: () => client.client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client.client as unknown as never,
       projectWriteRepository: writeStub.repository,
     });
 
@@ -1214,7 +1210,7 @@ describe("saveThumbnail lookup retry", () => {
     const attempts: number[] = [];
     const inputs: Array<Record<string, unknown>> = [];
     const uploads: string[] = [];
-    const rpcs: string[] = [];
+    const recordStub = makeRecordRepositoryStub();
 
     const repository = {
       async findReadableProjectWorkspaceForMutation(input: {
@@ -1244,7 +1240,7 @@ describe("saveThumbnail lookup retry", () => {
     const service = createProjectService({
       createUserClient: () => client.client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client.client as unknown as never,
+      assetRecordRepository: recordStub.repository,
       projectReadRepository: repository as unknown as ProjectReadRepository,
       projectWriteRepository: writeStub.repository,
     });
@@ -1254,7 +1250,7 @@ describe("saveThumbnail lookup retry", () => {
       attempts,
       inputs,
       uploads: client.uploads,
-      rpcs: client.rpcs,
+      recordCalls: recordStub.calls,
       writeCalls: writeStub.calls,
     };
   }
@@ -1305,7 +1301,15 @@ describe("saveThumbnail lookup retry", () => {
       expect(harness.uploads).toEqual([
         `${TEAM_ID}/project-1/thumbnail.png`,
       ]);
-      expect(harness.rpcs).toEqual(["record_project_asset"]);
+      expect(harness.recordCalls).toHaveLength(1);
+      expect(harness.recordCalls[0]).toMatchObject({
+        bucket: "project-assets",
+        objectPath: `${TEAM_ID}/project-1/thumbnail.png`,
+        createdBy: USER_ID,
+        fallbackWorkspaceId: TEAM_ID,
+        projectId: "project-1",
+        canvasId: null,
+      });
       expect(harness.writeCalls).toEqual([
         {
           method: SET_OWN_PROJECT_THUMBNAIL,
@@ -1341,7 +1345,7 @@ describe("saveThumbnail lookup retry", () => {
     );
     // Nothing was written: no object, no metadata row, no reference.
     expect(harness.uploads).toEqual([]);
-    expect(harness.rpcs).toEqual([]);
+    expect(harness.recordCalls).toEqual([]);
     expect(harness.writeCalls).toEqual([]);
   });
 
@@ -1369,7 +1373,7 @@ describe("saveThumbnail lookup retry", () => {
       expect(error?.code).toBe("project_query_failed");
       expect(error?.message).toBe("Unable to look up project.");
       expect(harness.uploads).toEqual([]);
-      expect(harness.rpcs).toEqual([]);
+      expect(harness.recordCalls).toEqual([]);
       expect(harness.writeCalls).toEqual([]);
     } finally {
       vi.useRealTimers();
@@ -1394,7 +1398,6 @@ describe("GN-14 list thumbnails go through the storage renderer", () => {
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
-      getAdminClient: () => client as unknown as never,
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
@@ -1423,7 +1426,6 @@ describe("GN-14 list thumbnails go through the storage renderer", () => {
       const service = createProjectService({
         createUserClient: () => client,
         viewerService: makeViewerStub(TEAM_WORKSPACE),
-        getAdminClient: () => client as unknown as never,
         projectReadRepository: repository,
         projectWriteRepository: makeWriteRepositoryStub().repository,
       });

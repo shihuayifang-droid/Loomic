@@ -148,9 +148,6 @@ beforeAll(async () => {
       throw new Error("getProject must not build a user client");
     },
     viewerService: {} as unknown as ViewerService,
-    getAdminClient: () => {
-      throw new Error("getProject must not reach for the admin client");
-    },
     projectReadRepository: repository,
     projectWriteRepository: {} as unknown as ProjectWriteRepository,
   });

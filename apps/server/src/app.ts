@@ -97,6 +97,7 @@ import {
   type AssetReadRepository,
 } from "./db/asset-read-repository.js";
 import { createAssetProvenanceRepository } from "./db/asset-provenance-repository.js";
+import { createAssetRecordRepository } from "./db/asset-record-repository.js";
 import { createAssetWriteRepository } from "./db/asset-write-repository.js";
 import {
   createWorkspaceSkillReadRepository,
@@ -597,12 +598,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       identityReadRepository,
       teamMembership: teamMembershipService,
     });
+  const assetRecordRepository = createAssetRecordRepository({
+    getTransactionPool: () => getTransactionPool(databaseEnv),
+  });
   const projectService =
     options.projectService ??
     createProjectService({
       createUserClient,
       viewerService,
-      getAdminClient,
+      assetRecordRepository,
       projectReadRepository,
       // ADR-0001 / workorder 21AA: the three project writes — archive, the
       // thumbnail reference and the name / brand-kit patch — are the write
@@ -705,7 +709,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.uploadService ??
     createUploadService({
       createUserClient,
-      getAdminClient,
+      assetRecordRepository,
       projectReadRepository,
       assetReadRepository,
       assetWriteRepository,
