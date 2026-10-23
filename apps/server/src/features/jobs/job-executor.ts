@@ -7,6 +7,7 @@ import type { ServerEnv } from "../../config/env.js";
 import type { CreditReadRepository } from "../../db/credit-read-repository.js";
 import type { AssetProvenanceRepository } from "../../db/asset-provenance-repository.js";
 import type { AssetReadRepository } from "../../db/asset-read-repository.js";
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 
 export type ExecutorContext = {
   jobService: JobService;
@@ -39,6 +40,13 @@ export type ExecutorContext = {
    * repository as an error rather than reading the object some other way.
    */
   assetReadRepository?: Pick<AssetReadRepository, "findReadableAsset">;
+  /**
+   * 44I onward: the image / tool / video executors record the ownership of the
+   * output they produce through this. The worker wires the real repository in;
+   * every other construction site (and every test substitute) may leave it out.
+   * An absent repository is treated by the executors as a failed record.
+   */
+  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   /**
    * GN-11: the amount this job was charged, as the worker read it from the
    * billing gate (`credits_cost`). The executors copy it into provenance.

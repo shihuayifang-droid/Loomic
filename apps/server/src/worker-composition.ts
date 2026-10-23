@@ -52,6 +52,10 @@ import {
   createAssetProvenanceRepository,
   type AssetProvenanceRepository,
 } from "./db/asset-provenance-repository.js";
+import {
+  createAssetRecordRepository,
+  type AssetRecordRepository,
+} from "./db/asset-record-repository.js";
 import { createRefundJob, type RefundJob } from "./features/jobs/refund-job.js";
 import { createCreditService, type CreditService } from "./features/credits/credit-service.js";
 import { createCreditPoolWriteRepository } from "./db/credit-pool-write-repository.js";
@@ -99,6 +103,7 @@ export type WorkerBaseContext = {
   creditReadRepository: CreditReadRepository;
   assetProvenanceRepository: AssetProvenanceRepository;
   assetReadRepository: AssetReadRepository;
+  assetRecordRepository: AssetRecordRepository;
 };
 
 export type WorkerComposition = {
@@ -196,6 +201,13 @@ export function buildWorkerComposition(
     getTransactionPool,
   });
 
+  // 44H: the image / tool / video executors record the ownership of their
+  // output through this. Built lazily like the repositories above, so
+  // construction connects to nothing.
+  const assetRecordRepository = createAssetRecordRepository({
+    getTransactionPool,
+  });
+
   // ADR-0001 / workorder 21H1: the billing gate the worker runs before it
   // consumes an attempt or calls a model. Built here, lazily, exactly like the
   // attempt repository above and against the same `DATABASE_URL`. With no
@@ -258,6 +270,8 @@ export function buildWorkerComposition(
     assetProvenanceRepository,
     // ED-00j: the input artifact of a tool_execution job is read through this.
     assetReadRepository,
+    // 44H: output ownership of image / tool / video jobs is recorded through this.
+    assetRecordRepository,
   };
 
   return {

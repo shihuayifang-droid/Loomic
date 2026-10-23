@@ -254,7 +254,7 @@ describe("buildWorkerComposition: what it builds", () => {
     expect(harness.userClientCalls()).toBe(0);
   });
 
-  it("carries exactly the six baseCtx keys, in the order the worker spreads them", () => {
+  it("carries exactly the eight baseCtx keys, in the order the worker spreads them", () => {
     const harness = createHarness();
 
     expect(Object.keys(harness.composition.baseCtx)).toEqual([
@@ -265,6 +265,7 @@ describe("buildWorkerComposition: what it builds", () => {
       "creditReadRepository",
       "assetProvenanceRepository",
       "assetReadRepository",
+      "assetRecordRepository",
     ]);
   });
 
