@@ -947,6 +947,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     // workspace skills. All four are the SAME instances the HTTP flows use; none
     // of them is constructed twice.
     assetWriteRepository,
+    // Workorder 44E: threaded to the Agent side, same instance; unused until 44F.
+    assetRecordRepository,
     brandKitReadRepository,
     workspaceSkillReadRepository,
     // Workorder 21S: the Agent runtime reads the row behind an attachment's

@@ -8,6 +8,7 @@ import { z } from "zod";
 
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
 import {
@@ -62,6 +63,8 @@ export type PersistSandboxFileDeps = {
   canvasReadRepository: CanvasReadRepository;
   /** The compensated row delete when signing fails (workorder 21AC). */
   assetWriteRepository: AssetWriteRepository;
+  /** Wired through but not used yet: from workorder 44F it records the asset. */
+  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   createUserClient: (accessToken: string) => SupabaseClient;
   /**
    * Service-role client getter. Required: ownership is recorded through the
@@ -115,6 +118,9 @@ export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
   const agentAssets = createAgentProjectAssetService({
     canvasReadRepository: deps.canvasReadRepository,
     assetWriteRepository: deps.assetWriteRepository,
+    ...(deps.assetRecordRepository
+      ? { assetRecordRepository: deps.assetRecordRepository }
+      : {}),
     createUserClient: (accessToken) =>
       deps.createUserClient(accessToken) as unknown as UserSupabaseClient,
     getAdminClient: deps.getAdminClient,

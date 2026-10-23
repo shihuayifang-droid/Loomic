@@ -23,6 +23,7 @@ import type {
   AssetReadRepository,
   AssetReadRow,
 } from "../db/asset-read-repository.js";
+import type { AssetRecordRepository } from "../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../db/brand-kit-read-repository.js";
 import type {
@@ -513,6 +514,8 @@ type CreateAgentRuntimeOptions = {
    * leave a half-created asset behind.
    */
   assetWriteRepository: AssetWriteRepository;
+  /** Wired through to the Agent tools; not used yet (workorder 44F). */
+  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   /**
    * Brand kit read repository (workorder 21AC). `get_brand_kit`'s two reads are
    * owner-keyed and belong to `brand-kit-read-repository.ts`. Required: without
@@ -878,6 +881,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         // goes through are injected HERE, so a caller that builds the runtime
         // cannot hand the agent a different set than the one it runs on.
         assetWriteRepository: options.assetWriteRepository,
+        ...(options.assetRecordRepository
+          ? { assetRecordRepository: options.assetRecordRepository }
+          : {}),
         brandKitReadRepository: options.brandKitReadRepository,
         canvasReadRepository: options.canvasReadRepository,
         ...(options.createUserClient
@@ -1995,6 +2001,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               // error codes of this sequence are unchanged.
               canvasReadRepository: options.canvasReadRepository,
               assetWriteRepository: options.assetWriteRepository,
+              ...(options.assetRecordRepository
+                ? { assetRecordRepository: options.assetRecordRepository }
+                : {}),
               createUserClient: (token) =>
                 createClient(token) as UserSupabaseClient,
               getAdminClient,

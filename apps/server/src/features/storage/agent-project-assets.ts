@@ -38,6 +38,7 @@
 // those would silently restore the exact dependency this ticket removes.
 import type { AgentAssetReference } from "@loomic/shared";
 
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type {
   CanvasProjectLinkRow,
@@ -153,6 +154,8 @@ export function createAgentProjectAssetService(options: {
   canvasReadRepository: CanvasReadRepository;
   /** The compensated row delete when signing fails (21AC). */
   assetWriteRepository: AssetWriteRepository;
+  /** Wired through but not used yet: from workorder 44F it records the asset. */
+  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   createUserClient: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
 }): AgentProjectAssetService {

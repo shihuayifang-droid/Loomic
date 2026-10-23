@@ -1,6 +1,7 @@
 import type { StructuredTool } from "@langchain/core/tools";
 import type { BackendFactory, BackendProtocol } from "deepagents";
 
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../../db/brand-kit-read-repository.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
@@ -63,6 +64,8 @@ export function createMainAgentTools(
      * silently missing fails at the one moment it is needed.
      */
     assetWriteRepository: AssetWriteRepository;
+    /** Wired through but not used yet: from workorder 44F it records the asset. */
+    assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
     /** Owner-keyed brand kit reads — `get_brand_kit` no longer reads tables (21AC). */
     brandKitReadRepository: BrandKitReadRepository;
     /** The canvas → project link behind every persisted asset's workspace (21AC). */
@@ -98,6 +101,9 @@ export function createMainAgentTools(
     tools.push(
       createPersistSandboxFileTool({
         assetWriteRepository: deps.assetWriteRepository,
+        ...(deps.assetRecordRepository
+          ? { assetRecordRepository: deps.assetRecordRepository }
+          : {}),
         canvasReadRepository: deps.canvasReadRepository,
         createUserClient: deps.createUserClient,
         getAdminClient: deps.getAdminClient,

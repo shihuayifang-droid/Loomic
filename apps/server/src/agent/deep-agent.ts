@@ -5,6 +5,7 @@ import { ChatVertexAI } from "@langchain/google-vertexai";
 import { createDeepAgent } from "deepagents";
 
 import { DEFAULT_AGENT_MODEL, DEFAULT_GOOGLE_AGENT_MODEL, type ServerEnv } from "../config/env.js";
+import type { AssetRecordRepository } from "../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../db/brand-kit-read-repository.js";
 import type { CanvasReadRepository } from "../db/canvas-read-repository.js";
@@ -26,6 +27,7 @@ export type LoomicAgent = Pick<
 
 export type LoomicAgentFactory = (options: {
   assetWriteRepository: AssetWriteRepository;
+  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   backendResult?: AgentBackendResult;
   brandKitId?: string | null;
   /** Owner-keyed brand kit reads behind `get_brand_kit` (workorder 21AC). */
@@ -50,6 +52,7 @@ export type LoomicAgentFactory = (options: {
 
 export function createLoomicDeepAgent(options: {
   assetWriteRepository: AssetWriteRepository;
+  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   backendResult?: AgentBackendResult;
   brandKitId?: string | null;
   brandKitReadRepository: BrandKitReadRepository;
@@ -130,6 +133,9 @@ export function createLoomicDeepAgent(options: {
     systemPrompt,
     tools: createMainAgentTools(backendResult.factory, {
       assetWriteRepository: options.assetWriteRepository,
+      ...(options.assetRecordRepository
+        ? { assetRecordRepository: options.assetRecordRepository }
+        : {}),
       brandKitReadRepository: options.brandKitReadRepository,
       canvasReadRepository: options.canvasReadRepository,
       createUserClient,
