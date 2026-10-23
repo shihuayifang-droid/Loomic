@@ -9,6 +9,10 @@ import {
   type ViewerService,
 } from "../bootstrap/ensure-user-foundation.js";
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
+import type {
+  CreatedProjectRow,
+  ProjectCreateRepository,
+} from "../../db/project-create-repository.js";
 import {
   FIND_READABLE_PROJECT_WORKSPACE_FOR_MUTATION,
   ProjectReadError,
@@ -146,6 +150,12 @@ export function createProjectService(options: {
    * translated verbatim), so no call site here can widen a write.
    */
   projectWriteRepository: ProjectWriteRepository;
+  /**
+   * Workorder 44O: project creation (project row + primary canvas) is the
+   * PostgreSQL repository's. Optional in the type only; absent fails closed with
+   * `project_create_failed`.
+   */
+  projectCreateRepository?: ProjectCreateRepository;
 }): ProjectService {
   return {
     async archiveProject(user, projectId) {
@@ -244,42 +254,37 @@ export function createProjectService(options: {
         "project_create_failed",
       );
 
-      const client = options.createUserClient(user.accessToken);
       const workspace = requireTeamWorkspace(viewer, "project_create_failed");
       const normalizedName = input.name.trim();
       const slug = slugify(normalizedName);
 
-      const { data, error } = await client.rpc(
-        "create_project_with_canvas",
-        {
-          p_workspace_id: workspace.id,
-          p_name: normalizedName,
-          p_slug: slug,
-          p_description: (normalizeDescription(input.description) ?? "") as string,
-          p_canvas_name: "Main Canvas",
-        },
-      );
+      // Workorder 44O: creation is the project create repository's, with the
+      // actor passed explicitly. A missing repository fails closed as the same
+      // 500 a failed insert is.
+      const repository = options.projectCreateRepository;
 
-      if (error) {
-        throw mapProjectCreateError(error);
+      if (!repository) {
+        throw new ProjectServiceError(
+          "project_create_failed",
+          PROJECT_CREATE_FAILED_MESSAGE,
+          500,
+        );
       }
 
-      const result = data as {
-        project: {
-          id: string;
-          name: string;
-          slug: string;
-          description: string | null;
-          created_at: string;
-          updated_at: string;
-          workspace_id: string;
-        };
-        canvas: {
-          id: string;
-          name: string;
-          is_primary: boolean;
-        };
-      } | null;
+      let result: CreatedProjectRow | null;
+
+      try {
+        result = await repository.createProjectWithCanvas({
+          actorId: user.id,
+          workspaceId: workspace.id,
+          name: normalizedName,
+          slug,
+          description: normalizeDescription(input.description) ?? "",
+          canvasName: "Main Canvas",
+        });
+      } catch (error) {
+        throw mapProjectCreateError(error);
+      }
 
       if (!result?.project?.id || !result?.canvas?.id) {
         throw new ProjectServiceError(
@@ -647,8 +652,8 @@ function requireTeamWorkspace(
   return teamWorkspace;
 }
 
-function mapProjectCreateError(error: { code?: string; message?: string }) {
-  if (error.code === "23505") {
+function mapProjectCreateError(error: unknown) {
+  if ((error as { code?: unknown } | null)?.code === "23505") {
     return new ProjectServiceError(
       "project_slug_taken",
       PROJECT_SLUG_TAKEN_MESSAGE,

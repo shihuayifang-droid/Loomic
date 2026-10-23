@@ -92,6 +92,7 @@ import {
   type ProjectReadRepository,
 } from "./db/project-read-repository.js";
 import { createProjectWriteRepository } from "./db/project-write-repository.js";
+import { createProjectCreateRepository } from "./db/project-create-repository.js";
 import {
   createAssetReadRepository,
   type AssetReadRepository,
@@ -620,8 +621,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       // repository's now, built lazily against the same pool as the read
       // repository beside it. Like the other write paths it has no PostgREST
       // fallback: `createUserClient` stays wired for Storage and the
-      // `create_project_with_canvas` RPC, and for nothing else in this service.
+      // and for nothing else in this service.
       projectWriteRepository: createProjectWriteRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
+      // Workorder 44O: project creation is repository SQL with an explicit actor.
+      projectCreateRepository: createProjectCreateRepository({
         getTransactionPool: () => getTransactionPool(databaseEnv),
       }),
     });

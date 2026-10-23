@@ -18,6 +18,10 @@ import {
   type ProjectWriteRepository,
 } from "../../db/project-write-repository.js";
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
+import type {
+  CreatedProjectRow,
+  ProjectCreateRepository,
+} from "../../db/project-create-repository.js";
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import type {
   AuthenticatedUser,
@@ -254,7 +258,7 @@ function makeWriteRepositoryStub(
 
 /**
  * Workorder 21AA: a user client that carries ONLY the two surfaces these flows are
- * still allowed to use — Storage and the `create_project_with_canvas` RPC. Reading
+ * still allowed to use — Storage. Reading
  * the table accessor throws, so a regression back to PostgREST for any of the three
  * project writes fails here loudly instead of passing quietly against a builder
  * nobody forbade.
@@ -304,6 +308,38 @@ function makeRecordRepositoryStub() {
       return { assetId: "asset-thumb", workspaceId: TEAM_ID, projectId: "project-1" };
     },
   } as unknown as AssetRecordRepository;
+  return { repository, calls };
+}
+
+/**
+ * Workorder 44O: a fake project create repository. It records the camelCase
+ * input; `failWith` makes it throw, `result` overrides what it returns.
+ */
+function makeCreateRepositoryStub(
+  config: { failWith?: unknown; result?: CreatedProjectRow | null } = {},
+) {
+  const calls: Array<Record<string, unknown>> = [];
+  const repository: ProjectCreateRepository = {
+    async createProjectWithCanvas(input) {
+      calls.push({ ...input });
+      if (config.failWith !== undefined) throw config.failWith;
+      if (config.result !== undefined) {
+        return config.result as unknown as CreatedProjectRow;
+      }
+      return {
+        project: {
+          id: "project-1",
+          name: input.name,
+          slug: input.slug,
+          description: input.description,
+          created_at: "2026-09-29T00:00:00.000Z",
+          updated_at: "2026-09-29T00:00:00.000Z",
+          workspace_id: input.workspaceId,
+        },
+        canvas: { id: "canvas-1", name: input.canvasName, is_primary: true },
+      };
+    },
+  };
   return { repository, calls };
 }
 
@@ -379,20 +415,28 @@ const DETAIL_ROW = {
 };
 
 describe("createProjectService with the team workspace", () => {
-  it("case 1: createProject sends the team workspace id to the RPC", async () => {
-    const { client, rpcs } = makeClientStub({});
+  it("case 1: createProject hands the actor and the team workspace to the create repository", async () => {
+    const { client } = makeClientStub({});
+    const create = makeCreateRepositoryStub();
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       // These cases exercise create/list only, so no asset is ever recorded.
       projectWriteRepository: makeWriteRepositoryStub().repository,
+      projectCreateRepository: create.repository,
     });
 
     const project = await service.createProject(USER, { name: "My Project" });
 
-    expect(rpcs.length).toBe(1);
-    expect(rpcs[0]?.name).toBe("create_project_with_canvas");
-    expect(rpcs[0]?.params.p_workspace_id).toBe(TEAM_ID);
+    expect(create.calls.length).toBe(1);
+    expect(create.calls[0]).toEqual({
+      actorId: USER_ID,
+      workspaceId: TEAM_ID,
+      name: "My Project",
+      slug: expect.stringMatching(/^my-project-[a-z0-9]+$/),
+      description: "",
+      canvasName: "Main Canvas",
+    });
     expect(project.workspace).toEqual({
       id: TEAM_ID,
       name: "HaHart 团队",
@@ -444,12 +488,14 @@ describe("createProjectService with the team workspace", () => {
     expect(projects[0]?.primaryCanvas.id).toBe("canvas-1");
   });
 
-  it("case 3: no team workspace means 403 and no RPC call", async () => {
-    const { client, rpcs } = makeClientStub({});
+  it("case 3: no team workspace means 403 and the create repository is not called", async () => {
+    const { client } = makeClientStub({});
+    const create = makeCreateRepositoryStub();
     const service = createProjectService({
       createUserClient: () => client,
       viewerService: makeViewerStub(null),
       projectWriteRepository: makeWriteRepositoryStub().repository,
+      projectCreateRepository: create.repository,
     });
 
     const error = await service
@@ -460,7 +506,89 @@ describe("createProjectService with the team workspace", () => {
     expect(error).toBeInstanceOf(ProjectServiceError);
     expect((error as ProjectServiceError).statusCode).toBe(403);
     expect((error as ProjectServiceError).code).toBe("not_team_member");
-    expect(rpcs.length).toBe(0);
+    expect(create.calls.length).toBe(0);
+  });
+
+  it("case 3b: a duplicate slug (23505) is 409 project_slug_taken", async () => {
+    const { client } = makeClientStub({});
+    const create = makeCreateRepositoryStub({
+      failWith: Object.assign(new Error("duplicate"), { code: "23505" }),
+    });
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      projectWriteRepository: makeWriteRepositoryStub().repository,
+      projectCreateRepository: create.repository,
+    });
+
+    const error = await service
+      .createProject(USER, { name: "My Project" })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect((error as ProjectServiceError).statusCode).toBe(409);
+    expect((error as ProjectServiceError).code).toBe("project_slug_taken");
+  });
+
+  it("case 3c: any other repository failure is 500 project_create_failed", async () => {
+    const { client } = makeClientStub({});
+    const create = makeCreateRepositoryStub({
+      failWith: Object.assign(new Error("boom"), { code: "42501" }),
+    });
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      projectWriteRepository: makeWriteRepositoryStub().repository,
+      projectCreateRepository: create.repository,
+    });
+
+    const error = await service
+      .createProject(USER, { name: "My Project" })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect((error as ProjectServiceError).statusCode).toBe(500);
+    expect((error as ProjectServiceError).code).toBe("project_create_failed");
+  });
+
+  it("case 3d: a result without ids is 500 project_create_failed", async () => {
+    const { client } = makeClientStub({});
+    const create = makeCreateRepositoryStub({ result: null });
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      projectWriteRepository: makeWriteRepositoryStub().repository,
+      projectCreateRepository: create.repository,
+    });
+
+    const error = await service
+      .createProject(USER, { name: "My Project" })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect((error as ProjectServiceError).statusCode).toBe(500);
+    expect((error as ProjectServiceError).code).toBe("project_create_failed");
+  });
+
+  it("case 3e: a service built without the create repository answers 500 project_create_failed", async () => {
+    const { client } = makeClientStub({});
+    const service = createProjectService({
+      createUserClient: () => client,
+      viewerService: makeViewerStub(TEAM_WORKSPACE),
+      projectWriteRepository: makeWriteRepositoryStub().repository,
+    });
+
+    const error = await service
+      .createProject(USER, { name: "My Project" })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(ProjectServiceError);
+    expect((error as ProjectServiceError).statusCode).toBe(500);
+    expect((error as ProjectServiceError).code).toBe("project_create_failed");
   });
 });
 
