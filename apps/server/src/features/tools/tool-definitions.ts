@@ -341,6 +341,19 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     eta_seconds: null,
     agent_callable: true,
     availability: "unavailable",
+    /**
+     * ED-12 / MD-03 — 「缩放」是三档离散（特写 / 中等 / 广角），前端按 `steps`
+     * 渲染成只停在三档的滑块。旋转 / 俯仰的滑块随 ED-12 本体，不在这条里。
+     */
+    param_groups: [
+      {
+        id: "angle",
+        label: "视角",
+        params: [
+          { id: "zoom", label: "缩放", min: 0, max: 100, defaultValue: 50, display: { kind: "steps", labels: ["特写", "中等", "广角"] } },
+        ],
+      },
+    ],
   },
   // ED-13 橡皮 — panel with a mask; the ONE tool the spec pins to
   // `agent_callable = false` (an Agent cannot draw a mask, list L594).

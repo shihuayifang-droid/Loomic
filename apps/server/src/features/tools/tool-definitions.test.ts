@@ -331,11 +331,39 @@ describe("ED-01 调整: the slider table ships from the server", () => {
     }
   });
 
-  it("ED-01: only adjust carries param groups for now", () => {
+  it("ED-01 / MD-03: only adjust and multi-angle carry param groups for now", () => {
     for (const tool of TOOL_DEFINITIONS) {
-      if (tool.id === "adjust") continue;
+      if (tool.id === "adjust" || tool.id === "multi_angle") continue;
 
       expect([tool.id, tool.param_groups]).toEqual([tool.id, undefined]);
     }
+  });
+});
+
+describe("MD-03 多角度: 缩放是三档离散", () => {
+  it("MD-03: multi-angle zoom is a three-step discrete slider", () => {
+    const multiAngle = TOOL_DEFINITIONS.find((tool) => tool.id === "multi_angle");
+
+    expect(multiAngle?.id).toBe("multi_angle");
+
+    const groups = multiAngle?.param_groups;
+
+    if (!groups) {
+      throw new Error("multi_angle carries no param_groups");
+    }
+
+    const zoom = groups[0]?.params.find((param) => param.id === "zoom");
+
+    if (!zoom) {
+      throw new Error("multi_angle group 0 has no zoom parameter");
+    }
+
+    expect(zoom.display.kind).toBe("steps");
+
+    if (zoom.display.kind !== "steps") {
+      throw new Error("multi-angle zoom is not a steps display");
+    }
+
+    expect(zoom.display.labels).toEqual(["特写", "中等", "广角"]);
   });
 });

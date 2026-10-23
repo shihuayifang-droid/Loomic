@@ -188,3 +188,33 @@ describe("ParamSlider 组件", () => {
     expect(input).toHaveAttribute("aria-valuenow", "100");
   });
 });
+
+/** MD-03：模型只支持 3 / 5 / 10 时，滑块只能停在这三个数上 */
+describe("values 显示（离散取值表）", () => {
+  const VALUES_CFG: ParamSliderConfig = {
+    id: "duration",
+    label: "时长",
+    min: 3,
+    max: 10,
+    defaultValue: 5,
+    display: { kind: "values", values: [3, 5, 10], unit: "s" },
+  };
+
+  it("values：4.2 吸附到 5、7 吸附到 5、8 吸附到 10", () => {
+    expect(snap(VALUES_CFG, 4.2)).toBe(5);
+    expect(snap(VALUES_CFG, 7)).toBe(5);
+    expect(snap(VALUES_CFG, 8)).toBe(10);
+  });
+
+  it("values：stepValues 就是升序去重的取值表", () => {
+    const cfg: ParamSliderConfig = {
+      ...VALUES_CFG,
+      display: { kind: "values", values: [10, 3, 5, 3] },
+    };
+    expect(stepValues(cfg)).toEqual([3, 5, 10]);
+  });
+
+  it("values：toDisplay 带单位", () => {
+    expect(toDisplay(VALUES_CFG, 5)).toEqual({ text: "5s", value: 5 });
+  });
+});
