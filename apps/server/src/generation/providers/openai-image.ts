@@ -120,6 +120,34 @@ const SIZE_TABLE: Record<string, Record<Orientation, string>> = {
 };
 
 /**
+ * The 7 sizes the gateway really accepts for GPT Image 2 (user ruling
+ * 2026-10-23). The single definition: the catalogue options, the pixel mapping
+ * and the billing tier are all derived from it. A size is billed by its LONG
+ * edge: <= 1.5K standard, 2K hd, 4K ultra.
+ */
+export const GPT_IMAGE_2_SIZES = [
+  { value: "1:1", label: "1:1", width: 1024, height: 1024, tier: "standard" },
+  { value: "3:2", label: "3:2", width: 1536, height: 1024, tier: "standard" },
+  { value: "2:3", label: "2:3", width: 1024, height: 1536, tier: "standard" },
+  { value: "1:1-2k", label: "1:1 · 2K", width: 2048, height: 2048, tier: "hd" },
+  { value: "16:9-2k", label: "16:9 · 2K", width: 2048, height: 1152, tier: "hd" },
+  { value: "16:9-4k", label: "16:9 · 4K", width: 3840, height: 2160, tier: "ultra" },
+  { value: "9:16-4k", label: "9:16 · 4K", width: 2160, height: 3840, tier: "ultra" },
+] as const;
+
+export type GptImage2SizeOption = (typeof GPT_IMAGE_2_SIZES)[number];
+
+/** Look a catalogue size value up; `undefined` when it is not one of the 7. */
+export function gptImage2SizeOption(value: string): GptImage2SizeOption | undefined {
+  return GPT_IMAGE_2_SIZES.find((option) => option.value === value);
+}
+
+/** Every `WxH` string the tier table can emit (the gateway accepts exactly these). */
+const TIER_TABLE_PIXELS: ReadonlySet<string> = new Set(
+  Object.values(SIZE_TABLE).flatMap((cells) => Object.values(cells)),
+);
+
+/**
  * MD-03: what each tier really produces, read off `SIZE_TABLE` itself instead of
  * a second hand-kept list. A tier's `output` is the LONGEST edge of the sizes the
  * table can pick for it — standard 1536 → "1.5K", hd 2048 → "2K",
@@ -158,6 +186,18 @@ const OPENAI_IMAGE_MODELS: readonly ImageModelInfo[] = [
     iconUrl: ICON_OPENAI,
     ...KWJM_IMAGE_DEFAULTS,
     ...kwjmQualityTiers(),
+    params: {
+      maxCount: 1,
+      params: [
+        {
+          type: "discrete",
+          id: "size",
+          label: "尺寸",
+          default: "1:1",
+          options: GPT_IMAGE_2_SIZES.map((s) => ({ value: s.value, label: s.label, tier: s.tier })),
+        },
+      ],
+    },
   },
   {
     id: "kwjm/gpt-image-1.5",
@@ -244,6 +284,12 @@ function resolveRequestSize(
 ): string {
   if (params.size && CUSTOM_SIZE_MODELS.has(apiModel)) {
     return `${clampEdge(params.size.width)}x${clampEdge(params.size.height)}`;
+  }
+  // A size the tier table itself can emit is something the endpoint accepts, so
+  // an explicit catalogue size is sent as is; anything else keeps the tier table.
+  if (params.size) {
+    const requested = `${params.size.width}x${params.size.height}`;
+    if (TIER_TABLE_PIXELS.has(requested)) return requested;
   }
   return resolveSize(params.aspectRatio ?? "1:1", qualityKey);
 }

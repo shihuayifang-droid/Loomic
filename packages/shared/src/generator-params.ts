@@ -19,6 +19,8 @@ import { z } from "zod";
 export const generatorParamOptionSchema = z.object({
   value: z.string().min(1),
   label: z.string().min(1),
+  /** Billing tier of this option; the client quotes the price with it as `quality`. */
+  tier: z.enum(["standard", "hd", "ultra"]).optional(),
 });
 export type GeneratorParamOption = z.infer<typeof generatorParamOptionSchema>;
 

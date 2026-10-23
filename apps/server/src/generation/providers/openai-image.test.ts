@@ -151,3 +151,31 @@ describe("OpenAIImageProvider sizes", () => {
     expect(ids).not.toContain("kwjm/gpt-image-2.5-sunburst");
   });
 });
+
+describe("OpenAIImageProvider catalogue sizes", () => {
+  it("gpt-image-2 sends a size the gateway lists verbatim", async () => {
+    const calls: RecordedCall[] = [];
+    stubFetch(calls);
+
+    await provider().generate({
+      prompt: "a cat",
+      model: "kwjm/gpt-image-2",
+      size: { width: 2048, height: 1152 },
+    });
+
+    expect(JSON.parse(String(calls[0]!.init.body)).size).toBe("2048x1152");
+  });
+
+  it("gpt-image-2 falls back to the tier table for a size the gateway does not list", async () => {
+    const calls: RecordedCall[] = [];
+    stubFetch(calls);
+
+    await provider().generate({
+      prompt: "a cat",
+      model: "kwjm/gpt-image-2",
+      size: { width: 1280, height: 720 },
+    });
+
+    expect(JSON.parse(String(calls[0]!.init.body)).size).toBe("2048x2048");
+  });
+});

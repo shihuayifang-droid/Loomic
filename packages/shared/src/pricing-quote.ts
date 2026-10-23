@@ -35,6 +35,8 @@ export const generateImageRequestSchema = z.object({
   model: z.string().optional(),
   aspectRatio: z.enum(["1:1", "16:9", "9:16", "4:3", "3:4"]).optional(),
   quality: z.enum(["standard", "hd", "ultra"]).optional(),
+  /** Catalogue size option value (e.g. "16:9-4k"); only honoured by models that publish size options. */
+  size: z.string().min(1).max(32).optional(),
 });
 export type GenerateImageRequest = z.infer<typeof generateImageRequestSchema>;
 

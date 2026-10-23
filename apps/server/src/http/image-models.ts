@@ -7,6 +7,7 @@ import {
   modelVisibility,
   qualityTierLabel,
   type CataloguedImageModelId,
+  type GeneratorParams,
   type ImageQualityOutput,
   type ModelVisibility,
   type SubscriptionPlan,
@@ -48,6 +49,8 @@ export interface ImageModelListItem {
    * parameter, so the panel shows no quality selector at all.
    */
   quality?: readonly ImageModelQualityOption[];
+  /** MD-03: the parameters this model ships; absent = the client keeps its legacy controls. */
+  params?: GeneratorParams;
 }
 
 /**
@@ -84,6 +87,7 @@ export function toImageModelListItem(
           })),
         }
       : {}),
+    ...(m.params ? { params: m.params } : {}),
   };
 }
 

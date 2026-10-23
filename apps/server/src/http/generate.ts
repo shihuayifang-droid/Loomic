@@ -22,6 +22,7 @@ import { generationLedgerDescription } from "../features/credits/ledger-descript
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
 import type { JobService } from "../features/jobs/job-service.js";
+import { gptImage2SizeOption } from "../generation/providers/openai-image.js";
 import { JobServiceError } from "../features/jobs/job-service.js";
 import { watchJob } from "../features/jobs/job-watcher.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
@@ -72,13 +73,34 @@ export function generatorRelayProvenance(input: { modelId: string; prompt: strin
  * and both halves read that local (the 35N rule, same as the video route does
  * for its own fields).
  */
+/**
+ * AG-07: a request `size` is only legal for a model that publishes size options
+ * (today GPT Image 2) and only for one of its catalogue values. No `size` is
+ * always legal. Kept a pure function so the route can answer 400 before any
+ * billing round-trip and a test can call it directly.
+ */
+export function isImageSizeAllowed(payload: GenerateImageRequest): boolean {
+  if (payload.size === undefined) return true;
+  const model = payload.model ?? DEFAULT_IMAGE_MODEL_ID;
+  return model === "kwjm/gpt-image-2" && gptImage2SizeOption(payload.size) !== undefined;
+}
+
 export function imageJobBillingRequest(
   user: AuthenticatedUser,
   workspaceId: string,
   payload: GenerateImageRequest,
 ): BillingRequest {
   const model = payload.model ?? DEFAULT_IMAGE_MODEL_ID;
-  const quality = payload.quality ?? "hd";
+  // A catalogue size decides the billed tier (what is shown is what is charged)
+  // and the ratio; without one nothing changes.
+  const sizeOption =
+    payload.size !== undefined && model === "kwjm/gpt-image-2"
+      ? gptImage2SizeOption(payload.size)
+      : undefined;
+  const quality = sizeOption?.tier ?? payload.quality ?? "hd";
+  const aspectRatio = sizeOption
+    ? sizeOption.value.split("-")[0]!
+    : (payload.aspectRatio ?? "1:1");
 
   return {
     user,
@@ -94,8 +116,9 @@ export function imageJobBillingRequest(
       payload: {
         prompt: payload.prompt,
         model,
-        aspect_ratio: payload.aspectRatio ?? "1:1",
+        aspect_ratio: aspectRatio,
         quality,
+        ...(sizeOption ? { size: sizeOption.value } : {}),
       },
     },
   };
@@ -324,6 +347,17 @@ export async function registerGenerateRoutes(
           error: {
             code: "invalid_request",
             message: "Invalid request body.",
+          },
+        }),
+      );
+    }
+
+    if (!isImageSizeAllowed(payload)) {
+      return reply.code(400).send(
+        applicationErrorResponseSchema.parse({
+          error: {
+            code: "invalid_request",
+            message: "Unsupported size for this model.",
           },
         }),
       );

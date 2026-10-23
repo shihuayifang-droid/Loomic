@@ -8,6 +8,7 @@ import { generateImage } from "../../../generation/image-generation.js";
 import { resolveImageProviderName } from "../../../generation/providers/registry.js";
 
 import { DEFAULT_IMAGE_MODEL_ID } from "@loomic/shared";
+import { gptImage2SizeOption } from "../../../generation/providers/openai-image.js";
 import type { ImageGenerateParams, ImageQuality } from "../../../generation/types.js";
 
 // BL-07: the ledger records what a job was charged for, so the job has to be
@@ -30,6 +31,7 @@ export function imageJobGenerateParams(
     aspect_ratio?: string;
     input_images?: string[];
     quality?: string;
+    size?: string;
   },
   model: string,
 ): ImageGenerateParams {
@@ -47,6 +49,19 @@ export function imageJobGenerateParams(
     } else {
       console.warn(
         `[image-job] ignoring unknown payload quality ${JSON.stringify(payload.quality)}; keeping the provider default`,
+      );
+    }
+  }
+
+  // AG-07: a catalogue size becomes explicit pixels; one we cannot resolve is
+  // dropped (tier + ratio still apply), the same way an unknown quality is.
+  if (payload.size !== undefined) {
+    const option = gptImage2SizeOption(payload.size);
+    if (option) {
+      params.size = { width: option.width, height: option.height };
+    } else {
+      console.warn(
+        `[image-job] ignoring unknown payload size ${JSON.stringify(payload.size)}; keeping the tier table`,
       );
     }
   }

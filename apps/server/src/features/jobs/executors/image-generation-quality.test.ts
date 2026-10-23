@@ -54,3 +54,21 @@ describe("image job generate params", () => {
     expect(params.inputImages).toEqual(["https://example.test/in.png"]);
   });
 });
+
+describe("image job size", () => {
+  it("AG-07: a catalogue size becomes explicit pixels", () => {
+    const params = imageJobGenerateParams({ prompt: "a cat", size: "9:16-4k" }, "kwjm/gpt-image-2");
+    expect(params.size).toEqual({ width: 2160, height: 3840 });
+  });
+
+  it("AG-07: an unknown size is ignored with a warning", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const params = imageJobGenerateParams({ prompt: "a cat", size: "3:2-4k" }, "kwjm/gpt-image-2");
+      expect(params.size).toBeUndefined();
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});

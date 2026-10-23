@@ -42,6 +42,7 @@ export const imageGenerationPayloadSchema = z.object({
   prompt: z.string().min(1),
   model: z.string().optional(),
   aspect_ratio: z.string().optional(),
+  size: z.string().optional(),
 });
 export type ImageGenerationPayload = z.infer<typeof imageGenerationPayloadSchema>;
 

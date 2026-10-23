@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { OpenAIImageProvider } from "../generation/providers/openai-image.js";
 import { ReplicateImageProvider } from "../generation/providers/replicate-image.js";
 import { toImageModelListItem } from "./image-models.js";
 
@@ -43,5 +44,31 @@ describe("MD-03 image model list items", () => {
       minTier: "starter",
       limits: imagen4.limits,
     });
+  });
+});
+
+describe("AG-07 image model params", () => {
+  const openai = new OpenAIImageProvider("test-key");
+  const gpt = { ...openai.models.find((m) => m.id === "kwjm/gpt-image-2")!, provider: openai.name };
+
+  it("AG-07: GPT Image 2 lists its 7 size options with a billing tier", () => {
+    const group = toImageModelListItem(gpt, null).params!.params[0]!;
+    expect(group.id).toBe("size");
+    if (group.type !== "discrete") throw new Error("size must be discrete");
+    expect(group.options).toHaveLength(7);
+    expect(group.options.every((o) => o.tier !== undefined)).toBe(true);
+  });
+
+  it("AG-07: Flux Kontext lists exactly one aspectRatio group with 5 options", () => {
+    const params = toImageModelListItem(fluxKontext, null).params!;
+    expect(params.params).toHaveLength(1);
+    const group = params.params[0]!;
+    expect(group.id).toBe("aspectRatio");
+    if (group.type !== "discrete") throw new Error("aspectRatio must be discrete");
+    expect(group.options.map((o) => o.value)).toEqual(["1:1", "16:9", "9:16", "4:3", "3:4"]);
+  });
+
+  it("AG-07: a model without params has no params key", () => {
+    expect("params" in toImageModelListItem(imagen4, null)).toBe(false);
   });
 });

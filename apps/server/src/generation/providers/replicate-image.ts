@@ -1,3 +1,4 @@
+import type { GeneratorParams } from "@loomic/shared";
 import type {
   GeneratedImage,
   ImageGenerateParams,
@@ -8,6 +9,20 @@ import type {
 import { aspectRatioToDimensions, GenerationError } from "../utils.js";
 
 const REPLICATE_API_BASE = "https://api.replicate.com/v1";
+
+/** Flux Kontext publishes one parameter group: the aspect ratio (user ruling 2026-10-23). */
+const FLUX_KONTEXT_PARAMS: GeneratorParams = {
+  maxCount: 1,
+  params: [
+    {
+      type: "discrete",
+      id: "aspectRatio",
+      label: "比例",
+      default: "1:1",
+      options: ["1:1", "16:9", "9:16", "4:3", "3:4"].map((v) => ({ value: v, label: v })),
+    },
+  ],
+};
 
 /**
  * Image input parameter mapping per model.
@@ -183,6 +198,7 @@ const REPLICATE_IMAGE_MODELS: readonly ImageModelInfo[] = [
     iconUrl: ICON_BFL,
     operation: "generate",
     limits: { maxInputImages: 1, supportsOutputFormat: true },
+    params: FLUX_KONTEXT_PARAMS,
   },
   {
     id: "black-forest-labs/flux-kontext-pro",
@@ -191,6 +207,7 @@ const REPLICATE_IMAGE_MODELS: readonly ImageModelInfo[] = [
     iconUrl: ICON_BFL,
     operation: "generate",
     limits: { maxInputImages: 1, supportsOutputFormat: true },
+    params: FLUX_KONTEXT_PARAMS,
   },
   // ByteDance
   {

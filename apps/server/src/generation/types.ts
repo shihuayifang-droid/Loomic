@@ -1,4 +1,5 @@
 import type {
+  GeneratorParams,
   CataloguedImageModelId,
   CataloguedVideoModelId,
 } from "@loomic/shared";
@@ -179,6 +180,8 @@ export interface ImageModelInfo extends ModelInfo {
    * quality selector is shown. Derived from the same map the provider sends.
    */
   qualityTiers?: readonly ImageQualityTier[];
+  /** MD-03 / AG-07: the parameters this model publishes to the generator panel. Absent = legacy controls. */
+  params?: GeneratorParams;
 }
 
 export interface ImageProvider {
