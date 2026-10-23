@@ -145,14 +145,17 @@ describe("canonical 0004 projects: schema", () => {
     ]);
   });
 
-  it("has no foreign key on source_job_id or brand_kit_id yet", async () => {
+  it("0004 itself adds no foreign key on brand_kit_id; source_job_id's comes with 0006", async () => {
     const result = await db.query<{ conname: string }>(
       `select conname from pg_constraint
         where contype = 'f'
           and conrelid in ('public.projects'::regclass, 'public.asset_objects'::regclass)
-          and conname in ('asset_objects_source_job_fkey', 'projects_brand_kit_id_fkey')`,
+          and conname in ('asset_objects_source_job_fkey', 'projects_brand_kit_id_fkey')
+        order by conname`,
     );
-    expect(result.rows).toEqual([]);
+    // brand_kits only arrives in a later canonical file, so 0004 leaves the FK out;
+    // the source_job_id FK is appended by 0006 and must be present once every file ran.
+    expect(result.rows.map((row) => row.conname)).toEqual(["asset_objects_source_job_fkey"]);
   });
 
   it("deleting a hahart_auth user sets created_by to null", async () => {
@@ -201,11 +204,8 @@ describe("canonical 0004 projects: final form equals the retired migration chain
     expect(await constraintDefs(db)).toEqual(await constraintDefs(oldDb));
   });
 
-  it("has the same indexes except the source_job_id one added with its foreign key later", async () => {
-    const oldNames = (await indexNames(oldDb)).filter(
-      (name) => name !== "asset_objects_source_job_id_idx",
-    );
-    expect(await indexNames(db)).toEqual(oldNames);
+  it("has the same indexes as the old schema", async () => {
+    expect(await indexNames(db)).toEqual(await indexNames(oldDb));
   });
 });
 
