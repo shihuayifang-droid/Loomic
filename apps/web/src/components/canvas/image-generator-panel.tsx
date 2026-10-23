@@ -24,8 +24,12 @@ import {
   createExcalidrawImageElement,
   fetchAsDataURL,
 } from "../../lib/canvas-elements";
-import type { GenerateImageRequest } from "@loomic/shared";
+import type { GenerateImageRequest, GeneratorParam } from "@loomic/shared";
 
+import {
+  GeneratorParamControls,
+  type GeneratorParamValue,
+} from "@/components/canvas/generator-param-controls";
 import { PriceTag } from "@/components/ui/price-tag";
 import {
   useGenerationQuote,
@@ -55,6 +59,34 @@ type ImageGeneratorPanelProps = {
 
 const ASPECT_RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4"] as const;
 
+/** AG-07: one value per parameter id, as the shared control component speaks it. */
+type ParamValues = Record<string, GeneratorParamValue>;
+
+/**
+ * AG-07 / MD-03: what the schema-driven parameters contribute to the quote and
+ * the submit body. `null` = this model publishes no schema, so the old
+ * `aspectRatio` / `quality` state and the old request shape stay in force.
+ */
+type ParamRequest = { aspectRatio?: string; quality?: string; size?: string };
+
+/**
+ * AG-07: every parameter enters at the value the server declared as its default.
+ * That is also what "switching models falls back to the new model's default"
+ * needs — the old model's values are not carried over.
+ */
+function defaultParamValues(params: readonly GeneratorParam[]): ParamValues {
+  const values: ParamValues = {};
+  for (const param of params) {
+    if (param.type === "discrete" || param.type === "continuous") {
+      values[param.id] = param.default;
+    } else if (param.type === "text") {
+      values[param.id] = param.default ?? "";
+    }
+    // `custom_size` declares no default: the pair is entered, then snapped on blur.
+  }
+  return values;
+}
+
 function generateId(): string {
   return (
     Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
@@ -76,6 +108,12 @@ export function ImageGeneratorPanel({
   const [model, setModel] = useState(data.model);
   const [aspectRatio, setAspectRatio] = useState(data.aspectRatio);
   const [quality, setQuality] = useState(data.quality);
+  /**
+   * AG-07: the values of the parameters the server declared for this model. Empty
+   * for a model without a schema (the old dropdowns keep using `aspectRatio` /
+   * `quality` above).
+   */
+  const [paramValues, setParamValues] = useState<ParamValues>({});
   const [loading, setLoading] = useState(data.status === "generating");
   const [error, setError] = useState<string | null>(data.errorMessage ?? null);
   /**
@@ -176,6 +214,70 @@ export function ImageGeneratorPanel({
   const qualityOptions = qualityOptionsFor(currentModel);
 
   /**
+   * AG-07 / MD-03: the parameter schema the server declared for this model (41A).
+   * `null` = no schema → the panel behaves exactly as before this ticket.
+   */
+  const paramDefs = currentModel?.params?.params ?? null;
+  const paramDefaults = useMemo(
+    () => (paramDefs ? defaultParamValues(paramDefs) : {}),
+    [paramDefs],
+  );
+  /**
+   * 进入一个模型（首次选中或切换模型）时把 `paramValues` 重置为各参数的下发默认值：
+   * 新模型不支持的旧取值不能带过来。`paramDefaults` 的身份只在换模型时变一次，
+   * 所以这个 effect 不会每帧重跑。
+   */
+  useEffect(() => {
+    setParamValues(paramDefaults);
+  }, [paramDefaults]);
+  /**
+   * 渲染 / 询价 / 提交一律读这份合并值：某个参数还没有值（首帧、或换了模型而
+   * effect 尚未落地）就当场回落默认值，不会出现「未选中任何项」的空档。
+   */
+  const effectiveParamValues = useMemo(() => {
+    const merged: ParamValues = {};
+    if (!paramDefs) return merged;
+    for (const param of paramDefs) {
+      const value = paramValues[param.id] ?? paramDefaults[param.id];
+      if (value !== undefined) merged[param.id] = value;
+    }
+    return merged;
+  }, [paramDefs, paramValues, paramDefaults]);
+  /**
+   * AG-07：schema 参数怎么落到请求体里。
+   * - 有 `size` 离散参数：`size` = 所选值，`quality` = 该选项的计价档 `tier`
+   *   （没有 tier 就不带 quality）；**不带** `aspectRatio` —— 服务端按 `size`
+   *   自行推出比例写进 payload，而 shared 的 `aspectRatio` 枚举里没有 `3:2` /
+   *   `2:3`，带上去会被请求校验 400；
+   * - 否则有 `aspectRatio` 参数：只用它的取值，不带 quality；
+   * - 两者都没有：`null`，退回旧的 `aspectRatio` / `quality` 口径。
+   */
+  const paramRequest = useMemo<ParamRequest | null>(() => {
+    if (!paramDefs) return null;
+    const sizeParam = paramDefs.find(
+      (param): param is Extract<GeneratorParam, { type: "discrete" }> =>
+        param.type === "discrete" && param.id === "size",
+    );
+    if (sizeParam) {
+      const value = String(effectiveParamValues[sizeParam.id] ?? sizeParam.default);
+      const chosen = sizeParam.options.find((option) => option.value === value);
+      const request: ParamRequest = { size: value };
+      if (chosen?.tier) request.quality = chosen.tier;
+      return request;
+    }
+    const ratioParam = paramDefs.find(
+      (param): param is Extract<GeneratorParam, { type: "discrete" }> =>
+        param.type === "discrete" && param.id === "aspectRatio",
+    );
+    if (ratioParam) {
+      return {
+        aspectRatio: String(effectiveParamValues[ratioParam.id] ?? ratioParam.default),
+      };
+    }
+    return null;
+  }, [paramDefs, effectiveParamValues]);
+
+  /**
    * BL-45 / T-109：提交之前的「这次要花多少」与「够不够」。
    *
    * 只在宿主传了 `availableCredits` 时才启用：不传就整块关掉 —— 不发询价请求、
@@ -193,11 +295,26 @@ export function ImageGeneratorPanel({
             model,
             // 面板状态是元素自定义数据里的字符串（旧数据可能是任意值），提交
             // 走的是 `submitImageJob` 的宽松参数；询价请求体按契约收窄。
-            aspectRatio:
-              aspectRatio as NonNullable<GenerateImageRequest["aspectRatio"]>,
-            ...(qualityOptions
-              ? { quality: quality as NonNullable<GenerateImageRequest["quality"]> }
-              : {}),
+            ...(paramRequest !== null
+              ? {
+                  ...(paramRequest.aspectRatio
+                    ? {
+                        aspectRatio:
+                          paramRequest.aspectRatio as NonNullable<GenerateImageRequest["aspectRatio"]>,
+                      }
+                    : {}),
+                  ...(paramRequest.quality
+                    ? { quality: paramRequest.quality as NonNullable<GenerateImageRequest["quality"]> }
+                    : {}),
+                  ...(paramRequest.size ? { size: paramRequest.size } : {}),
+                }
+              : {
+                  aspectRatio:
+                    aspectRatio as NonNullable<GenerateImageRequest["aspectRatio"]>,
+                  ...(qualityOptions
+                    ? { quality: quality as NonNullable<GenerateImageRequest["quality"]> }
+                    : {}),
+                }),
           },
         }
       : null;
@@ -244,6 +361,11 @@ export function ImageGeneratorPanel({
     [excalidrawApi, elementId],
   );
 
+  /** AG-07：schema 参数变了只改面板状态，询价 / 提交自己跟着重算。 */
+  const handleParamChange = useCallback((id: string, value: GeneratorParamValue) => {
+    setParamValues((prev) => ({ ...prev, [id]: value }));
+  }, []);
+
   const handleGenerate = useCallback(async () => {
     if (!prompt.trim() || loading) return;
     // T-109：键盘 Enter 走的也是这条路径，光把按钮 disabled 挡不住回车，
@@ -283,7 +405,14 @@ export function ImageGeneratorPanel({
       const submitted = await submitImageJob(
         accessTokenRef.current,
         prompt.trim(),
-        { model, aspectRatio, ...(qualityOptions ? { quality } : {}) },
+        paramRequest !== null
+          ? {
+              model,
+              ...(paramRequest.aspectRatio ? { aspectRatio: paramRequest.aspectRatio } : {}),
+              ...(paramRequest.quality ? { quality: paramRequest.quality } : {}),
+              ...(paramRequest.size ? { size: paramRequest.size } : {}),
+            }
+          : { model, aspectRatio, ...(qualityOptions ? { quality } : {}) },
       );
 
       // CV-10：job 提交成功即进入本轮，与该 job 最终成功与否无关。
@@ -385,6 +514,7 @@ export function ImageGeneratorPanel({
     aspectRatio,
     quality,
     qualityOptions,
+    paramRequest,
     excalidrawApi,
     elementId,
     elementBounds,
@@ -510,6 +640,22 @@ export function ImageGeneratorPanel({
         >
           {precheckReason}
         </p>
+      )}
+
+      {/* AG-07 / MD-03：服务端下发了参数 schema 就按 schema 渲染整行参数组，
+          每组带标题；原来挤在底部工具栏那一行的质量 / 比例下拉不再渲染。
+          没有 schema 的模型仍旧用下面那两个下拉（行为与改动前一致）。 */}
+      {paramDefs !== null && (
+        <div
+          data-testid="canvas-image-generator-params"
+          className="mt-2 border-t-[0.5px] border-border pt-2"
+        >
+          <GeneratorParamControls
+            params={paramDefs}
+            values={effectiveParamValues}
+            onChange={handleParamChange}
+          />
+        </div>
       )}
 
       {/* Bottom toolbar */}
@@ -647,6 +793,10 @@ export function ImageGeneratorPanel({
 
         {/* Right: quality + ratio + generate */}
         <div className="flex items-center gap-1">
+          {/* AG-07：有 schema 时质量 / 比例这两个旧下拉都不渲染 —— 参数由上面
+              的 GeneratorParamControls 接管；无 schema 的模型行为与改动前一致。 */}
+          {paramDefs === null && (
+            <>
           {/* Quality (1K/2K/4K) — MD-03: not rendered when the model has no quality tiers */}
           {qualityOptions && (
           <div className="relative">
@@ -715,6 +865,9 @@ export function ImageGeneratorPanel({
               </div>
             )}
           </div>
+
+            </>
+          )}
 
           {/* GN-32: 生成中才有东西可取消 —— 只有拿到 jobId 之后才显示 */}
           {loading && activeJobId !== null && (

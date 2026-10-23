@@ -2,6 +2,7 @@ import type {
   AssetSignedUrlResponse,
   CanvasDetail,
   ChatMessageCreateRequest,
+  GeneratorParams,
   JobCreditsResponse,
   JobResponse,
   MarketplaceDetail,
@@ -725,6 +726,12 @@ export type ImageModelInfo = {
     output: string;
     label: string;
   }>;
+  /**
+   * AG-07 / MD-03: the parameter schema this model accepts, declared server-side
+   * (41A). Present = the panel renders those parameter groups instead of the old
+   * quality / ratio dropdowns; absent = the old dropdowns, unchanged.
+   */
+  params?: GeneratorParams;
 };
 
 export async function fetchImageModels(): Promise<{
@@ -801,7 +808,7 @@ export type SubmitImageResponse = {
 export async function submitImageJob(
   accessToken: string,
   prompt: string,
-  options?: { model?: string; aspectRatio?: string; quality?: string },
+  options?: { model?: string; aspectRatio?: string; quality?: string; size?: string },
 ): Promise<SubmitImageResponse> {
   const response = await fetch(
     `${getServerBaseUrl()}/api/agent/generate-image-job`,
@@ -813,6 +820,9 @@ export async function submitImageJob(
         ...(options?.model ? { model: options.model } : {}),
         ...(options?.aspectRatio ? { aspectRatio: options.aspectRatio } : {}),
         ...(options?.quality ? { quality: options.quality } : {}),
+        // AG-07: the catalogue size option (e.g. "16:9-4k"), only sent by models
+        // that publish a size parameter — otherwise the request keeps its old shape.
+        ...(options?.size ? { size: options.size } : {}),
       }),
     },
   );
