@@ -6,41 +6,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useTheme } from "next-themes";
 import { Sun, Moon, Menu, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { HaHartLogo } from "@/components/icons/hahart-logo";
 import { cn } from "@/lib/utils";
-
-// ---------------------------------------------------------------------------
-// Loomic Logo SVG (reused from loading-screen)
-// ---------------------------------------------------------------------------
-
-function LoomicLogo({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 100 100"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      className={cn("text-foreground", className)}
-      aria-hidden="true"
-    >
-      <path
-        d="M50 4 C56 4, 64 8, 68 16 C74 10, 84 10, 90 18 C96 26, 96 36, 90 42 C98 48, 100 58, 96 66 C92 74, 84 78, 76 76 C72 84, 62 92, 50 92 C38 92, 28 84, 24 76 C16 78, 8 74, 4 66 C0 58, 2 48, 10 42 C4 36, 4 26, 10 18 C16 10, 26 10, 32 16 C36 8, 44 4, 50 4 Z"
-        fill="currentColor"
-      />
-      <g style={{ transformOrigin: "35.5px 50.5px" }}>
-        <path
-          d="M31 46 L35.5 34 L40 46 L51 50.5 L40 55 L35.5 67 L31 55 L20 50.5 Z"
-          className="fill-white dark:fill-black"
-        />
-      </g>
-      <path
-        d="M56 42 Q65 54, 74 42"
-        className="stroke-white dark:stroke-black"
-        strokeWidth="3"
-        fill="none"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Nav links config
@@ -150,7 +117,7 @@ export function FloatingNav() {
             href="/"
             className="flex items-center gap-2 shrink-0 group"
           >
-            <LoomicLogo className="size-6 transition-transform duration-300 group-hover:scale-110 group-hover:rotate-6" />
+            <HaHartLogo className="size-6 transition-transform duration-300 group-hover:scale-110 group-hover:rotate-6" />
             <span className="font-bold text-lg tracking-tight">HaHart</span>
           </Link>
 
