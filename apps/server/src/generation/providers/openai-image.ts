@@ -44,7 +44,29 @@ const MODEL_MAP: Record<string, string> = {
   "kwjm/gpt-image-2": "gpt-image-2",
   "kwjm/gpt-image-1.5": "gpt-image-1.5",
   "kwjm/gpt-image-2-inpaint": "gpt-image-2",
+  // Server-internal model for the no-selection fallback of the quick-edit flow
+  // (ED-06). Deliberately NOT listed in OPENAI_IMAGE_MODELS: it must not show up
+  // in the public catalog, so it needs no price row either.
+  "kwjm/gpt-image-2.5-sunburst": "gpt-image-2.5-sunburst",
 };
+
+/**
+ * Gateway models that accept an ARBITRARY `WxH` size on the wire. Everything
+ * else is limited to the `SIZE_TABLE` strings and rejects anything else with a
+ * 400, so `params.size` is ignored for them.
+ *
+ * Keyed by the UPSTREAM model name (the value in MODEL_MAP), not the internal
+ * id, so two internal ids pointing at the same upstream model cannot disagree.
+ */
+const CUSTOM_SIZE_MODELS = new Set(["gpt-image-2.5-sunburst"]);
+
+/**
+ * The gateway sits behind Cloudflare, which answers any request whose
+ * User-Agent looks non-browser with `403 error code: 1010` — Node's default
+ * `undici` UA is rejected, so both calls below must look like a desktop Chrome.
+ */
+const GATEWAY_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 /**
  * Both kwjm models take repeated `image[]` fields on /images/edits, so several
@@ -200,6 +222,32 @@ function parseSize(size: string): { width: number; height: number } {
   return { width: w ?? 1024, height: h ?? 1024 };
 }
 
+/**
+ * Rounds a requested edge and clamps it into the range the gateway documents as
+ * acceptable ([256, 4096]); non-finite input falls back to the low bound rather
+ * than producing `NaNxNaN` on the wire.
+ */
+function clampEdge(value: number): number {
+  if (!Number.isFinite(value)) return 256;
+  return Math.min(4096, Math.max(256, Math.round(value)));
+}
+
+/**
+ * Size actually sent to the gateway. Models in CUSTOM_SIZE_MODELS honour an
+ * explicit `size` verbatim (clamped); every other model keeps the tier-table
+ * behaviour, which is what the endpoint accepts.
+ */
+function resolveRequestSize(
+  params: ImageGenerateParams,
+  apiModel: string,
+  qualityKey: string,
+): string {
+  if (params.size && CUSTOM_SIZE_MODELS.has(apiModel)) {
+    return `${clampEdge(params.size.width)}x${clampEdge(params.size.height)}`;
+  }
+  return resolveSize(params.aspectRatio ?? "1:1", qualityKey);
+}
+
 interface ImagesApiResponse {
   data?: Array<{ b64_json?: string; url?: string }>;
   error?: { message?: string };
@@ -260,7 +308,7 @@ export class OpenAIImageProvider implements ImageProvider {
 
     const qualityKey = params.quality ?? "hd";
     const quality = QUALITY_MAP[qualityKey] ?? "medium";
-    const size = resolveSize(params.aspectRatio ?? "1:1", qualityKey);
+    const size = resolveRequestSize(params, apiModel, qualityKey);
 
     const hasInputs = !!params.inputImages?.length;
     const response = hasInputs
@@ -282,6 +330,7 @@ export class OpenAIImageProvider implements ImageProvider {
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
         "Content-Type": "application/json",
+        "User-Agent": GATEWAY_USER_AGENT,
       },
       body: JSON.stringify({
         model: apiModel,
@@ -348,7 +397,10 @@ export class OpenAIImageProvider implements ImageProvider {
 
     return fetch(`${this.baseURL}/images/edits`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${this.apiKey}` },
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        "User-Agent": GATEWAY_USER_AGENT,
+      },
       body: form,
     });
   }

@@ -97,6 +97,12 @@ export interface ImageGenerateParams {
    * successful edit.
    */
   mask?: string;
+  /**
+   * Explicit output pixel size. A provider that accepts arbitrary sizes sends
+   * this verbatim; one that only accepts its own size strings ignores it and
+   * falls back to its tier table (`aspectRatio` + `quality`).
+   */
+  size?: { width: number; height: number };
   metadata?: Record<string, unknown>;
 }
 
