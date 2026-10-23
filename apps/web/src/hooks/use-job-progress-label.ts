@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 
 import { formatRetryLabel, normalizeJobStatus } from "../lib/job-status";
+import { SLOT_STATE_VISUALS } from "../lib/state-visuals";
 import type { WebSocketHandle } from "./use-websocket";
 
 /**
@@ -47,7 +48,7 @@ export function useJobProgressLabel(
         return;
       }
       if (status === "queued") {
-        setLabel("排队中");
+        setLabel(SLOT_STATE_VISUALS.queued.label);
         return;
       }
       // running (and every terminal status) reads as the default copy again, so

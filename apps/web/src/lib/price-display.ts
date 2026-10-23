@@ -26,13 +26,13 @@ export type PriceState =
 export type PriceVariant = "button" | "badge" | "plain";
 
 /** ED-00c：获取失败的文案三种 variant 一样。 */
-const RETRY_TEXT = "价格获取失败，点击重试";
+export const RETRY_TEXT = "价格获取失败，点击重试";
 /** ED-00l：估算中必须有字，不能留空、也不能只显示尺寸。 */
-const ESTIMATING_TEXT = "估算中";
+export const ESTIMATING_TEXT = "估算中";
 /** ED-00f：免费的直接执行项标「免费」。 */
-const FREE_TEXT = "免费";
+export const FREE_TEXT = "免费";
 /** BL-14 §3：待定价。 */
-const PENDING_TEXT = "待定价";
+export const PENDING_TEXT = "待定价";
 /** BL-14 §3：按钮上写成「生成 · N」。 */
 const BUTTON_PREFIX = "生成 · ";
 /** ED-00f：菜单 / 档位上的 ⚡ 标价。 */

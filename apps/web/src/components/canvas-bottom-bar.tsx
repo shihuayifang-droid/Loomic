@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 import { HexColorPicker } from "react-colorful";
 
 import { AppDropdown, type AppDropdownItem } from "@/components/ui/app-dropdown";
+import { TRANSPARENT_CHECKERBOARD_STYLE } from "@/lib/state-visuals";
 
 /* ── Preset color swatches for background picker ── */
 const BG_PRESETS = ["transparent","#000000","#FFFFFF","#d3f256","#6C5CE7","#00B894","#FD79A8","#0984E3"] as const;
@@ -49,13 +50,6 @@ const CheckerIcon = ({ className }: { className?: string }) => (
     <rect x="8" width="8" height="8" fill="#fff" /><rect y="8" width="8" height="8" fill="#fff" />
   </svg>
 );
-
-/* checkerboard inline style for the transparent swatch button */
-const CHECKER_STYLE: React.CSSProperties = {
-  backgroundImage: "linear-gradient(45deg,#ccc 25%,transparent 25%),linear-gradient(-45deg,#ccc 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#ccc 75%),linear-gradient(-45deg,transparent 75%,#ccc 75%)",
-  backgroundSize: "8px 8px",
-  backgroundPosition: "0 0,0 4px,4px -4px,-4px 0px",
-};
 
 /* ── Hook: dismiss popover on Escape / click-outside ── */
 function usePopoverDismiss(
@@ -283,7 +277,7 @@ export function CanvasBottomBar({ excalidrawApi, layersOpen, onToggleLayers, fil
             {BG_PRESETS.map((hex) => (
               <button data-testid={`canvas-background-swatch-${hex.replace(/#/g, "")}`} key={hex} type="button"
                 className={`h-6 w-6 shrink-0 rounded-full border hover:scale-110 transition-transform ${bgColor === hex ? "border-foreground ring-1 ring-foreground ring-offset-1 ring-offset-card" : "border-border"}`}
-                style={hex === "transparent" ? CHECKER_STYLE : { backgroundColor: hex }}
+                style={hex === "transparent" ? TRANSPARENT_CHECKERBOARD_STYLE : { backgroundColor: hex }}
                 onClick={() => applyBgColor(hex)} aria-label={`Set background to ${hex}`} aria-pressed={bgColor === hex} />
             ))}
           </div>

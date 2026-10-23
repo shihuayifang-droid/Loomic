@@ -2,6 +2,7 @@
 
 import React, { useEffect, useState } from "react";
 
+import { TONE_CLASSES } from "../../lib/state-visuals";
 import { formatModelDisplayName } from "../chat/utils";
 
 /**
@@ -71,7 +72,7 @@ export function GenerationShimmer({
 
   return (
     <div
-      className="flex flex-col overflow-hidden rounded-xl border-[0.5px] border-border bg-card"
+      className={`flex flex-col overflow-hidden rounded-xl border-[0.5px] ${TONE_CLASSES.progress.border} bg-card`}
       style={
         fixedSize
           ? {
@@ -98,7 +99,7 @@ export function GenerationShimmer({
             : { aspectRatio: (aspectRatio ?? "1:1").replace(":", " / ") }
         }
       >
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-muted">
+        <div className={`absolute inset-0 flex flex-col items-center justify-center ${TONE_CLASSES.progress.bg}`}>
           <MediaIcon isVideo={isVideo} />
         </div>
         {/* Shimmer sweep — the only thing that signals "still working" at a glance */}

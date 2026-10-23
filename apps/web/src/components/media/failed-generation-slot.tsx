@@ -3,6 +3,8 @@
 import { AlertTriangle } from "lucide-react";
 import type { JSX } from "react";
 
+import { TONE_CLASSES } from "../../lib/state-visuals";
+
 /**
  * GN-19 / CV-02: the "generation failed" placeholder.
  *
@@ -46,16 +48,16 @@ export function FailedGenerationSlot(props: {
     <div
       data-testid="canvas-failed-slot"
       data-kind={kind}
-      className="flex flex-col overflow-hidden rounded-xl border-[0.5px] border-destructive bg-card"
+      className={`flex flex-col overflow-hidden rounded-xl border-[0.5px] ${TONE_CLASSES.danger.border} bg-card`}
       style={{ width, height, pointerEvents: "none" }}
     >
       <div className="relative min-h-0 flex-1 overflow-hidden">
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-destructive/5">
+        <div className={`absolute inset-0 flex flex-col items-center justify-center gap-2 ${TONE_CLASSES.danger.bg}`}>
           <AlertTriangle
             className="h-10 w-10 text-destructive/70"
             aria-hidden="true"
           />
-          <div className="text-[12px] font-medium text-destructive">
+          <div className={`text-[12px] font-medium ${TONE_CLASSES.danger.text}`}>
             生成失败
           </div>
         </div>
