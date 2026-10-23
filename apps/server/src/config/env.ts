@@ -31,6 +31,13 @@ export type AgentBackendMode = "filesystem" | "state";
 export type AuthProvider = "supabase" | "self";
 
 /**
+ * OP-05: which object storage backend the server uses. `supabase` keeps the
+ * pre-OP-05 behaviour; `fs` is the private file volume and is not implemented
+ * yet, so selecting it fails at the point the store is built.
+ */
+export type StorageProvider = "supabase" | "fs";
+
+/**
  * OP-13: the one place that decides "this is production". NODE_ENV=production.
  *
  * Read through the index signature on purpose: the `.env.example` guard in
@@ -124,6 +131,12 @@ export type ServerEnv = {
   authJwtIssuer?: string;
   /** S-A3: `aud` of the self-hosted access tokens (default "hahart-api"). */
   authJwtAudience?: string;
+  /**
+   * OP-05: which object storage backend to use. Optional on the type so existing
+   * literals keep compiling; `loadServerEnv` always fills it (default
+   * "supabase", so an unset variable keeps the pre-OP-05 behaviour).
+   */
+  storageProvider?: StorageProvider;
 };
 
 export const DEFAULT_AGENT_CONFIRM_THRESHOLD = 50;
@@ -131,6 +144,8 @@ export const DEFAULT_AGENT_CONFIRM_THRESHOLD = 50;
 export const DEFAULT_AUTH_PROVIDER: AuthProvider = "supabase";
 export const DEFAULT_AUTH_JWT_ISSUER = "hahart";
 export const DEFAULT_AUTH_JWT_AUDIENCE = "hahart-api";
+/** OP-05: an unset storage switch means "keep reading and writing objects where we do today". */
+export const DEFAULT_STORAGE_PROVIDER: StorageProvider = "supabase";
 
 /** HS256 key material below this many UTF-8 bytes is a configuration error. */
 const MIN_AUTH_JWT_SECRET_BYTES = 32;
@@ -155,6 +170,22 @@ function parseAuthProvider(raw: string | undefined): AuthProvider {
     return trimmed;
   }
   throw new Error(`Invalid HAHART_AUTH_PROVIDER value: ${raw}`);
+}
+
+/**
+ * OP-05: the object storage switch. An unknown value is a configuration error
+ * rather than a silent fallback: bytes must never land on a backend the
+ * operator did not choose.
+ */
+function parseStorageProvider(raw: string | undefined): StorageProvider {
+  const trimmed = normalizeOptionalString(raw);
+  if (!trimmed) {
+    return DEFAULT_STORAGE_PROVIDER;
+  }
+  if (trimmed === "supabase" || trimmed === "fs") {
+    return trimmed;
+  }
+  throw new Error(`Invalid HAHART_STORAGE_PROVIDER value: ${raw}`);
 }
 
 /**
@@ -352,6 +383,8 @@ export function loadServerEnv(
     overrides.authJwtAudience ??
     normalizeOptionalString(source.HAHART_AUTH_JWT_AUDIENCE) ??
     DEFAULT_AUTH_JWT_AUDIENCE;
+  const storageProvider =
+    overrides.storageProvider ?? parseStorageProvider(source.HAHART_STORAGE_PROVIDER);
 
   // S-A3: the self-hosted mode is unusable without its own signing key, so it
   // fails at load time instead of at the first request.
@@ -447,6 +480,7 @@ export function loadServerEnv(
     authProvider,
     authJwtIssuer,
     authJwtAudience,
+    storageProvider,
     ...(authJwtSecret ? { authJwtSecret } : {}),
   };
 

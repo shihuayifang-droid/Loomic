@@ -236,3 +236,43 @@ describe("S-A3 auth provider switch", () => {
     ).toThrow("Invalid HAHART_AUTH_PROVIDER value: oauth");
   });
 });
+
+/**
+ * OP-05 (43B): the object storage switch. The default keeps the backend the
+ * server uses today, `fs` parses even though the volume backend is a later
+ * ticket, and an unknown value refuses to start.
+ */
+describe("OP-05 object storage provider switch", () => {
+  it("OP-05: storageProvider defaults to supabase", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, { NODE_ENV: "development" });
+
+    expect(env.storageProvider).toBe("supabase");
+  });
+
+  it("OP-05: HAHART_STORAGE_PROVIDER=fs parses", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      HAHART_STORAGE_PROVIDER: "fs",
+    });
+
+    expect(env.storageProvider).toBe("fs");
+  });
+
+  it("OP-05: HAHART_STORAGE_PROVIDER=supabase parses", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      HAHART_STORAGE_PROVIDER: "supabase",
+    });
+
+    expect(env.storageProvider).toBe("supabase");
+  });
+
+  it("OP-05: an unknown storage provider refuses to start", () => {
+    expect(() =>
+      loadServerEnv(VERSION_OVERRIDE, {
+        NODE_ENV: "development",
+        HAHART_STORAGE_PROVIDER: "s3",
+      }),
+    ).toThrow("Invalid HAHART_STORAGE_PROVIDER value: s3");
+  });
+});
