@@ -219,7 +219,11 @@ import { registerCreditRoutes } from "./http/credits.js";
 import { registerPricingRoutes } from "./http/pricing.js";
 import { registerFontsRoutes } from "./http/fonts.js";
 import { registerJobRoutes } from "./http/jobs.js";
+import { createObjectStore } from "./features/storage/object-store-factory.js";
+import { objectUrlSecretFrom } from "./features/storage/object-url-signature.js";
+import type { SupabaseStorageLike } from "./features/storage/supabase-object-store.js";
 import { registerAdminTeamRoutes } from "./http/admin-team.js";
+import { registerObjectRoutes } from "./http/object-routes.js";
 import { registerBrandKitRoutes } from "./http/brand-kits.js";
 import { registerCanvasRoutes } from "./http/canvases.js";
 import { registerChatRoutes } from "./http/chat.js";
@@ -1020,6 +1024,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       auth,
       teamMembership: teamMembershipService,
       pool: () => getTransactionPool(databaseEnv),
+    });
+  }
+
+  // Workorder 43E: the read route of the private file volume. The signed link is
+  // the credential (an `<img>` / `<video>` cannot send an Authorization header),
+  // so the route is registered only when the volume is the chosen backend.
+  if (env.storageProvider === "fs") {
+    void registerObjectRoutes(app, {
+      store: createObjectStore(env, {
+        supabaseClient: () => getAdminClient() as unknown as SupabaseStorageLike,
+      }),
+      secret: objectUrlSecretFrom(env.objectUrlSecret!),
     });
   }
 

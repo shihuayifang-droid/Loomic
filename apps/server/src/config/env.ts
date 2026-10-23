@@ -137,6 +137,16 @@ export type ServerEnv = {
    * "supabase", so an unset variable keeps the pre-OP-05 behaviour).
    */
   storageProvider?: StorageProvider;
+  /**
+   * OP-05 / 43E: the private file volume. `objectRoot` is the directory that
+   * holds `<root>/<bucket>/<key>`; `objectUrlSecret` is the HMAC key of the
+   * signed read links (at least 32 bytes); `objectPublicBase` is the origin the
+   * links are built on (trailing slashes removed). All three are mandatory once
+   * `storageProvider` is "fs" and unused otherwise.
+   */
+  objectRoot?: string;
+  objectUrlSecret?: string;
+  objectPublicBase?: string;
 };
 
 export const DEFAULT_AGENT_CONFIRM_THRESHOLD = 50;
@@ -149,6 +159,9 @@ export const DEFAULT_STORAGE_PROVIDER: StorageProvider = "supabase";
 
 /** HS256 key material below this many UTF-8 bytes is a configuration error. */
 const MIN_AUTH_JWT_SECRET_BYTES = 32;
+
+/** OP-05: HMAC key material below this many UTF-8 bytes is a configuration error. */
+const MIN_OBJECT_URL_SECRET_BYTES = 32;
 
 function parseAgentConfirmThreshold(raw: string | undefined): number {
   const trimmed = raw?.trim();
@@ -204,6 +217,37 @@ function hasEnoughAuthJwtSecret(secret: string | undefined): boolean {
     return false;
   }
   return new TextEncoder().encode(secret).byteLength >= MIN_AUTH_JWT_SECRET_BYTES;
+}
+
+/**
+ * OP-05 / 43E: the file volume signs its own read links, so it needs key
+ * material of its own. Same rule and same "names only, never values" message as
+ * the self-hosted auth secret.
+ */
+function objectStorageConfigError(): Error {
+  return new Error(
+    "HAHART_STORAGE_PROVIDER=fs requires HAHART_OBJECT_ROOT, HAHART_OBJECT_URL_SECRET (at least 32 bytes) and HAHART_OBJECT_PUBLIC_BASE",
+  );
+}
+
+function hasEnoughObjectUrlSecret(secret: string | undefined): boolean {
+  if (!secret) {
+    return false;
+  }
+  return new TextEncoder().encode(secret).byteLength >= MIN_OBJECT_URL_SECRET_BYTES;
+}
+
+/**
+ * OP-05 / 43E: signed links are built as `<base>/objects/...`, so a trailing
+ * slash on the configured origin would produce a double slash. Normalising it
+ * here keeps `signObjectUrl` and the route guessing about nothing.
+ */
+function normalizePublicBase(raw: string | undefined): string | undefined {
+  const trimmed = normalizeOptionalString(raw);
+  if (!trimmed) {
+    return undefined;
+  }
+  return trimmed.replace(/\/+$/, "");
 }
 
 /**
@@ -385,11 +429,32 @@ export function loadServerEnv(
     DEFAULT_AUTH_JWT_AUDIENCE;
   const storageProvider =
     overrides.storageProvider ?? parseStorageProvider(source.HAHART_STORAGE_PROVIDER);
+  const objectRoot =
+    overrides.objectRoot ?? normalizeOptionalString(source.HAHART_OBJECT_ROOT);
+  const objectUrlSecret =
+    overrides.objectUrlSecret ??
+    normalizeOptionalString(source.HAHART_OBJECT_URL_SECRET);
+  const objectPublicBase = normalizePublicBase(
+    overrides.objectPublicBase ??
+      normalizeOptionalString(source.HAHART_OBJECT_PUBLIC_BASE),
+  );
 
   // S-A3: the self-hosted mode is unusable without its own signing key, so it
   // fails at load time instead of at the first request.
   if (authProvider === "self" && !hasEnoughAuthJwtSecret(authJwtSecret)) {
     throw authJwtSecretError();
+  }
+
+  // OP-05 / 43E: the file volume has no sensible default for any of its three
+  // settings - a missing directory, key or origin would only surface on the
+  // first request - so it refuses to load without them.
+  if (
+    storageProvider === "fs" &&
+    (!objectRoot ||
+      !objectPublicBase ||
+      !hasEnoughObjectUrlSecret(objectUrlSecret))
+  ) {
+    throw objectStorageConfigError();
   }
 
   // Resolve default agent model based on available provider keys.
@@ -481,6 +546,9 @@ export function loadServerEnv(
     authJwtIssuer,
     authJwtAudience,
     storageProvider,
+    ...(objectRoot ? { objectRoot } : {}),
+    ...(objectUrlSecret ? { objectUrlSecret } : {}),
+    ...(objectPublicBase ? { objectPublicBase } : {}),
     ...(authJwtSecret ? { authJwtSecret } : {}),
   };
 

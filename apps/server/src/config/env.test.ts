@@ -253,6 +253,9 @@ describe("OP-05 object storage provider switch", () => {
     const env = loadServerEnv(VERSION_OVERRIDE, {
       NODE_ENV: "development",
       HAHART_STORAGE_PROVIDER: "fs",
+      HAHART_OBJECT_ROOT: "/data/objects",
+      HAHART_OBJECT_URL_SECRET: "x".repeat(32),
+      HAHART_OBJECT_PUBLIC_BASE: "https://hahart.example.test",
     });
 
     expect(env.storageProvider).toBe("fs");
@@ -274,5 +277,82 @@ describe("OP-05 object storage provider switch", () => {
         HAHART_STORAGE_PROVIDER: "s3",
       }),
     ).toThrow("Invalid HAHART_STORAGE_PROVIDER value: s3");
+  });
+});
+
+/**
+ * OP-05 (43E): the file volume's three settings. They are all-or-nothing once
+ * `HAHART_STORAGE_PROVIDER=fs` - a missing directory, key or public origin would
+ * otherwise only break at the first request.
+ */
+describe("OP-05 file volume configuration", () => {
+  const FS_SOURCE = {
+    NODE_ENV: "development",
+    HAHART_STORAGE_PROVIDER: "fs",
+    HAHART_OBJECT_ROOT: "/var/lib/hahart/objects",
+    HAHART_OBJECT_URL_SECRET: "0123456789abcdef0123456789abcdef",
+    HAHART_OBJECT_PUBLIC_BASE: "https://hahart.example.com",
+  };
+
+  it("OP-05: fs with all three variables loads them", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, FS_SOURCE);
+
+    expect(env.objectRoot).toBe("/var/lib/hahart/objects");
+    expect(env.objectUrlSecret).toBe("0123456789abcdef0123456789abcdef");
+    expect(env.objectPublicBase).toBe("https://hahart.example.com");
+  });
+
+  it("OP-05: the public base loses its trailing slash", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      ...FS_SOURCE,
+      HAHART_OBJECT_PUBLIC_BASE: "https://hahart.example.com/",
+    });
+
+    expect(env.objectPublicBase).toBe("https://hahart.example.com");
+  });
+
+  it.each([
+    "HAHART_OBJECT_ROOT",
+    "HAHART_OBJECT_URL_SECRET",
+    "HAHART_OBJECT_PUBLIC_BASE",
+  ])("OP-05: fs without %s refuses to start and names the variables", (name) => {
+    const source: NodeJS.ProcessEnv = { ...FS_SOURCE };
+    delete source[name];
+
+    let message = "";
+    try {
+      loadServerEnv(VERSION_OVERRIDE, source);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain("HAHART_OBJECT_ROOT");
+    expect(message).toContain("HAHART_OBJECT_URL_SECRET");
+    expect(message).toContain("HAHART_OBJECT_PUBLIC_BASE");
+  });
+
+  it("OP-05: fs with a too-short secret refuses to start and never echoes it", () => {
+    const short = "too-short-placeholder-secret";
+
+    let message = "";
+    try {
+      loadServerEnv(VERSION_OVERRIDE, {
+        ...FS_SOURCE,
+        HAHART_OBJECT_URL_SECRET: short,
+      });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain("HAHART_OBJECT_URL_SECRET");
+    expect(message).not.toContain(short);
+  });
+
+  it("OP-05: a supabase install leaves the three fields unset", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, { NODE_ENV: "development" });
+
+    expect(env.objectRoot).toBeUndefined();
+    expect(env.objectUrlSecret).toBeUndefined();
+    expect(env.objectPublicBase).toBeUndefined();
   });
 });

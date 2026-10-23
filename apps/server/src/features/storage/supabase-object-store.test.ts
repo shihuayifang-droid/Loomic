@@ -2,6 +2,10 @@
 // Every case records the client calls and asserts the arguments verbatim, so a
 // later refactor of the wrapper cannot silently drop `upsert`, `contentType`, a
 // transform or a download name.
+import { promises as fsp } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { loadServerEnv } from "../../config/env.js";
@@ -467,13 +471,39 @@ describe("43B createObjectStore factory", () => {
     expect(clientCalls).toBe(1);
   });
 
-  it("43B: provider fs refuses to build a store", () => {
-    expect(() =>
-      createObjectStore(envFrom({ HAHART_STORAGE_PROVIDER: "fs" }), {
-        supabaseClient: () => {
-          throw new Error("the client must not be touched for fs");
+  // 43E: the placeholder used to throw "not implemented". The file volume now
+  // exists, so the same switch must yield a working store - proven by writing
+  // and reading an object in a temporary directory.
+  it("43E: provider fs builds a file-volume store that can put and get", async () => {
+    const rootDir = await fsp.mkdtemp(
+      path.join(os.tmpdir(), "object-store-factory-"),
+    );
+    try {
+      const store = createObjectStore(
+        envFrom({
+          HAHART_STORAGE_PROVIDER: "fs",
+          HAHART_OBJECT_ROOT: rootDir,
+          HAHART_OBJECT_URL_SECRET: "0123456789abcdef0123456789abcdef",
+          HAHART_OBJECT_PUBLIC_BASE: "https://files.example.test",
+        }),
+        {
+          supabaseClient: () => {
+            throw new Error("the client must not be touched for fs");
+          },
         },
-      }),
-    ).toThrow("HAHART_STORAGE_PROVIDER=fs is not implemented yet");
+      );
+
+      await store.put(objectRef("a.png"), Buffer.from("hello"), {
+        contentType: "text/plain",
+      });
+
+      const read = await store.get(objectRef("a.png"));
+
+      expect(read.contentType).toBe("text/plain");
+      expect(read.size).toBe(5);
+      expect(read.body.toString("utf8")).toBe("hello");
+    } finally {
+      await fsp.rm(rootDir, { recursive: true, force: true });
+    }
   });
 });
