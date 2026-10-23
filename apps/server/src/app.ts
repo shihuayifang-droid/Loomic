@@ -236,6 +236,7 @@ import { registerSettingsRoutes } from "./http/settings.js";
 import { registerTeamGate } from "./http/team-gate.js";
 import { registerToolRoutes } from "./http/tools.js";
 import { registerAuthRoutes } from "./http/auth.js";
+import { registerAuthPasswordRoutes } from "./http/auth-password.js";
 import { registerUploadRoutes } from "./http/uploads.js";
 import { registerSkillRoutes } from "./http/skills.js";
 import { registerMarketplaceRoutes } from "./http/skills-marketplace.js";
@@ -1012,6 +1013,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     void registerAuthRoutes(app, {
       pool: () => getTransactionPool(databaseEnv),
       token: buildSelfTokenConfig(),
+    });
+    // Workorder 42E: administrator password reset (temporary password) and the
+    // member's own password change, same self-provider condition.
+    void registerAuthPasswordRoutes(app, {
+      auth,
+      teamMembership: teamMembershipService,
+      pool: () => getTransactionPool(databaseEnv),
     });
   }
 

@@ -418,4 +418,34 @@ describe("team member gate", () => {
       expect(response.statusCode).not.toBe(503);
     }
   });
+
+  it("工单42E: /api/auth/change-password is exempt (a new user may not be on the team yet)", async () => {
+    mode = "none";
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/auth/change-password",
+      headers: { authorization: `Bearer ${MEMBER_TOKEN}` },
+      payload: { currentPassword: "a", newPassword: "b" },
+    });
+
+    // The route is not mounted under the default provider, so the answer is
+    // Fastify's 404 - what matters is that it is not the gate's 403/503.
+    expect(response.statusCode).not.toBe(403);
+    expect(response.statusCode).not.toBe(503);
+  });
+
+  it("工单42E: /api/admin/auth/reset-password is NOT exempt, a non-member gets 403", async () => {
+    mode = "none";
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/admin/auth/reset-password",
+      headers: { authorization: `Bearer ${MEMBER_TOKEN}` },
+      payload: { email: "someone@hahart.test" },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error.code).toBe("not_team_member");
+  });
 });

@@ -25,6 +25,9 @@ const EXEMPT_PATHS = new Set([
   "/api/auth/sign-in",
   "/api/auth/refresh",
   "/api/auth/sign-out",
+  // Workorder 42E: a member replacing a temporary password may not be in the
+  // team workspace yet, and the route answers 401/400 itself.
+  "/api/auth/change-password",
 ]);
 
 /**
