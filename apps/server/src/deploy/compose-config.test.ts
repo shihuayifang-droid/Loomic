@@ -303,7 +303,7 @@ describe("43M deploy/nginx.conf", () => {
   it("43M: proxies /api/ to the server container without buffering", () => {
     const api = locationBlock("/api/");
 
-    expect(api).toContain("proxy_pass http://server:3001");
+    expect(api).toContain("proxy_pass $hahart_api");
     expect(api).toContain("proxy_set_header Host");
     expect(api).toContain("X-Forwarded-For");
     expect(api).toContain("X-Forwarded-Proto");
@@ -313,18 +313,24 @@ describe("43M deploy/nginx.conf", () => {
   it("43M: proxies /objects/ and keeps Range responses unbuffered", () => {
     const objects = locationBlock("/objects/");
 
-    expect(objects).toContain("proxy_pass http://server:3001");
+    expect(objects).toContain("proxy_pass $hahart_api");
     expect(objects).toContain("proxy_buffering off");
   });
 
   it("43M: upgrades /api/ws instead of proxying it as plain HTTP", () => {
     const ws = locationBlock("/api/ws");
 
-    expect(ws).toContain("proxy_pass http://server:3001");
+    expect(ws).toContain("proxy_pass $hahart_api");
     expect(ws).toContain("proxy_http_version 1.1");
     expect(ws).toContain("Upgrade $http_upgrade");
     expect(ws).toContain('Connection "upgrade"');
     expect(ws).toContain("proxy_read_timeout 3600s");
+  });
+
+  it("45E: re-resolves the server container per request via Docker DNS", () => {
+    expect(NGINX_TEXT).toContain("resolver 127.0.0.11");
+    expect(NGINX_TEXT).toContain("set $hahart_api http://server:3001;");
+    expect(NGINX_TEXT).not.toContain("proxy_pass http://server:3001");
   });
 });
 
