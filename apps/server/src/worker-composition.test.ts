@@ -264,6 +264,7 @@ describe("buildWorkerComposition: what it builds", () => {
       "env",
       "creditReadRepository",
       "assetProvenanceRepository",
+      "assetReadRepository",
     ]);
   });
 

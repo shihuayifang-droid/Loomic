@@ -40,6 +40,7 @@ import { createUserSupabaseClientFactory } from "./supabase/user.js";
 // Import executors to trigger registration via side effects
 import "./features/jobs/executors/image-generation.js";
 import "./features/jobs/executors/video-generation.js";
+import "./features/jobs/executors/tool-execution.js";
 
 import type { BackgroundJobType } from "@loomic/shared";
 

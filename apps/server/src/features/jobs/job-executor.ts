@@ -6,6 +6,7 @@ import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { ServerEnv } from "../../config/env.js";
 import type { CreditReadRepository } from "../../db/credit-read-repository.js";
 import type { AssetProvenanceRepository } from "../../db/asset-provenance-repository.js";
+import type { AssetReadRepository } from "../../db/asset-read-repository.js";
 
 export type ExecutorContext = {
   jobService: JobService;
@@ -31,6 +32,13 @@ export type ExecutorContext = {
    * executor simply skips provenance.
    */
   assetProvenanceRepository?: Pick<AssetProvenanceRepository, "recordProvenance">;
+  /**
+   * ED-00j: the read ACL the tool executor resolves an input artifact through.
+   * The worker wires the real repository in; every other construction site (and
+   * every test substitute) may leave it out. The tool executor treats an absent
+   * repository as an error rather than reading the object some other way.
+   */
+  assetReadRepository?: Pick<AssetReadRepository, "findReadableAsset">;
   /**
    * GN-11: the amount this job was charged, as the worker read it from the
    * billing gate (`credits_cost`). The executors copy it into provenance.

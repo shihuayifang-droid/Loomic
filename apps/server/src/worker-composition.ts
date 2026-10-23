@@ -38,6 +38,10 @@ import {
   type JobBillingGateRepository,
 } from "./db/job-billing-gate-repository.js";
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
+import {
+  createAssetReadRepository,
+  type AssetReadRepository,
+} from "./db/asset-read-repository.js";
 import { createJobRefundBasisRepository } from "./db/job-refund-basis-repository.js";
 import { createRefundCompensationRepository } from "./db/refund-compensation-repository.js";
 import {
@@ -94,6 +98,7 @@ export type WorkerBaseContext = {
   env: ServerEnv;
   creditReadRepository: CreditReadRepository;
   assetProvenanceRepository: AssetProvenanceRepository;
+  assetReadRepository: AssetReadRepository;
 };
 
 export type WorkerComposition = {
@@ -184,6 +189,13 @@ export function buildWorkerComposition(
     getTransactionPool,
   });
 
+  // ED-00j: the tool_execution executor resolves its input artifact through the
+  // read ACL. Built lazily like the repositories above, so construction
+  // connects to nothing.
+  const assetReadRepository = createAssetReadRepository({
+    getTransactionPool,
+  });
+
   // ADR-0001 / workorder 21H1: the billing gate the worker runs before it
   // consumes an attempt or calls a model. Built here, lazily, exactly like the
   // attempt repository above and against the same `DATABASE_URL`. With no
@@ -244,6 +256,8 @@ export function buildWorkerComposition(
     creditReadRepository,
     // GN-11: provenance written onto the asset row by the image / video executors.
     assetProvenanceRepository,
+    // ED-00j: the input artifact of a tool_execution job is read through this.
+    assetReadRepository,
   };
 
   return {

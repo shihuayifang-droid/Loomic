@@ -1,6 +1,7 @@
 // Image generation executor (BL-40: generated images are never watermarked)
 import { registerExecutor, type ExecutorContext } from "../job-executor.js";
 import { loadExecutorJob } from "./load-executor-job.js";
+import { storeJobOutput } from "./store-job-output.js";
 import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateImage } from "../../../generation/image-generation.js";
@@ -146,46 +147,17 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     const buffer: Buffer = Buffer.from(arrayBuffer);
     lap("image_download_done");
 
-    // Upload to Supabase Storage under the project-assets bucket
+    // Upload to storage and record ownership (shared with the tool executor).
     const timestamp = Date.now();
-    const objectPath = `${workspaceId}/generated/${timestamp}-${jobId}.png`;
-
-    const { error: uploadError } = await admin.storage
-      .from("project-assets")
-      .upload(objectPath, buffer, {
-        contentType: generated.mimeType ?? "image/png",
-        upsert: false,
-      });
-
-    if (uploadError) {
-      throw new Error(`Storage upload failed: ${uploadError.message}`);
-    }
-    lap("storage_upload_done");
-
-    // Record ownership through the single service_role-only entry point. A
-    // direct insert here is what left generated media attached to the billing
-    // workspace with project_id null, which a private bucket then cannot
-    // authorise. If this fails the job must fail: an uploaded object with no
-    // metadata is exactly the "silent success" this ticket exists to remove.
-    const { data: assetData, error: assetError } = await admin.rpc("record_project_asset", {
-      p_bucket: "project-assets",
-      p_object_path: objectPath,
-      p_created_by: createdBy,
-      p_fallback_workspace_id: workspaceId,
-      p_project_id: projectId,
-      p_canvas_id: canvasId,
-      p_mime_type: generated.mimeType ?? "image/png",
-      p_byte_size: buffer.length,
+    const { assetId, objectPath } = await storeJobOutput(admin, {
+      objectPath: `${workspaceId}/generated/${timestamp}-${jobId}.png`,
+      bytes: buffer,
+      mimeType: generated.mimeType ?? "image/png",
+      createdBy,
+      workspaceId,
+      projectId,
+      canvasId,
     });
-
-    if (assetError) {
-      throw new Error(`Failed to record asset ownership: ${assetError.message}`);
-    }
-
-    const assetId = (assetData as { asset_id?: string } | null)?.asset_id;
-    if (!assetId) {
-      throw new Error("Failed to record asset ownership: no asset id returned");
-    }
 
     lap("asset_record_done");
 
