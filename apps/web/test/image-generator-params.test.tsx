@@ -268,14 +268,16 @@ describe("AG-07 图像生成面板按服务端参数渲染（工单 41D）", () 
     fireEvent.click(await screen.findByTestId("generator-size-option-16:9-4k"));
 
     // 询价：档位取所选项的 tier，尺寸原样带上；带 size 就不发 aspectRatio
-    expect(lastQuoteCall()?.input).toEqual({
-      kind: "image_generation",
-      request: {
-        prompt: "cat",
-        model: GPT_MODEL,
-        quality: "ultra",
-        size: "16:9-4k",
-      },
+    await waitFor(() => {
+      expect(lastQuoteCall()?.input).toEqual({
+        kind: "image_generation",
+        request: {
+          prompt: "cat",
+          model: GPT_MODEL,
+          quality: "ultra",
+          size: "16:9-4k",
+        },
+      });
     });
 
     fireEvent.click(screen.getByTestId("canvas-image-generator-submit"));
@@ -297,12 +299,14 @@ describe("AG-07 图像生成面板按服务端参数渲染（工单 41D）", () 
     // 询价：`3:2` 原样当 size 发，质量取 standard，且请求体里没有 aspectRatio 键
     // （shared 的 `generateImageRequestSchema.aspectRatio` 只收 1:1 / 16:9 / 9:16 /
     // 4:3 / 3:4，带上 3:2 会被服务端 400）。
-    const quoteCall = lastQuoteCall();
-    const quoteRequest = (quoteCall?.input as { request: Record<string, unknown> })
-      .request;
-    expect(quoteRequest.size).toBe("3:2");
-    expect(quoteRequest.quality).toBe("standard");
-    expect("aspectRatio" in quoteRequest).toBe(false);
+    await waitFor(() => {
+      const quoteCall = lastQuoteCall();
+      const quoteRequest = (quoteCall?.input as { request: Record<string, unknown> })
+        .request;
+      expect(quoteRequest.size).toBe("3:2");
+      expect(quoteRequest.quality).toBe("standard");
+      expect("aspectRatio" in quoteRequest).toBe(false);
+    });
 
     fireEvent.click(screen.getByTestId("canvas-image-generator-submit"));
     await waitFor(() => expect(apiMock.submitImageJob).toHaveBeenCalledTimes(1));
@@ -438,8 +442,11 @@ describe("AG-07 张数控件与多占位（工单 41G）", () => {
 
     fireEvent.click(await screen.findByTestId("generator-count-option-10"));
 
-    const request = (lastQuoteCall()?.input as { request: Record<string, unknown> }).request;
-    expect(request.count).toBe(10);
+    await waitFor(() => {
+      const request = (lastQuoteCall()?.input as { request: Record<string, unknown> })
+        .request;
+      expect(request.count).toBe(10);
+    });
   });
 
   it("AG-07: ten images draw ten placeholders", async () => {
