@@ -1321,3 +1321,105 @@ describe("ED-07：去背景直接执行并原位替换（工单 40T）", () => {
     expect(runToolMock).toHaveBeenCalledTimes(0);
   });
 });
+
+describe("ED-06：快捷编辑面板（工单 40U）", () => {
+  /** 源图的 assetId 就是 `artifact_id` 的来源（同裁剪 / 调整 / 去背景的取法）。 */
+  const sourceFiles = {
+    "file-1": {
+      dataURL: "data:image/png;base64,AAAA",
+      mimeType: "image/png",
+      assetId: "a-src",
+    },
+  };
+
+  beforeEach(() => {
+    runToolMock.mockReset();
+    awaitJobCompletionMock.mockReset();
+    fetchAsDataURLMock.mockReset();
+    runToolMock.mockResolvedValue({ jobId: "job-1", status: "queued", model: null });
+    awaitJobCompletionMock.mockResolvedValue({
+      result: {
+        asset_id: "a-out",
+        signed_url: "https://x/out.png",
+        width: 100,
+        height: 80,
+        mime_type: "image/png",
+      },
+    });
+    fetchAsDataURLMock.mockResolvedValue("data:image/png;base64,OUT");
+  });
+
+  /** 工具条上真正可见的按钮（`image-toolbar-layer` 容器自己也匹配前缀，要按 tagName 排掉）。 */
+  const toolbarButtons = () =>
+    screen.queryAllByTestId(/^image-toolbar-/).filter((el) => el.tagName === "BUTTON");
+
+  it("ED-06: Tab on a selected image swaps the toolbar for the quick edit panel", () => {
+    setupSelectedImage();
+
+    // 进之前：工具条上的按钮是能点到的
+    expect(toolbarButtons().length).toBeGreaterThan(0);
+
+    fireEvent.keyDown(document, { key: "Tab" });
+
+    expect(layerState()).toBe("quick-edit");
+    expect(screen.getByTestId("quickedit-panel")).toBeInTheDocument();
+    expect(toolbarButtons()).toHaveLength(0);
+  });
+
+  it("ED-06: Tab inside a text field does nothing", () => {
+    setupSelectedImage();
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    fireEvent.keyDown(document, { key: "Tab" });
+
+    expect(layerState()).toBe("toolbar");
+    expect(screen.queryByTestId("quickedit-panel")).toBeNull();
+
+    input.remove();
+  });
+
+  it("ED-06: submit runs quick_edit once and adds a new image beside the source", async () => {
+    const source = imageElement();
+    const { api, push } = setup({ files: sourceFiles });
+    push([source, rectangleElement()], makeAppState());
+
+    fireEvent.keyDown(document, { key: "Tab" });
+    const input = screen.getByTestId("quickedit-input");
+    input.textContent = "改成蓝色";
+    fireEvent.input(input);
+
+    fireEvent.click(screen.getByTestId("quickedit-submit"));
+
+    await waitFor(() => expect(api.updateScene).toHaveBeenCalledTimes(1));
+
+    // 一次点击 = 一次运行，参数带着用户写的描述
+    expect(runToolMock).toHaveBeenCalledTimes(1);
+    expect(runToolMock.mock.calls[0]?.[1]).toBe("quick_edit");
+    expect(runToolMock.mock.calls[0]?.[2]).toMatchObject({
+      artifact_id: "a-src",
+      params: { prompt: "改成蓝色" },
+    });
+
+    const call = api.updateScene.mock.calls[0]?.[0] as {
+      elements: Array<Record<string, any>>;
+      captureUpdate: string;
+    };
+    // 产物是**新对象**：元素数 = 原元素数 + 1
+    expect(call.elements).toHaveLength(3);
+    // 源元素一个字段都没动（同一个引用，不是复制出来的等值对象）
+    expect(call.elements[0]).toBe(source);
+    const added = call.elements.find((el) => el["id"] !== "img-1" && el["id"] !== "rect-1");
+    expect(added?.["type"]).toBe("image");
+    // 插在源图右侧：x = 源.x + 源.width + 40
+    expect(added?.["x"]).toBe(100 + 80 + 40);
+    expect(added?.["y"]).toBe(200);
+    expect(added?.["width"]).toBe(100);
+    expect(added?.["height"]).toBe(80);
+    expect(added?.["customData"].toolSource).toBe("tool:quick_edit");
+    expect(added?.["customData"].parentAssetId).toBe("a-src");
+    expect(call.captureUpdate).toBe("IMMEDIATELY");
+  });
+});

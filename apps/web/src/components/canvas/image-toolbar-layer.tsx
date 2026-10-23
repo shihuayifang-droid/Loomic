@@ -9,7 +9,8 @@ import type { SelectionItemKind, ToolbarKind } from "@/lib/toolbar-kind";
 import { elementKind, resolveToolbar } from "@/lib/toolbar-kind";
 import { placePanel } from "@/lib/panel-placement";
 import { elementScreenRect, imageToolbarPosition } from "@/lib/toolbar-position";
-import { fetchAsDataURL } from "@/lib/canvas-elements";
+import { createExcalidrawImageElement, fetchAsDataURL } from "@/lib/canvas-elements";
+import { toolPriceKey } from "@/lib/tool-price-tooltip";
 import { browserRenderCrop, commitCropOutput } from "@/lib/crop-commit";
 import { replaceImageInPlace } from "@/lib/tool-output-replace";
 import { createServerToolRunner } from "@/lib/server-tool-run";
@@ -36,6 +37,7 @@ import { CropToolSession } from "./crop-tool-session";
 import { DownloadAllBar } from "./download-all-bar";
 import { FlipRotateBar } from "./flip-rotate-bar";
 import { ImageToolbar } from "./image-toolbar";
+import { QuickEditPanel } from "./quick-edit-panel";
 import { SOURCE_DELETED_MESSAGE } from "./tool-panel-host";
 
 /**
@@ -100,6 +102,12 @@ const CROP_TOOL_ID = "crop";
 
 /** ED-01: the main toolbar adjust tool id. */
 const ADJUST_TOOL_ID = "adjust";
+
+/** ED-06: the main toolbar quick edit tool id (工单 40U). */
+const QUICK_EDIT_TOOL_ID = "quick_edit";
+
+/** ED-06: 产物插在源图右侧时留的间距（规格原文：产物是新对象，放在源图旁）。 */
+const QUICK_EDIT_OUTPUT_GAP = 40;
 
 /**
  * `excalidrawApi` 在本仓是 `any`（`canvas-editor.tsx:169`），这里只声明用到的 4 个方法。
@@ -274,7 +282,9 @@ type Mode =
       sourceDataUrl: string;
       assetId: string;
       fileName: string;
-    };
+    }
+  /** ED-06：快捷编辑面板（工单 40U）—— 取代主工具条，绑打开时那张图。 */
+  | { kind: "quick-edit"; elementId: string };
 
 /** 元素上本文件会读的字段（Excalidraw 元素的结构子集）。 */
 type ElementLike = {
@@ -529,6 +539,17 @@ export function ImageToolbarLayer({
    */
   const activeToolRunsRef = useRef(new Set<string>());
 
+  /**
+   * ED-06（40U）：按元素 id 记的输入草稿。
+   *
+   * 用 ref 而不是 state：Esc 关掉面板再按 Tab 打开要能看到原来打的字，但草稿变化
+   * **不该**让整条工具条重渲。取消选中时才删（规格原文「已输入内容保留到取消选中为止」）。
+   */
+  const quickEditDraftsRef = useRef<Map<string, string>>(new Map());
+  /** ED-06：快捷编辑正在等服务端 / 上一次提交的错误文案（面板的两条状态）。 */
+  const [quickEditSubmitting, setQuickEditSubmitting] = useState(false);
+  const [quickEditError, setQuickEditError] = useState<string | null>(null);
+
   const handleChange = useCallback((elements: unknown[], appState: unknown) => {
     elementsRef.current = Array.isArray(elements) ? elements : [];
 
@@ -639,9 +660,41 @@ export function ImageToolbarLayer({
   // `handleChange` 里，见那里的注释。
   const selectedElementId = snapshot?.elementId ?? null;
   useEffect(() => {
-    if (mode.kind !== "flip-rotate") return;
-    if (selectedElementId !== mode.elementId) setMode({ kind: "toolbar" });
+    if (mode.kind !== "flip-rotate" && mode.kind !== "quick-edit") return;
+    if (selectedElementId !== mode.elementId) {
+      // ED-06：取消选中（或选中换成别的对象）→ 草稿作废（「保留到取消选中为止」）。
+      quickEditDraftsRef.current.delete(mode.elementId);
+      setMode({ kind: "toolbar" });
+    }
   }, [mode, selectedElementId]);
+
+  /**
+   * ED-06：**Tab** 呼出快捷编辑面板。
+   *
+   * 三个条件缺一不可（规格原文「Tab 快捷键只在『选中单张图片且焦点不在输入框』时生效」）：
+   * 当前是主工具条、恰好选中 1 张图、焦点不在可输入的元素上。三条任一不满足就**不碰**
+   * 这个事件 —— Tab 是浏览器的焦点移动键，抢过来会让画布上没法用键盘走位。
+   */
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      if (mode.kind !== "toolbar") return;
+      if (snapshot === null || snapshot.toolbarKind !== "image" || snapshot.elementId === null) {
+        return;
+      }
+      const active = document.activeElement as HTMLElement | null;
+      if (active !== null) {
+        const tag = active.tagName.toLowerCase();
+        if (tag === "input" || tag === "textarea" || active.isContentEditable) return;
+      }
+      event.preventDefault();
+      const elementId = snapshot.elementId;
+      setQuickEditError(null);
+      setMode({ kind: "quick-edit", elementId });
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [mode, snapshot]);
 
   const visibleImage =
     snapshot !== null &&
@@ -1121,6 +1174,110 @@ export function ImageToolbarLayer({
     [snapshot, excalidrawApi, accessToken, toast, toolRunner],
   );
 
+  /**
+   * ED-06（40U）：打开快捷编辑面板 —— 点主工具条的「快捷编辑」，或按 Tab。
+   *
+   * 不在这里取原图：面板一开就要出现在对象旁边，异步取图会让它晚一拍。
+   * 源图 assetId 的判定放到提交那一步（与 `loadOriginalOf` 同一套口径）。
+   */
+  const enterQuickEdit = useCallback(() => {
+    const el = snapshot?.element as ElementLike | null | undefined;
+    if (!el || typeof el.id !== "string") return;
+    setQuickEditError(null);
+    setMode({ kind: "quick-edit", elementId: el.id });
+  }, [snapshot]);
+
+  /**
+   * ED-06（40U）：提交一次快捷编辑。
+   *
+   * 「源图保留不动；产物是新对象」是这条路径与裁剪 / 调整 / 去背景（都**原位替换**）
+   * 的根本区别：这里要往场景里**加一个**新图片元素，插在源图右侧，源元素一个字段都不改。
+   *
+   * 顺序按规格：先关面板（草稿随之作废），再发运行请求，产物到了才插入新对象；
+   * 失败只提示（面板已经关了，用户可以从工具条再进来，草稿不保留 —— 已经提交过了）。
+   */
+  const handleQuickEditSubmit = useCallback(
+    async (prompt: string) => {
+      if (mode.kind !== "quick-edit") return;
+      const elementId = mode.elementId;
+      const source = (elementsRef.current as ElementLike[]).find((el) => el?.id === elementId);
+      if (source === undefined) return;
+      const files = excalidrawApi.getFiles?.() ?? {};
+      const fileId = typeof source.fileId === "string" ? source.fileId : "";
+      const file = fileId === "" ? undefined : files[fileId];
+      const assetId = file?.assetId;
+      if (
+        typeof assetId !== "string" ||
+        assetId === "" ||
+        accessToken === null ||
+        accessToken === ""
+      ) {
+        toast(DOWNLOAD_FAILED_MESSAGE);
+        return;
+      }
+
+      quickEditDraftsRef.current.delete(elementId);
+      setMode({ kind: "toolbar" });
+      setQuickEditError(null);
+      setQuickEditSubmitting(true);
+      try {
+        // ED-00m：key = 元素 + 工具，在途期间重复提交复用同一个请求（不多扣一次）。
+        const output = await toolRunner.runOnce(
+          `${elementId}:${QUICK_EDIT_TOOL_ID}`,
+          QUICK_EDIT_TOOL_ID,
+          { artifactId: assetId, params: { prompt } },
+        );
+        const outputFileId = newCropFileId();
+        excalidrawApi.addFiles?.([
+          {
+            id: outputFileId,
+            dataURL: output.dataUrl,
+            mimeType: output.mimeType,
+            created: Date.now(),
+            // 产物之后还能当别的工具的源，所以 assetId 必须跟着文件记录走。
+            assetId: output.assetId,
+          },
+        ]);
+        const scene =
+          elementsRef.current.length > 0
+            ? elementsRef.current
+            : Array.from(excalidrawApi.getSceneElements?.() ?? []);
+        if (scene.length === 0) return;
+
+        const sourceX = typeof source.x === "number" ? source.x : 0;
+        const sourceY = typeof source.y === "number" ? source.y : 0;
+        const sourceWidth = typeof source.width === "number" ? source.width : 0;
+        const sourceHeight = typeof source.height === "number" ? source.height : 0;
+        const created = createExcalidrawImageElement({
+          fileId: outputFileId,
+          x: sourceX + sourceWidth + QUICK_EDIT_OUTPUT_GAP,
+          y: sourceY,
+          width: output.width ?? sourceWidth,
+          height: output.height ?? sourceHeight,
+          source: "generated",
+        });
+        // 产物来源与父对象记在 customData 上（与 `replaceImageInPlace` 同一组字段名）。
+        created["customData"] = {
+          ...(created["customData"] as Record<string, unknown> | undefined),
+          toolSource: "tool:quick_edit",
+          parentAssetId: assetId,
+        };
+        excalidrawApi.updateScene?.({
+          elements: [...scene, created],
+          captureUpdate: "IMMEDIATELY",
+        });
+      } catch (err) {
+        const message =
+          err instanceof Error && err.message !== "" ? err.message : DOWNLOAD_FAILED_MESSAGE;
+        setQuickEditError(message);
+        toast(message);
+      } finally {
+        setQuickEditSubmitting(false);
+      }
+    },
+    [mode, excalidrawApi, accessToken, toast, toolRunner],
+  );
+
   const handleToolSelect = useCallback(
     (toolId: string) => {
       if (toolId === CROP_TOOL_ID) {
@@ -1140,6 +1297,12 @@ export function ImageToolbarLayer({
         void handleDownloadOriginal();
         return;
       }
+      // ED-06（40U）：快捷编辑进面板。必须放在「直接执行」分支**之前** ——
+      // 它是 panel 类工具，但面板本身才是它的一期形态，不能被当成 direct 直接跑掉。
+      if (toolId === QUICK_EDIT_TOOL_ID) {
+        enterQuickEdit();
+        return;
+      }
       // ED-07：定义里是「直接执行」且计价的服务端工具 → 直接执行，不进面板、不确认。
       const tool = definitions.tools.find((candidate) => candidate.id === toolId);
       if (tool !== undefined && tool.form === "direct" && tool.pricing !== null) {
@@ -1153,6 +1316,7 @@ export function ImageToolbarLayer({
       enterFlipRotate,
       enterCrop,
       enterAdjust,
+      enterQuickEdit,
       handleDownloadOriginal,
       definitions.tools,
       runServerTool,
@@ -1308,13 +1472,28 @@ export function ImageToolbarLayer({
             ? "crop"
             : mode.kind === "adjust"
               ? "adjust"
-              : "toolbar"
+              : mode.kind === "quick-edit"
+                ? "quick-edit"
+                : "toolbar"
       }
       data-placement={position.placement}
       className="absolute z-20"
       style={{ left: position.x, top: position.y }}
     >
-      {mode.kind === "adjust" && adjustTool !== undefined ? (
+      {mode.kind === "quick-edit" ? (
+        // ED-06：面板**取代**工具条（不是叠在上面）；`key` 按元素 id，换一张图就重挂，
+        // 初值才不会是上一张图的草稿。
+        <QuickEditPanel
+          key={mode.elementId}
+          initialText={quickEditDraftsRef.current.get(mode.elementId) ?? ""}
+          price={prices[toolPriceKey(QUICK_EDIT_TOOL_ID)]}
+          submitting={quickEditSubmitting}
+          error={quickEditError}
+          onTextChange={(text) => quickEditDraftsRef.current.set(mode.elementId, text)}
+          onSubmit={(prompt) => void handleQuickEditSubmit(prompt)}
+          onClose={() => setMode({ kind: "toolbar" })}
+        />
+      ) : mode.kind === "adjust" && adjustTool !== undefined ? (
         <AdjustToolSession
           tool={adjustTool}
           previewSource={adjustPreviewSource}
