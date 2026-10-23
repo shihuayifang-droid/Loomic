@@ -24,6 +24,7 @@ import type {
   JobOwnerWriteRepository,
   JobOwnerWriteRow,
 } from "../../db/job-owner-write-repository.js";
+import type { JobCreateRepository } from "../../db/job-create-repository.js";
 import type { JobBillingGateRepository } from "../../db/job-billing-gate-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import type { JobTransitionRepository } from "../../db/job-transition-repository.js";
@@ -84,6 +85,11 @@ type HarnessConfig = {
   jobOwnerWriteError?: Error;
   /** Build the service with NO owner write repository at all (fail-closed). */
   withoutJobOwnerWriteRepository?: boolean;
+  /**
+   * Workorder 44Q: build the service with NO job create repository at all
+   * (fail-closed): the insert is the same 500 and nothing is enqueued.
+   */
+  withoutJobCreateRepository?: boolean;
   rpc?: { data: unknown; error: { message: string } | null };
   /**
    * The answer of createJob's two authorization reads, in the shape the PostgREST
@@ -319,7 +325,6 @@ function makeHarness(config: HarnessConfig = {}) {
   function makeClient(via: ClientKind) {
     function makeBuilder(table: string) {
       let chain: "update" | "insert" | "delete" | "select" = "select";
-      let targetId: unknown;
 
       const builder = {
         update: (patch: Record<string, unknown>) => {
@@ -329,24 +334,11 @@ function makeHarness(config: HarnessConfig = {}) {
           trace.push(`update:${table}`);
           return builder;
         },
-        insert: (row: Record<string, unknown>) => {
-          chain = "insert";
-          ops.push({ kind: "insert", table, row, via });
-          trace.push(`insert:${table}`);
-          return builder;
-        },
-        delete: () => {
-          chain = "delete";
-          ops.push({ kind: "delete", via });
-          trace.push(`delete:${table}`);
-          return builder;
-        },
         select: (columns?: string) => {
           ops.push({ kind: "select", columns, via });
           return builder;
         },
         eq: (column: string, value: unknown) => {
-          if (column === "id") targetId = value;
           ops.push({ kind: "eq", column, value, via });
           return builder;
         },
@@ -379,28 +371,10 @@ function makeHarness(config: HarnessConfig = {}) {
             "the harness has no client-side background_jobs read: the cancel belongs to the job owner write repository",
           );
         },
-        single: async () => {
-          ops.push({ kind: "single", table, via });
-          const row = config.insertedJob ?? null;
-          if (table === "background_jobs" && row && row.id !== undefined) {
-            jobRows.set(String(row.id), row);
-          }
-          return { data: row, error: config.insertError ?? null };
-        },
         then: (
           resolve: (value: unknown) => unknown,
           reject?: (reason: unknown) => unknown,
         ) => {
-          if (chain === "delete") {
-            const error = config.deleteError ?? null;
-            const rows = error === null ? (config.deleteRows ?? 1) : 0;
-            if (rows > 0 && table === "background_jobs") jobRows.delete(String(targetId));
-            return Promise.resolve({
-              data: Array.from({ length: rows }, () => ({ id: targetId })),
-              error,
-            }).then(resolve, reject);
-          }
-
           if (chain === "update") {
             // Workorder 21M: every guarded status transition goes through
             // `jobTransitionRepository` now, and the only client-side update
@@ -642,6 +616,49 @@ function makeHarness(config: HarnessConfig = {}) {
     },
   };
 
+  // Workorder 44Q: the job row insert and its compensating delete now go
+  // through `jobCreateRepository`. The double keeps the SAME observation points
+  // the PostgREST builder had: an `insert` op (snake_case row, `client_request_id`
+  // only when the submission carried one), a `delete` op, and the
+  // `insert:background_jobs` / `delete:background_jobs` trace markers, so
+  // `insertOp()`, `deletes()` and every trace pin measure the same run.
+  const jobCreateRepository: JobCreateRepository = {
+    async insertOwnJob(input) {
+      const row: Record<string, unknown> = {
+        workspace_id: input.workspaceId,
+        project_id: input.projectId,
+        canvas_id: input.canvasId,
+        session_id: input.sessionId,
+        thread_id: input.threadId,
+        queue_name: input.queueName,
+        job_type: input.jobType,
+        payload: input.payload,
+        created_by: input.actorId,
+        ...(input.clientRequestId
+          ? { client_request_id: input.clientRequestId }
+          : {}),
+      };
+      ops.push({ kind: "insert", table: "background_jobs", row, via: "user" });
+      trace.push("insert:background_jobs");
+      if (config.insertError) throw new Error(config.insertError.message);
+      const inserted = config.insertedJob ?? null;
+      if (inserted === null) {
+        throw new Error("job create: expected one row from the insert");
+      }
+      if (inserted.id !== undefined) jobRows.set(String(inserted.id), inserted);
+      return inserted;
+    },
+    async deleteOwnJob(input) {
+      ops.push({ kind: "delete", via: "user" });
+      ops.push({ kind: "eq", column: "id", value: input.jobId, via: "user" });
+      trace.push("delete:background_jobs");
+      if (config.deleteError) throw new Error(config.deleteError.message);
+      const rows = config.deleteRows ?? 1;
+      if (rows > 0) jobRows.delete(input.jobId);
+      return rows;
+    },
+  };
+
   // ADR-0001 / workorder 21V: the two authorization reads `createJob` performs
   // before it inserts anything. Both doubles keep the SAME outward shape the two
   // PostgREST reads had — driven by `canvasRow` / `projectRow` and their `*Error`
@@ -763,6 +780,7 @@ function makeHarness(config: HarnessConfig = {}) {
     ...(config.withoutJobOwnerWriteRepository
       ? {}
       : { jobOwnerWriteRepository }),
+    ...(config.withoutJobCreateRepository ? {} : { jobCreateRepository }),
     ...(config.withoutJobTransitionRepository
       ? {}
       : { jobTransitionRepository }),
@@ -2224,9 +2242,13 @@ describe("createJob: authorize, then insert, then enqueue (工单21H0)", () => {
 
     expect(harness.ops.length).toBeGreaterThan(0);
     expect(harness.ops.every((op) => op.via === "user")).toBe(true);
-    // The client is built from the caller's access token, so RLS decides what
-    // the authorization read can see. The admin client is not used here at all.
-    expect(harness.clientTokens).toEqual(["token-21h0"]);
+    // OLD ASSERTION (pre-44Q): `clientTokens` equal to the caller's token - the
+    // job insert and its compensation ran through a client built from it.
+    // NEW ASSERTION: no client is built at all; the insert goes through the job
+    // create repository with `user.id` as the actor. The admin client is not
+    // used here either.
+    // WHY: the repository's statement carries `created_by = actor` itself.
+    expect(harness.clientTokens).toEqual([]);
 
     // cancelJob is NOT the caller's client any more (workorder 21U)...
     //
@@ -2298,6 +2320,30 @@ describe("createJob: authorize, then insert, then enqueue (工单21H0)", () => {
     }
   });
 
+  it("case H4b: with no job create repository wired the insert fails closed as the same 500 and nothing is enqueued", async () => {
+    const harness = makeHarness({
+      insertedJob: WRITE_JOB_ROW,
+      withoutJobCreateRepository: true,
+    });
+
+    const error = await harness.service
+      .createJob(WRITE_USER, {
+        workspaceId: "ws-1",
+        jobType: "image_generation",
+        payload: { prompt: "x" },
+      })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as JobServiceError);
+
+    expect(error).toBeInstanceOf(JobServiceError);
+    expect(error?.code).toBe("job_create_failed");
+    expect(error?.statusCode).toBe(500);
+    expect(error?.message).toBe("Failed to create job record.");
+    expect(harness.insertOp()).toBeUndefined();
+    expect(harness.sentMessages).toHaveLength(0);
+    expect(harness.deletes()).toHaveLength(0);
+    expect(harness.clientTokens).toEqual([]);
+  });
   it("case H5: the inserted row is shaped here - including the queue, which comes from the job type", async () => {
     const image = makeHarness({
       canvasRow: { project_id: "project-from-canvas" },
@@ -2779,10 +2825,10 @@ describe("createJob: the two authorization reads reuse the existing repositories
     );
     expect(clientTableReads).toEqual([]);
 
-    // The insert is unchanged: it is still the caller's own client, built from
-    // the caller's token, so RLS still decides whether the row may land.
+    // Workorder 44Q: the insert runs through the job create repository, so no
+    // client is built from the caller's token any more (OLD: ["token-21h0"]).
     expect(harness.insertOp()?.via).toBe("user");
-    expect(harness.clientTokens).toEqual(["token-21h0"]);
+    expect(harness.clientTokens).toEqual([]);
   });
 
   it("case V13: the project authorization no longer goes through the caller's client, and the only projects entry is the repository's", async () => {
@@ -2809,7 +2855,7 @@ describe("createJob: the two authorization reads reuse the existing repositories
     ).toEqual([{ kind: "maybeSingle", table: "projects", via: "repository" }]);
 
     expect(harness.insertOp()?.via).toBe("user");
-    expect(harness.clientTokens).toEqual(["token-21h0"]);
+    expect(harness.clientTokens).toEqual([]);
   });
 
   it("case V14: the actor handed to both repositories is the authenticated user's id, never the access token", async () => {

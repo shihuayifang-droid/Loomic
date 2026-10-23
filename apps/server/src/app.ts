@@ -124,6 +124,7 @@ import {
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
 import { createJobOwnerReadRepository } from "./db/job-owner-read-repository.js";
 import { createJobOwnerWriteRepository } from "./db/job-owner-write-repository.js";
+import { createJobCreateRepository } from "./db/job-create-repository.js";
 import { createJobConcurrencyRepository } from "./db/job-concurrency-repository.js";
 import { createJobTransitionRepository } from "./db/job-transition-repository.js";
 import { createCreditLedgerFunctionRepository } from "./db/credit-ledger-function-repository.js";
@@ -770,6 +771,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           // through is no longer reachable from that method. `createUserClient`
           // stays wired for `createJob`, which still reads and writes through it.
           jobOwnerWriteRepository: createJobOwnerWriteRepository({
+            getTransactionPool: () => getTransactionPool(databaseEnv),
+          }),
+          // Workorder 44Q: the job row insert behind `createJob` and the
+          // compensating delete of a failed enqueue. Built lazily against the
+          // same pool; no repository means `createJob` fails closed as the
+          // service's existing `job_create_failed` 500.
+          jobCreateRepository: createJobCreateRepository({
             getTransactionPool: () => getTransactionPool(databaseEnv),
           }),
           // ADR-0001 / workorder 21M: the four guarded status transitions

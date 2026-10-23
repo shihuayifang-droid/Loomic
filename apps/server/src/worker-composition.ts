@@ -38,6 +38,7 @@ import {
   type JobBillingGateRepository,
 } from "./db/job-billing-gate-repository.js";
 import { createJobAdminReadRepository } from "./db/job-admin-read-repository.js";
+import { createJobCreateRepository } from "./db/job-create-repository.js";
 import {
   createAssetReadRepository,
   type AssetReadRepository,
@@ -156,6 +157,11 @@ export function buildWorkerComposition(
     // read fails closed as `job_query_failed`. Built lazily against the same
     // `DATABASE_URL` as the repositories above.
     jobAdminReadRepository: createJobAdminReadRepository({
+      getTransactionPool,
+    }),
+    // Workorder 44Q: the job row insert and its compensating delete, built
+    // lazily against the same pool as the repositories above.
+    jobCreateRepository: createJobCreateRepository({
       getTransactionPool,
     }),
   });

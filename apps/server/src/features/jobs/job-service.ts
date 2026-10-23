@@ -2,7 +2,6 @@ import type {
   BackgroundJob,
   BackgroundJobStatus,
   BackgroundJobType,
-  Json,
 } from "@loomic/shared";
 
 import type { PgmqClient } from "../../queue/pgmq-client.js";
@@ -18,6 +17,7 @@ import type { JobAttemptRepository } from "../../db/job-attempt-repository.js";
 import type { JobAdminReadRepository } from "../../db/job-admin-read-repository.js";
 import type { JobOwnerReadRepository } from "../../db/job-owner-read-repository.js";
 import type { JobOwnerWriteRepository } from "../../db/job-owner-write-repository.js";
+import type { JobCreateRepository } from "../../db/job-create-repository.js";
 import type { JobCreditsLinkRepository } from "../../db/job-credits-link-repository.js";
 import type { JobTransitionRepository } from "../../db/job-transition-repository.js";
 import type { ChargedJobWriteRepository } from "../../db/charged-job-write-repository.js";
@@ -162,7 +162,12 @@ export const SELECT_COLS =
   "id, workspace_id, project_id, canvas_id, session_id, thread_id, queue_name, job_type, status, payload, result, error_code, error_message, attempt_count, max_attempts, created_by, created_at, updated_at, started_at, completed_at, failed_at, canceled_at";
 
 export function createJobService(options: {
-  createUserClient: (accessToken: string) => UserSupabaseClient;
+  /**
+   * No longer used by this service: `createJob` now writes through
+   * `jobCreateRepository`. Kept optional only so existing wiring still type
+   * checks; to be removed with T-131.
+   */
+  createUserClient?: (accessToken: string) => UserSupabaseClient;
   getAdminClient: () => AdminSupabaseClient;
   pgmq: PgmqClient;
   /**
@@ -214,7 +219,7 @@ export function createJobService(options: {
    * are exactly what workorder 21T removes, and a missing dependency must not be
    * able to bring them back.
    *
-   * `createUserClient` stays: `createJob` still reads and writes through it.
+   * `createUserClient` is now optional (T-131): `createJob` writes through `jobCreateRepository`.
    */
   jobOwnerReadRepository?: JobOwnerReadRepository;
   /**
@@ -232,10 +237,22 @@ export function createJobService(options: {
    * is exactly what workorder 21U removes, and a missing dependency must not be
    * able to bring it back.
    *
-   * `createUserClient` stays: `createJob` still reads and writes through it, and
-   * `cancelJob` no longer touches it at all.
+   * `createUserClient` is now optional (T-131): neither `createJob` nor
+   * `cancelJob` touches it.
    */
   jobOwnerWriteRepository?: JobOwnerWriteRepository;
+  /**
+   * Workorder 44Q: the caller's OWN job row insert behind `createJob`, and the
+   * compensating delete after a failed enqueue. Its ACL is statement text in the
+   * repository's SQL (`created_by` is the actor).
+   *
+   * Optional for the same reason the repositories above are, and with the same
+   * consequence: with no repository wired, or with a failing one, the insert
+   * fails closed as the same `job_create_failed` 500 it already published
+   * ("Failed to create job record."), and nothing is enqueued. There is
+   * deliberately no user-client fallback.
+   */
+  jobCreateRepository?: JobCreateRepository;
   /**
    * ADR-0001 / workorder 21M: the four guarded status transitions of the worker
    * (`markRunning`, `markRetrying`, `markSucceeded`, `markFailed`). It is the
@@ -421,7 +438,6 @@ export function createJobService(options: {
 
   const service: JobService = {
     async createJob(user, input) {
-      const client = options.createUserClient(user.accessToken);
       const queueName = queueForJobType(input.jobType);
 
       // "Which project did this come from?" is not the caller's decision: the
@@ -438,45 +454,42 @@ export function createJobService(options: {
       // ("Failed to verify ..."), the canvas/project mismatch is still the same
       // 400, and nothing is inserted or enqueued on any of those paths.
       //
-      // `client` is still built here (and still the caller's): the INSERT below
-      // and the compensation DELETE of a failed enqueue both run through it.
+      // Workorder 44Q: the INSERT below and the compensation DELETE of a failed
+      // enqueue both run through `jobCreateRepository`, with `user.id` as the actor.
       const projectId = await resolveProjectId(user, input);
 
-      const { data: job, error } = await client
-        .from("background_jobs")
-        .insert({
-          workspace_id: input.workspaceId,
-          project_id: projectId ?? null,
-          canvas_id: input.canvasId ?? null,
-          session_id: input.sessionId ?? null,
-          thread_id: input.threadId ?? null,
-          queue_name: queueName,
-          job_type: input.jobType,
-          payload: input.payload as Json,
-          created_by: user.id,
-          // ED-00m: absent means "no submission id" — the column stays NULL and
-          // two anonymous submissions stay two jobs. Spread conditionally so an
-          // empty id cannot become a stored `null` that some other id-less
-          // submission would then have to be told apart from.
-          ...(input.clientRequestId
-            ? { client_request_id: input.clientRequestId }
-            : {}),
-        })
-        .select(SELECT_COLS)
-        .single();
-
-      if (error || !job) {
+      let job: Record<string, unknown>;
+      try {
+        const repository = options.jobCreateRepository;
+        if (!repository) {
+          throw new Error("jobCreateRepository is not wired");
+        }
+        job = await repository.insertOwnJob({
+          actorId: user.id,
+          workspaceId: input.workspaceId,
+          projectId: projectId ?? null,
+          canvasId: input.canvasId ?? null,
+          sessionId: input.sessionId ?? null,
+          threadId: input.threadId ?? null,
+          queueName,
+          jobType: input.jobType,
+          payload: input.payload,
+          // ED-00m: absent means "no submission id" - the column stays NULL and
+          // two anonymous submissions stay two jobs.
+          clientRequestId: input.clientRequestId || null,
+        });
+      } catch (createErr) {
+        console.error("[job-service] job insert failed:", createErr);
         throw new JobServiceError(
           "job_create_failed",
           "Failed to create job record.",
           500,
         );
       }
-
       // Enqueue to pgmq — rollback on failure
       try {
         await options.pgmq.send(queueName, {
-          job_id: job.id,
+          job_id: job.id as string,
           job_type: input.jobType,
           workspace_id: input.workspaceId,
           ...(input.canvasId ? { canvas_id: input.canvasId } : {}),
@@ -484,7 +497,14 @@ export function createJobService(options: {
         });
       } catch (enqueueErr) {
         console.error("[job-service] pgmq.send failed:", enqueueErr);
-        await client.from("background_jobs").delete().eq("id", job.id);
+        try {
+          await options.jobCreateRepository?.deleteOwnJob({
+            actorId: user.id,
+            jobId: job.id as string,
+          });
+        } catch (compensateErr) {
+          console.error("[job-service] compensating delete failed:", compensateErr);
+        }
         throw new JobServiceError(
           "job_create_failed",
           "Failed to enqueue job.",
@@ -492,7 +512,7 @@ export function createJobService(options: {
         );
       }
 
-      return mapJobRow(job as unknown as Record<string, unknown>);
+      return mapJobRow(job);
     },
 
     async getJob(user, jobId) {
