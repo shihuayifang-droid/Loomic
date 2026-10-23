@@ -8,6 +8,7 @@ import {
   CanvasReadError,
   type CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import { ObjectStoreError } from "../storage/object-store.js";
 import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
 import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
@@ -97,7 +98,17 @@ export type CanvasService = {
 
 export function createCanvasService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
-  getAdminClient: () => AdminSupabaseClient;
+  /**
+   * Ticket 44D onward this service no longer uses it; kept optional only so
+   * existing callers keep compiling. A later cleanup ticket removes it.
+   */
+  getAdminClient?: () => AdminSupabaseClient;
+  /**
+   * Records the stored canvas file as a project asset (ticket 44D). Optional
+   * like the read repository: when absent the extraction takes the same path
+   * as a failed record - the base64 is kept and nothing throws.
+   */
+  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   /**
    * Canvas read repository (workorder 20C). The canvas inherits its project's
    * ACL, so the asset-identity projection and the recovery job list are read
@@ -173,7 +184,7 @@ export function createCanvasService(options: {
       // Extract base64 files to Storage, replacing dataURLs with oss:// markers
       const leanContent = await extractFilesToStorage(
         client,
-        options.getAdminClient,
+        options.assetRecordRepository,
         canvasId,
         content,
         user.id,
@@ -401,7 +412,9 @@ async function resolveWorkspaceId(
 
 async function extractFilesToStorage(
   client: UserSupabaseClient,
-  getAdminClient: () => AdminSupabaseClient,
+  assetRecordRepository:
+    | Pick<AssetRecordRepository, "recordProjectAsset">
+    | undefined,
   canvasId: string,
   content: CanvasContent,
   createdBy: string,
@@ -491,21 +504,30 @@ async function extractFilesToStorage(
         // this path must not lose the user's canvas, and by NOT writing the
         // oss:// marker we keep the base64, so the next save retries the upload
         // (upsert) and the record (idempotent on bucket+path).
-        const { error: recordError } = await getAdminClient().rpc("record_project_asset", {
-          p_bucket: CANVAS_FILES_BUCKET,
-          p_object_path: objectPath,
-          p_created_by: createdBy,
-          p_fallback_workspace_id: workspaceId,
-          p_project_id: null,
-          p_canvas_id: canvasId,
-          p_mime_type: mimeType,
-          p_byte_size: buffer.length,
-        });
+        let recordFailure: string | null = null;
+        if (!assetRecordRepository) {
+          recordFailure = "no asset record repository";
+        } else {
+          try {
+            await assetRecordRepository.recordProjectAsset({
+              bucket: CANVAS_FILES_BUCKET,
+              objectPath,
+              createdBy,
+              fallbackWorkspaceId: workspaceId,
+              projectId: null,
+              canvasId,
+              mimeType,
+              byteSize: buffer.length,
+            });
+          } catch (err) {
+            recordFailure = err instanceof Error ? err.message : String(err);
+          }
+        }
 
-        if (recordError) {
+        if (recordFailure !== null) {
           console.log(
             `[canvas-service] asset metadata failed, keeping base64 fileId=${fileId} ` +
-              `path=${objectPath} error=${recordError.message}`,
+              `path=${objectPath} error=${recordFailure}`,
           );
           updatedFiles[fileId] = fileData;
           return;

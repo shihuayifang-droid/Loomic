@@ -653,7 +653,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.canvasService ??
     createCanvasService({
       createUserClient,
-      getAdminClient,
+      assetRecordRepository,
       canvasReadRepository,
     });
   const threadService =

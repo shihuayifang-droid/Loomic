@@ -43,15 +43,26 @@ const PROJECT = "project-1";
 const PNG_BASE64 =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-type RpcCall = { name: string; params: Record<string, unknown> };
+type RecordCall = {
+  bucket: string;
+  objectPath: string;
+  createdBy: string;
+  fallbackWorkspaceId: string;
+  projectId?: string | null;
+  canvasId?: string | null;
+  mimeType?: string | null;
+  byteSize?: number | null;
+};
 
 function makeStubs(options: {
-  rpcError?: { message: string } | null;
+  recordError?: Error | null;
+  /** Omit the asset record repository entirely. */
+  withoutRepository?: boolean;
   uploadError?: { message: string } | null;
   /** Distinguishes cases: resolveWorkspaceId caches per canvas id. */
   canvasId: string;
 }) {
-  const rpcs: RpcCall[] = [];
+  const records: RecordCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
 
   const userClient = {
@@ -83,20 +94,24 @@ function makeStubs(options: {
     },
   };
 
-  const adminClient = {
-    rpc: async (name: string, params: Record<string, unknown>) => {
-      rpcs.push({ name, params });
-      if (options.rpcError) return { data: null, error: options.rpcError };
-      return { data: { asset_id: `asset-${rpcs.length}` }, error: null };
+  const assetRecordRepository = {
+    async recordProjectAsset(input: RecordCall) {
+      records.push({ ...input });
+      if (options.recordError) throw options.recordError;
+      return {
+        assetId: `asset-${records.length}`,
+        workspaceId: WORKSPACE,
+        projectId: null,
+      };
     },
   };
 
   const service = createCanvasService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
-    getAdminClient: () => adminClient as unknown as AdminSupabaseClient,
+    ...(options.withoutRepository ? {} : { assetRecordRepository }),
   });
 
-  return { service, rpcs, uploads, canvasId: options.canvasId };
+  return { service, records, uploads, canvasId: options.canvasId };
 }
 
 function contentWithFiles(files: Record<string, unknown>): CanvasContent {
@@ -133,16 +148,15 @@ describe("canvas file extraction records asset metadata", () => {
     await stub.service.saveCanvasContent(USER, "canvas-a", content, 1);
 
     expect(stub.uploads).toHaveLength(1);
-    expect(stub.rpcs).toHaveLength(1);
-    expect(stub.rpcs[0]?.name).toBe("record_project_asset");
-    expect(stub.rpcs[0]?.params).toMatchObject({
-      p_bucket: "project-assets",
-      p_canvas_id: "canvas-a",
-      p_project_id: null,
-      p_created_by: "user-1",
-      p_fallback_workspace_id: WORKSPACE,
+    expect(stub.records).toHaveLength(1);
+    expect(stub.records[0]).toMatchObject({
+      bucket: "project-assets",
+      canvasId: "canvas-a",
+      projectId: null,
+      createdBy: "user-1",
+      fallbackWorkspaceId: WORKSPACE,
     });
-    expect(stub.rpcs[0]?.params.p_object_path).toBe(stub.uploads[0]?.path);
+    expect(stub.records[0]?.objectPath).toBe(stub.uploads[0]?.path);
 
     // The marker is written only after the metadata exists.
     const files = savedFiles();
@@ -161,7 +175,7 @@ describe("canvas file extraction records asset metadata", () => {
     await stub.service.saveCanvasContent(USER, "canvas-b", content, 1);
 
     expect(stub.uploads).toHaveLength(0);
-    expect(stub.rpcs).toHaveLength(0);
+    expect(stub.records).toHaveLength(0);
     const files = savedFiles();
     expect(files["file-1"]?.dataURL).toBe(marker);
   });
@@ -177,15 +191,15 @@ describe("canvas file extraction records asset metadata", () => {
     await stub.service.saveCanvasContent(USER, "canvas-c", content, 1);
 
     expect(stub.uploads).toHaveLength(2);
-    expect(stub.rpcs).toHaveLength(2);
-    expect(stub.rpcs.map((call) => call.params.p_canvas_id)).toEqual([
+    expect(stub.records).toHaveLength(2);
+    expect(stub.records.map((call) => call.canvasId)).toEqual([
       "canvas-c",
       "canvas-c",
     ]);
   });
 
   it("case 4: a metadata failure keeps the base64 and writes no marker", async () => {
-    const stub = makeStubs({ canvasId: "canvas-d", rpcError: { message: "rpc exploded" } });
+    const stub = makeStubs({ canvasId: "canvas-d", recordError: new Error("record exploded") });
     const content = contentWithFiles({
       "file-1": { id: "file-1", dataURL: PNG_BASE64 },
     });
@@ -195,6 +209,24 @@ describe("canvas file extraction records asset metadata", () => {
     // The upload happened, but the canvas keeps its data — so the next save
     // retries both the upload (upsert) and the record (idempotent on the key).
     expect(stub.uploads).toHaveLength(1);
+    expect(stub.records).toHaveLength(1);
+    const files = savedFiles();
+    expect(files["file-1"]?.dataURL).toBe(PNG_BASE64);
+    expect(files["file-1"]?.dataURL).not.toMatch(/^oss:\/\//);
+  });
+
+  it("case 4b: without a repository the base64 is kept and nothing throws", async () => {
+    const stub = makeStubs({ canvasId: "canvas-d2", withoutRepository: true });
+    const content = contentWithFiles({
+      "file-1": { id: "file-1", dataURL: PNG_BASE64 },
+    });
+
+    await expect(
+      stub.service.saveCanvasContent(USER, "canvas-d2", content, 1),
+    ).resolves.toEqual({ version: 2 });
+
+    expect(stub.uploads).toHaveLength(1);
+    expect(stub.records).toHaveLength(0);
     const files = savedFiles();
     expect(files["file-1"]?.dataURL).toBe(PNG_BASE64);
   });
@@ -207,7 +239,7 @@ describe("canvas file extraction records asset metadata", () => {
 
     await stub.service.saveCanvasContent(USER, "canvas-e", content, 1);
 
-    expect(stub.rpcs).toHaveLength(0);
+    expect(stub.records).toHaveLength(0);
     const files = savedFiles();
     expect(files["file-1"]?.dataURL).toBe(PNG_BASE64);
   });
@@ -222,7 +254,7 @@ describe("canvas file extraction records asset metadata", () => {
     await stub.service.saveCanvasContent(USER, "canvas-f", content, 1);
 
     expect(stub.uploads).toHaveLength(0);
-    expect(stub.rpcs).toHaveLength(0);
+    expect(stub.records).toHaveLength(0);
     const files = savedFiles();
     expect(files["file-1"]?.dataURL).toBe("https://cdn.test/legacy.png");
     expect(files["file-2"]?.dataURL).toBeUndefined();
