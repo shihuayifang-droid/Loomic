@@ -38,8 +38,8 @@ function findAppRoot(): string {
 const APP_ROOT = findAppRoot();
 const SRC_ROOT = join(APP_ROOT, "src");
 
-/** 外部脚本 host 白名单：lemon.js（去留待 payments 裁决） */
-const ALLOWED_SCRIPT_HOSTS: readonly string[] = ["app.lemonsqueezy.com"];
+/** 外部脚本 host 白名单：空（lemon.js 随支付下线，40Y） */
+const ALLOWED_SCRIPT_HOSTS: readonly string[] = [];
 
 // ---------------------------------------------------------------------------
 // 守卫本体（放在测试里，产品代码不需要为「证明自己干净」多一个模块）
@@ -158,7 +158,7 @@ describe("X-04 第三方采集守卫", () => {
     expect(hits).toEqual([]);
   });
 
-  it("外链脚本 host 集合等于白名单（lemon.js 去留待 payments 裁决）", () => {
+  it("外链脚本 host 集合等于白名单（当前为空）", () => {
     expect(externalScriptHosts(SRC_ROOT)).toEqual([...ALLOWED_SCRIPT_HOSTS]);
   });
 

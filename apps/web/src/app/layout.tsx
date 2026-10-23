@@ -1,11 +1,12 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
-import Script from "next/script";
 import { Geist } from "next/font/google";
 import { cn } from "@/lib/utils";
 
 import { Providers } from "../components/providers";
 import { DevErrorReporter } from "../components/dev-error-reporter";
+import { buildContentSecurityPolicy } from "../lib/content-security-policy";
+import { getServerBaseUrl } from "../lib/env";
 
 import "./globals.css";
 
@@ -34,16 +35,27 @@ export const metadata: Metadata = {
   },
 };
 
+/**
+ * 工单40Y / OP-17：`output: "export"` 下没有服务端阶段可挂响应头，
+ * `headers()` 不生效，CSP 只能以 meta 标签下发。值在构建时算好并内联。
+ */
+const contentSecurityPolicy = buildContentSecurityPolicy({
+  serverBaseUrl: getServerBaseUrl(),
+  supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL,
+});
+
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" className={cn(geist.variable, "scroll-smooth")} suppressHydrationWarning>
+      <head>
+        <meta
+          httpEquiv="Content-Security-Policy"
+          content={contentSecurityPolicy}
+        />
+      </head>
       <body className="min-h-screen bg-background font-sans antialiased">
         <DevErrorReporter />
         <Providers>{children}</Providers>
-        <Script
-          src="https://app.lemonsqueezy.com/js/lemon.js"
-          strategy="lazyOnload"
-        />
       </body>
     </html>
   );

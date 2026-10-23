@@ -214,6 +214,7 @@ import {
 } from "./features/jobs/refund-job.js";
 import type { PaymentService } from "./features/payments/payment-service.js";
 import { registerRetiredPaymentRoutes } from "./http/payments-retired.js";
+import { registerSecurityHeaders } from "./http/security-headers.js";
 import { registerCreditRoutes } from "./http/credits.js";
 import { registerPricingRoutes } from "./http/pricing.js";
 import { registerFontsRoutes } from "./http/fonts.js";
@@ -932,6 +933,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     creditLedgerWriteRepository,
     viewerService,
   });
+
+  // 工单40Y / OP-17：安全响应头挂在 onSend 上，CORS 拒绝、错误响应也一并覆盖。
+  registerSecurityHeaders(app);
 
   app.addHook("onRequest", async (request, reply) => {
     const corsResult = evaluateCors(request, env.webOrigin);
