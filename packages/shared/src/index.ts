@@ -4,6 +4,7 @@ export * from "./credit-pools.js";
 export * from "./credits.js";
 export * from "./errors.js";
 export * from "./events.js";
+export * from "./generator-params.js";
 export * from "./http.js";
 export * from "./supabase/database.js";
 export * from "./brand-kit-contracts.js";
