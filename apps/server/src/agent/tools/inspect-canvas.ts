@@ -3,8 +3,11 @@ import { z } from "zod";
 
 import {
   CanvasUnavailableError,
+  createRepositoryCanvasStore,
   readCanvasSnapshot,
 } from "../../features/canvas/canvas-version.js";
+import type { CanvasContentRepository } from "../../db/canvas-content-repository.js";
+import { readSubject } from "./persist-sandbox-file.js";
 
 const inspectCanvasSchema = z.object({
   detail_level: z
@@ -155,7 +158,10 @@ export function buildCanvasSummaryForContext(
 }
 
 export function createInspectCanvasTool(deps: {
-  createUserClient: (accessToken: string) => any;
+  canvasContentRepository?: Pick<
+    CanvasContentRepository,
+    "readCanvasRow" | "writeIfUnchanged"
+  >;
 }) {
   return tool(
     async (input, config) => {
@@ -170,7 +176,19 @@ export function createInspectCanvasTool(deps: {
         });
       }
 
-      const client = deps.createUserClient(accessToken);
+      const actorId = readSubject(accessToken);
+      if (!actorId || !deps.canvasContentRepository) {
+        return JSON.stringify({
+          error: "canvas_unavailable",
+          message:
+            "The canvas store did not respond. This is transient — retry the " +
+            "same call. Do NOT assume the canvas is empty or missing.",
+        });
+      }
+      const store = createRepositoryCanvasStore(
+        deps.canvasContentRepository,
+        actorId,
+      );
 
       // Reads the row through the one reader that distinguishes "no such canvas"
       // from "the database did not answer". This used to be a local `.single()`
@@ -182,7 +200,7 @@ export function createInspectCanvasTool(deps: {
         appState?: Record<string, unknown>;
       };
       try {
-        const snapshot = await readCanvasSnapshot(client, canvasId);
+        const snapshot = await readCanvasSnapshot(store, canvasId);
         content = snapshot.content as {
           elements?: CanvasElement[];
           appState?: Record<string, unknown>;

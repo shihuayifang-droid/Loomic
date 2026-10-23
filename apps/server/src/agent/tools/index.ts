@@ -4,6 +4,7 @@ import type { BackendFactory, BackendProtocol } from "deepagents";
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../../db/brand-kit-read-repository.js";
+import type { CanvasContentRepository } from "../../db/canvas-content-repository.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
 import type { ConnectionManager } from "../../ws/connection-manager.js";
 import { createBrandKitTool } from "./brand-kit.js";
@@ -69,6 +70,11 @@ export function createMainAgentTools(
     brandKitReadRepository: BrandKitReadRepository;
     /** The canvas → project link behind every persisted asset's workspace (21AC). */
     canvasReadRepository: CanvasReadRepository;
+    /** Canvas content reads/writes for inspect_canvas and manipulate_canvas; without it both report canvas_unavailable. */
+    canvasContentRepository?: Pick<
+      CanvasContentRepository,
+      "readCanvasRow" | "writeIfUnchanged"
+    >;
     createUserClient: (accessToken: string) => any;
     brandKitId?: string | null;
     connectionManager?: ConnectionManager;

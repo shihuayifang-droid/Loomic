@@ -26,6 +26,7 @@ import type {
 import type { AssetRecordRepository } from "../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../db/brand-kit-read-repository.js";
+import type { CanvasContentRepository } from "../db/canvas-content-repository.js";
 import type { IdentityReadRepository } from "../db/identity-read-repository.js";
 import type {
   CanvasProjectLinkRow,
@@ -516,7 +517,11 @@ type CreateAgentRuntimeOptions = {
   assetWriteRepository: AssetWriteRepository;
   /** Wired through to the Agent tools; not used yet (workorder 44F). */
   assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
-  /**
+  /** Canvas content reads/writes behind inspect_canvas / manipulate_canvas (workorder 44X). */
+  canvasContentRepository?: Pick<
+    CanvasContentRepository,
+    "readCanvasRow" | "writeIfUnchanged"
+  >;  /**
    * Brand kit read repository (workorder 21AC). `get_brand_kit`'s two reads are
    * owner-keyed and belong to `brand-kit-read-repository.ts`. Required: without
    * it the tool must not be offered at all, and "offered but unable to read" is
@@ -888,6 +893,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           ? { assetRecordRepository: options.assetRecordRepository }
           : {}),
         brandKitReadRepository: options.brandKitReadRepository,
+        ...(options.canvasContentRepository
+          ? { canvasContentRepository: options.canvasContentRepository }
+          : {}),
         canvasReadRepository: options.canvasReadRepository,
         ...(options.createUserClient
           ? { createUserClient: options.createUserClient }

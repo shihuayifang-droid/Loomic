@@ -8,6 +8,7 @@ import { DEFAULT_AGENT_MODEL, DEFAULT_GOOGLE_AGENT_MODEL, type ServerEnv } from 
 import type { AssetRecordRepository } from "../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../db/brand-kit-read-repository.js";
+import type { CanvasContentRepository } from "../db/canvas-content-repository.js";
 import type { CanvasReadRepository } from "../db/canvas-read-repository.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
 import { createAgentBackend, type AgentBackendResult } from "./backends/index.js";
@@ -32,6 +33,11 @@ export type LoomicAgentFactory = (options: {
   /** Owner-keyed brand kit reads behind `get_brand_kit` (workorder 21AC). */
   brandKitReadRepository: BrandKitReadRepository;
   canvasId?: string;
+  /** Canvas content reads/writes behind inspect_canvas / manipulate_canvas. */
+  canvasContentRepository?: Pick<
+    CanvasContentRepository,
+    "readCanvasRow" | "writeIfUnchanged"
+  >;
   /** The canvas → project link behind every persisted asset (workorder 21AC). */
   canvasReadRepository: CanvasReadRepository;
   checkpointer?: BaseCheckpointSaver;
@@ -54,6 +60,10 @@ export function createLoomicDeepAgent(options: {
   brandKitId?: string | null;
   brandKitReadRepository: BrandKitReadRepository;
   canvasId?: string;
+  canvasContentRepository?: Pick<
+    CanvasContentRepository,
+    "readCanvasRow" | "writeIfUnchanged"
+  >;
   canvasReadRepository: CanvasReadRepository;
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
@@ -133,6 +143,9 @@ export function createLoomicDeepAgent(options: {
         ? { assetRecordRepository: options.assetRecordRepository }
         : {}),
       brandKitReadRepository: options.brandKitReadRepository,
+      ...(options.canvasContentRepository
+        ? { canvasContentRepository: options.canvasContentRepository }
+        : {}),
       canvasReadRepository: options.canvasReadRepository,
       createUserClient,
       ...(options.brandKitId != null ? { brandKitId: options.brandKitId } : {}),

@@ -17,7 +17,12 @@ import {
   computeEdgePoint,
   computeFixedPoint,
 } from "./canvas-element-helpers.js";
-import { mutateCanvasContent } from "../../features/canvas/canvas-version.js";
+import {
+  createRepositoryCanvasStore,
+  mutateCanvasContent,
+} from "../../features/canvas/canvas-version.js";
+import type { CanvasContentRepository } from "../../db/canvas-content-repository.js";
+import { readSubject } from "./persist-sandbox-file.js";
 
 // Re-export for consumers that import measureTextWidth from this module
 // (e.g. the test suite). New code should import directly from canvas-element-helpers.
@@ -729,7 +734,10 @@ const handlers: Record<
 // ---------------------------------------------------------------------------
 
 export function createManipulateCanvasTool(deps: {
-  createUserClient: (accessToken: string) => any;
+  canvasContentRepository?: Pick<
+    CanvasContentRepository,
+    "readCanvasRow" | "writeIfUnchanged"
+  >;
 }) {
   return tool(
     async (input, config) => {
@@ -744,7 +752,19 @@ export function createManipulateCanvasTool(deps: {
         });
       }
 
-      const client = deps.createUserClient(accessToken);
+      const actorId = readSubject(accessToken);
+      if (!actorId || !deps.canvasContentRepository) {
+        return JSON.stringify({
+          error: "canvas_unavailable",
+          message:
+            "The canvas store did not respond, so nothing was written. This is " +
+            "transient — retry the same call.",
+        });
+      }
+      const store = createRepositoryCanvasStore(
+        deps.canvasContentRepository,
+        actorId,
+      );
 
       // Accumulated per attempt, not across attempts: the operations are replayed
       // from scratch on a version conflict, so these must be cleared each time or
@@ -759,7 +779,7 @@ export function createManipulateCanvasTool(deps: {
       let written;
       try {
         written = await mutateCanvasContent(
-          client,
+          store,
           canvasId,
           (canvasContent) => {
             const content = canvasContent as {

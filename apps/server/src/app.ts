@@ -663,15 +663,17 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         getTransactionPool: () => getTransactionPool(databaseEnv),
       }),
     });
+  // One instance for the canvas service and the Agent's canvas tools (44X).
+  const canvasContentRepository = createCanvasContentRepository({
+    getTransactionPool: () => getTransactionPool(databaseEnv),
+  });
   const canvasService =
     options.canvasService ??
     createCanvasService({
       createUserClient,
       assetRecordRepository,
       canvasReadRepository,
-      canvasContentRepository: createCanvasContentRepository({
-        getTransactionPool: () => getTransactionPool(databaseEnv),
-      }),
+      canvasContentRepository,
     });
   const threadService =
     options.threadService ?? createThreadService({ chatReadRepository });
@@ -983,6 +985,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     // `assetId` through the same repository the upload/project flows use.
     assetReadRepository,
     canvasReadRepository,
+    // Workorder 44X: inspect_canvas / manipulate_canvas read and write through it.
+    canvasContentRepository,
     connectionManager,
     createUserClient,
     ...(options.agentModel ? { model: options.agentModel } : {}),
