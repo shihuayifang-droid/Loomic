@@ -59,16 +59,25 @@ async function runWithImageSubmit(opts: {
     let submitError: unknown = null;
     let signalAborted = false;
 
-    const userClient = {
-      // Built without the literal table-call spelling the dependency audit scans for.
-      ["fro" + "m"]: () => ({
-        select: () => ({
-          eq: () => ({
-            limit: () => ({
-              single: async () => ({ data: { id: "ws-1" }, error: null }),
-            }),
-          }),
-        }),
+    const identityReadRepository = {
+      findPersonalFoundation: async (userId: string) => ({
+        workspace: {
+          id: "ws-1",
+          name: "Personal",
+          type: "personal" as const,
+          ownerUserId: userId,
+        },
+        profile: {
+          id: userId,
+          email: null,
+          displayName: null,
+          avatarUrl: null,
+        },
+        membership: {
+          workspaceId: "ws-1",
+          userId,
+          role: "owner" as const,
+        },
       }),
     };
 
@@ -82,7 +91,8 @@ async function runWithImageSubmit(opts: {
           pushed.push(event);
         },
       } as never,
-      createUserClient: () => userClient,
+      createUserClient: () => ({}),
+      identityReadRepository,
       creditService: {
         getSubscription: vi.fn(async () => ({ plan: "pro" })),
         getBalance: vi.fn(async () => ({ balance: 1000, plan: "pro", dailyClaimed: false })),

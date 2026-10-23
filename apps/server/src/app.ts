@@ -971,6 +971,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     assetWriteRepository,
     // Workorder 44E: threaded to the Agent side, same instance; unused until 44F.
     assetRecordRepository,
+    // Workorder 44S: the personal workspace lookup of the image / video jobs.
+    identityReadRepository,
     brandKitReadRepository,
     workspaceSkillReadRepository,
     // Workorder 21S: the Agent runtime reads the row behind an attachment's

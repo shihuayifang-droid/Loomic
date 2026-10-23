@@ -26,6 +26,7 @@ import type {
 import type { AssetRecordRepository } from "../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../db/brand-kit-read-repository.js";
+import type { IdentityReadRepository } from "../db/identity-read-repository.js";
 import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
@@ -531,6 +532,11 @@ type CreateAgentRuntimeOptions = {
   canvasReadRepository: CanvasReadRepository;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => unknown;
+  /**
+   * Workorder 44S: the personal workspace an image / video job is billed and
+   * filed under is resolved through the identity read repository.
+   */
+  identityReadRepository?: Pick<IdentityReadRepository, "findPersonalFoundation">;
   creditService?: CreditService;
   env: ServerEnv;
   eventDelayMs?: number;
@@ -677,36 +683,41 @@ export async function readCanvasSummaryForRun(input: {
  * the row actually exists. Always surface `error` instead.
  */
 async function resolvePersonalWorkspaceId(
-  client: UserSupabaseClient,
+  repository: Pick<IdentityReadRepository, "findPersonalFoundation"> | undefined,
+  userId: string,
   context: string,
 ): Promise<string> {
-  const { data: ws, error } = await client
-    .from("workspaces")
-    .select("id")
-    .eq("type", "personal")
-    .limit(1)
-    .single();
-  if (error) {
+  if (!repository) {
+    const message = "identity read repository is not configured";
+    console.log(
+      `[${context}] personal workspace lookup failed`,
+      JSON.stringify({ code: "no-repository", message }),
+    );
+    throw new Error(`Personal workspace lookup failed (no-repository): ${message}`);
+  }
+  let foundation: Awaited<ReturnType<IdentityReadRepository["findPersonalFoundation"]>>;
+  try {
+    foundation = await repository.findPersonalFoundation(userId);
+  } catch (error) {
+    const failure = error as { code?: unknown; message?: unknown };
+    const code = typeof failure?.code === "string" ? failure.code : undefined;
+    const message =
+      typeof failure?.message === "string" ? failure.message : String(error);
     // console.log (not console.error): the dev runner wraps stderr into an
     // error record and truncates it, hiding the very fields we need.
     console.log(
       `[${context}] personal workspace lookup failed`,
-      JSON.stringify({
-        code: error.code,
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-      }),
+      JSON.stringify({ code, message }),
     );
     throw new Error(
-      `Personal workspace lookup failed (${error.code ?? "no-code"}): ${error.message}`,
+      `Personal workspace lookup failed (${code ?? "no-code"}): ${message}`,
     );
   }
-  if (!ws?.id) {
+  if (!foundation?.workspace?.id) {
     console.log(`[${context}] personal workspace lookup returned no row`);
     throw new Error("No personal workspace found (query succeeded but returned no row)");
   }
-  return ws.id;
+  return foundation.workspace.id;
 }
 
 /**
@@ -1127,8 +1138,11 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           // Look up personal workspace directly — the viewer is already
           // bootstrapped from the normal auth flow, so we skip ensureViewer
           // to avoid its strict email validation on the profile schema.
-          const client = createClient(accessToken) as UserSupabaseClient;
-          const workspaceId = await resolvePersonalWorkspaceId(client, "submitImageJob");
+          const workspaceId = await resolvePersonalWorkspaceId(
+            options.identityReadRepository,
+            userId,
+            "submitImageJob",
+          );
           jobLap("workspace_resolved", { workspaceId });
 
           // Billing stays on the personal workspace above; the PROJECT comes from
@@ -1510,8 +1524,11 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             console.log(`[submitVideoJob] ${label} +${Date.now() - jobT0}ms`, extra ? JSON.stringify(extra) : "");
           };
 
-          const client = createClient(accessToken) as UserSupabaseClient;
-          const workspaceId = await resolvePersonalWorkspaceId(client, "submitVideoJob");
+          const workspaceId = await resolvePersonalWorkspaceId(
+            options.identityReadRepository,
+            userId,
+            "submitVideoJob",
+          );
           jobLap("workspace_resolved", { workspaceId });
 
           const projectId = canvasId
