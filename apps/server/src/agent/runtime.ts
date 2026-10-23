@@ -47,7 +47,10 @@ import type { PersistImageFn, SubmitImageJobFn } from "./tools/image-generate.js
 import type { SubmitVideoJobFn } from "./tools/video-generate.js";
 import type { CreditService } from "../features/credits/credit-service.js";
 import type { TierGuard } from "../features/credits/tier-guard.js";
-import { withBilling } from "../features/credits/with-billing.js";
+import {
+  type BillingConfirmation,
+  withBilling,
+} from "../features/credits/with-billing.js";
 import { agentLedgerDescription } from "../features/credits/ledger-description.js";
 import type { CreditLedgerWriteRepository } from "../db/credit-ledger-write-repository.js";
 import type { PriceQuoter } from "../features/pricing/price-quoter.js";
@@ -897,6 +900,7 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
       requiredAmount?: number;
       plan?: string;
       dailyClaimed?: boolean;
+      confirmation?: BillingConfirmation;
     },
   ): void {
     const canvasTarget = canvasId ?? run.conversationId;
@@ -1172,6 +1176,18 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 quality: billedQuality,
               },
               description: agentLedgerDescription(run.prompt, "image", input.model),
+              // AG-10: above the threshold the Agent only asks; the user confirms
+              // through the generator's own submit endpoint.
+              confirmAbove: options.env?.agentConfirmThreshold ?? 50,
+              confirmation: {
+                jobType: "image_generation",
+                model: input.model,
+                count: 1,
+                ...(input.aspectRatio ? { aspectRatio: input.aspectRatio } : {}),
+                quality: billedQuality,
+                prompt: input.prompt,
+                ...(input.title ? { title: input.title } : {}),
+              },
               job: {
                 payload: {
                   prompt: input.prompt,
@@ -1230,6 +1246,18 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                     run, canvasId, options,
                     "account_suspended",
                     "账户已被管理员暂停生成，请联系管理员",
+                  );
+                } else if (rejection.kind === "confirmation_required") {
+                  // AG-10: over the confirmation threshold. Nothing was created
+                  // or charged; the client builds a confirmation card from
+                  // `confirmation`, and "confirm" goes through the generator's own
+                  // submit endpoint rather than resuming this run.
+                  const c = rejection.confirmation;
+                  pushBillingErrorAndAbort(
+                    run, canvasId, options,
+                    "confirmation_required",
+                    `将用 ${c.model} 生成 ${c.count} 张${c.quality ? ` ${c.quality}` : ""}${c.aspectRatio ? ` ${c.aspectRatio}` : ""}，消耗 ${rejection.creditsCost} 分`,
+                    { confirmation: c },
                   );
                 } else {
                   pushBillingErrorAndAbort(
@@ -1522,6 +1550,15 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                   : {}),
               },
               description: agentLedgerDescription(run.prompt, "video", input.model),
+              confirmAbove: options.env?.agentConfirmThreshold ?? 50,
+              confirmation: {
+                jobType: "video_generation",
+                model: input.model,
+                count: 1,
+                ...(input.aspectRatio ? { aspectRatio: input.aspectRatio } : {}),
+                ...(input.resolution ? { quality: String(input.resolution) } : {}),
+                prompt: input.prompt,
+              },
               job: {
                 payload: {
                   prompt: input.prompt,
@@ -1582,6 +1619,18 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                     run, canvasId, options,
                     "account_suspended",
                     "账户已被管理员暂停生成，请联系管理员",
+                  );
+                } else if (rejection.kind === "confirmation_required") {
+                  // AG-10: over the confirmation threshold. Nothing was created
+                  // or charged; the client builds a confirmation card from
+                  // `confirmation`, and "confirm" goes through the generator's own
+                  // submit endpoint rather than resuming this run.
+                  const c = rejection.confirmation;
+                  pushBillingErrorAndAbort(
+                    run, canvasId, options,
+                    "confirmation_required",
+                    `将用 ${c.model} 生成 ${c.count} 张${c.quality ? ` ${c.quality}` : ""}${c.aspectRatio ? ` ${c.aspectRatio}` : ""}，消耗 ${rejection.creditsCost} 分`,
+                    { confirmation: c },
                   );
                 } else {
                   pushBillingErrorAndAbort(

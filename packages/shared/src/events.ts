@@ -105,6 +105,10 @@ export const billingErrorCodeSchema = z.enum([
   // lifts it — only an administrator does — so it must not be shown as
   // "insufficient credits".
   "account_suspended",
+  // AG-10: an Agent generation priced above the confirmation threshold. Nothing
+  // was created or charged; the client shows a confirmation card and the user
+  // submits through the generator's own endpoint.
+  "confirmation_required",
 ]);
 
 export type BillingErrorCode = z.infer<typeof billingErrorCodeSchema>;
@@ -120,6 +124,19 @@ export const billingErrorEventSchema = z.object({
   requiredAmount: z.number().optional(),
   plan: z.string().optional(),
   dailyClaimed: z.boolean().optional(),
+  // AG-10 (only for confirmation_required): what the confirmation card shows.
+  confirmation: z
+    .object({
+      jobType: z.enum(["image_generation", "video_generation"]),
+      model: z.string(),
+      count: z.number().int().positive(),
+      aspectRatio: z.string().optional(),
+      quality: z.string().optional(),
+      creditsCost: z.number(),
+      prompt: z.string(),
+      title: z.string().optional(),
+    })
+    .optional(),
 });
 
 /**

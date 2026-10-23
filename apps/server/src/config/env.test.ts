@@ -141,3 +141,38 @@ describe("OP-13 production refuses to start without required configuration", () 
     expect(env.agentBackendMode).toBe("state");
   });
 });
+
+describe("AG-10 agent confirmation threshold", () => {
+  it("AG-10: the threshold defaults to 50", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, { NODE_ENV: "development" });
+
+    expect(env.agentConfirmThreshold).toBe(50);
+  });
+
+  it("AG-10: HAHART_AGENT_CONFIRM_THRESHOLD=20 sets the threshold to 20", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      HAHART_AGENT_CONFIRM_THRESHOLD: "20",
+    });
+
+    expect(env.agentConfirmThreshold).toBe(20);
+  });
+
+  it("AG-10: a negative threshold refuses to start", () => {
+    expect(() =>
+      loadServerEnv(VERSION_OVERRIDE, {
+        NODE_ENV: "development",
+        HAHART_AGENT_CONFIRM_THRESHOLD: "-1",
+      }),
+    ).toThrow("HAHART_AGENT_CONFIRM_THRESHOLD");
+  });
+
+  it("AG-10: a non-numeric threshold refuses to start", () => {
+    expect(() =>
+      loadServerEnv(VERSION_OVERRIDE, {
+        NODE_ENV: "development",
+        HAHART_AGENT_CONFIRM_THRESHOLD: "abc",
+      }),
+    ).toThrow("HAHART_AGENT_CONFIRM_THRESHOLD");
+  });
+});

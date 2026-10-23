@@ -99,7 +99,26 @@ export type ServerEnv = {
   workerId?: string;
   workerPollIntervalMs?: number;
   workerMaxBatchSize?: number;
+  /**
+   * AG-10: an Agent generation priced above this many credits asks for
+   * confirmation first. Optional on the type so existing literals keep
+   * compiling; `loadServerEnv` always fills it (default 50).
+   */
+  agentConfirmThreshold?: number;
 };
+
+export const DEFAULT_AGENT_CONFIRM_THRESHOLD = 50;
+
+function parseAgentConfirmThreshold(raw: string | undefined): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) {
+    return DEFAULT_AGENT_CONFIRM_THRESHOLD;
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`Invalid HAHART_AGENT_CONFIRM_THRESHOLD value: ${raw}`);
+  }
+  return Number.parseInt(trimmed, 10);
+}
 
 /**
  * OP-13: the ServerEnv fields production cannot start without, in report order.
@@ -262,6 +281,9 @@ export function loadServerEnv(
     (source.WORKER_MAX_BATCH_SIZE
       ? Number.parseInt(source.WORKER_MAX_BATCH_SIZE, 10)
       : undefined);
+  const agentConfirmThreshold = parseAgentConfirmThreshold(
+    source.HAHART_AGENT_CONFIRM_THRESHOLD,
+  );
 
   // Resolve default agent model based on available provider keys.
   // Explicit LOOMIC_AGENT_MODEL always takes precedence; otherwise fall back
@@ -347,6 +369,7 @@ export function loadServerEnv(
     ...(workerId ? { workerId } : {}),
     ...(workerPollIntervalMs ? { workerPollIntervalMs } : {}),
     ...(workerMaxBatchSize ? { workerMaxBatchSize } : {}),
+    agentConfirmThreshold,
   };
 
   // OP-13: production must refuse to start with a material configuration gap.

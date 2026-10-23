@@ -138,7 +138,48 @@ export type BillingRejection =
   // generation. Its own shape rather than `pool_refusal` or `tier`: nothing was
   // charged and no plan change or top-up fixes it, and the client has to say
   // exactly that, so there is no balance or price to report.
-  | { kind: "account_suspended" };
+  | { kind: "account_suspended" }
+  // AG-10: the quote is above the caller's confirmation threshold, so the request
+  // stops before a job, a balance read or a charge. The client shows a card built
+  // from `confirmation` and the user submits through the generator's own endpoint.
+  | {
+      kind: "confirmation_required";
+      creditsCost: number;
+      confirmation: BillingConfirmation;
+    };
+
+/** What the confirmation card shows (everything but the price, which is quoted). */
+export interface BillingConfirmationInput {
+  jobType: "image_generation" | "video_generation";
+  model: string;
+  count: number;
+  aspectRatio?: string;
+  quality?: string;
+  prompt: string;
+  title?: string;
+}
+
+export interface BillingConfirmation extends BillingConfirmationInput {
+  creditsCost: number;
+}
+
+/**
+ * AG-10: thrown when a quote exceeds `confirmAbove`. Deliberately NOT a
+ * `CreditServiceError`: that code union is mapped to HTTP responses, and only
+ * callers that pass `confirmAbove` (the Agent runtime) can ever meet this one.
+ */
+export class ConfirmationRequiredError extends Error {
+  readonly code = "confirmation_required" as const;
+  constructor(
+    readonly creditsCost: number,
+    readonly confirmation: BillingConfirmation,
+  ) {
+    super(
+      `Confirmation required: this generation costs ${creditsCost} credits.`,
+    );
+    this.name = "ConfirmationRequiredError";
+  }
+}
 
 export interface BillingDeps {
   /** Absent = credit system not configured; guards and charging are skipped. */
@@ -226,6 +267,12 @@ export interface BillingRequest {
    * their error handler map the thrown error to a status code.
    */
   onRejected?: (rejection: BillingRejection) => void;
+  /**
+   * AG-10: ask for confirmation when the quote is strictly above this many
+   * credits. Absent = never ask (every HTTP route). Needs `confirmation` too.
+   */
+  confirmAbove?: number;
+  confirmation?: BillingConfirmationInput;
 }
 
 export interface BillingOutcome {
@@ -436,6 +483,29 @@ export async function withBilling<T>(
       ruleId: outcome.ruleId,
     };
     creditsCost = outcome.detail.total_price;
+
+    // AG-10: above the caller's threshold, stop BEFORE the balance read, the job
+    // and the charge. Nothing is created, deducted or written to the ledger.
+    if (
+      request.confirmAbove !== undefined &&
+      creditsCost > request.confirmAbove
+    ) {
+      const confirmation: BillingConfirmation = {
+        ...(request.confirmation ?? {
+          jobType: guard.jobType,
+          model: modelId,
+          count: 1,
+          prompt: "",
+        }),
+        creditsCost,
+      };
+      request.onRejected?.({
+        kind: "confirmation_required",
+        creditsCost,
+        confirmation,
+      });
+      throw new ConfirmationRequiredError(creditsCost, confirmation);
+    }
   }
 
   // Balance pre-check. Previously only the agent paths did this; without it the

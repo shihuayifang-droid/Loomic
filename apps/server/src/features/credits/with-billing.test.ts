@@ -23,6 +23,7 @@ import type { PriceQuoter } from "../pricing/price-quoter.js";
 import { CreditServiceError, type CreditService } from "./credit-service.js";
 import { TierGuardError, type TierGuard } from "./tier-guard.js";
 import { withBilling, type BillingOutcome, type BillingRejection } from "./with-billing.js";
+import { ConfirmationRequiredError } from "./with-billing.js";
 
 const USER: AuthenticatedUser = {
   id: "user-1",
@@ -1744,5 +1745,148 @@ describe("with-billing: GN-20 concurrency is counted per member", () => {
       "pro",
       USER.id,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AG-10: an Agent generation priced above the confirmation threshold asks first.
+// ---------------------------------------------------------------------------
+describe("with-billing: AG-10 confirmation above the threshold", () => {
+  const CONFIRMATION = {
+    jobType: "image_generation" as const,
+    model: "kwjm/gpt-image-2",
+    count: 1,
+    aspectRatio: "16:9",
+    quality: "hd",
+    prompt: "a fox",
+    title: "Fox",
+  };
+
+  function quoterAt(totalPrice: number) {
+    return makePriceQuoter({
+      quote: vi.fn(async () => makeQuote({ priceStatus: "active", totalPrice })),
+    });
+  }
+
+  it("AG-10: above the threshold nothing is charged and no job exists", async () => {
+    const creditService = makeCreditService();
+    const tierGuard = makeTierGuard();
+    const jobService = makeJobService();
+    const priceQuoter = quoterAt(60);
+    const ledger = makeLedger();
+    const onRejected = vi.fn();
+    const runSpy = vi.fn(async () => "ok");
+
+    const error = await withBilling(
+      { creditService, tierGuard, jobService, priceQuoter, creditLedgerWriteRepository: ledger },
+      {
+        ...IMAGE_REQUEST,
+        entryPoint: "agent" as const,
+        job: { payload: { prompt: "a fox" } },
+        confirmAbove: 50,
+        confirmation: CONFIRMATION,
+        onRejected,
+      },
+      runSpy,
+    )
+      .then(() => null)
+      .catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(ConfirmationRequiredError);
+    expect((error as ConfirmationRequiredError).code).toBe("confirmation_required");
+    expect((error as ConfirmationRequiredError).creditsCost).toBe(60);
+    expect(onRejected).toHaveBeenCalledTimes(1);
+    const rejection = onRejected.mock.calls[0]?.[0] as BillingRejection;
+    expect(rejection.kind).toBe("confirmation_required");
+    if (rejection.kind === "confirmation_required") {
+      expect(rejection.creditsCost).toBe(60);
+      expect(rejection.confirmation.creditsCost).toBe(60);
+      expect(rejection.confirmation.model).toBe("kwjm/gpt-image-2");
+    }
+    expect(jobService.createJob).toHaveBeenCalledTimes(0);
+    expect(creditService.deductCredits).toHaveBeenCalledTimes(0);
+    expect(ledger.recordPendingConsume).toHaveBeenCalledTimes(0);
+    expect(creditService.getBalance).toHaveBeenCalledTimes(0);
+    expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  it("AG-10: at or below the threshold it runs as before", async () => {
+    const creditService = makeCreditService();
+    const jobService = makeJobService();
+    const onRejected = vi.fn();
+
+    await withBilling(
+      {
+        creditService,
+        tierGuard: makeTierGuard(),
+        jobService,
+        priceQuoter: quoterAt(50),
+        creditLedgerWriteRepository: makeLedger(),
+      },
+      {
+        ...IMAGE_REQUEST,
+        entryPoint: "agent" as const,
+        job: { payload: { prompt: "a fox" } },
+        confirmAbove: 50,
+        confirmation: CONFIRMATION,
+        onRejected,
+      },
+      async () => "ok",
+    );
+
+    expect(onRejected).not.toHaveBeenCalled();
+    expect(jobService.createJob).toHaveBeenCalledTimes(1);
+    expect(creditService.deductCredits).toHaveBeenCalledTimes(1);
+  });
+
+  it("AG-10: no threshold means no confirmation", async () => {
+    const creditService = makeCreditService();
+    const jobService = makeJobService();
+
+    await withBilling(
+      {
+        creditService,
+        tierGuard: makeTierGuard(),
+        jobService,
+        priceQuoter: quoterAt(500),
+        creditLedgerWriteRepository: makeLedger(),
+      },
+      { ...IMAGE_REQUEST, job: { payload: { prompt: "a fox" } } },
+      async () => "ok",
+    );
+
+    expect(jobService.createJob).toHaveBeenCalledTimes(1);
+    expect(creditService.deductCredits).toHaveBeenCalledTimes(1);
+  });
+
+  it("AG-10: a threshold of 20 asks for a 30-credit generation", async () => {
+    const creditService = makeCreditService();
+    const jobService = makeJobService();
+    const onRejected = vi.fn();
+
+    await expect(
+      withBilling(
+        {
+          creditService,
+          tierGuard: makeTierGuard(),
+          jobService,
+          priceQuoter: quoterAt(30),
+          creditLedgerWriteRepository: makeLedger(),
+        },
+        {
+          ...IMAGE_REQUEST,
+          entryPoint: "agent" as const,
+          job: { payload: { prompt: "a fox" } },
+          confirmAbove: 20,
+          confirmation: CONFIRMATION,
+          onRejected,
+        },
+        async () => "ok",
+      ),
+    ).rejects.toBeInstanceOf(ConfirmationRequiredError);
+
+    expect(onRejected).toHaveBeenCalledTimes(1);
+    expect(jobService.createJob).not.toHaveBeenCalled();
+    expect(creditService.deductCredits).not.toHaveBeenCalled();
   });
 });
