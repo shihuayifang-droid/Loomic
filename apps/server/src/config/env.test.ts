@@ -142,6 +142,69 @@ describe("OP-13 production refuses to start without required configuration", () 
   });
 });
 
+/**
+ * OP-06 / OP-13: the Supabase keys are required only by the backends that use
+ * them. A self-hosted production env carries none of them.
+ */
+const SELF_HOSTED_BACKENDS = {
+  HAHART_AUTH_PROVIDER: "self",
+  HAHART_AUTH_JWT_SECRET: "0123456789abcdef0123456789abcdef",
+  HAHART_STORAGE_PROVIDER: "fs",
+  HAHART_OBJECT_ROOT: "/var/lib/placeholder/objects",
+  HAHART_OBJECT_URL_SECRET: "fedcba9876543210fedcba9876543210",
+  HAHART_OBJECT_PUBLIC_BASE: "https://placeholder.invalid",
+  HAHART_QUEUE_PROVIDER: "native",
+} as const;
+
+const SELF_HOSTED_PRODUCTION_SOURCE = {
+  ...PRODUCTION_SOURCE,
+  ...SELF_HOSTED_BACKENDS,
+  DATABASE_URL:
+    "postgres://placeholder-user@placeholder-host:5432/placeholder-db",
+  OPENAI_API_KEY: "placeholder-openai-key",
+} as const;
+
+describe("OP-06 production requires Supabase keys only for Supabase backends", () => {
+  it("OP-06: a self-hosted production env without any Supabase key starts", () => {
+    expect(() =>
+      loadServerEnv(VERSION_OVERRIDE, SELF_HOSTED_PRODUCTION_SOURCE),
+    ).not.toThrow();
+  });
+
+  it("OP-06: self-hosted without DATABASE_URL names only databaseUrl", () => {
+    const message = productionErrorMessage({
+      ...SELF_HOSTED_PRODUCTION_SOURCE,
+      DATABASE_URL: undefined,
+    });
+
+    expect(message).toContain("OP-13");
+    expect(message).toContain("databaseUrl");
+    expect(message).not.toContain("supabase");
+  });
+
+  it("OP-06: self auth with Supabase storage names the access keys, not the JWT secret", () => {
+    const message = productionErrorMessage({
+      ...SELF_HOSTED_PRODUCTION_SOURCE,
+      HAHART_STORAGE_PROVIDER: "supabase",
+    });
+
+    expect(message).toContain("supabaseUrl");
+    expect(message).toContain("supabaseServiceRoleKey");
+    expect(message).not.toContain("supabaseJwtSecret");
+  });
+
+  it("OP-06: Supabase auth with fs storage and no Supabase keys names all three", () => {
+    const message = productionErrorMessage({
+      ...SELF_HOSTED_PRODUCTION_SOURCE,
+      HAHART_AUTH_PROVIDER: "supabase",
+    });
+
+    expect(message).toContain("supabaseUrl");
+    expect(message).toContain("supabaseServiceRoleKey");
+    expect(message).toContain("supabaseJwtSecret");
+  });
+});
+
 describe("AG-10 agent confirmation threshold", () => {
   it("AG-10: the threshold defaults to 50", () => {
     const env = loadServerEnv(VERSION_OVERRIDE, { NODE_ENV: "development" });

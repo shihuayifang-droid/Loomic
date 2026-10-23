@@ -292,8 +292,22 @@ function normalizePublicBase(raw: string | undefined): string | undefined {
  */
 export const PRODUCTION_REQUIRED_FIELDS = [
   "databaseUrl",
+] as const satisfies readonly (keyof ServerEnv)[];
+
+/**
+ * OP-06 / OP-13: the hosted-Supabase fields are required only when the chosen
+ * backend actually uses them - a self-hosted production env carries no
+ * Supabase keys, and the Supabase clients are created lazily, so nothing reads
+ * them at start-up. In report order:
+ * - supabaseUrl + supabaseServiceRoleKey: auth OR storage on Supabase;
+ * - supabaseJwtSecret: auth on Supabase.
+ */
+export const PRODUCTION_SUPABASE_ACCESS_FIELDS = [
   "supabaseUrl",
   "supabaseServiceRoleKey",
+] as const satisfies readonly (keyof ServerEnv)[];
+
+export const PRODUCTION_SUPABASE_AUTH_FIELDS = [
   "supabaseJwtSecret",
 ] as const satisfies readonly (keyof ServerEnv)[];
 
@@ -311,9 +325,16 @@ export const PRODUCTION_IMAGE_PROVIDER_FIELDS = [
  * never their values, so the thrown message stays safe to log verbatim.
  */
 export function missingProductionKeys(resolved: ServerEnv): string[] {
-  const missing: string[] = PRODUCTION_REQUIRED_FIELDS.filter(
-    (field) => !resolved[field],
-  );
+  const usesSupabaseAuth = resolved.authProvider === "supabase";
+  const usesSupabaseStorage = resolved.storageProvider === "supabase";
+  const requiredFields: (keyof ServerEnv)[] = [
+    ...PRODUCTION_REQUIRED_FIELDS,
+    ...(usesSupabaseAuth || usesSupabaseStorage
+      ? PRODUCTION_SUPABASE_ACCESS_FIELDS
+      : []),
+    ...(usesSupabaseAuth ? PRODUCTION_SUPABASE_AUTH_FIELDS : []),
+  ];
+  const missing: string[] = requiredFields.filter((field) => !resolved[field]);
 
   if (!PRODUCTION_IMAGE_PROVIDER_FIELDS.some((field) => resolved[field])) {
     missing.push(`one of ${PRODUCTION_IMAGE_PROVIDER_FIELDS.join("|")}`);
