@@ -57,11 +57,21 @@ export class ApiApplicationError extends Error {
    * every time (4xx).
    */
   status?: number;
-  constructor(code: string, message: string, status?: number) {
+  /**
+   * AG-10 / 41H: the parsed error body, when the server sent one and it parsed.
+   *
+   * A 409 `confirmation_required` carries the numbers of the batch it refused to
+   * run (and therefore did not create or charge) in `body.confirmation`. Reading
+   * only `error.code` / `error.message` dropped them, so a panel could do nothing
+   * with the 409 but show the server's English sentence.
+   */
+  readonly body?: unknown;
+  constructor(code: string, message: string, status?: number, body?: unknown) {
     super(message);
     this.name = "ApiApplicationError";
     this.code = code;
     if (status !== undefined) this.status = status;
+    if (body !== undefined) this.body = body;
   }
 }
 
@@ -146,7 +156,63 @@ async function handleErrorResponse(response: Response): Promise<never> {
   const body = await response.json().catch(() => null);
   const code = body?.error?.code ?? "application_error";
   const message = body?.error?.message ?? "Request failed";
-  throw new ApiApplicationError(code, message, response.status);
+  // AG-10 / 41H: the body travels with the error — a 409 `confirmation_required`
+  // is only usable if `body.confirmation` survives the trip (see `confirmationOf`).
+  throw new ApiApplicationError(code, message, response.status, body);
+}
+
+/**
+ * AG-10 / 41H: the batch the server stopped before running, read off a 409
+ * `confirmation_required`.
+ *
+ * `null` for every other error, and for a `confirmation_required` whose body is
+ * missing or incomplete — the caller then behaves exactly as before this ticket
+ * (no card, the ordinary error path), instead of asking with numbers it cannot
+ * vouch for.
+ */
+export function confirmationOf(err: unknown): {
+  model: string;
+  count: number;
+  creditsCost: number;
+  prompt: string;
+  aspectRatio?: string;
+  quality?: string;
+  size?: string;
+} | null {
+  if (!(err instanceof ApiApplicationError)) return null;
+  if (err.code !== "confirmation_required") return null;
+
+  const body = err.body;
+  if (typeof body !== "object" || body === null) return null;
+  const confirmation = (body as { confirmation?: unknown }).confirmation;
+  if (typeof confirmation !== "object" || confirmation === null) return null;
+
+  const raw = confirmation as Record<string, unknown>;
+  if (typeof raw.model !== "string" || raw.model === "") return null;
+  if (typeof raw.count !== "number" || !Number.isFinite(raw.count)) return null;
+  if (typeof raw.creditsCost !== "number" || !Number.isFinite(raw.creditsCost)) {
+    return null;
+  }
+  if (typeof raw.prompt !== "string") return null;
+
+  const parsed: {
+    model: string;
+    count: number;
+    creditsCost: number;
+    prompt: string;
+    aspectRatio?: string;
+    quality?: string;
+    size?: string;
+  } = {
+    model: raw.model,
+    count: raw.count,
+    creditsCost: raw.creditsCost,
+    prompt: raw.prompt,
+  };
+  if (typeof raw.aspectRatio === "string") parsed.aspectRatio = raw.aspectRatio;
+  if (typeof raw.quality === "string") parsed.quality = raw.quality;
+  if (typeof raw.size === "string") parsed.size = raw.size;
+  return parsed;
 }
 
 export async function fetchViewer(
@@ -830,6 +896,11 @@ export async function submitImageJob(
     quality?: string;
     size?: string;
     count?: number;
+    /**
+     * AG-10 / 41H: answers a 409 `confirmation_required` — the batch was already
+     * quoted and agreed to, so the same request is allowed past the threshold.
+     */
+    confirmed?: true;
   },
 ): Promise<SubmitImageResponse> {
   const response = await fetch(
@@ -847,6 +918,8 @@ export async function submitImageJob(
         ...(options?.size ? { size: options.size } : {}),
         // AG-07: how many images; only sent above 1 so the single-job body is unchanged.
         ...(options?.count !== undefined && options.count > 1 ? { count: options.count } : {}),
+        // AG-10: only the confirmed re-submit carries it; every other body is unchanged.
+        ...(options?.confirmed === true ? { confirmed: true } : {}),
       }),
     },
   );

@@ -5,7 +5,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import type { ImageModelInfo } from "../../lib/server-api";
-import { cancelJob, fetchImageModels, submitImageJob } from "../../lib/server-api";
+import {
+  cancelJob,
+  confirmationOf,
+  fetchImageModels,
+  submitImageJob,
+} from "../../lib/server-api";
 import { visibleOn } from "../../lib/model-visibility";
 import { qualityOptionsFor } from "../../lib/image-quality-options";
 import { awaitJobCompletion } from "../../lib/await-job";
@@ -31,6 +36,7 @@ import {
   GeneratorParamControls,
   type GeneratorParamValue,
 } from "@/components/canvas/generator-param-controls";
+import { GenerationConfirmCard } from "@/components/chat/generation-confirm-card";
 import { PriceTag } from "@/components/ui/price-tag";
 import { useToast } from "@/components/toast";
 import {
@@ -70,6 +76,27 @@ type ParamValues = Record<string, GeneratorParamValue>;
  * `aspectRatio` / `quality` state and the old request shape stay in force.
  */
 type ParamRequest = { aspectRatio?: string; quality?: string; size?: string };
+
+/**
+ * AG-10 / T-122: the batch the server refused to run because its total crosses the
+ * confirmation threshold. Read off the 409 by `confirmationOf`, so the card can
+ * quote the server's own numbers instead of the panel re-deriving them.
+ */
+type PendingConfirmation = NonNullable<ReturnType<typeof confirmationOf>>;
+
+/**
+ * AG-10: 「将用 … 生成 N 张，消耗 M 分」— the catalogue display name when it is
+ * loaded, otherwise the raw model id (the card must never show a blank name).
+ */
+function confirmationMessage(
+  confirmation: PendingConfirmation,
+  models: readonly ImageModelInfo[],
+): string {
+  const name =
+    models.find((m) => m.id === confirmation.model)?.displayName ??
+    confirmation.model;
+  return `将用 ${name} 生成 ${confirmation.count} 张，消耗 ${confirmation.creditsCost} 分`;
+}
 
 /**
  * AG-07: every parameter enters at the value the server declared as its default.
@@ -127,6 +154,14 @@ export function ImageGeneratorPanel({
    * 只 abort 前端等待是不够的 —— 服务端任务照样计费。
    */
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  /**
+   * AG-10 / T-122：服务端在创建与扣费之前停下、回了 409 `confirmation_required`。
+   * 非空 = 面板上摆着确认卡等用户回答；里面是服务端给出的这一批的数字。
+   */
+  const [pendingConfirmation, setPendingConfirmation] =
+    useState<PendingConfirmation | null>(null);
+  const [confirmSubmitting, setConfirmSubmitting] = useState(false);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
   const [confirmingCancel, setConfirmingCancel] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
@@ -460,7 +495,28 @@ export function ImageGeneratorPanel({
     [prompt, begin, end, ws, excalidrawApi],
   );
 
-  const handleGenerate = useCallback(async () => {
+  /**
+   * AG-10 / T-122：提交请求体只在这里组一次。门槛放行后的第二次提交走的也是它，
+   * 所以两次请求是同一组参数，只多一个 `confirmed: true`。
+   */
+  const submitOptionsFor = useCallback(
+    (confirmed: boolean) => {
+      const base =
+        paramRequest !== null
+          ? {
+              model,
+              ...(paramRequest.aspectRatio ? { aspectRatio: paramRequest.aspectRatio } : {}),
+              ...(paramRequest.quality ? { quality: paramRequest.quality } : {}),
+              ...(paramRequest.size ? { size: paramRequest.size } : {}),
+              ...(effectiveCount > 1 ? { count: effectiveCount } : {}),
+            }
+          : { model, aspectRatio, ...(qualityOptions ? { quality } : {}) };
+      return confirmed ? { ...base, confirmed: true as const } : base;
+    },
+    [model, aspectRatio, quality, qualityOptions, paramRequest, effectiveCount],
+  );
+
+  const handleGenerate = useCallback(async (confirmed = false) => {
     if (!prompt.trim() || loading) return;
     // T-109：键盘 Enter 走的也是这条路径，光把按钮 disabled 挡不住回车，
     // 所以预检在这里再拦一次（与按钮的 disabled 同一个口径）。
@@ -473,6 +529,11 @@ export function ImageGeneratorPanel({
 
     setLoading(true);
     setError(null);
+    if (confirmed) {
+      // AG-10：确认卡上的提交 —— 两个按钮在此期间都禁用，不会被连点两次。
+      setConfirmSubmitting(true);
+      setConfirmError(null);
+    }
     updateImageGeneratorElement(excalidrawApi, elementId, {
       status: "generating",
       prompt: prompt.trim(),
@@ -499,16 +560,16 @@ export function ImageGeneratorPanel({
       const submitted = await submitImageJob(
         accessTokenRef.current,
         prompt.trim(),
-        paramRequest !== null
-          ? {
-              model,
-              ...(paramRequest.aspectRatio ? { aspectRatio: paramRequest.aspectRatio } : {}),
-              ...(paramRequest.quality ? { quality: paramRequest.quality } : {}),
-              ...(paramRequest.size ? { size: paramRequest.size } : {}),
-              ...(effectiveCount > 1 ? { count: effectiveCount } : {}),
-            }
-          : { model, aspectRatio, ...(qualityOptions ? { quality } : {}) },
+        submitOptionsFor(confirmed),
       );
+
+      // AG-10：门槛放行后的提交成功了 —— 问题已经答过，卡片收起，下面照常进入
+      // 等任务 / 多占位流程。
+      if (confirmed) {
+        setPendingConfirmation(null);
+        setConfirmSubmitting(false);
+        setConfirmError(null);
+      }
 
       // CV-10：job 提交成功即进入本轮，与该 job 最终成功与否无关。
       jobId = submitted.jobId;
@@ -607,11 +668,33 @@ export function ImageGeneratorPanel({
       // Ignore aborted requests (user cancelled or component unmounted)
       if (controller.signal.aborted) return;
 
+      // AG-10 / T-122：服务端在创建任何任务、扣一分钱之前停下，回了 409
+      // `confirmation_required` —— 这是「问一句」，不是失败：不打 error 标记、
+      // 不走 handleGenerationError，只把确认卡摆出来等回答。
+      const confirmation = confirmed ? null : confirmationOf(err);
+      if (confirmation !== null) {
+        setPendingConfirmation(confirmation);
+        setConfirmError(null);
+        setConfirmSubmitting(false);
+        setLoading(false);
+        updateImageGeneratorElement(excalidrawApi, elementId, { status: "idle" });
+        return;
+      }
+
       console.error("[image-gen] Generation error:", err);
+      const reason = lookupError(errorCodeOf(err)).message;
+      if (confirmed) {
+        // AG-10：确认后的这次提交失败了 —— 卡片留着，让人重试或取消；面板本身
+        // 不算这一轮失败（占位回到可提交的 idle，不写 error）。
+        setConfirmError(reason);
+        setConfirmSubmitting(false);
+        setLoading(false);
+        updateImageGeneratorElement(excalidrawApi, elementId, { status: "idle" });
+        return;
+      }
       const handled = handleGenerationError(err);
       // X-40 二期: same as the video panel — the copy comes from the catalogue
       // by code, not from a line written here (30B left this one hard-coded).
-      const reason = lookupError(errorCodeOf(err)).message;
       if (!handled) {
         setError(reason);
       }
@@ -641,7 +724,20 @@ export function ImageGeneratorPanel({
     effectiveCount,
     fillBatchSlot,
     toast,
+    submitOptionsFor,
   ]);
+
+  /** AG-10 / T-122：「确认生成」= 同一组参数再提一次，带 `confirmed: true` 跳过门槛。 */
+  const handleConfirmGenerate = useCallback(() => {
+    void handleGenerate(true);
+  }, [handleGenerate]);
+
+  /** AG-10 / T-122：「取消」= 不提交，卡片收起，面板回到可编辑状态。 */
+  const handleConfirmCancel = useCallback(() => {
+    setPendingConfirmation(null);
+    setConfirmError(null);
+    setConfirmSubmitting(false);
+  }, []);
 
   /**
    * CV-02 / Q-17：点「取消」只弹确认条，不直接发请求 —— 这一步是不可逆的，
@@ -781,6 +877,21 @@ export function ImageGeneratorPanel({
               />
             </div>
           )}
+        </div>
+      )}
+
+      {/* AG-10 / T-122：这一批的合计超出门槛时，服务端还没创建任何任务、也没扣费，
+          所以这里要把数字摆出来问一句；卡上按的是服务端给的同一组数字。 */}
+      {pendingConfirmation !== null && (
+        <div className="mt-2">
+          <GenerationConfirmCard
+            message={confirmationMessage(pendingConfirmation, models)}
+            creditsCost={pendingConfirmation.creditsCost}
+            submitting={confirmSubmitting}
+            error={confirmError}
+            onConfirm={handleConfirmGenerate}
+            onCancel={handleConfirmCancel}
+          />
         </div>
       )}
 
