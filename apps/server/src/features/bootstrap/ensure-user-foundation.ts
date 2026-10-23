@@ -1,14 +1,10 @@
-import {
-  type Json,
-  type ViewerResponse,
-  viewerResponseSchema,
-} from "@loomic/shared";
+import { type ViewerResponse, viewerResponseSchema } from "@loomic/shared";
 
 import type {
   IdentityReadRepository,
   PersonalFoundationRecord,
 } from "../../db/identity-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type { IdentityWriteRepository } from "../../db/identity-write-repository.js";
 import type { TeamMembershipService } from "../team/team-membership.js";
 import type { AuthenticatedUser } from "../../supabase/user.js";
 
@@ -34,24 +30,29 @@ export class BootstrapError extends Error {
 }
 
 export function createViewerService(options: {
-  getAdminClient: () => AdminSupabaseClient;
+  identityWriteRepository?: Pick<IdentityWriteRepository, "bootstrapViewer">;
   identityReadRepository: IdentityReadRepository;
   teamMembership: TeamMembershipService;
 }): ViewerService {
   return {
     async ensureViewer(user) {
-      const admin = options.getAdminClient();
-
-      // The RPC stays first and stays authoritative: if bootstrap fails, the
-      // read below must not run and paper over it.
-      const { error: rpcError } = await admin.rpc("bootstrap_viewer", {
-        p_user_id: user.id,
-        p_email: user.email,
-        p_user_meta: user.userMetadata as Json,
-      });
-
-      if (rpcError) {
-        throw new BootstrapError(rpcError);
+      // The initialisation stays first and stays authoritative: if it fails,
+      // the read below must not run and paper over it. A missing repository is
+      // the same failure, not a silent skip.
+      const writeRepository = options.identityWriteRepository;
+      if (!writeRepository) {
+        throw new BootstrapError(
+          new Error("identity write repository is not configured"),
+        );
+      }
+      try {
+        await writeRepository.bootstrapViewer({
+          userId: user.id,
+          email: user.email,
+          userMeta: user.userMetadata,
+        });
+      } catch (error) {
+        throw new BootstrapError(error);
       }
 
       const foundation = await loadFoundation(

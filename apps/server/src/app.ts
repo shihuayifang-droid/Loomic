@@ -107,6 +107,7 @@ import {
   createTeamAdminReadRepository,
   type TeamAdminReadRepository,
 } from "./db/team-admin-read-repository.js";
+import { createIdentityWriteRepository } from "./db/identity-write-repository.js";
 import { createTeamAdminWriteRepository } from "./db/team-admin-write-repository.js";
 import {
   createWorkspaceSettingsReadRepository,
@@ -598,7 +599,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const viewerService =
     options.viewerService ??
     createViewerService({
-      getAdminClient,
+      identityWriteRepository: createIdentityWriteRepository({
+        getTransactionPool: () => getTransactionPool(databaseEnv),
+      }),
       identityReadRepository,
       teamMembership: teamMembershipService,
     });

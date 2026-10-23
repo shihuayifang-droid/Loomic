@@ -5,7 +5,7 @@ import {
   type IdentityReadRepository,
   type PersonalFoundationRecord,
 } from "../../db/identity-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
+import type { IdentityWriteRepository } from "../../db/identity-write-repository.js";
 import type { AuthenticatedUser } from "../../supabase/user.js";
 import type { TeamMembership, TeamMembershipService } from "../team/team-membership.js";
 
@@ -60,7 +60,7 @@ const TEAM: TeamMembership = {
 };
 
 type HarnessOptions = {
-  rpcError?: { message: string } | null;
+  bootstrapError?: Error | null;
   foundation?: PersonalFoundationRecord | null;
   foundationFailure?: Error;
   team?: TeamMembership | null;
@@ -68,15 +68,15 @@ type HarnessOptions = {
 
 function createHarness(options: HarnessOptions = {}) {
   const events: string[] = [];
-  const rpcCalls: Array<{ fn: string; args: unknown }> = [];
+  const bootstrapCalls: unknown[] = [];
 
-  const admin = {
-    async rpc(fn: string, args: unknown) {
-      events.push(`rpc:${fn}`);
-      rpcCalls.push({ fn, args });
-      return { data: null, error: options.rpcError ?? null };
+  const writeRepository: Pick<IdentityWriteRepository, "bootstrapViewer"> = {
+    async bootstrapViewer(input) {
+      events.push("repo:bootstrapViewer");
+      bootstrapCalls.push(input);
+      if (options.bootstrapError) throw options.bootstrapError;
     },
-  } as unknown as AdminSupabaseClient;
+  };
 
   const repository: IdentityReadRepository = {
     async findPersonalFoundation(userId) {
@@ -99,9 +99,9 @@ function createHarness(options: HarnessOptions = {}) {
 
   return {
     events,
-    rpcCalls,
+    bootstrapCalls,
     service: createViewerService({
-      getAdminClient: () => admin,
+      identityWriteRepository: writeRepository,
       identityReadRepository: repository,
       teamMembership,
     }),
@@ -109,13 +109,13 @@ function createHarness(options: HarnessOptions = {}) {
 }
 
 describe("createViewerService", () => {
-  it("case 1: a failed bootstrap RPC never reaches the repository", async () => {
-    const harness = createHarness({ rpcError: { message: "rpc exploded" } });
+  it("case 1: a failed bootstrap never reaches the read repository", async () => {
+    const harness = createHarness({ bootstrapError: new Error("bootstrap exploded") });
 
     await expect(harness.service.ensureViewer(USER)).rejects.toBeInstanceOf(
       BootstrapError,
     );
-    expect(harness.events).toEqual(["rpc:bootstrap_viewer"]);
+    expect(harness.events).toEqual(["repo:bootstrapViewer"]);
   });
 
   it("case 2: a full foundation becomes the unchanged viewer DTO", async () => {
@@ -146,9 +146,9 @@ describe("createViewerService", () => {
       teamMembership: { workspaceId: TEAM_ID, userId: USER_ID, role: "member" },
     });
 
-    // RPC first, foundation read second, team lookup last.
+    // Bootstrap first, foundation read second, team lookup last.
     expect(harness.events).toEqual([
-      "rpc:bootstrap_viewer",
+      "repo:bootstrapViewer",
       `foundation:${USER_ID}`,
       `team:${USER_ID}`,
     ]);
@@ -184,7 +184,7 @@ describe("createViewerService", () => {
       BootstrapError,
     );
     expect(harness.events).toEqual([
-      "rpc:bootstrap_viewer",
+      "repo:bootstrapViewer",
       `foundation:${USER_ID}`,
     ]);
   });
@@ -225,20 +225,44 @@ describe("createViewerService", () => {
     expect(viewer.workspace.id).toBe(PERSONAL_ID);
   });
 
-  it("case 7: the bootstrap RPC keeps its parameter contract", async () => {
+  it("case 7: the bootstrap call keeps its parameter contract", async () => {
     const harness = createHarness({ foundation: FOUNDATION, team: TEAM });
 
     await harness.service.ensureViewer(USER);
 
-    expect(harness.rpcCalls).toEqual([
+    expect(harness.bootstrapCalls).toEqual([
       {
-        fn: "bootstrap_viewer",
-        args: {
-          p_user_id: USER_ID,
-          p_email: "member@hahart.test",
-          p_user_meta: { full_name: "Member" },
-        },
+        userId: USER_ID,
+        email: "member@hahart.test",
+        userMeta: { full_name: "Member" },
       },
     ]);
+  });
+
+  it("case 8: no identity write repository is a bootstrap failure", async () => {
+    const events: string[] = [];
+    const service = createViewerService({
+      identityReadRepository: {
+        async findPersonalFoundation(userId) {
+          events.push(`foundation:${userId}`);
+          return FOUNDATION;
+        },
+        async findTeamMembership() {
+          throw new Error("findTeamMembership is not used by the viewer service");
+        },
+      },
+      teamMembership: {
+        async get() {
+          return null;
+        },
+        invalidate() {},
+      },
+    });
+
+    const error = await service.ensureViewer(USER).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(BootstrapError);
+    expect((error as BootstrapError).statusCode).toBe(500);
+    expect(events).toEqual([]);
   });
 });
