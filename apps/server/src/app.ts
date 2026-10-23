@@ -235,6 +235,7 @@ import { registerRunRoutes } from "./http/runs.js";
 import { registerSettingsRoutes } from "./http/settings.js";
 import { registerTeamGate } from "./http/team-gate.js";
 import { registerToolRoutes } from "./http/tools.js";
+import { registerAuthRoutes } from "./http/auth.js";
 import { registerUploadRoutes } from "./http/uploads.js";
 import { registerSkillRoutes } from "./http/skills.js";
 import { registerMarketplaceRoutes } from "./http/skills-marketplace.js";
@@ -409,18 +410,21 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   // self-hosted verifier against the same lazily resolved pool, so `buildApp`
   // still never connects. Both factories are thunks, so only the selected one
   // is ever constructed.
+  // A function, not a value: the secret check throws on a short secret, which
+  // must only happen when the self provider is actually selected.
+  const buildSelfTokenConfig = () => ({
+    secret: accessTokenSecretFrom(env.authJwtSecret ?? ""),
+    issuer: env.authJwtIssuer ?? "hahart",
+    audience: env.authJwtAudience ?? "hahart-api",
+    ttlSeconds: DEFAULT_ACCESS_TTL_SECONDS,
+  });
   const auth =
     options.auth ??
     selectRequestAuthenticator(env, {
       supabase: () => createSupabaseRequestAuthenticator(env),
       self: () =>
         createSelfRequestAuthenticator({
-          token: {
-            secret: accessTokenSecretFrom(env.authJwtSecret ?? ""),
-            issuer: env.authJwtIssuer ?? "hahart",
-            audience: env.authJwtAudience ?? "hahart-api",
-            ttlSeconds: DEFAULT_ACCESS_TTL_SECONDS,
-          },
+          token: buildSelfTokenConfig(),
           findUserById: (id) => findUserById(getTransactionPool(databaseEnv), id),
           isSessionActive: (sid, at) =>
             isSessionActive(getTransactionPool(databaseEnv), sid, at),
@@ -1001,6 +1005,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     auth,
     teamMembership: teamMembershipService,
   });
+
+  // Workorder 42D: self-hosted sign-up / sign-in / refresh / sign-out. Not
+  // registered under the default (Supabase) provider.
+  if (env.authProvider === "self") {
+    void registerAuthRoutes(app, {
+      pool: () => getTransactionPool(databaseEnv),
+      token: buildSelfTokenConfig(),
+    });
+  }
 
   void registerHealthRoutes(app, env);
   // Dev-only: no-ops itself in production. See dev-client-errors.ts.

@@ -20,6 +20,11 @@ const EXEMPT_PATHS = new Set([
   "/api/dev/client-errors",
   "/api/payments/webhook",
   "/api/ws",
+  // Workorder 42D: self-hosted authentication, reached before there is a token.
+  "/api/auth/sign-up",
+  "/api/auth/sign-in",
+  "/api/auth/refresh",
+  "/api/auth/sign-out",
 ]);
 
 /**

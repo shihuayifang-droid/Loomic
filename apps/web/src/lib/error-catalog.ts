@@ -121,6 +121,14 @@ export const APP_ERROR_CATALOG: Record<ApplicationErrorCode, ErrorEntry> = {
   quote_mismatch: fixable("价格已经变化，请重新确认后再试。"),
   tool_disabled: fixable("这个工具暂不可用，请取消勾选后重试。"),
 
+  // 工单42D：自研认证
+  weak_password: fixable("密码至少 8 位，请换一个。"),
+  email_taken: fixable("这个邮箱已注册，请直接登录。"),
+  invalid_credentials: fixable("邮箱或密码不正确。"),
+  too_many_attempts: quota("尝试次数过多，请 15 分钟后再试。"),
+  invalid_refresh: policy("登录已过期，请重新登录。"),
+  account_disabled: policy("账号已停用，请联系管理员。"),
+
   // MD-03 / workorder 40B: the six models whose reference-image cap is
   // unverified declare `"unbounded"`, so nothing is blocked on the client and the
   // upstream's refusal is the only moment the cap shows. It is the user's

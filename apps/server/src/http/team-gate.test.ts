@@ -395,4 +395,27 @@ describe("team member gate", () => {
     expect(response.statusCode).toBe(200);
     expect(claimDailyCreditsCalls).toBe(1);
   });
+
+  it("工单42D: the four /api/auth/* paths are not stopped by the gate", async () => {
+    mode = "none";
+
+    for (const path of [
+      "/api/auth/sign-up",
+      "/api/auth/sign-in",
+      "/api/auth/refresh",
+      "/api/auth/sign-out",
+    ]) {
+      const response = await app.inject({
+        method: "POST",
+        url: path,
+        headers: { authorization: `Bearer ${MEMBER_TOKEN}` },
+        payload: {},
+      });
+
+      // The routes are not mounted under the default provider, so the answer is
+      // Fastify's 404 - what matters is that it is not the gate's 403/503.
+      expect(response.statusCode).not.toBe(403);
+      expect(response.statusCode).not.toBe(503);
+    }
+  });
 });
