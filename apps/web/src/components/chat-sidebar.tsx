@@ -43,7 +43,7 @@ import {
   MessageMentionPicker,
   type MessageMentionPickerItem,
 } from "./canvas-image-picker";
-import { ChatInput } from "./chat-input"; import { AddAssetPicker } from "./chat/add-asset-picker";
+import { ChatInput } from "./chat-input"; import { AddAssetPicker } from "./chat/add-asset-picker"; import { GenerationConfirmCard } from "./chat/generation-confirm-card"; import { useGenerationConfirmation } from "./chat/use-generation-confirmation";
 import { ChatMessage } from "./chat-message";
 import { ChatSkills } from "./chat-skills";
 import { CreditInsufficientDialog } from "./credits/credit-insufficient-dialog";
@@ -566,6 +566,21 @@ export function ChatSidebar({
             } else if (route.kind === "tier_toast") {
               // concurrency_limit, model_not_accessible, resolution_not_allowed
               showTierLimit({ code: event.code, message: event.message });
+            } else if (route.kind === "confirmation") {
+              // AG-10 / 工单40N: the run was stopped ON PURPOSE — nothing was
+              // created and nothing was charged — so this is a question, not a
+              // failure. It goes to the card above the input; a toast here would
+              // vanish with the answer still missing.
+              if (event.confirmation) {
+                requestGenerationConfirmation({
+                  message: event.message,
+                  confirmation: event.confirmation,
+                });
+              } else {
+                // A `confirmation_required` without the payload is a contract
+                // break: show its sentence rather than dropping it on the floor.
+                showToast(event.message, "error");
+              }
             } else {
               // AG-10 fail closed: model_not_available (no price rule, the run
               // was never created) and any other refusal the tier toast would
@@ -1032,6 +1047,23 @@ export function ChatSidebar({
   };
 
   // The inner panel content is shared across all breakpoints.
+  // ── AG-10 / 工单40N：对话里的生成确认卡 ──
+  // 服务端在阈值以上中止本轮 —— 什么都没建、什么都没扣 —— 用户的回答决定要不要
+  // 走生成器的同一提交接口。提交与状态放在 hook 里，`cancel` 一个请求都不发。
+  const {
+    pending: pendingGenerationConfirmation,
+    submitting: generationConfirmationSubmitting,
+    error: generationConfirmationError,
+    request: requestGenerationConfirmation,
+    confirm: confirmGeneration,
+    cancel: cancelGenerationConfirmation,
+  } = useGenerationConfirmation({
+    accessToken,
+    awaitOptions: { ws },
+    ...(onImageGenerated ? { onImageGenerated } : {}),
+    onNotice: (text: string) => showToast(text, "success"),
+  });
+
   // Extracted as a variable to avoid duplicating the chat UI tree
   // between overlay (mobile/tablet) and inline (desktop) render paths.
   const panelContent = (
@@ -1135,6 +1167,17 @@ export function ChatSidebar({
           />
         )}
         <AddAssetPicker items={brandKitMentionItems} onSelect={handleMentionSelect} disabled={streaming || sessionsLoading} />
+        {/* AG-10 / 工单40N：确认卡（有 pending 时才出现，取消即消失） */}
+        {pendingGenerationConfirmation && (
+          <GenerationConfirmCard
+            message={pendingGenerationConfirmation.message}
+            creditsCost={pendingGenerationConfirmation.confirmation.creditsCost}
+            submitting={generationConfirmationSubmitting}
+            error={generationConfirmationError}
+            onConfirm={() => void confirmGeneration()}
+            onCancel={cancelGenerationConfirmation}
+          />
+        )}
         <ChatInput
           ref={chatInputRef}
           onSend={(text, canvasRefs) =>

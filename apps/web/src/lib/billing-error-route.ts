@@ -22,6 +22,15 @@ import { lookupError } from "./error-catalog";
 export type BillingErrorRoute =
   | { kind: "credit_dialog" }
   | { kind: "tier_toast" }
+  /**
+   * AG-10 / 工单40N: the Agent priced the run above the confirmation threshold
+   * and stopped before creating or charging anything. The sentence the user
+   * needs ("将用 … 消耗 N 分") is the event's own `message`, and the numbers the
+   * submit needs ride on the event's `confirmation` — so this route carries no
+   * payload of its own, it only says "this belongs in the confirm card, not in
+   * a toast".
+   */
+  | { kind: "confirmation" }
   | { kind: "message"; text: string };
 
 /**
@@ -67,6 +76,9 @@ export function billingErrorRoute(
   code: string,
   serverMessage?: string,
 ): BillingErrorRoute {
+  // AG-10 / 工单40N: judged first — a confirmation is not a refusal to explain
+  // away with a toast, it is a question the user has to answer.
+  if (code === "confirmation_required") return { kind: "confirmation" };
   if (code === "insufficient_credits") return { kind: "credit_dialog" };
   if (TIER_TOAST_CODE_SET.has(code)) return { kind: "tier_toast" };
   if (

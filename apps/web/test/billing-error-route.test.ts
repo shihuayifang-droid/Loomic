@@ -117,3 +117,16 @@ describe("billingErrorRoute", () => {
     );
   });
 });
+
+/**
+ * AG-10 / 工单40N：阈值以上的生成不是「拒绝」，而是一个要用户回答的问题。
+ * 服务端已经中止本轮（什么都没建、什么都没扣），所以它必须去确认卡，不能落进
+ * toast —— toast 会带着「还没回答」这件事一起消失。
+ */
+describe("billingErrorRoute —— AG-10 确认卡", () => {
+  it("AG-10: a confirmation is routed to the confirm card, not a toast", () => {
+    expect(billingErrorRoute("confirmation_required")).toEqual({
+      kind: "confirmation",
+    });
+  });
+});
