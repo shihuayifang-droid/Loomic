@@ -15,7 +15,10 @@ export const metadata: Metadata = {
   title: "HaHart",
   description: "HaHart · AI 创意画布",
   icons: {
-    icon: "/favicon.svg",
+    icon: [
+      { url: "/favicon.ico", sizes: "any" },
+      { url: "/favicon.svg", type: "image/svg+xml" },
+    ],
     apple: "/apple-touch-icon.png",
   },
   openGraph: {
