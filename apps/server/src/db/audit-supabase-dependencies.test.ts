@@ -988,16 +988,16 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // wrapper of the same shape still has to be counted by hand. The new and
     // modified test files name no client method either, so
     // `fromCallsIncludingTests` follows `fromCalls` down again.
-    // 43F: the upload service goes through the ObjectStore adapter.
-    expect(metricValue(run.stdout, "server.fromCalls")).toBe(59);
+    // 43G: job outputs and agent assets go through the ObjectStore adapter.
+    expect(metricValue(run.stdout, "server.fromCalls")).toBe(55);
     // Guard for this file's own fixture discipline: fragment-assembled probe
     // text must not raise the server test counters it is testing. The wrapper
     // fixtures above are assembled the same way (`UNTYPED_FROM_CALL`), so a
     // literal token there cannot inflate this counter either - the two server
     // counters below still agree exactly.
     expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
-    // 43F: the upload service goes through the ObjectStore adapter.
-    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(59);
+    // 43G: job outputs and agent assets go through the ObjectStore adapter.
+    expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(55);
 
     // Workorder 21-preflight B (T-35): `CreditService.updatePlan` invokes
     // `grant_plan_credits` through a parenthesised type assertion —
@@ -1034,8 +1034,8 @@ describe("audit-supabase-dependencies: real repository root", () => {
       /^\[anchor\] server\.runtimeRpc: anchor=17 measured\[server\.rpcCallsRuntime\]=17 \(match\)$/m,
     );
 
-    // 43F: the upload service goes through the ObjectStore adapter.
-    expect(metricValue(run.stdout, "server.storageCalls")).toBe(19);
+    // 43G: job outputs and agent assets go through the ObjectStore adapter.
+    expect(metricValue(run.stdout, "server.storageCalls")).toBe(15);
     expect(metricValue(run.stdout, "server.authGetUserCalls")).toBe(1);
     expect(metricValue(run.stdout, "server.supabaseSdkImportHits")).toBe(3);
   }, AUDIT_TEST_TIMEOUT_MS);

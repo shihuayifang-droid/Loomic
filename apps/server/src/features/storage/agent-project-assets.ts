@@ -45,11 +45,22 @@ import type {
 } from "../../db/canvas-read-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
+import type { ObjectStore } from "./object-store.js";
+import { ObjectStoreError } from "./object-store.js";
 import {
   PROJECT_ASSET_BUCKET,
   ProjectAssetUrlError,
   signProjectAssetUrl,
 } from "./project-asset-urls.js";
+import type { SupabaseStorageLike } from "./supabase-object-store.js";
+import { createSupabaseObjectStore } from "./supabase-object-store.js";
+
+/**
+ * 43G: every object operation in this file goes through the `ObjectStore` seam,
+ * with the user client wrapped exactly as it used to be reached directly.
+ */
+const storeFor = (client: UserSupabaseClient): ObjectStore =>
+  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
 
 export type AgentProjectAssetErrorCode =
   | "no_canvas"
@@ -178,18 +189,22 @@ export function createAgentProjectAssetService(options: {
 
       // Upload with the USER's client. A refusal here is the user's own RLS
       // answering "no", so it is reported rather than retried against another
-      // client.
-      const { error: uploadError } = await client.storage
-        .from(PROJECT_ASSET_BUCKET)
-        .upload(objectPath, buffer, {
-          contentType: input.mimeType,
-          upsert: false,
-        });
-
-      if (uploadError) {
+      // client. 43G: the write goes through the `ObjectStore` seam; the message
+      // keeps the backend's own text, read off the adapter's `detail`.
+      try {
+        await storeFor(client).put(
+          { bucket: PROJECT_ASSET_BUCKET, key: objectPath },
+          buffer,
+          { contentType: input.mimeType, upsert: false },
+        );
+      } catch (err) {
+        const detail =
+          err instanceof ObjectStoreError
+            ? (err.detail ?? err.message)
+            : String(err);
         throw new AgentProjectAssetError(
           "upload_failed",
-          `Storage upload failed: ${uploadError.message}`,
+          `Storage upload failed: ${detail}`,
         );
       }
 
@@ -322,10 +337,12 @@ async function removeUploadedObject(
   assetId?: string,
 ): Promise<void> {
   try {
-    const { error } = await client.storage
-      .from(PROJECT_ASSET_BUCKET)
-      .remove([objectPath]);
-    if (error) throw new Error(error.message);
+    // 43G: the removal goes through the `ObjectStore` seam. The adapter turns a
+    // backend refusal into an `ObjectStoreError`, so it lands in the catch below
+    // and this cleanup keeps reporting the failure instead of passing silently.
+    await storeFor(client).delete([
+      { bucket: PROJECT_ASSET_BUCKET, key: objectPath },
+    ]);
   } catch (error) {
     console.error(
       `[agent-project-assets] cleanup of an unowned object FAILED ` +

@@ -3,6 +3,9 @@
 // Image generation and tool execution both end here, so the storage write and the
 // ownership record live in exactly one place.
 import type { AdminSupabaseClient } from "../../../supabase/admin.js";
+import { ObjectStoreError } from "../../storage/object-store.js";
+import type { SupabaseStorageLike } from "../../storage/supabase-object-store.js";
+import { createSupabaseObjectStore } from "../../storage/supabase-object-store.js";
 
 export type StoreJobOutputInput = {
   objectPath: string;
@@ -20,16 +23,20 @@ export async function storeJobOutput(
 ): Promise<{ assetId: string; objectPath: string }> {
   const { objectPath, bytes, mimeType, createdBy, workspaceId, projectId, canvasId } = input;
 
-  // Upload to Supabase Storage under the project-assets bucket
-  const { error: uploadError } = await admin.storage
-    .from("project-assets")
-    .upload(objectPath, bytes, {
+  // Upload to the project-assets bucket through the ObjectStore seam (43G). The
+  // caller-visible message keeps the backend's own text, which the adapter keeps
+  // in `detail`, so this reads exactly as it did when it used the SDK directly.
+  try {
+    await createSupabaseObjectStore(
+      admin as unknown as SupabaseStorageLike,
+    ).put({ bucket: "project-assets", key: objectPath }, bytes, {
       contentType: mimeType,
       upsert: false,
     });
-
-  if (uploadError) {
-    throw new Error(`Storage upload failed: ${uploadError.message}`);
+  } catch (err) {
+    const detail =
+      err instanceof ObjectStoreError ? (err.detail ?? err.message) : String(err);
+    throw new Error(`Storage upload failed: ${detail}`);
   }
 
   // Record ownership through the single service_role-only entry point. A
