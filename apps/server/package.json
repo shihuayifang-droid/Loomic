@@ -57,6 +57,7 @@
     "worker": "node --env-file=../../.env.local --import tsx ./src/worker.ts",
     "test": "vitest run",
     "db:migrate": "node --env-file-if-exists=../../.env.local --import tsx ./src/cli/hahart-db-migrate.ts",
+    "db:bootstrap-admin": "node --env-file-if-exists=../../.env.local --import tsx ./src/cli/hahart-bootstrap-admin.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }
