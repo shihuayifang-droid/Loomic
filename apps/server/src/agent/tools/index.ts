@@ -64,7 +64,7 @@ export function createMainAgentTools(
      * silently missing fails at the one moment it is needed.
      */
     assetWriteRepository: AssetWriteRepository;
-    /** Wired through but not used yet: from workorder 44F it records the asset. */
+    /** Records the asset ownership for persist_sandbox_file (44F); without it that tool is not offered. */
     assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
     /** Owner-keyed brand kit reads — `get_brand_kit` no longer reads tables (21AC). */
     brandKitReadRepository: BrandKitReadRepository;
@@ -95,26 +95,22 @@ export function createMainAgentTools(
 
   // persist_sandbox_file 必须有沙箱根目录才有可校验的上传范围。
   // 没有 sandboxDir 就不注册这个工具，而不是注册一个不校验路径的版本。
-  // X-52 之后还有一个必要条件：没有 admin client 就记不了归属，
+  // X-52 之后还有一个必要条件：没有 assetRecordRepository 就记不了归属，
   // 同样不注册 —— 而不是注册一个会写出无归属对象的版本。
-  if (deps.sandboxDir && deps.getAdminClient) {
+  if (deps.sandboxDir && deps.assetRecordRepository) {
     tools.push(
       createPersistSandboxFileTool({
         assetWriteRepository: deps.assetWriteRepository,
-        ...(deps.assetRecordRepository
-          ? { assetRecordRepository: deps.assetRecordRepository }
-          : {}),
+        assetRecordRepository: deps.assetRecordRepository,
         canvasReadRepository: deps.canvasReadRepository,
         createUserClient: deps.createUserClient,
-        getAdminClient: deps.getAdminClient,
         sandboxDir: deps.sandboxDir,
       }),
     );
   } else if (deps.sandboxDir) {
     console.warn(
-      "[tools] no getAdminClient — persist_sandbox_file will not be offered, " +
-        "because an upload without recorded ownership cannot be authorised once " +
-        "the bucket is private (X-52)",
+      "[tools] no assetRecordRepository — persist_sandbox_file will not be offered, " +
+        "because an upload without recorded ownership cannot be authorised (X-52)",
     );
   }
 

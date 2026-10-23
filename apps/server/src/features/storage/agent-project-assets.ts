@@ -44,7 +44,6 @@ import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { ObjectStore } from "./object-store.js";
 import { ObjectStoreError } from "./object-store.js";
@@ -154,10 +153,9 @@ export function createAgentProjectAssetService(options: {
   canvasReadRepository: CanvasReadRepository;
   /** The compensated row delete when signing fails (21AC). */
   assetWriteRepository: AssetWriteRepository;
-  /** Wired through but not used yet: from workorder 44F it records the asset. */
+  /** Records the asset's ownership (44F). A missing repository fails closed. */
   assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   createUserClient: (accessToken: string) => UserSupabaseClient;
-  getAdminClient: () => AdminSupabaseClient;
 }): AgentProjectAssetService {
   return {
     async persist(input) {
@@ -216,31 +214,40 @@ export function createAgentProjectAssetService(options: {
       // project and the team workspace from. `p_fallback_workspace_id` is passed
       // because the function has no default for it; it is only ever consulted
       // when there is no project, which cannot happen on this path.
-      const { data: recorded, error: recordError } = await options
-        .getAdminClient()
-        .rpc("record_project_asset", {
-          p_bucket: PROJECT_ASSET_BUCKET,
-          p_object_path: objectPath,
-          p_created_by: input.createdBy,
-          p_fallback_workspace_id: workspaceId,
-          p_project_id: null,
-          p_canvas_id: canvasId,
-          p_mime_type: input.mimeType,
-          p_byte_size: buffer.length,
-        });
+      let assetId: string | undefined;
+      let recordFailure: string | undefined;
+      if (!options.assetRecordRepository) {
+        recordFailure = "no asset record repository";
+      } else {
+        try {
+          const recorded = await options.assetRecordRepository.recordProjectAsset(
+            {
+              bucket: PROJECT_ASSET_BUCKET,
+              objectPath,
+              createdBy: input.createdBy,
+              fallbackWorkspaceId: workspaceId,
+              projectId: null,
+              canvasId,
+              mimeType: input.mimeType,
+              byteSize: buffer.length,
+            },
+          );
+          assetId = recorded.assetId;
+        } catch (error) {
+          recordFailure = error instanceof Error ? error.message : String(error);
+        }
+      }
 
-      const assetId = (recorded as { asset_id?: string } | null)?.asset_id;
-
-      if (recordError || !assetId) {
+      if (!assetId) {
         // The object is already in the bucket and now has no owner. Leaving it
         // there would create exactly the un-authorisable object X-52 exists to
         // eliminate, so remove it — best effort, but the failure is reported
         // either way, including when the cleanup itself fails.
-        await removeUploadedObject(client, objectPath, recordError?.message);
+        await removeUploadedObject(client, objectPath, recordFailure);
         throw new AgentProjectAssetError(
           "metadata_failed",
           `Could not record asset metadata for the uploaded object: ${
-            recordError?.message ?? "no asset id returned"
+            recordFailure ?? "no asset id returned"
           }`,
         );
       }

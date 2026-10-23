@@ -4,12 +4,12 @@ import { join } from "node:path";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import {
   createPersistSandboxFileTool,
   type PersistSandboxFileDeps,
@@ -54,7 +54,7 @@ type Harness = {
   deps: PersistSandboxFileDeps;
   upload: ReturnType<typeof vi.fn>;
   createSignedUrl: ReturnType<typeof vi.fn>;
-  rpc: ReturnType<typeof vi.fn>;
+  recordProjectAsset: ReturnType<typeof vi.fn>;
   remove: ReturnType<typeof vi.fn>;
   /** How many table reads the caller's client was asked for — must stay zero. */
   tableReads: () => number;
@@ -64,7 +64,8 @@ type Harness = {
 function makeHarness(
   sandboxDir: string,
   overrides: {
-    rpcError?: { message: string } | null;
+    /** The asset record repository rejects with this message. */
+    recordError?: { message: string } | null;
     /** Omit the canvas id so the tool has no owner to file the object under. */
     noCanvas?: boolean;
     /** The canvas → project link answers nothing, i.e. the ACL hid the canvas. */
@@ -93,11 +94,13 @@ function makeHarness(
     },
   };
 
-  const rpc = vi.fn().mockResolvedValue(
-    overrides.rpcError
-      ? { data: null, error: overrides.rpcError }
-      : { data: { asset_id: "asset-1" }, error: null },
-  );
+  const recordProjectAsset = vi.fn(async (_input: Record<string, unknown>) => {
+    if (overrides.recordError) throw new Error(overrides.recordError.message);
+    return { assetId: "asset-1", workspaceId: WORKSPACE, projectId: "project-1" };
+  });
+  const assetRecordRepository: Pick<AssetRecordRepository, "recordProjectAsset"> = {
+    recordProjectAsset,
+  };
 
   const canvasReadRepository = {
     async findReadableCanvasProjectLink(): Promise<CanvasProjectLinkRow | null> {
@@ -127,12 +130,12 @@ function makeHarness(
       canvasReadRepository,
       assetWriteRepository,
       createUserClient: () => client as unknown as SupabaseClient,
-      getAdminClient: () => ({ rpc }) as unknown as AdminSupabaseClient,
+      assetRecordRepository,
       sandboxDir,
     },
     upload,
     createSignedUrl,
-    rpc,
+    recordProjectAsset,
     remove,
     tableReads: () => tableReads,
     config: overrides.noCanvas
@@ -199,7 +202,7 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
     const sandboxDir = makeTempDir("loomic-persist-x1-");
     writeFileSync(join(sandboxDir, "out.png"), "png-bytes", "utf-8");
 
-    const { deps, rpc, config, tableReads } = makeHarness(sandboxDir);
+    const { deps, recordProjectAsset, config, tableReads } = makeHarness(sandboxDir);
     const persist = createPersistSandboxFileTool(deps);
 
     const parsed = JSON.parse(
@@ -219,12 +222,12 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
 
     // Ownership came from the canvas, and the creator is the token's subject —
     // not a `configurable` field that could disagree with the JWT.
-    expect(rpc).toHaveBeenCalledTimes(1);
-    expect(rpc.mock.calls[0]?.[1]).toMatchObject({
-      p_canvas_id: CANVAS,
-      p_created_by: USER,
-      p_bucket: "project-assets",
-      p_project_id: null,
+    expect(recordProjectAsset).toHaveBeenCalledTimes(1);
+    expect(recordProjectAsset.mock.calls[0]?.[0]).toMatchObject({
+      canvasId: CANVAS,
+      createdBy: USER,
+      bucket: "project-assets",
+      projectId: null,
     });
   });
 
@@ -232,7 +235,7 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
     const sandboxDir = makeTempDir("loomic-persist-x2-");
     writeFileSync(join(sandboxDir, "out.png"), "png-bytes", "utf-8");
 
-    const { deps, upload, rpc, config } = makeHarness(sandboxDir, {
+    const { deps, upload, recordProjectAsset, config } = makeHarness(sandboxDir, {
       noCanvas: true,
     });
     const persist = createPersistSandboxFileTool(deps);
@@ -242,7 +245,7 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
     // An unowned object is worse than no object: nothing is written.
     expect(result).toMatch(NO_CANVAS);
     expect(upload).toHaveBeenCalledTimes(0);
-    expect(rpc).toHaveBeenCalledTimes(0);
+    expect(recordProjectAsset).toHaveBeenCalledTimes(0);
   });
 
   it("case 4: a canvas the repository cannot read is refused after reading the file but before any upload", async () => {
@@ -252,7 +255,7 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
     // 工单21AC: the canvas → project link is `findReadableCanvasProjectLink`, so a
     // canvas the caller may not read is a `null` answer rather than a row the tool
     // could derive a workspace from.
-    const { deps, upload, rpc, config } = makeHarness(sandboxDir, {
+    const { deps, upload, recordProjectAsset, config } = makeHarness(sandboxDir, {
       canvasHidden: true,
     });
     const persist = createPersistSandboxFileTool(deps);
@@ -262,7 +265,7 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
     expect(result).toContain("Error uploading file");
     expect(result).toContain("not found or not accessible");
     expect(upload).toHaveBeenCalledTimes(0);
-    expect(rpc).toHaveBeenCalledTimes(0);
+    expect(recordProjectAsset).toHaveBeenCalledTimes(0);
   });
 
   it("case 3: a metadata failure deletes the object and reports an error", async () => {
@@ -270,7 +273,7 @@ describe("persist_sandbox_file stable asset reference (T1)", () => {
     writeFileSync(join(sandboxDir, "out.png"), "png-bytes", "utf-8");
 
     const { deps, upload, remove, config } = makeHarness(sandboxDir, {
-      rpcError: { message: "rpc exploded" },
+      recordError: { message: "record exploded" },
     });
     const persist = createPersistSandboxFileTool(deps);
 

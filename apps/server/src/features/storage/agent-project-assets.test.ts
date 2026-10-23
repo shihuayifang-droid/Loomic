@@ -21,12 +21,15 @@
 // longer issued here" into a measurement instead of a claim.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type {
+  AssetRecordRepository,
+  RecordProjectAssetInput,
+} from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 import {
   AgentProjectAssetError,
@@ -42,15 +45,13 @@ const TOKEN = "jwt-token";
 
 type UploadCall = { bucket: string; path: string; bytes: number; contentType?: string };
 type RemoveCall = { bucket: string; paths: string[] };
-type RpcCall = { name: string; params: Record<string, unknown> };
+type RecordCall = RecordProjectAssetInput;
 type CanvasLinkCall = { actorId: string; canvasId: string };
 type MetadataDeleteCall = { actorId: string; assetId: string };
 
 function makeHarness(options: {
-  /** `record_project_asset` failure. */
-  rpcError?: { message: string } | null;
-  /** Returned row for the RPC; omit the asset id to simulate a silent failure. */
-  rpcData?: unknown;
+  /** The asset record repository throws this (a database error or "no asset id"). */
+  recordError?: { message: string } | null;
   uploadError?: { message: string } | null;
   signError?: { message: string } | null;
   removeError?: { message: string } | null;
@@ -64,7 +65,7 @@ function makeHarness(options: {
 }) {
   const uploads: UploadCall[] = [];
   const removes: RemoveCall[] = [];
-  const rpcs: RpcCall[] = [];
+  const records: RecordCall[] = [];
   const canvasLinks: CanvasLinkCall[] = [];
   const metadataDeletes: MetadataDeleteCall[] = [];
   /** Every side effect in the order it happened — the sequence IS the contract. */
@@ -122,14 +123,15 @@ function makeHarness(options: {
     },
   };
 
-  const adminClient = {
-    rpc: async (name: string, params: Record<string, unknown>) => {
+  const assetRecordRepository: Pick<AssetRecordRepository, "recordProjectAsset"> = {
+    async recordProjectAsset(input) {
       events.push("record_asset");
-      rpcs.push({ name, params });
-      if (options.rpcError) return { data: null, error: options.rpcError };
+      records.push({ ...input });
+      if (options.recordError) throw new Error(options.recordError.message);
       return {
-        data: options.rpcData ?? { asset_id: `asset-${rpcs.length}` },
-        error: null,
+        assetId: `asset-${records.length}`,
+        workspaceId: WORKSPACE,
+        projectId: "project-1",
       };
     },
   };
@@ -173,14 +175,14 @@ function makeHarness(options: {
     canvasReadRepository,
     assetWriteRepository,
     createUserClient: () => userClient as unknown as UserSupabaseClient,
-    getAdminClient: () => adminClient as unknown as AdminSupabaseClient,
+    assetRecordRepository,
   });
 
   return {
     service,
     uploads,
     removes,
-    rpcs,
+    records,
     canvasLinks,
     metadataDeletes,
     events,
@@ -251,25 +253,24 @@ describe("agent project asset persistence (T1)", () => {
     const h = makeHarness({});
     await persist(h);
 
-    expect(h.rpcs).toHaveLength(1);
-    expect(h.rpcs[0]?.name).toBe("record_project_asset");
-    expect(h.rpcs[0]?.params).toMatchObject({
-      p_bucket: "project-assets",
-      p_canvas_id: CANVAS,
-      p_created_by: USER,
-      // No project named directly: the RPC derives it from the canvas.
-      p_project_id: null,
+    expect(h.records).toHaveLength(1);
+    expect(h.records[0]).toMatchObject({
+      bucket: "project-assets",
+      canvasId: CANVAS,
+      createdBy: USER,
+      // No project named directly: the repository derives it from the canvas.
+      projectId: null,
     });
     // The key starts with the canvas-derived workspace (the Storage RLS
     // requirement) and the recorded path is the uploaded path, verbatim.
-    expect(String(h.rpcs[0]?.params.p_object_path).startsWith(`${WORKSPACE}/`)).toBe(true);
-    expect(h.rpcs[0]?.params.p_object_path).toBe(h.uploads[0]?.path);
+    expect(String(h.records[0]?.objectPath).startsWith(`${WORKSPACE}/`)).toBe(true);
+    expect(h.records[0]?.objectPath).toBe(h.uploads[0]?.path);
     // The billing/personal workspace is nowhere in the decision.
-    expect(JSON.stringify(h.rpcs[0]?.params)).not.toContain("personal");
+    expect(JSON.stringify(h.records[0])).not.toContain("personal");
   });
 
   it("case 3: a metadata failure deletes the just-uploaded object and throws", async () => {
-    const h = makeHarness({ rpcError: { message: "rpc exploded" } });
+    const h = makeHarness({ recordError: { message: "record exploded" } });
 
     await expect(persist(h)).rejects.toBeInstanceOf(AgentProjectAssetError);
     expect(h.uploads).toHaveLength(1);
@@ -279,8 +280,10 @@ describe("agent project asset persistence (T1)", () => {
     expect(h.signedPaths()).toHaveLength(0);
   });
 
-  it("case 4: an RPC that returns no asset id counts as failure, not success", async () => {
-    const h = makeHarness({ rpcData: { asset_id: null } });
+  it("case 4: a record that yields no asset id counts as failure, not success", async () => {
+    const h = makeHarness({
+      recordError: { message: "record_project_asset returned no asset id" },
+    });
 
     await expect(persist(h)).rejects.toMatchObject({ code: "metadata_failed" });
     expect(h.removes[0]?.paths).toEqual([h.uploads[0]?.path]);
@@ -293,7 +296,7 @@ describe("agent project asset persistence (T1)", () => {
       code: "no_canvas",
     });
     expect(h.uploads).toHaveLength(0);
-    expect(h.rpcs).toHaveLength(0);
+    expect(h.records).toHaveLength(0);
     // Refused before the repository was even asked.
     expect(h.canvasLinks).toHaveLength(0);
   });
@@ -303,7 +306,7 @@ describe("agent project asset persistence (T1)", () => {
 
     await expect(persist(h)).rejects.toMatchObject({ code: "canvas_not_found" });
     expect(h.uploads).toHaveLength(0);
-    expect(h.rpcs).toHaveLength(0);
+    expect(h.records).toHaveLength(0);
   });
 
   it("case 7: a signing failure never degrades to a public or data URL", async () => {
@@ -430,7 +433,7 @@ describe("agent project asset persistence (T1)", () => {
     // The message the caller already produced for a failed lookup.
     expect(error.message).toContain("Canvas lookup failed: connect failed");
     expect(h.uploads).toHaveLength(0);
-    expect(h.rpcs).toHaveLength(0);
+    expect(h.records).toHaveLength(0);
   });
 
   it("case 8: the object key is sanitised into the workspace/canvas namespace", async () => {

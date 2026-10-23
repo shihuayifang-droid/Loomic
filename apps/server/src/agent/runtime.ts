@@ -2006,7 +2006,6 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 : {}),
               createUserClient: (token) =>
                 createClient(token) as UserSupabaseClient,
-              getAdminClient,
             });
 
             // LOCAL FORK: retry. Storage latency on a free instance (ours is

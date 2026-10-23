@@ -6,7 +6,6 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { decodeJwt } from "jose";
 import { z } from "zod";
 
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
@@ -63,14 +62,12 @@ export type PersistSandboxFileDeps = {
   canvasReadRepository: CanvasReadRepository;
   /** The compensated row delete when signing fails (workorder 21AC). */
   assetWriteRepository: AssetWriteRepository;
-  /** Wired through but not used yet: from workorder 44F it records the asset. */
-  assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
-  createUserClient: (accessToken: string) => SupabaseClient;
   /**
-   * Service-role client getter. Required: ownership is recorded through the
-   * service_role-only `record_project_asset`, which the user client cannot call.
+   * Records the asset's ownership (workorder 44F). Required: without it an
+   * upload has no recorded owner and cannot be authorised (X-52).
    */
-  getAdminClient: () => AdminSupabaseClient;
+  assetRecordRepository: Pick<AssetRecordRepository, "recordProjectAsset">;
+  createUserClient: (accessToken: string) => SupabaseClient;
   /**
    * Sandbox root. Required on purpose: without it there is no range we can
    * prove a path belongs to, and this tool reads a host file and uploads it.
@@ -118,12 +115,9 @@ export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
   const agentAssets = createAgentProjectAssetService({
     canvasReadRepository: deps.canvasReadRepository,
     assetWriteRepository: deps.assetWriteRepository,
-    ...(deps.assetRecordRepository
-      ? { assetRecordRepository: deps.assetRecordRepository }
-      : {}),
+    assetRecordRepository: deps.assetRecordRepository,
     createUserClient: (accessToken) =>
       deps.createUserClient(accessToken) as unknown as UserSupabaseClient,
-    getAdminClient: deps.getAdminClient,
   });
 
   return tool(

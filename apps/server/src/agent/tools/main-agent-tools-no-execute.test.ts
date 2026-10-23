@@ -13,17 +13,17 @@
 //     pass `backends.test.ts` and fail here.
 //
 // Both deployment shapes are covered: a run with a sandbox directory plus the
-// service-role client (persist_sandbox_file is offered) and a run with neither.
+// asset record repository (persist_sandbox_file is offered) and a run with neither.
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BackendProtocol } from "deepagents";
 import { afterEach, describe, expect, it } from "vitest";
 
+import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { BrandKitReadRepository } from "../../db/brand-kit-read-repository.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { createAgentBackend } from "../backends/index.js";
 import { createMainAgentTools } from "./index.js";
 
@@ -92,13 +92,17 @@ describe("QA-12: the model's tool list cannot run a command", () => {
     expect(toolNames(tools)).toContain("manipulate_canvas");
   });
 
-  it("QA-12: the tools the model gets have no execute (sandbox dir + admin client)", () => {
+  it("QA-12: the tools the model gets have no execute (sandbox dir + asset record repository)", () => {
     const sandboxDir = makeTempDir("loomic-tools-no-exec-");
 
     const tools = createMainAgentTools({} as unknown as BackendProtocol, {
       ...minimalDeps(),
       sandboxDir,
-      getAdminClient: () => ({}) as unknown as AdminSupabaseClient,
+      assetRecordRepository: {
+        recordProjectAsset: async () => {
+          throw new Error("not used: this file never runs a tool");
+        },
+      } as Pick<AssetRecordRepository, "recordProjectAsset">,
     });
 
     // This dependency shape really does add a tool, so the two cases do not
