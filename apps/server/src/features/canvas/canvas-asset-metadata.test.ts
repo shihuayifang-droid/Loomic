@@ -30,6 +30,8 @@ import {
 } from "../../db/canvas-read-repository.js";
 import { readCanvasRow, replaceCanvasContent } from "./canvas-version.js";
 import { createCanvasService } from "./canvas-service.js";
+import { ObjectStoreError } from "../storage/object-store.js";
+import type { ObjectStore } from "../storage/object-store.js";
 
 const USER = {
   id: "user-1",
@@ -51,6 +53,17 @@ const fakeContentRepository = {
 
 const WORKSPACE = "ws-team";
 const PROJECT = "project-1";
+
+/**
+ * 45AJ: the read-path fixtures below never upload — the service builds its store
+ * only on the SAVE path, and every case using this factory reads a canvas. It is
+ * required by the service's options, so it is supplied here and throws rather than
+ * answering a stub: an upload creeping into these cases must fail loudly instead
+ * of passing against a store that silently does nothing.
+ */
+const noObjectStoreOnTheReadPath = (): ObjectStore => {
+  throw new Error("the canvas read path must not build an object store");
+};
 
 const PNG_BASE64 =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -80,23 +93,62 @@ function makeStubs(options: {
 }) {
   const records: RecordCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
+  // 45AJ: the clients the injected store factory was handed. Recorded so "the
+  // store is built from the caller's OWN client, never the admin's" is observable
+  // instead of assumed.
+  const storeClients: UserSupabaseClient[] = [];
 
   const userClient = {
     storage: {
-
+      // 45AJ: the save path writes through the injected `ObjectStore` now, so the
+      // user client is only reached for signatures. `upload` is deliberately gone:
+      // a regression back to the raw SDK would then fail loudly instead of working
+      // around the factory through this stub.
       from(bucket: string) {
         return {
-          upload: async (path: string, buffer: { length: number }) => {
-            if (options.uploadError) return { data: null, error: options.uploadError };
-            uploads.push({ bucket, path, bytes: buffer.length });
-            return { data: { path }, error: null };
-          },
           getPublicUrl: (path: string) => ({
             data: { publicUrl: `https://cdn.test/${bucket}/${path}` },
           }),
         };
       },
     },
+  };
+
+  // 45AJ / T-133 (4th slice): a FAKE STORE the injected factory answers with — the
+  // same shape brand-kit (45AH) and uploads (45AI) use in their tests. Replacing
+  // the fake user client + real adapter pair with this keeps every assertion's
+  // meaning: it records the same bucket / key / byte count, and a failure is
+  // raised as the `ObjectStoreError` the adapter would have produced.
+  const objectStore: ObjectStore = {
+    async put(ref, body) {
+      if (options.uploadError) {
+        throw new ObjectStoreError("backend_failed", options.uploadError.message);
+      }
+      uploads.push({ bucket: ref.bucket, path: ref.key, bytes: body.length });
+    },
+    async get() {
+      throw new Error("the canvas save path must not read an object");
+    },
+    async head() {
+      throw new Error("the canvas save path must not head an object");
+    },
+    async delete() {
+      throw new Error("the canvas save path must not delete an object");
+    },
+    async copy() {
+      throw new Error("the canvas save path must not copy an object");
+    },
+    async signedReadUrl() {
+      throw new Error("the canvas save path must not sign a read URL");
+    },
+    async signedReadUrls() {
+      throw new Error("the canvas save path must not sign read URLs");
+    },
+  };
+
+  const createObjectStore = (client: UserSupabaseClient): ObjectStore => {
+    storeClients.push(client);
+    return objectStore;
   };
 
   const assetRecordRepository = {
@@ -129,6 +181,7 @@ function makeStubs(options: {
 
   const service = createCanvasService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
+    createObjectStore,
     canvasContentRepository: fakeContentRepository,
     ...(options.withoutRepository ? {} : { assetRecordRepository }),
     ...(options.withoutCanvasReadRepository
@@ -143,6 +196,8 @@ function makeStubs(options: {
     service,
     records,
     uploads,
+    storeClients,
+    userClient: userClient as unknown as UserSupabaseClient,
     canvasLinkCalls,
     canvasId: options.canvasId,
   };
@@ -182,6 +237,10 @@ describe("canvas file extraction records asset metadata", () => {
     await stub.service.saveCanvasContent(USER, "canvas-a", content, 1);
 
     expect(stub.uploads).toHaveLength(1);
+    // 45AJ: the bytes went through the store the injected factory built, and the
+    // factory was handed the caller's OWN user client — that is what keeps the
+    // upload inside the saver's RLS.
+    expect(stub.storeClients).toEqual([stub.userClient]);
     expect(stub.records).toHaveLength(1);
     expect(stub.records[0]).toMatchObject({
       bucket: "project-assets",
@@ -434,6 +493,7 @@ function makeReadStub(options: {
 
   const service = createCanvasService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
+    createObjectStore: noObjectStoreOnTheReadPath,
     canvasContentRepository: fakeContentRepository,
     getAdminClient: () =>
       ({ rpc: async () => ({ data: null, error: null }) }) as unknown as AdminSupabaseClient,
@@ -724,6 +784,7 @@ describe("canvas content repository is required (44V)", () => {
   it("case 1: without the content repository getCanvas answers 503 service_unavailable", async () => {
     const service = createCanvasService({
       createUserClient: () => ({}) as unknown as UserSupabaseClient,
+      createObjectStore: noObjectStoreOnTheReadPath,
     });
 
     await expect(service.getCanvas(USER, "canvas-1")).rejects.toMatchObject({
@@ -735,6 +796,7 @@ describe("canvas content repository is required (44V)", () => {
   it("case 2: without the content repository saveCanvasContent answers 503 service_unavailable", async () => {
     const service = createCanvasService({
       createUserClient: () => ({}) as unknown as UserSupabaseClient,
+      createObjectStore: noObjectStoreOnTheReadPath,
     });
 
     await expect(

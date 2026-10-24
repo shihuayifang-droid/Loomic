@@ -9,9 +9,7 @@ import {
   type CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
-import { ObjectStoreError } from "../storage/object-store.js";
-import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
-import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
+import { ObjectStoreError, type ObjectStore } from "../storage/object-store.js";
 import {
   signProjectAssetUrl,
   storageRenderTransformEnabled,
@@ -100,6 +98,19 @@ export type CanvasService = {
 
 export function createCanvasService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
+  /**
+   * 45AJ / T-133 (4th slice): a FACTORY, not a single shared store.
+   *
+   * Canvas files are uploaded for the caller who is saving the canvas, so the
+   * store is built from THAT user's client and Storage answers under that user's
+   * RLS — the same per-user scoping this service applied itself when it wrapped
+   * the caller's client inline, and the same form brand-kit (45AH) and uploads
+   * (45AI) take. Handing the service one store built from the server's/admin's
+   * client would widen the permission on this feature: 45D pinned that a canvas
+   * marker is only signed or written when it belongs to this canvas's workspace
+   * or project, and that check is meaningless if the write itself bypasses RLS.
+   */
+  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
   /**
    * Ticket 44D onward this service no longer uses it; kept optional only so
    * existing callers keep compiling. A later cleanup ticket removes it.
@@ -215,9 +226,15 @@ export function createCanvasService(options: {
       }
       const contentStore = createRepositoryCanvasStore(contentRepository, user.id);
 
+      // 45AJ / T-133 (4th slice): the store is built by the injected factory from
+      // THIS user's client, right before the bytes are written — not once at
+      // construction and not from the admin client. Every upload below therefore
+      // carries the saver's JWT and answers under that user's RLS.
+      const objectStore = options.createObjectStore(client);
+
       // Extract base64 files to Storage, replacing dataURLs with oss:// markers
       const leanContent = await extractFilesToStorage(
-        client,
+        objectStore,
         options.canvasReadRepository,
         options.assetRecordRepository,
         canvasId,
@@ -470,7 +487,7 @@ async function resolveWorkspaceId(
 }
 
 async function extractFilesToStorage(
-  client: UserSupabaseClient,
+  store: ObjectStore,
   canvasReadRepository: CanvasReadRepository | undefined,
   assetRecordRepository:
     | Pick<AssetRecordRepository, "recordProjectAsset">
@@ -529,12 +546,11 @@ async function extractFilesToStorage(
         const ext = mimeToExt(mimeType);
         const objectPath = `${workspaceId}/canvas-files/${canvasId}/${fileId}.${ext}`;
 
-        // Upsert: the same file ID may be re-saved. 43H: the write goes through
-        // the `ObjectStore` seam instead of the raw SDK.
+        // Upsert: the same file ID may be re-saved. 43H put the write behind the
+        // `ObjectStore` seam; since 45AJ that store comes from the injected
+        // per-user factory (see the options doc), so no backend is named here.
         try {
-          await createSupabaseObjectStore(
-            client as unknown as SupabaseStorageLike,
-          ).put(
+          await store.put(
             { bucket: CANVAS_FILES_BUCKET, key: objectPath },
             buffer,
             { contentType: mimeType, upsert: true },

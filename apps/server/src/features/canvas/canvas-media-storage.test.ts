@@ -22,12 +22,28 @@ import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.
 import { insertVideoElementForJobResult } from "../../agent/runtime.js";
 import { createCanvasService } from "./canvas-service.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
+import type { ObjectStore } from "../storage/object-store.js";
 import { insertVideoElement } from "./canvas-element-writer.js";
 import { createRepositoryCanvasStore } from "./canvas-version.js";
 
 const USER = { accessToken: "test-token" } as AuthenticatedUser;
 const CANVAS_ID = "canvas-1";
 const MARKER = "oss://project-assets/ws-team/gen/v1.mp4";
+
+/**
+ * 45AJ / T-133 (4th slice): the canvas service takes the object store as an
+ * injected per-user FACTORY, the same form brand-kit (45AH) and uploads (45AI)
+ * take, and the option is required so no save path can silently skip an upload.
+ *
+ * Every case in this file READS a canvas (or writes through the content
+ * repository): the factory is only reached on the save path's extraction step, so
+ * it is never called here. It throws instead of answering a stub, so an upload
+ * creeping into these cases fails loudly rather than passing against a store that
+ * does nothing.
+ */
+const noObjectStoreUploads = (): ObjectStore => {
+  throw new Error("canvas-media-storage does not upload objects");
+};
 
 type CanvasContentLike = {
   elements: Array<Record<string, any>>;
@@ -190,6 +206,7 @@ describe("CV-01 video object keys", () => {
     // the SAVE path; these cases read canvases, so it is never called.
     const service = createCanvasService({
       createUserClient: () => fake.client,
+      createObjectStore: noObjectStoreUploads,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -226,6 +243,7 @@ describe("CV-01 video object keys", () => {
     });
     const service = createCanvasService({
       createUserClient: () => fake.client,
+      createObjectStore: noObjectStoreUploads,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -308,6 +326,7 @@ describe("CV-01 video object keys", () => {
     // the SAVE path; these cases read canvases, so it is never called.
     const service = createCanvasService({
       createUserClient: () => fake.client,
+      createObjectStore: noObjectStoreUploads,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -340,6 +359,7 @@ describe("CV-01 video object keys", () => {
     });
     const service = createCanvasService({
       createUserClient: () => fake.client,
+      createObjectStore: noObjectStoreUploads,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -366,6 +386,7 @@ describe("CV-01 video object keys", () => {
     });
     const service = createCanvasService({
       createUserClient: () => fake.client,
+      createObjectStore: noObjectStoreUploads,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository({
         rows: [{ id: "asset-v1", bucket: "project-assets", object_path: "legacy-root/v1.mp4" }],
