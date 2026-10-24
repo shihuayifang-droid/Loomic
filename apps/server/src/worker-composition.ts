@@ -66,6 +66,9 @@ import {
   creditPoolsEnabled,
   withCreditPools,
 } from "./features/credits/credit-pools-billing.js";
+import { createObjectStore } from "./features/storage/object-store-factory.js";
+import type { ObjectStore } from "./features/storage/object-store.js";
+import type { SupabaseStorageLike } from "./features/storage/supabase-object-store.js";
 import type { ServerEnv } from "./config/env.js";
 import type { PgmqClient } from "./queue/pgmq-client.js";
 import type { AdminSupabaseClient } from "./supabase/admin.js";
@@ -106,6 +109,11 @@ export type WorkerBaseContext = {
   assetProvenanceRepository: AssetProvenanceRepository;
   assetReadRepository: AssetReadRepository;
   assetRecordRepository: AssetRecordRepository;
+  /**
+   * T-133 1c: the object storage the executors upload their output through.
+   * Built here, once, and handed to every executor context.
+   */
+  objectStore: ObjectStore;
 };
 
 export type WorkerComposition = {
@@ -219,6 +227,19 @@ export function buildWorkerComposition(
     getTransactionPool,
   });
 
+  // T-133 1c: the object storage the executors upload their output through.
+  //
+  // ONE instance, built once and reused by every message, the same way
+  // `worker.ts` and `app.ts` build theirs: `createObjectStore` picks the backend
+  // from `HAHART_STORAGE_PROVIDER`, and in `supabase` mode its delegate is LAZY —
+  // so this line constructs no client, reads no connection string and connects to
+  // nothing, exactly like the repositories above. The thunk is `getAdminClient`,
+  // the same lazy client the 1b fallback inside the executors used, so the bytes
+  // keep going to the buckets they went to before.
+  const objectStore: ObjectStore = createObjectStore(env, {
+    supabaseClient: () => getAdminClient() as unknown as SupabaseStorageLike,
+  });
+
   // ADR-0001 / workorder 21H1: the billing gate the worker runs before it
   // consumes an attempt or calls a model. Built here, lazily, exactly like the
   // attempt repository above and against the same `DATABASE_URL`. With no
@@ -283,6 +304,10 @@ export function buildWorkerComposition(
     assetReadRepository,
     // 44H: output ownership of image / tool / video jobs is recorded through this.
     assetRecordRepository,
+    // T-133 1c: the executors upload their output through this store, so the 1b
+    // transitional branch (`ctx.objectStore ?? <build one>`) is no longer reached
+    // on the production path — the 8th slice deletes that branch.
+    objectStore,
   };
 
   return {
