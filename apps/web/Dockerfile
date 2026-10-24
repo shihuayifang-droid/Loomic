@@ -17,7 +17,20 @@ COPY apps/web/package.json apps/web/
 COPY packages/shared/package.json packages/shared/
 COPY packages/config/package.json packages/config/
 
-RUN pnpm install --frozen-lockfile --ignore-scripts
+# Network tuning for the registry (OP-06/OP-07 deploy reliability). Measured on
+# the .37 host (2026-10-24): concurrent downloads from registry.npmjs.org get
+# ECONNRESET and per-package speed collapses to 3-47 KiB/s, while a single
+# threaded curl of the same 47MB tarball reaches 2.2 MB/s -- so the bandwidth is
+# fine and the failures are aborted parallel connections without enough retries.
+# Lower the concurrency and raise the retry/timeout budget instead.
+ARG NPM_NETWORK_CONCURRENCY=8
+ARG NPM_FETCH_RETRIES=6
+ARG NPM_FETCH_TIMEOUT=120000
+
+RUN pnpm install --frozen-lockfile --ignore-scripts \
+    --network-concurrency=$NPM_NETWORK_CONCURRENCY \
+    --fetch-retries=$NPM_FETCH_RETRIES \
+    --fetch-timeout=$NPM_FETCH_TIMEOUT
 
 COPY packages/shared/ packages/shared/
 COPY packages/config/ packages/config/

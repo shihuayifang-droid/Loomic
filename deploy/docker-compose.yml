@@ -31,6 +31,10 @@ services:
     build:
       context: ..
       dockerfile: apps/server/Dockerfile
+      args:
+        NPM_NETWORK_CONCURRENCY: "${NPM_NETWORK_CONCURRENCY:-8}"
+        NPM_FETCH_RETRIES: "${NPM_FETCH_RETRIES:-6}"
+        NPM_FETCH_TIMEOUT: "${NPM_FETCH_TIMEOUT:-120000}"
     restart: unless-stopped
     env_file: .env.production
     environment:
@@ -58,6 +62,10 @@ services:
     build:
       context: ..
       dockerfile: apps/server/Dockerfile
+      args:
+        NPM_NETWORK_CONCURRENCY: "${NPM_NETWORK_CONCURRENCY:-8}"
+        NPM_FETCH_RETRIES: "${NPM_FETCH_RETRIES:-6}"
+        NPM_FETCH_TIMEOUT: "${NPM_FETCH_TIMEOUT:-120000}"
     restart: unless-stopped
     env_file: .env.production
     environment:
@@ -71,6 +79,10 @@ services:
     build:
       context: ..
       dockerfile: apps/web/Dockerfile
+      args:
+        NPM_NETWORK_CONCURRENCY: "${NPM_NETWORK_CONCURRENCY:-8}"
+        NPM_FETCH_RETRIES: "${NPM_FETCH_RETRIES:-6}"
+        NPM_FETCH_TIMEOUT: "${NPM_FETCH_TIMEOUT:-120000}"
     restart: unless-stopped
     # Loopback only; the public entry point is the Cloudflare Tunnel (OP-09).
     ports:
