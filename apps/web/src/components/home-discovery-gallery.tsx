@@ -102,7 +102,7 @@ export function HomeDiscoveryGallery({
           <div>
             <h2 className="text-lg font-medium text-foreground">灵感发现</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              点击卡片后会直接按这条案例思路新建 Loomic 项目，并进入 agent 对话流。
+              点击卡片后会直接按这条案例思路新建 HaHart 项目，并进入 agent 对话流。
             </p>
           </div>
         </div>
@@ -165,7 +165,7 @@ export function HomeDiscoveryGallery({
                   </span>
                 </div>
                 <p className="mt-1 text-left text-xs text-muted-foreground">
-                  点击后直接作为 Loomic 的起始需求
+                  点击后直接作为 HaHart 的起始需求
                 </p>
               </div>
 

@@ -1072,7 +1072,7 @@ export function ChatSidebar({
       <div className="flex min-h-[48px] items-center justify-between pl-4 pr-2">
         <div className="flex items-center gap-1 min-w-0">
           <h2 className="text-sm font-semibold text-foreground shrink-0">
-            Loomic Agent
+            HaHart Agent
           </h2>
           {!sessionsLoading && (
             <SessionSelector

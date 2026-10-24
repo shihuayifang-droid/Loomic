@@ -234,7 +234,7 @@ export default function HomePage() {
         >
           <HaHartLogo className="size-7 text-foreground md:size-8" />
           <span className="text-lg font-semibold text-foreground md:text-xl">
-            Loomic
+            HaHart
           </span>
         </motion.div>
 

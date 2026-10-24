@@ -17,7 +17,7 @@ export function PricingNav() {
         <Link href="/" className="flex items-center gap-2">
           <HaHartLogo className="size-7 text-foreground" />
           <span className="text-base font-semibold tracking-tight">
-            Loomic
+            HaHart
           </span>
         </Link>
 
