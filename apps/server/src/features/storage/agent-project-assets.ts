@@ -62,6 +62,22 @@ import { createSupabaseObjectStore } from "./supabase-object-store.js";
 const storeFor = (client: UserSupabaseClient): ObjectStore =>
   createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
 
+/**
+ * 45AN (T-133 6b): resolve the `ObjectStore` for ONE operation.
+ *
+ * A supplied factory wins; absent one, the operation falls back to the adapter
+ * above. The fallback is a TRANSITION, not a supported shape: the slice that
+ * deletes it is 第 8 片, at which point `createObjectStore` becomes required and
+ * `storeFor` / `createSupabaseObjectStore` go away with it.
+ */
+const storeFrom = (
+  client: UserSupabaseClient,
+  createObjectStore?: (client: UserSupabaseClient) => ObjectStore,
+): ObjectStore =>
+  // TRANSITION (第 8 片删): no factory supplied -> today's adapter, byte-for-byte
+  // the same wrapping as before this slice.
+  createObjectStore ? createObjectStore(client) : storeFor(client);
+
 export type AgentProjectAssetErrorCode =
   | "no_canvas"
   | "canvas_not_found"
@@ -156,6 +172,14 @@ export function createAgentProjectAssetService(options: {
   /** Records the asset's ownership (44F). A missing repository fails closed. */
   assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
   createUserClient: (accessToken: string) => UserSupabaseClient;
+  /**
+   * 45AN (T-133 6b): the per-user object-store factory. Optional on purpose —
+   * every existing deps literal (tests included) keeps compiling unchanged, and
+   * a caller that does not supply one keeps the adapter path via `storeFrom`.
+   * It is always handed the USER client: reaching for another one here would
+   * upload with a privilege the caller's own RLS never granted.
+   */
+  createObjectStore?: (client: UserSupabaseClient) => ObjectStore;
 }): AgentProjectAssetService {
   return {
     async persist(input) {
@@ -193,7 +217,7 @@ export function createAgentProjectAssetService(options: {
       // client. 43G: the write goes through the `ObjectStore` seam; the message
       // keeps the backend's own text, read off the adapter's `detail`.
       try {
-        await storeFor(client).put(
+        await storeFrom(client, options.createObjectStore).put(
           { bucket: PROJECT_ASSET_BUCKET, key: objectPath },
           buffer,
           { contentType: input.mimeType, upsert: false },
@@ -243,7 +267,13 @@ export function createAgentProjectAssetService(options: {
         // there would create exactly the un-authorisable object X-52 exists to
         // eliminate, so remove it — best effort, but the failure is reported
         // either way, including when the cleanup itself fails.
-        await removeUploadedObject(client, objectPath, recordFailure);
+        await removeUploadedObject(
+          client,
+          objectPath,
+          recordFailure,
+          undefined,
+          options.createObjectStore,
+        );
         throw new AgentProjectAssetError(
           "metadata_failed",
           `Could not record asset metadata for the uploaded object: ${
@@ -278,7 +308,13 @@ export function createAgentProjectAssetService(options: {
           { actorId: input.createdBy, assetId },
           objectPath,
         );
-        await removeUploadedObject(client, objectPath, "sign_failed", assetId);
+        await removeUploadedObject(
+          client,
+          objectPath,
+          "sign_failed",
+          assetId,
+          options.createObjectStore,
+        );
         throw new AgentProjectAssetError(
           "sign_failed",
           error instanceof ProjectAssetUrlError
@@ -345,12 +381,15 @@ async function removeUploadedObject(
   objectPath: string,
   reason: string | undefined,
   assetId?: string,
+  createObjectStore?: (client: UserSupabaseClient) => ObjectStore,
 ): Promise<void> {
   try {
     // 43G: the removal goes through the `ObjectStore` seam. The adapter turns a
     // backend refusal into an `ObjectStoreError`, so it lands in the catch below
     // and this cleanup keeps reporting the failure instead of passing silently.
-    await storeFor(client).delete([
+    // 45AN (6b): the same seam, resolved through the caller's factory when one
+    // was supplied — the cleanup must not outlive the store that wrote the bytes.
+    await storeFrom(client, createObjectStore).delete([
       { bucket: PROJECT_ASSET_BUCKET, key: objectPath },
     ]);
   } catch (error) {

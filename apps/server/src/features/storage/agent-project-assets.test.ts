@@ -31,6 +31,7 @@ import type {
   CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
 import type { UserSupabaseClient } from "../../supabase/user.js";
+import type { ObjectStore } from "./object-store.js";
 import {
   AgentProjectAssetError,
   buildAgentObjectPath,
@@ -62,6 +63,11 @@ function makeHarness(options: {
   /** Canvas link returns nothing, i.e. the ACL hid it. */
   canvasHidden?: boolean;
   canvasError?: { message: string } | null;
+  /**
+   * 45AN (T-133 6b): supply an `ObjectStore` factory, so the case measures the
+   * "factory was given" path. Absent → the transition branch (the adapter).
+   */
+  withFactory?: boolean;
 }) {
   const uploads: UploadCall[] = [];
   const removes: RemoveCall[] = [];
@@ -72,6 +78,53 @@ function makeHarness(options: {
   const events: string[] = [];
   let signedPaths: string[] = [];
   let tableReads = 0;
+  // 45AN (T-133 6b): what a supplied factory was handed and what the store it
+  // returned was asked to do. Kept apart from `uploads`, because the property
+  // being measured is WHICH of the two paths served the write.
+  const factoryClients: unknown[] = [];
+  const factoryPuts: {
+    bucket: string;
+    key: string;
+    bytes: number;
+    contentType?: string;
+  }[] = [];
+  const factoryDeletes: { bucket: string; key: string }[] = [];
+  const factoryStore = {
+    async put(
+      ref: { bucket: string; key: string },
+      body: { length: number },
+      putOptions?: { contentType?: string },
+    ): Promise<void> {
+      if (options.uploadError) throw new Error(options.uploadError.message);
+      factoryPuts.push({
+        bucket: ref.bucket,
+        key: ref.key,
+        bytes: body.length,
+        ...(putOptions?.contentType
+          ? { contentType: putOptions.contentType }
+          : {}),
+      });
+    },
+    async get(): Promise<never> {
+      throw new Error("ObjectStore.get is not used by this path");
+    },
+    async head(): Promise<never> {
+      throw new Error("ObjectStore.head is not used by this path");
+    },
+    async delete(refs: readonly { bucket: string; key: string }[]) {
+      for (const ref of refs) factoryDeletes.push({ ...ref });
+      if (options.removeError) throw new Error(options.removeError.message);
+    },
+    async copy(): Promise<never> {
+      throw new Error("ObjectStore.copy is not used by this path");
+    },
+    async signedReadUrl(): Promise<never> {
+      throw new Error("ObjectStore.signedReadUrl is not used by this path");
+    },
+    async signedReadUrls(): Promise<never> {
+      throw new Error("ObjectStore.signedReadUrls is not used by this path");
+    },
+  } as unknown as ObjectStore;
 
   const userClient = {
     // The canvas and the metadata row are repositories' business now (工单21AC),
@@ -176,6 +229,16 @@ function makeHarness(options: {
     assetWriteRepository,
     createUserClient: () => userClient as unknown as UserSupabaseClient,
     assetRecordRepository,
+    // 45AN (T-133 6b): only the cases that ask for it inject the factory, so the
+    // other cases keep measuring the transition branch (the adapter).
+    ...(options.withFactory
+      ? {
+          createObjectStore: (client: UserSupabaseClient) => {
+            factoryClients.push(client);
+            return factoryStore;
+          },
+        }
+      : {}),
   });
 
   return {
@@ -189,6 +252,11 @@ function makeHarness(options: {
     signedPaths: () => signedPaths,
     /** How many table reads the caller's client was asked for — must stay zero. */
     tableReads: () => tableReads,
+    /** 45AN (6b): the clients a supplied factory was handed, and its writes. */
+    userClient,
+    factoryClients,
+    factoryPuts,
+    factoryDeletes,
   };
 }
 
@@ -443,6 +511,64 @@ describe("agent project asset persistence (T1)", () => {
     expect(result.objectPath.startsWith(`${WORKSPACE}/agent/${CANVAS}/`)).toBe(true);
     expect(result.objectPath).not.toContain("..");
     expect(result.objectPath).not.toContain(" ");
+  });
+
+  it("case 13: a supplied factory serves the upload, and is handed the USER client", async () => {
+    const h = makeHarness({ withFactory: true });
+    const result = await persist(h);
+
+    // 45AN (T-133 6b): the factory is called with the caller's own client, never
+    // a second one — the upload must carry the JWT's authority, not more.
+    expect(h.factoryClients).toEqual([h.userClient]);
+    // The write went through the factory's store, and the record IS the upload:
+    // same bucket, same key, same byte count the caller is told about.
+    expect(h.factoryPuts).toHaveLength(1);
+    expect(h.factoryPuts[0]).toMatchObject({
+      bucket: "project-assets",
+      key: result.objectPath,
+      bytes: PNG.length,
+      contentType: "image/png",
+    });
+    // The adapter path was NOT the one that wrote: the client's own storage
+    // surface saw no upload at all.
+    expect(h.uploads).toHaveLength(0);
+    // Everything after the upload is unchanged — same identity, same read.
+    expect(result.bucket).toBe("project-assets");
+    expect(result.byteSize).toBe(PNG.length);
+    expect(h.signedPaths()).toEqual([result.objectPath]);
+    expect(h.records).toHaveLength(1);
+  });
+
+  it("case 14: no factory supplied keeps the adapter path (transition branch)", async () => {
+    const h = makeHarness({});
+    const result = await persist(h);
+
+    // The factory was never asked for, so today's adapter served the write.
+    expect(h.factoryClients).toHaveLength(0);
+    expect(h.factoryPuts).toHaveLength(0);
+    expect(h.uploads).toHaveLength(1);
+    expect(h.uploads[0]).toMatchObject({
+      bucket: "project-assets",
+      path: result.objectPath,
+      bytes: PNG.length,
+      contentType: "image/png",
+    });
+  });
+
+  it("case 15: with a factory, the compensation delete goes through the same store", async () => {
+    const h = makeHarness({
+      recordError: { message: "record exploded" },
+      withFactory: true,
+    });
+
+    await expect(persist(h)).rejects.toMatchObject({ code: "metadata_failed" });
+
+    expect(h.factoryPuts).toHaveLength(1);
+    // The object removed is the one this store wrote — not looked up elsewhere.
+    expect(h.factoryDeletes).toEqual([
+      { bucket: "project-assets", key: h.factoryPuts[0]?.key },
+    ]);
+    expect(h.removes).toHaveLength(0);
   });
 });
 

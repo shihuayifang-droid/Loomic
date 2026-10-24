@@ -2044,6 +2044,14 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
                 : {}),
               createUserClient: (token) =>
                 createClient(token) as UserSupabaseClient,
+              // 45AN (T-133 6b): this service is built here as well as in the
+              // tools, so the factory has to reach it here too — otherwise the
+              // image-persist path would keep the adapter while the sandbox-file
+              // path used the injected store. Same optional shape as the fields
+              // above (`exactOptionalPropertyTypes`).
+              ...(options.createObjectStore
+                ? { createObjectStore: options.createObjectStore }
+                : {}),
             });
 
             // LOCAL FORK: retry. Storage latency on a free instance (ours is

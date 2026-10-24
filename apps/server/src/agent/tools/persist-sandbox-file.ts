@@ -70,11 +70,12 @@ export type PersistSandboxFileDeps = {
   assetRecordRepository: Pick<AssetRecordRepository, "recordProjectAsset">;
   createUserClient: (accessToken: string) => SupabaseClient;
   /**
-   * T-133 6a: 透传占位，6b 起由 agent-project-assets 消费。
+   * T-133 6a → 6b: the per-user object-store factory, carried down to
+   * `agent-project-assets` where 6b consumes it (a supplied factory serves the
+   * upload; absent one that service keeps its adapter fallback).
    *
    * Optional on purpose: the existing deps literals (tests included) must keep
-   * compiling unchanged. Nothing in this file reads it yet — this slice only
-   * carries the factory down to where 6b will consume it.
+   * compiling unchanged.
    */
   createObjectStore?: (client: UserSupabaseClient) => ObjectStore;
   /**
@@ -127,6 +128,13 @@ export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
     assetRecordRepository: deps.assetRecordRepository,
     createUserClient: (accessToken) =>
       deps.createUserClient(accessToken) as unknown as UserSupabaseClient,
+    // T-133 6b: handed straight to the asset service, so the object store this
+    // tool writes through is the one the composition root chose. Conditional
+    // spread because `exactOptionalPropertyTypes: true` rejects an explicit
+    // `undefined` for an optional property (TS2379).
+    ...(deps.createObjectStore
+      ? { createObjectStore: deps.createObjectStore }
+      : {}),
   });
 
   return tool(
