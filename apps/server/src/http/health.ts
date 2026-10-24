@@ -11,7 +11,7 @@ export async function registerHealthRoutes(
   app.get("/api/health", async (_request, reply) => {
     const payload = healthResponseSchema.parse({
       ok: true,
-      service: "loomic-server",
+      service: "hahart-server",
       version: env.version,
     });
 

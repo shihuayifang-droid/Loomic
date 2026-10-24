@@ -28,12 +28,12 @@ describe("@loomic/shared contracts", () => {
   it("shares the health response schema for server and web", () => {
     const parsed = healthResponseSchema.parse({
       ok: true,
-      service: "loomic-server",
+      service: "hahart-server",
       version: "0.1.0",
     });
 
     expect(parsed.ok).toBe(true);
-    expect(parsed.service).toBe("loomic-server");
+    expect(parsed.service).toBe("hahart-server");
   });
 
   it("accepts canvasId as optional field", () => {

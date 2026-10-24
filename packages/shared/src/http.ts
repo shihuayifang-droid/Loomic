@@ -20,7 +20,7 @@ import {
 
 export const healthResponseSchema = z.object({
   ok: z.literal(true),
-  service: z.literal("loomic-server"),
+  service: z.literal("hahart-server"),
   version: z.string().min(1),
 });
 
