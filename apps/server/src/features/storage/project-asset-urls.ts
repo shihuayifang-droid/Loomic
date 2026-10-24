@@ -18,6 +18,7 @@ import type { UserSupabaseClient } from "../../supabase/user.js";
 // the failure wording — now come from the `ObjectStore` adapter, so a future
 // backend swap does not have to touch the fifteen call sites that trust it.
 import { ObjectStoreError } from "./object-store.js";
+import type { ObjectStore } from "./object-store.js";
 import { createSupabaseObjectStore } from "./supabase-object-store.js";
 import type { SupabaseStorageLike } from "./supabase-object-store.js";
 
@@ -121,6 +122,45 @@ export type ProjectAssetSigningClient = {
   };
 };
 
+/**
+ * Everything this module accepts as the thing that signs.
+ *
+ * T-133 slice 9 step 1: the seam is being widened from "a Supabase-shaped client"
+ * to "a Supabase-shaped client OR an `ObjectStore`". Both spellings are live at
+ * the same time on purpose — the fifteen call sites still hand in a client, and
+ * the slices that follow move them over one service at a time. This is a
+ * TRANSITIONAL shape: slice 10 deletes the legacy member below (and the
+ * `createSupabaseObjectStore` hop that serves it), and only then does
+ * `ObjectStore` become the one answer. Until that deletion, both branches must
+ * stay behaviourally identical, which is why they share the TTL and the option
+ * building rather than each growing their own copy.
+ */
+export type ProjectAssetSigningSource =
+  | UserSupabaseClient
+  | AdminSupabaseClient
+  | ProjectAssetSigningClient
+  | ObjectStore;
+
+/**
+ * Which of the two shapes above was handed in.
+ *
+ * Structural, because the whole point of the union is that the two shapes share
+ * no nominal tag: a Supabase client carries a `storage` namespace, an
+ * `ObjectStore` has the seam's own methods, and `signedReadUrl` is the one method
+ * that only the seam has. (The dependency audit reads raw source text, so this
+ * comment deliberately does not spell out the SDK's bucket-lookup call: a mention
+ * would be counted as a call site.)
+ * Written defensively (`?.` plus a `typeof` test) because the call sites are typed
+ * loosely enough to pass `undefined`/`null` through in practice: a missing client
+ * must be treated as "not a store" and fail the way it always did, rather than
+ * throwing a new TypeError out of the guard itself.
+ */
+export function isObjectStoreSource(value: unknown): value is ObjectStore {
+  return (
+    typeof (value as ObjectStore | null | undefined)?.signedReadUrl === "function"
+  );
+}
+
 export type SignProjectAssetOptions = {
   ttlSeconds?: number;
   transform?: ProjectAssetTransform;
@@ -139,18 +179,28 @@ export type SignProjectAssetOptions = {
  * is an answer, not a failure to paper over.
  */
 export async function signProjectAssetUrl(
-  client: UserSupabaseClient | AdminSupabaseClient | ProjectAssetSigningClient,
+  client: ProjectAssetSigningSource,
   objectPath: string,
   options: SignProjectAssetOptions = {},
 ): Promise<string> {
   const bucket = options.bucket ?? PROJECT_ASSET_BUCKET;
   const ttl = options.ttlSeconds ?? PROJECT_ASSET_URL_TTL_SECONDS;
 
-  // The cast is only about the type: the adapter reaches nothing but the signed
-  // URL call, which is the one method every structural stub of this module has
-  // always had to provide. Making the type name the rest of the SDK surface would
-  // widen the requirement on the callers' clients for no runtime difference.
-  const store = createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
+  // T-133 slice 9 step 1, the two branches: a caller that already speaks the
+  // seam signs directly; a caller that still holds a Supabase client keeps the
+  // adapter hop it has had since 43C. Both end in the same `signedReadUrl` call
+  // with the same ref, TTL and optional parts, so this is a widening of what is
+  // accepted, not a new way for a URL to be produced. Slice 10 removes the
+  // adapter hop.
+  //
+  // The cast in the else arm is only about the type: the adapter reaches nothing
+  // but the signed URL call, which is the one method every structural stub of
+  // this module has always had to provide. Making the type name the rest of the
+  // SDK surface would widen the requirement on the callers' clients for no
+  // runtime difference.
+  const store = isObjectStoreSource(client)
+    ? client
+    : createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
 
   try {
     // Only send the optional parts when the caller asked for them: a plain
@@ -183,12 +233,47 @@ export async function signProjectAssetUrl(
  * one". One bad object must not deny the rest of a list.
  */
 export async function signProjectAssetUrls(
-  client: UserSupabaseClient | AdminSupabaseClient | ProjectAssetSigningClient,
+  client: ProjectAssetSigningSource,
   objectPaths: readonly string[],
   options: SignProjectAssetOptions = {},
 ): Promise<Map<string, string>> {
   const signed = new Map<string, string>();
   const unique = [...new Set(objectPaths)].filter((path) => path.length > 0);
+
+  // T-133 slice 9 step 1: an `ObjectStore` caller that asked for nothing but
+  // plain URLs gets the seam's own batch call, one round trip for the whole set.
+  // The gate is on the options because `signedReadUrls` carries only a TTL: with
+  // a transform or a download name there is no batch spelling of the request, so
+  // those fall through to the per-path loop below and reach `signedReadUrl` —
+  // the one place that decides how a single signature is made, whichever shape
+  // was handed in.
+  if (
+    isObjectStoreSource(client) &&
+    !options.transform &&
+    !options.download &&
+    unique.length > 0
+  ) {
+    const bucket = options.bucket ?? PROJECT_ASSET_BUCKET;
+    const ttl = options.ttlSeconds ?? PROJECT_ASSET_URL_TTL_SECONDS;
+
+    try {
+      const answered = await client.signedReadUrls(bucket, unique, {
+        ttlSeconds: ttl,
+      });
+      // Same answer as the loop below: a key the backend did not sign is simply
+      // ABSENT, and the order is the order the caller asked in.
+      for (const path of unique) {
+        const url = answered.get(path);
+        if (url) signed.set(path, url);
+      }
+      return signed;
+    } catch {
+      // This function has never thrown: one unusable key must not deny the rest,
+      // and a batch the backend rejected wholesale is the same answer as a batch
+      // that came back empty.
+      return signed;
+    }
+  }
 
   const results = await Promise.all(
     unique.map(async (path) => {

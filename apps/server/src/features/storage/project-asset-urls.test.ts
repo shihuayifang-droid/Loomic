@@ -13,6 +13,12 @@ import {
   withWebpFormat,
   type ProjectAssetSigningClient,
 } from "./project-asset-urls.js";
+import { ObjectStoreError } from "./object-store.js";
+import type {
+  ObjectRef,
+  ObjectStore,
+  SignedReadUrlOptions,
+} from "./object-store.js";
 
 type Call = {
   bucket: string;
@@ -315,5 +321,268 @@ describe("OP-05 signing through the ObjectStore", () => {
 
     expect(thrown).toBeInstanceOf(ProjectAssetUrlError);
     expect(thrown?.message).toBe("Could not sign the stored object (boom).");
+  });
+});
+
+// T-133 slice 9 step 1: the signing seam accepts a second shape. Until now the
+// only thing it could sign with was a Supabase-shaped client, which is exactly why
+// the adapter below it could not be deleted: every caller held a client. This
+// block pins the OTHER shape — a bare `ObjectStore` — and pins it against the same
+// answers the client shape gives above: the same ref, the same default TTL, the
+// same optional parts, the same failure wording. Slice 10 deletes the legacy
+// branch; the cases in `OP-05 signing through the ObjectStore` are what must keep
+// passing until then, and these are what has to survive that deletion.
+describe("T-133: signing through a bare ObjectStore", () => {
+  type SignCall = { ref: ObjectRef; options: SignedReadUrlOptions };
+  type BatchCall = {
+    bucket: string;
+    keys: readonly string[];
+    options: { ttlSeconds: number };
+  };
+
+  function makeStore(
+    behaviour: {
+      refusing?: string;
+      rawError?: Error;
+      failWholesale?: boolean;
+    } = {},
+  ) {
+    const single: SignCall[] = [];
+    const batches: BatchCall[] = [];
+
+    const store = {
+      put: async () => {
+        throw new Error("put is not part of the signing seam");
+      },
+      get: async () => {
+        throw new Error("get is not part of the signing seam");
+      },
+      head: async () => null,
+      delete: async () => {
+        throw new Error("delete is not part of the signing seam");
+      },
+      copy: async () => {
+        throw new Error("copy is not part of the signing seam");
+      },
+      signedReadUrl: async (
+        ref: ObjectRef,
+        options: SignedReadUrlOptions,
+      ): Promise<string> => {
+        single.push({ ref, options });
+        if (behaviour.rawError) throw behaviour.rawError;
+        if (behaviour.refusing) {
+          throw new ObjectStoreError(
+            "backend_failed",
+            `Could not sign the stored object (${behaviour.refusing}).`,
+          );
+        }
+        return `https://volume.test/${ref.bucket}/${ref.key}?sig=1`;
+      },
+      signedReadUrls: async (
+        bucket: string,
+        keys: readonly string[],
+        options: { ttlSeconds: number },
+      ): Promise<Map<string, string>> => {
+        batches.push({ bucket, keys, options });
+        if (behaviour.failWholesale) {
+          throw new ObjectStoreError(
+            "backend_failed",
+            "Could not sign the stored objects.",
+          );
+        }
+        const answered = new Map<string, string>();
+        for (const key of keys) {
+          answered.set(key, `https://volume.test/${bucket}/${key}?sig=1`);
+        }
+        return answered;
+      },
+    };
+
+    return { store: store as unknown as ObjectStore, single, batches };
+  }
+
+  it("T-133: one object is signed through signedReadUrl with the default bucket and TTL", async () => {
+    const seam = makeStore();
+
+    const url = await signProjectAssetUrl(seam.store, "ws/p/a.png");
+
+    expect(seam.single).toEqual([
+      {
+        ref: { bucket: PROJECT_ASSET_BUCKET, key: "ws/p/a.png" },
+        options: { ttlSeconds: PROJECT_ASSET_URL_TTL_SECONDS },
+      },
+    ]);
+    expect(seam.single[0]?.options.ttlSeconds).toBe(3600);
+    expect(url).toBe(
+      `https://volume.test/${PROJECT_ASSET_BUCKET}/ws/p/a.png?sig=1`,
+    );
+  });
+
+  it("T-133: bucket, TTL, transform and download travel unchanged on the store branch", async () => {
+    const seam = makeStore();
+
+    await signProjectAssetUrl(seam.store, "canvases/team/p/legacy.png", {
+      bucket: "canvases",
+      ttlSeconds: 60,
+      transform: { width: 512, height: 512, resize: "contain" },
+      download: "角色-小橘.png",
+    });
+
+    // Same ref shape, same option names, same TTL rule as the client branch: the
+    // seam is being widened, not re-worded.
+    expect(seam.single).toEqual([
+      {
+        ref: { bucket: "canvases", key: "canvases/team/p/legacy.png" },
+        options: {
+          ttlSeconds: 60,
+          transform: { width: 512, height: 512, resize: "contain" },
+          download: "角色-小橘.png",
+        },
+      },
+    ]);
+  });
+
+  it("T-133: a store refusal is reported as a signing failure with the adapter's wording", async () => {
+    const seam = makeStore({ refusing: "boom" });
+
+    const thrown = await signProjectAssetUrl(seam.store, "ws/p/secret.png")
+      .then(() => null)
+      .catch((error: unknown) => error as ProjectAssetUrlError);
+
+    // Byte for byte what the client branch throws (case above), and it still
+    // carries neither the object key nor a URL.
+    expect(thrown).toBeInstanceOf(ProjectAssetUrlError);
+    expect(thrown?.code).toBe("sign_failed");
+    expect(thrown?.message).toBe("Could not sign the stored object (boom).");
+    expect(thrown?.message).not.toContain("secret.png");
+  });
+
+  it("T-133: a non-store failure is not reworded on the store branch either", async () => {
+    const raw = new Error("the volume is not mounted");
+    const seam = makeStore({ rawError: raw });
+
+    const thrown = await signProjectAssetUrl(seam.store, "ws/p/a.png")
+      .then(() => null)
+      .catch((error: unknown) => error);
+
+    expect(thrown).toBe(raw);
+    expect(thrown).not.toBeInstanceOf(ProjectAssetUrlError);
+  });
+
+  it("T-133: a client that merely carries a non-function signedReadUrl keeps the legacy route", async () => {
+    const buckets: string[] = [];
+    const client = {
+      storage: {
+        from(bucket: string) {
+          buckets.push(bucket);
+          return {
+            createSignedUrl: async (path: string) => ({
+              data: { signedUrl: `https://proj.test/sign/${bucket}/${path}?token=sig` },
+              error: null,
+            }),
+          };
+        },
+      },
+      // Present but not callable: it must not be taken for a store.
+      signedReadUrl: undefined,
+    };
+
+    const url = await signProjectAssetUrl(
+      client as unknown as ProjectAssetSigningClient,
+      "ws/p/a.png",
+    );
+
+    expect(buckets).toEqual([PROJECT_ASSET_BUCKET]);
+    expect(url).toContain("token=sig");
+  });
+
+  it("T-133: an absent client is not mistaken for a store", async () => {
+    // The guard itself must survive a null/undefined argument: the failure has to
+    // come from the signing attempt, not from the branch test.
+    await expect(
+      signProjectAssetUrl(
+        undefined as unknown as ProjectAssetSigningClient,
+        "ws/p/a.png",
+      ),
+    ).rejects.toThrow();
+
+    await expect(
+      signProjectAssetUrl(
+        null as unknown as ProjectAssetSigningClient,
+        "ws/p/a.png",
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("T-133: a batch on the store branch is one signedReadUrls call", async () => {
+    const seam = makeStore();
+
+    const signed = await signProjectAssetUrls(seam.store, [
+      "ws/p/a.png",
+      "ws/p/gone.png",
+      "ws/p/b.png",
+      "ws/p/a.png",
+      "",
+    ]);
+
+    expect(seam.batches).toEqual([
+      {
+        bucket: PROJECT_ASSET_BUCKET,
+        // Deduplicated and with the empty path dropped, in the caller's order.
+        keys: ["ws/p/a.png", "ws/p/gone.png", "ws/p/b.png"],
+        options: { ttlSeconds: PROJECT_ASSET_URL_TTL_SECONDS },
+      },
+    ]);
+    // No per-object request: the batch spelling is the whole point.
+    expect(seam.single).toHaveLength(0);
+    expect([...signed.keys()]).toEqual([
+      "ws/p/a.png",
+      "ws/p/gone.png",
+      "ws/p/b.png",
+    ]);
+    expect(signed.get("ws/p/b.png")).toContain("sig=1");
+  });
+
+  it("T-133: a batch the store rejects wholesale answers with no URLs and no throw", async () => {
+    const seam = makeStore({ failWholesale: true });
+
+    const signed = await signProjectAssetUrls(seam.store, [
+      "ws/p/a.png",
+      "ws/p/b.png",
+    ]);
+
+    expect(seam.batches).toHaveLength(1);
+    expect(signed.size).toBe(0);
+  });
+
+  it("T-133: an empty batch on the store branch sends no request", async () => {
+    const seam = makeStore();
+
+    const signed = await signProjectAssetUrls(seam.store, []);
+
+    expect(signed.size).toBe(0);
+    expect(seam.batches).toHaveLength(0);
+    expect(seam.single).toHaveLength(0);
+  });
+
+  it("T-133: a transform keeps the batch on the per-path route", async () => {
+    const seam = makeStore();
+
+    // `signedReadUrls` carries a TTL only, so a batch that also asks for a
+    // transform has no batch spelling and must go one path at a time — through
+    // the same single-signature branch.
+    const signed = await signProjectAssetUrls(
+      seam.store,
+      ["ws/p/a.png", "ws/p/b.png"],
+      { transform: { width: 256, height: 256, resize: "cover" } },
+    );
+
+    expect(seam.batches).toHaveLength(0);
+    expect(seam.single).toHaveLength(2);
+    expect(seam.single[0]?.options).toEqual({
+      ttlSeconds: PROJECT_ASSET_URL_TTL_SECONDS,
+      transform: { width: 256, height: 256, resize: "cover" },
+    });
+    expect([...signed.keys()].sort()).toEqual(["ws/p/a.png", "ws/p/b.png"]);
   });
 });
