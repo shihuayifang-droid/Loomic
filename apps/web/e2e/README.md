@@ -1,7 +1,9 @@
 # Web composer E2E (Playwright)
 
-- Run: build first (`NEXT_PUBLIC_HAHART_AUTH_PROVIDER=self`, `NEXT_PUBLIC_SERVER_BASE_URL=same-origin`
-  `pnpm --filter @loomic/web build`), then `pnpm --filter @loomic/web e2e`.
+- Run: build first with the two env vars set, then `pnpm --filter @loomic/web e2e`.
+  - PowerShell: `$env:NEXT_PUBLIC_HAHART_AUTH_PROVIDER="self"; $env:NEXT_PUBLIC_SERVER_BASE_URL="same-origin"; pnpm --filter @loomic/web build`
+  - bash: `NEXT_PUBLIC_HAHART_AUTH_PROVIDER=self NEXT_PUBLIC_SERVER_BASE_URL=same-origin pnpm --filter @loomic/web build`
+  - Warning: do not use cmd `set X=v&& ...` (the space before `&&` becomes part of the value, so the build does not use the self auth provider).
 - Uses the machine's installed Microsoft Edge (`channel: "msedge"`); no browser is downloaded.
 - `static-server.mjs` serves `apps/web/out` on port 4317; `/api/*` is 404 there.
 - Every API call is mocked with `page.route` in `fixtures.ts`; no real backend, account or key.
