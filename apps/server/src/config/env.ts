@@ -82,6 +82,12 @@ export type ServerEnv = {
   googleVertexLocation?: string;
   googleVertexProject?: string;
   googleVertexVideoLocation?: string;
+  /**
+   * HAHART_IMAGE_PROVIDER_MOCK=1|true: every image provider that would be
+   * registered is replaced by an offline mock with the same name and models
+   * (deterministic fake image, no network). Absent / false = real providers.
+   */
+  hahartImageProviderMock?: boolean;
   metasoApiBase?: string;
   metasoApiKey?: string;
   openAIApiBase?: string;
@@ -352,6 +358,13 @@ export function loadServerEnv(
     parseAgentFilesRoot(source.LOOMIC_AGENT_FILES_ROOT);
   const databaseUrl =
     overrides.databaseUrl ?? normalizeOptionalString(source.DATABASE_URL);
+  // Read through the index signature, same reason as NODE_ENV in
+  // `isProductionEnv`: keeps this test switch out of the `.env.example` scan.
+  const hahartImageProviderMock =
+    overrides.hahartImageProviderMock ??
+    /^(1|true)$/i.test(
+      normalizeOptionalString(source["HAHART_IMAGE_PROVIDER_MOCK"]) ?? "",
+    );
   const openAIApiBase =
     overrides.openAIApiBase ?? normalizeOptionalString(source.OPENAI_API_BASE);
   const openAIApiKey =
@@ -549,6 +562,7 @@ export function loadServerEnv(
     ...(googleApiBase ? { googleApiBase } : {}),
     ...(googleApiKey ? { googleApiKey } : {}),
     ...(googleApplicationCredentials ? { googleApplicationCredentials } : {}),
+    ...(hahartImageProviderMock ? { hahartImageProviderMock } : {}),
     ...(openAIApiBase ? { openAIApiBase } : {}),
     ...(openAIApiKey ? { openAIApiKey } : {}),
     ...(supabaseUrl ? { supabaseUrl } : {}),

@@ -6,11 +6,13 @@
  * source of truth so that adding a new provider only requires a change here.
  */
 import type { ServerEnv } from "../../config/env.js";
+import type { ImageProvider } from "../types.js";
 import { GoogleImageProvider } from "./google-image.js";
 import { GoogleVertexImageProvider } from "./google-vertex-image.js";
 import { GoogleVertexVideoProvider } from "./google-vertex-video.js";
 import { GoogleVideoProvider } from "./google-video.js";
 import { MetasoVideoProvider } from "./metaso-video.js";
+import { MockImageProvider } from "./mock-image.js";
 import { OpenAIImageProvider } from "./openai-image.js";
 import { registerImageProvider, registerVideoProvider } from "./registry.js";
 import { ReplicateImageProvider } from "./replicate-image.js";
@@ -25,6 +27,14 @@ import { VolcesImageProvider } from "./volces-image.js";
  * ensuring every process gets the full set.
  */
 export function registerAllProviders(env: ServerEnv): void {
+  // HAHART_IMAGE_PROVIDER_MOCK: every image provider that WOULD be registered is
+  // replaced by an offline mock with the same name and models (video untouched).
+  const registerImage = (provider: ImageProvider): void => {
+    registerImageProvider(
+      env.hahartImageProviderMock ? new MockImageProvider(provider) : provider,
+    );
+  };
+
   // Metaso — MiniMax H3 V2 video
   if (env.metasoApiKey) {
     registerVideoProvider(
@@ -34,7 +44,7 @@ export function registerAllProviders(env: ServerEnv): void {
 
   // Replicate — image + video
   if (env.replicateApiToken) {
-    registerImageProvider(new ReplicateImageProvider(env.replicateApiToken));
+    registerImage(new ReplicateImageProvider(env.replicateApiToken));
     registerVideoProvider(new ReplicateVideoProvider(env.replicateApiToken));
   }
 
@@ -45,9 +55,7 @@ export function registerAllProviders(env: ServerEnv): void {
   // multi-reference-image input (up to 14 on Gemini 3 Pro), aspect ratio and
   // 1K/2K/4K sizing, none of which the OpenAI-style path supports here.
   if (env.googleApiKey) {
-    registerImageProvider(
-      new GoogleImageProvider(env.googleApiKey, env.googleApiBase),
-    );
+    registerImage(new GoogleImageProvider(env.googleApiKey, env.googleApiBase));
     registerVideoProvider(new GoogleVideoProvider(env.googleApiKey));
   }
 
@@ -59,7 +67,7 @@ export function registerAllProviders(env: ServerEnv): void {
       project: env.googleVertexProject,
       location: env.googleVertexLocation,
     };
-    registerImageProvider(new GoogleVertexImageProvider(vertexConfig));
+    registerImage(new GoogleVertexImageProvider(vertexConfig));
 
     const videoLocation =
       env.googleVertexVideoLocation ?? env.googleVertexLocation;
@@ -73,15 +81,11 @@ export function registerAllProviders(env: ServerEnv): void {
 
   // OpenAI — image only
   if (env.openAIApiKey) {
-    registerImageProvider(
-      new OpenAIImageProvider(env.openAIApiKey, env.openAIApiBase),
-    );
+    registerImage(new OpenAIImageProvider(env.openAIApiKey, env.openAIApiBase));
   }
 
   // Volces — image only
   if (env.volcesApiKey) {
-    registerImageProvider(
-      new VolcesImageProvider(env.volcesApiKey, env.volcesBaseUrl),
-    );
+    registerImage(new VolcesImageProvider(env.volcesApiKey, env.volcesBaseUrl));
   }
 }
