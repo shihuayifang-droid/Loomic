@@ -26,6 +26,11 @@ import { startSchedules } from "./features/schedules/schedule-runner.js";
 import { createJobCreditsLinkRepository } from "./db/job-credits-link-repository.js";
 import { createRefundCompensationRepository } from "./db/refund-compensation-repository.js";
 import { createJobStuckReaderRepository } from "./db/job-stuck-reader-repository.js";
+import { createObjectReferenceRepository } from "./db/object-reference-repository.js";
+import {
+  createFsObjectLister,
+  scanOrphanObjects,
+} from "./features/storage/orphan-object-scan.js";
 import { createPoolGrantWriteRepository } from "./db/pool-grant-write-repository.js";
 import { buildWorkerComposition } from "./worker-composition.js";
 import { getExecutor, type ExecutorContext } from "./features/jobs/job-executor.js";
@@ -202,6 +207,28 @@ async function main() {
           log: (m) => console.log(`${tag} [refund-compensator] ${m}`),
         });
       },
+      // Workorder 45L: report-only orphan inspection (no deletion), fs mode only.
+      ...(env.storageProvider === "fs" && env.objectRoot
+        ? {
+            orphan_asset_cleanup: async () => {
+              const references = createObjectReferenceRepository({
+                getTransactionPool: getPool,
+              });
+              const report = await scanOrphanObjects({
+                listObjects: createFsObjectLister(env.objectRoot as string),
+                isReferenced: (refs) => references.findReferenced(refs),
+                now: () => Date.now(),
+                minAgeMs: 24 * 60 * 60 * 1000,
+              });
+              console.log(
+                `${tag} [orphan-scan] scanned=${report.scanned} referenced=${report.referenced} orphans=${report.orphans} tooNew=${report.tooNew}`,
+              );
+              if (report.orphans > 0) {
+                throw new Error(`orphan objects found: ${report.orphans}`);
+              }
+            },
+          }
+        : {}),
       ...(shouldStartTeamCycleGrant()
         ? {
             team_cycle_grant: async () => {

@@ -7,7 +7,7 @@
  * of pretending, and an entry that is really a read-time decision says `on_read`
  * instead of getting a timer it does not need.
  *
- * Three entries are `running` today. Every one of them is driven by
+ * Four entries are `running` today. Every one of them is driven by
  * `startSchedules` (`./schedule-runner.ts`) from the worker process; nothing in
  * this file runs anything by itself.
  *
@@ -72,9 +72,9 @@ export const SCHEDULE_CATALOG: readonly ScheduleEntry[] = [
     cadence: { kind: "daily", atBeijing: "03:30" },
     timeZone: "Asia/Shanghai",
     owns: "GN-24",
-    alert: "none",
-    status: "not_built",
-    note: "随自主存储（OP-05）实现",
+    alert: "on_failure",
+    status: "running",
+    note: "只巡检不删除：统计卷内无引用且超过 24 小时的对象，数量 > 0 时告警；删除口径待用户确认（T-138）",
   },
   {
     name: "job_retention",

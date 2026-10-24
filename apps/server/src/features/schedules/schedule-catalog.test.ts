@@ -38,9 +38,10 @@ describe("SCHEDULE_CATALOG", () => {
     }
   });
 
-  it("OP-11: exactly the three wired-up tasks are running, and they alert", () => {
+  it("OP-11: exactly the four wired-up tasks are running, and they alert", () => {
     const running = SCHEDULE_CATALOG.filter((entry) => entry.status === "running");
     expect(running.map((entry) => entry.name).sort()).toEqual([
+      "orphan_asset_cleanup",
       "refund_compensation",
       "stuck_job_reaper",
       "team_cycle_grant",
