@@ -71,10 +71,20 @@ ENV NODE_ENV=production
 
 EXPOSE 3001
 
+# Network tuning for the PyPI index (OP-06 deploy reliability). Measured on the
+# .37 host (2026-10-24): downloading pillow/reportlab from
+# files.pythonhosted.org ends in ReadTimeoutError after 231s and the build
+# fails, while the same packages from a domestic mirror answer in ~0.6s.
+# The default index stays the official one; pass
+# `--build-arg PIP_INDEX_URL=<mirror>` to build against a mirror instead.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_TIMEOUT=120
+ARG PIP_RETRIES=5
+
 # Python runtime for sandbox code execution (canvas-design skill)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends python3 python3-pip && \
-    pip3 install --no-cache-dir --break-system-packages pillow reportlab && \
+    pip3 install --no-cache-dir --break-system-packages --index-url=$PIP_INDEX_URL --timeout=$PIP_TIMEOUT --retries=$PIP_RETRIES pillow reportlab && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy skills (fonts + SKILL.md) to /opt/loomic/skills/

@@ -36,6 +36,9 @@ services:
         NPM_FETCH_RETRIES: "${NPM_FETCH_RETRIES:-6}"
         NPM_FETCH_TIMEOUT: "${NPM_FETCH_TIMEOUT:-120000}"
         NPM_REGISTRY: "${NPM_REGISTRY:-https://registry.npmjs.org}"
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
+        PIP_TIMEOUT: "${PIP_TIMEOUT:-120}"
+        PIP_RETRIES: "${PIP_RETRIES:-5}"
     restart: unless-stopped
     env_file: .env.production
     environment:
@@ -68,6 +71,9 @@ services:
         NPM_FETCH_RETRIES: "${NPM_FETCH_RETRIES:-6}"
         NPM_FETCH_TIMEOUT: "${NPM_FETCH_TIMEOUT:-120000}"
         NPM_REGISTRY: "${NPM_REGISTRY:-https://registry.npmjs.org}"
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
+        PIP_TIMEOUT: "${PIP_TIMEOUT:-120}"
+        PIP_RETRIES: "${PIP_RETRIES:-5}"
     restart: unless-stopped
     env_file: .env.production
     environment:
