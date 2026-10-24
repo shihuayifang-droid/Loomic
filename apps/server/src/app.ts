@@ -219,7 +219,6 @@ import {
   CANCEL_REFUND_DESCRIPTION,
   createRefundJob,
 } from "./features/jobs/refund-job.js";
-import type { PaymentService } from "./features/payments/payment-service.js";
 import { registerRetiredPaymentRoutes } from "./http/payments-retired.js";
 import { registerSecurityHeaders } from "./http/security-headers.js";
 import { registerCreditRoutes } from "./http/credits.js";
@@ -305,7 +304,6 @@ export type BuildAppOptions = {
   env?: Partial<ServerEnv>;
   identityReadRepository?: IdentityReadRepository;
   jobService?: JobService;
-  paymentService?: PaymentService;
   profileWriteRepository?: ProfileWriteRepository;
   tierGuard?: TierGuard;
   /**
