@@ -10,6 +10,22 @@ export const DEFAULT_SERVER_PORT = 3001;
 export const DEFAULT_WEB_ORIGIN = "http://localhost:3000";
 
 /**
+ * BR-20: HAHART_* is the current, official spelling of this server's own
+ * variables. LOOMIC_* is kept only for compatibility - it is the legacy
+ * spelling that the `.37` deployment's `.env.production` still uses - and it
+ * will be deleted once that file has been switched over.
+ *
+ * Every one of these settings is therefore read as
+ * `HAHART_<suffix> ?? <legacy LOOMIC_ suffix>`: the new name wins when both are
+ * set, the old name still works while it exists, and `??` is used instead of
+ * `||` so an empty string keeps its old "present but empty" meaning. The legacy
+ * reads go through the index signature (like NODE_ENV below) so that the
+ * `.env.example` scan in `env-example.test.ts`, which collects literal
+ * `source.<KEY>` accesses, does not require the retirable names to stay listed
+ * in `.env.example`.
+ */
+
+/**
  * Resolve the default agent model based on available provider configuration.
  * When Google/Vertex is configured but OpenAI is not, defaults to Gemini 2.5 Flash.
  */
@@ -355,7 +371,9 @@ export function loadServerEnv(
 ): ServerEnv {
   const agentFilesRoot =
     overrides.agentFilesRoot ??
-    parseAgentFilesRoot(source.LOOMIC_AGENT_FILES_ROOT);
+    parseAgentFilesRoot(
+      source.HAHART_AGENT_FILES_ROOT ?? source["LOOMIC_AGENT_FILES_ROOT"],
+    );
   const databaseUrl =
     overrides.databaseUrl ?? normalizeOptionalString(source.DATABASE_URL);
   // Read through the index signature, same reason as NODE_ENV in
@@ -449,7 +467,10 @@ export function loadServerEnv(
     overrides.lemonSqueezyVariantBusinessYearly ??
     normalizeOptionalString(source.LEMONSQUEEZY_VARIANT_BUSINESS_YEARLY);
   const skillsRoot =
-    overrides.skillsRoot ?? normalizeOptionalString(source.LOOMIC_SKILLS_ROOT);
+    overrides.skillsRoot ??
+    normalizeOptionalString(
+      source.HAHART_SKILLS_ROOT ?? source["LOOMIC_SKILLS_ROOT"],
+    );
   const workerConcurrency =
     overrides.workerConcurrency ??
     (source.WORKER_CONCURRENCY
@@ -526,10 +547,12 @@ export function loadServerEnv(
   }
 
   // Resolve default agent model based on available provider keys.
-  // Explicit LOOMIC_AGENT_MODEL always takes precedence; otherwise fall back
-  // to Gemini 2.5 Flash when only Google/Vertex is configured.
+  // Explicit HAHART_AGENT_MODEL (or the legacy LOOMIC_ spelling) always takes
+  // precedence; otherwise fall back to Gemini 2.5 Flash when only
+  // Google/Vertex is configured.
   const explicitModel =
-    overrides.agentModel ?? parseAgentModel(source.LOOMIC_AGENT_MODEL);
+    overrides.agentModel ??
+    parseAgentModel(source.HAHART_AGENT_MODEL ?? source["LOOMIC_AGENT_MODEL"]);
   const resolvedAgentModel =
     explicitModel ??
     resolveDefaultAgentModel({
@@ -543,20 +566,29 @@ export function loadServerEnv(
   // `overrides.agentBackendMode` can smuggle "filesystem" into production.
   const agentBackendMode =
     overrides.agentBackendMode ??
-    parseAgentBackendMode(source.LOOMIC_AGENT_BACKEND_MODE);
+    parseAgentBackendMode(
+      source.HAHART_AGENT_BACKEND_MODE ?? source["LOOMIC_AGENT_BACKEND_MODE"],
+    );
   if (agentBackendMode === "filesystem" && isProductionEnv(source)) {
     throw new Error(
-      "LOOMIC_AGENT_BACKEND_MODE=filesystem is not allowed in production (AG-39)",
+      "HAHART_AGENT_BACKEND_MODE (or legacy LOOMIC_AGENT_BACKEND_MODE)=filesystem is not allowed in production (AG-39)",
     );
   }
 
   const env: ServerEnv = {
     agentBackendMode,
     agentModel: resolvedAgentModel,
-    port: overrides.port ?? parsePort(source.LOOMIC_SERVER_PORT ?? source.PORT),
+    port:
+      overrides.port ??
+      parsePort(
+        source.HAHART_SERVER_PORT ?? source["LOOMIC_SERVER_PORT"] ?? source.PORT,
+      ),
     version: overrides.version ?? readServerVersion(),
     webOrigin:
-      overrides.webOrigin ?? source.LOOMIC_WEB_ORIGIN ?? DEFAULT_WEB_ORIGIN,
+      overrides.webOrigin ??
+      source.HAHART_WEB_ORIGIN ??
+      source["LOOMIC_WEB_ORIGIN"] ??
+      DEFAULT_WEB_ORIGIN,
     ...(agentFilesRoot ? { agentFilesRoot } : {}),
     ...(databaseUrl ? { databaseUrl } : {}),
     ...(googleApiBase ? { googleApiBase } : {}),
@@ -647,7 +679,9 @@ function parseAgentBackendMode(rawMode: string | undefined): AgentBackendMode {
     return rawMode;
   }
 
-  throw new Error(`Invalid LOOMIC_AGENT_BACKEND_MODE value: ${rawMode}`);
+  throw new Error(
+    `Invalid HAHART_AGENT_BACKEND_MODE (or legacy LOOMIC_AGENT_BACKEND_MODE) value: ${rawMode}`,
+  );
 }
 
 function parseAgentFilesRoot(rawRoot: string | undefined) {
@@ -670,7 +704,9 @@ function parsePort(rawPort: string | undefined) {
 
   const port = Number.parseInt(rawPort, 10);
   if (!Number.isInteger(port) || port <= 0) {
-    throw new Error(`Invalid LOOMIC_SERVER_PORT value: ${rawPort}`);
+    throw new Error(
+      `Invalid HAHART_SERVER_PORT (or legacy LOOMIC_SERVER_PORT) value: ${rawPort}`,
+    );
   }
 
   return port;

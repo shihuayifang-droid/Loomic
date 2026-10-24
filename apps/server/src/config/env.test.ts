@@ -451,3 +451,66 @@ describe("43L queue provider switch", () => {
     ).toThrow("Invalid HAHART_QUEUE_PROVIDER value: rabbit");
   });
 });
+
+/**
+ * BR-20: HAHART_* is the official spelling and LOOMIC_* is the legacy one that
+ * `.37` still uses. Both must parse; when both are set the HAHART_ name wins,
+ * so switching a deployment over cannot silently keep reading the old value.
+ */
+describe("BR-20 HAHART_ env names with the legacy LOOMIC_ fallback", () => {
+  it("BR-20: HAHART_SERVER_PORT alone sets the port", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      HAHART_SERVER_PORT: "4123",
+    });
+
+    expect(env.port).toBe(4123);
+  });
+
+  it("BR-20: the legacy LOOMIC_SERVER_PORT alone still sets the port", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      LOOMIC_SERVER_PORT: "4124",
+    });
+
+    expect(env.port).toBe(4124);
+  });
+
+  it("BR-20: HAHART_SERVER_PORT wins over LOOMIC_SERVER_PORT", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      HAHART_SERVER_PORT: "4125",
+      LOOMIC_SERVER_PORT: "4126",
+    });
+
+    expect(env.port).toBe(4125);
+  });
+
+  it("BR-20: HAHART_WEB_ORIGIN alone sets the web origin", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      HAHART_WEB_ORIGIN: "https://hahart-new.example.com",
+    });
+
+    expect(env.webOrigin).toBe("https://hahart-new.example.com");
+  });
+
+  it("BR-20: the legacy LOOMIC_WEB_ORIGIN alone still sets the web origin", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      LOOMIC_WEB_ORIGIN: "https://loomic-legacy.example.com",
+    });
+
+    expect(env.webOrigin).toBe("https://loomic-legacy.example.com");
+  });
+
+  it("BR-20: HAHART_WEB_ORIGIN wins over LOOMIC_WEB_ORIGIN", () => {
+    const env = loadServerEnv(VERSION_OVERRIDE, {
+      NODE_ENV: "development",
+      HAHART_WEB_ORIGIN: "https://hahart-winner.example.com",
+      LOOMIC_WEB_ORIGIN: "https://loomic-loser.example.com",
+    });
+
+    expect(env.webOrigin).toBe("https://hahart-winner.example.com");
+  });
+});
