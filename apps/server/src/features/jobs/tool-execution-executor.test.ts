@@ -11,6 +11,8 @@ import type { BackgroundJob } from "@loomic/shared";
 import type { RecordProjectAssetInput } from "../../db/asset-record-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { getExecutor, type ExecutorContext } from "./job-executor.js";
+import { createFakeObjectStore } from "../../test-support/fake-object-store.js";
+import type { ObjectStore } from "../storage/object-store.js";
 import {
   clearToolRunnersForTest,
   registerToolRunner,
@@ -65,6 +67,10 @@ type ProvenanceInput = Parameters<
 function makeContext(options: {
   payload: Record<string, unknown>;
   readable?: boolean;
+  // T-133 1b: the ObjectStore the context may carry. Left off by default, which
+  // is the worker's shape until ticket 1c wires it (the executor then falls back
+  // to the admin client's storage).
+  objectStore?: ObjectStore;
 }) {
   const admin = makeAdmin();
   const provenanceCalls: ProvenanceInput[] = [];
@@ -119,6 +125,7 @@ function makeContext(options: {
         return undefined as never;
       },
     },
+    ...(options.objectStore ? { objectStore: options.objectStore } : {}),
   } as ExecutorContext;
 
   return { ctx, admin, provenanceCalls, readCalls };
@@ -254,5 +261,41 @@ describe("tool_execution executor", () => {
     expect((failure as Error).name).toBe("OriginalSourceError");
     expect(admin.uploads).toHaveLength(0);
     expect(runner).not.toHaveBeenCalled();
+  });
+
+  // T-133 1b: the upload step now takes an `ObjectStore`. A context that carries
+  // one is uploaded through it — nothing reaches the admin client's storage — and
+  // the bucket, path and bytes are the ones the admin client used to receive.
+  it("T-133 1b: a context carrying an objectStore uploads through it", async () => {
+    registerToolRunner("fake_tool", async (input) => ({
+      bytes: input.bytes,
+      mimeType: input.mimeType,
+    }));
+    const store = createFakeObjectStore();
+    const { ctx, admin } = makeContext({ payload: PAYLOAD, objectStore: store });
+
+    const result = await run(ctx);
+
+    const putCall = store.calls.find((call) => call.method === "put");
+    if (putCall?.method !== "put") throw new Error("the object store received no put call");
+    expect(putCall.ref.bucket).toBe("project-assets");
+    expect(putCall.ref.key.startsWith(`${WORKSPACE}/tool/fake_tool/`)).toBe(true);
+    expect(putCall.ref.key.endsWith(`-${JOB_ID}.png`)).toBe(true);
+    expect(putCall.options).toEqual({ contentType: "image/png", upsert: false });
+
+    // The bytes are the ones the admin client used to be handed: a PNG of the
+    // source size.
+    const stored = await store.get(putCall.ref);
+    const meta = await sharp(stored.body).metadata();
+    expect(meta.width).toBe(64);
+    expect(meta.height).toBe(40);
+    expect(meta.format).toBe("png");
+    expect(stored.size).toBe(putCall.size);
+
+    // The injected store was used, not the admin client's storage.
+    expect(admin.uploads).toHaveLength(0);
+    expect(admin.records[0]?.objectPath).toBe(putCall.ref.key);
+    expect(result.asset_id).toBe("asset-9");
+    expect(result.object_path).toBe(putCall.ref.key);
   });
 });

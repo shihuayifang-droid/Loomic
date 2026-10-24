@@ -3,6 +3,9 @@ import { registerExecutor, type ExecutorContext } from "../job-executor.js";
 import { loadExecutorJob } from "./load-executor-job.js";
 import { storeJobOutput } from "./store-job-output.js";
 import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
+import type { ObjectStore } from "../../storage/object-store.js";
+import type { SupabaseStorageLike } from "../../storage/supabase-object-store.js";
+import { createSupabaseObjectStore } from "../../storage/supabase-object-store.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateImage } from "../../../generation/image-generation.js";
 import { resolveImageProviderName } from "../../../generation/providers/registry.js";
@@ -164,15 +167,26 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
     // Upload to storage and record ownership (shared with the tool executor).
     const timestamp = Date.now();
-    const { assetId, objectPath } = await storeJobOutput(admin, ctx.assetRecordRepository, {
-      objectPath: `${workspaceId}/generated/${timestamp}-${jobId}.png`,
-      bytes: buffer,
-      mimeType: generated.mimeType ?? "image/png",
-      createdBy,
-      workspaceId,
-      projectId,
-      canvasId,
-    });
+    // T-133 1b TRANSITION BRANCH: the executor context does not carry an
+    // ObjectStore yet (ticket 1c wires the worker up), so a context without one
+    // keeps building the Supabase adapter here exactly as before — same backend,
+    // same errors, zero behaviour change. DELETE THIS FALLBACK AFTER 1c.
+    const objectStore: ObjectStore =
+      ctx.objectStore ??
+      createSupabaseObjectStore(admin as unknown as SupabaseStorageLike);
+    const { assetId, objectPath } = await storeJobOutput(
+      objectStore,
+      ctx.assetRecordRepository,
+      {
+        objectPath: `${workspaceId}/generated/${timestamp}-${jobId}.png`,
+        bytes: buffer,
+        mimeType: generated.mimeType ?? "image/png",
+        createdBy,
+        workspaceId,
+        projectId,
+        canvasId,
+      },
+    );
 
     lap("asset_record_done");
 

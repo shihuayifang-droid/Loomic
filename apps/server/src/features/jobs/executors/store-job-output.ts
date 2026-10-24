@@ -3,10 +3,8 @@
 // Image generation and tool execution both end here, so the storage write and the
 // ownership record live in exactly one place.
 import type { AssetRecordRepository } from "../../../db/asset-record-repository.js";
-import type { AdminSupabaseClient } from "../../../supabase/admin.js";
 import { ObjectStoreError } from "../../storage/object-store.js";
-import type { SupabaseStorageLike } from "../../storage/supabase-object-store.js";
-import { createSupabaseObjectStore } from "../../storage/supabase-object-store.js";
+import type { ObjectStore } from "../../storage/object-store.js";
 
 export type StoreJobOutputInput = {
   objectPath: string;
@@ -19,7 +17,7 @@ export type StoreJobOutputInput = {
 };
 
 export async function storeJobOutput(
-  admin: AdminSupabaseClient,
+  store: ObjectStore,
   recorder: Pick<AssetRecordRepository, "recordProjectAsset"> | undefined,
   input: StoreJobOutputInput,
 ): Promise<{ assetId: string; objectPath: string }> {
@@ -28,10 +26,9 @@ export async function storeJobOutput(
   // Upload to the project-assets bucket through the ObjectStore seam (43G). The
   // caller-visible message keeps the backend's own text, which the adapter keeps
   // in `detail`, so this reads exactly as it did when it used the SDK directly.
+  // T-133 1b: the store is handed in; this step no longer builds a backend.
   try {
-    await createSupabaseObjectStore(
-      admin as unknown as SupabaseStorageLike,
-    ).put({ bucket: "project-assets", key: objectPath }, bytes, {
+    await store.put({ bucket: "project-assets", key: objectPath }, bytes, {
       contentType: mimeType,
       upsert: false,
     });

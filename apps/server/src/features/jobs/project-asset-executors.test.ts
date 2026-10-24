@@ -53,6 +53,9 @@ import type { AssetRecordRepository, RecordProjectAssetInput } from "../../db/as
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { SubscriptionReadRow } from "../../db/credit-read-repository.js";
 import { getExecutor, type ExecutorContext } from "./job-executor.js";
+import { createFakeObjectStore } from "../../test-support/fake-object-store.js";
+import type { ObjectStore } from "../storage/object-store.js";
+import { ObjectStoreError } from "../storage/object-store.js";
 
 // Importing the executors is what registers them.
 import "./executors/image-generation.js";
@@ -219,6 +222,10 @@ function makeContext(
   // Default: the repository the admin was made with. `null` leaves the field off
   // the context entirely (the "worker forgot to wire it" shape).
   recorder: Pick<AssetRecordRepository, "recordProjectAsset"> | null | undefined = undefined,
+  // T-133 1b: the ObjectStore the context may carry. `null` (the default) leaves
+  // the field off, which is the shape the worker has until ticket 1c wires it —
+  // those cases go through the executor's transition fallback to the admin client.
+  objectStore: ObjectStore | null = null,
 ): TestExecutorContext {
   const assetRecordRepository =
     recorder === undefined ? recorderByClient.get(client) : recorder;
@@ -262,6 +269,8 @@ function makeContext(
     // GN-11: same conditional-spread rule; absent unless a case asks for it.
     ...(provenance ? { assetProvenanceRepository: provenance.repository } : {}),
     ...(assetRecordRepository ? { assetRecordRepository } : {}),
+    // T-133 1b: same conditional-spread rule; absent unless a case injects one.
+    ...(objectStore ? { objectStore } : {}),
     jobReads,
   };
 }
@@ -465,6 +474,62 @@ describe("generation executors record project asset ownership", () => {
     // Nothing reached the admin client for a job row. The old read is a loud
     // failure now, so a regression cannot pass this case by staying quiet.
     expect(admin.jobRowReads).toEqual([]);
+  });
+
+  // T-133 1b: the upload step now takes an `ObjectStore`. A context that carries
+  // one is uploaded through it — nothing reaches the admin client's storage — and
+  // the object path, bucket and byte count are the same ones the admin client
+  // used to receive. The cases above keep pinning the transition shape (no store
+  // on the context) so both paths stay covered.
+  it("case 8: a context carrying an objectStore uploads through it", async () => {
+    const admin = makeAdmin();
+    const store = createFakeObjectStore();
+
+    const result = await getExecutor("image_generation")!(
+      "job-8",
+      {},
+      makeContext(admin.client, jobRow(), makeCreditRead(), null, undefined, store),
+    );
+
+    const putCall = store.calls.find((call) => call.method === "put");
+    if (putCall?.method !== "put") throw new Error("the object store received no put call");
+    expect(putCall.ref.bucket).toBe("project-assets");
+    expect(putCall.ref.key).toMatch(
+      new RegExp(`^${PERSONAL_WORKSPACE}/generated/[0-9]+-job-8\\.png$`),
+    );
+    expect(putCall.options).toEqual({ contentType: "image/png", upsert: false });
+    expect(putCall.size).toBe(32);
+
+    // The injected store was the one used: the admin client's storage saw nothing.
+    expect(admin.uploads).toHaveLength(0);
+    expect(store.has(putCall.ref)).toBe(true);
+    expect(admin.records[0]?.objectPath).toBe(putCall.ref.key);
+    expect(result.object_path).toBe(putCall.ref.key);
+  });
+
+  it("case 8b: an objectStore failure fails the job with the upload's own detail", async () => {
+    const admin = makeAdmin();
+    const store = createFakeObjectStore();
+    // The adapter keeps the backend's own text in `detail`; the upload step must
+    // keep reporting that text, not this module's composed sentence.
+    const failing: ObjectStore = {
+      ...store,
+      async put() {
+        throw new ObjectStoreError("backend_failed", "Object storage said no.", "backend said no");
+      },
+    };
+
+    await expect(
+      getExecutor("image_generation")!(
+        "job-8b",
+        {},
+        makeContext(admin.client, jobRow(), makeCreditRead(), null, undefined, failing),
+      ),
+    ).rejects.toThrow(/Storage upload failed: backend said no/);
+
+    // Nothing was recorded and the admin client's storage was never touched.
+    expect(admin.records).toHaveLength(0);
+    expect(admin.uploads).toHaveLength(0);
   });
 });
 

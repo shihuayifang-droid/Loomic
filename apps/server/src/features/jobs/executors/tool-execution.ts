@@ -10,6 +10,9 @@ import { registerExecutor, type ExecutorContext } from "../job-executor.js";
 import { loadExecutorJob } from "./load-executor-job.js";
 import { storeJobOutput } from "./store-job-output.js";
 import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
+import type { ObjectStore } from "../../storage/object-store.js";
+import type { SupabaseStorageLike } from "../../storage/supabase-object-store.js";
+import { createSupabaseObjectStore } from "../../storage/supabase-object-store.js";
 import { resolveOriginalSource } from "../../tools/original-source.js";
 import { getToolRunner, ToolRunError } from "../../tools/tool-runners.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
@@ -120,15 +123,26 @@ registerExecutor("tool_execution", async (jobId, _rawPayload, ctx: ExecutorConte
       );
     }
 
-    const { assetId, objectPath } = await storeJobOutput(admin, ctx.assetRecordRepository, {
-      objectPath: `${workspaceId}/tool/${toolId}/${Date.now()}-${jobId}.png`,
-      bytes: png,
-      mimeType: "image/png",
-      createdBy,
-      workspaceId,
-      projectId,
-      canvasId,
-    });
+    // T-133 1b TRANSITION BRANCH: the executor context does not carry an
+    // ObjectStore yet (ticket 1c wires the worker up), so a context without one
+    // keeps building the Supabase adapter here exactly as before — same backend,
+    // same errors, zero behaviour change. DELETE THIS FALLBACK AFTER 1c.
+    const objectStore: ObjectStore =
+      ctx.objectStore ??
+      createSupabaseObjectStore(admin as unknown as SupabaseStorageLike);
+    const { assetId, objectPath } = await storeJobOutput(
+      objectStore,
+      ctx.assetRecordRepository,
+      {
+        objectPath: `${workspaceId}/tool/${toolId}/${Date.now()}-${jobId}.png`,
+        bytes: png,
+        mimeType: "image/png",
+        createdBy,
+        workspaceId,
+        projectId,
+        canvasId,
+      },
+    );
 
     // GN-24: where the product came from. Best effort, like the image executor.
     if (ctx.assetProvenanceRepository) {
