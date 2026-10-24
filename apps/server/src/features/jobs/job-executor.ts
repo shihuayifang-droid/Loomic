@@ -8,6 +8,7 @@ import type { CreditReadRepository } from "../../db/credit-read-repository.js";
 import type { AssetProvenanceRepository } from "../../db/asset-provenance-repository.js";
 import type { AssetReadRepository } from "../../db/asset-read-repository.js";
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
+import type { ObjectStore } from "../storage/object-store.js";
 
 export type ExecutorContext = {
   jobService: JobService;
@@ -47,6 +48,15 @@ export type ExecutorContext = {
    * An absent repository is treated by the executors as a failed record.
    */
   assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
+  /**
+   * OP-03 / T-133: the object store the executors write their output through.
+   * Same policy as the repositories above — the worker wires the real store in,
+   * every other construction site and every test substitute may leave it out.
+   * Absent is NOT an error: until 1c lands the executors keep building their
+   * client from `getAdminClient()` exactly as before, so this field being
+   * optional keeps every existing construction site compiling untouched.
+   */
+  objectStore?: ObjectStore;
   /**
    * GN-11: the amount this job was charged, as the worker read it from the
    * billing gate (`credits_cost`). The executors copy it into provenance.
