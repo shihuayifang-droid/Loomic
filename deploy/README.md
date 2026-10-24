@@ -101,3 +101,28 @@ find /opt/hahart/current/deploy -maxdepth 1 -name '*.sh' ! -perm -u+x
 ```
 
 第二条命令**不应有任何输出**；有输出就是该文件缺可执行位（`chmod +x` 补上）。
+
+---
+
+## 证书（OP-13）
+
+**约定：TLS 证书和私钥不进仓库。** `.gitignore` 里有 `certs/` 和 `*.pem` 两条。仓库里不会出现真实证书，也不放占位 PEM；`git archive` 打 release 包时同样不会带上（这些文件不在版本库里）。
+
+**`.37` 上的存放位置**：`/opt/hahart/certs/`。目录权限 `700`、里面的文件 `600`；由部署脚本从仓库外的位置拷进去，不是从 release 包里取。
+
+```bash
+sudo install -d -m 0700 /opt/hahart/certs
+# 从仓库外的备份位置拷入（示例路径，实际按当期介质走）
+sudo install -m 0600 /path/to/from-outside/fullchain.pem /opt/hahart/certs/fullchain.pem
+sudo install -m 0600 /path/to/from-outside/privkey.pem   /opt/hahart/certs/privkey.pem
+```
+
+**当前部署形态不需要本地证书**：一期是 Cloudflare Tunnel 终结 TLS（OP-09），源站 nginx 只监听 80，`deploy/nginx.conf` 里没有任何 `ssl_certificate` 配置。这一节是为将来改成直连 HTTPS 留的位置，现在就按上面的约定放文件、放着不用也可以。
+
+**轮换**：替换 `/opt/hahart/certs/` 下的文件后重建容器，让 nginx 重新读证书。
+
+```bash
+docker compose up -d --force-recreate web
+```
+
+私钥**不允许**写进 `.env.production`（也别写进任何进仓库的文件）——它只以文件形式存在 `/opt/hahart/certs/` 下。

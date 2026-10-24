@@ -24,6 +24,8 @@ supabase/.temp/
 # misc
 .DS_Store
 *.pem
+# TLS 证书不进仓库（.37 上放 /opt/hahart/certs/）
+certs/
 .worktrees/
 .superpowers/
 
