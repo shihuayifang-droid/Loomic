@@ -11,7 +11,7 @@ import type { BackgroundJob } from "@loomic/shared";
 import type { RecordProjectAssetInput } from "../../db/asset-record-repository.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import { getExecutor, type ExecutorContext } from "./job-executor.js";
-import { createFakeObjectStore } from "../../test-support/fake-object-store.js";
+import { createFakeObjectStore, type FakeObjectStore } from "../../test-support/fake-object-store.js";
 import type { ObjectStore } from "../storage/object-store.js";
 import {
   clearToolRunnersForTest,
@@ -64,14 +64,36 @@ type ProvenanceInput = Parameters<
   NonNullable<ExecutorContext["assetProvenanceRepository"]>["recordProvenance"]
 >[0];
 
+/** Every call the injected store recorded (empty when the case carried none). */
+function storeCalls(store: ObjectStore | null) {
+  return store ? (store as FakeObjectStore).calls : [];
+}
+
+/** The single put the executor made, or a loud failure when it made none. */
+function onlyPut(store: ObjectStore | null) {
+  if (!store) throw new Error("the context carried no objectStore");
+  const call = (store as FakeObjectStore).calls.find((entry) => entry.method === "put");
+  if (call?.method !== "put") throw new Error("the object store received no put call");
+  return call;
+}
+
+/** The bytes the injected store now holds for the one put the executor made. */
+async function storedBytes(store: ObjectStore | null): Promise<Buffer> {
+  const put = onlyPut(store);
+  if (!store) throw new Error("the context carried no objectStore");
+  return (await store.get(put.ref)).body;
+}
+
 function makeContext(options: {
   payload: Record<string, unknown>;
   readable?: boolean;
-  // T-133 1b: the ObjectStore the context may carry. Left off by default, which
-  // is the worker's shape until ticket 1c wires it (the executor then falls back
-  // to the admin client's storage).
-  objectStore?: ObjectStore;
+  // T-133 (7th slice): the ObjectStore the context carries. Omitted → a fresh
+  // fake store, because the executor now REQUIRES one. `null` leaves the field
+  // off — the "worker forgot to wire it" shape the assembly-error case pins.
+  objectStore?: ObjectStore | null;
 }) {
+  const store =
+    options.objectStore === undefined ? createFakeObjectStore() : options.objectStore;
   const admin = makeAdmin();
   const provenanceCalls: ProvenanceInput[] = [];
   const readCalls: Array<{ actorId: string; assetId: string }> = [];
@@ -125,10 +147,10 @@ function makeContext(options: {
         return undefined as never;
       },
     },
-    ...(options.objectStore ? { objectStore: options.objectStore } : {}),
+    ...(store ? { objectStore: store } : {}),
   } as ExecutorContext;
 
-  return { ctx, admin, provenanceCalls, readCalls };
+  return { ctx, admin, provenanceCalls, readCalls, store };
 }
 
 function run(ctx: ExecutorContext) {
@@ -165,20 +187,23 @@ describe("tool_execution executor", () => {
       bytes: input.bytes,
       mimeType: input.mimeType,
     }));
-    const { ctx, admin, provenanceCalls } = makeContext({ payload: PAYLOAD });
+    const { ctx, admin, provenanceCalls, store } = makeContext({ payload: PAYLOAD });
 
     const result = await run(ctx);
 
-    expect(admin.uploads).toHaveLength(1);
-    const upload = admin.uploads[0]!;
-    expect(upload.bucket).toBe("project-assets");
-    expect(upload.path.startsWith(`${WORKSPACE}/tool/fake_tool/`)).toBe(true);
-    expect(upload.path.endsWith(`-${JOB_ID}.png`)).toBe(true);
+    // T-133 (7th slice): the product goes through the injected store, so the
+    // bucket, key, content type and bytes are read off what the store received.
+    const put = onlyPut(store);
+    expect(put.ref.bucket).toBe("project-assets");
+    expect(put.ref.key.startsWith(`${WORKSPACE}/tool/fake_tool/`)).toBe(true);
+    expect(put.ref.key.endsWith(`-${JOB_ID}.png`)).toBe(true);
+    expect(put.options).toEqual({ contentType: "image/png", upsert: false });
+    expect(admin.uploads).toHaveLength(0);
 
     expect(admin.records).toHaveLength(1);
     expect(admin.records[0]).toMatchObject({
       bucket: "project-assets",
-      objectPath: upload.path,
+      objectPath: put.ref.key,
       createdBy: CREATED_BY,
       canvasId: "canvas-1",
       projectId: "project-1",
@@ -202,11 +227,11 @@ describe("tool_execution executor", () => {
       bytes: await makePng(128, 128),
       mimeType: "image/png",
     }));
-    const { ctx, admin } = makeContext({ payload: PAYLOAD });
+    const { ctx, store } = makeContext({ payload: PAYLOAD });
 
     const result = await run(ctx);
 
-    const meta = await sharp(admin.uploads[0]!.bytes).metadata();
+    const meta = await sharp(await storedBytes(store)).metadata();
     expect(meta.width).toBe(64);
     expect(meta.height).toBe(40);
     expect(meta.format).toBe("png");
@@ -232,7 +257,7 @@ describe("tool_execution executor", () => {
   });
 
   it("an unknown tool fails the job and stores nothing", async () => {
-    const { ctx, admin } = makeContext({ payload: { ...PAYLOAD, tool_id: "no_such_tool" } });
+    const { ctx, store } = makeContext({ payload: { ...PAYLOAD, tool_id: "no_such_tool" } });
 
     const failure = await run(ctx).then(
       () => null,
@@ -241,7 +266,7 @@ describe("tool_execution executor", () => {
 
     expect(failure).toBeInstanceOf(ToolRunError);
     expect((failure as ToolRunError).code).toBe("unknown_tool");
-    expect(admin.uploads).toHaveLength(0);
+    expect(storeCalls(store)).toHaveLength(0);
   });
 
   it("an unreadable artifact fails the job and stores nothing", async () => {
@@ -250,7 +275,7 @@ describe("tool_execution executor", () => {
       mimeType: input.mimeType,
     }));
     registerToolRunner("fake_tool", runner);
-    const { ctx, admin } = makeContext({ payload: PAYLOAD, readable: false });
+    const { ctx, store } = makeContext({ payload: PAYLOAD, readable: false });
 
     const failure = await run(ctx).then(
       () => null,
@@ -259,7 +284,7 @@ describe("tool_execution executor", () => {
 
     expect((failure as { code?: string }).code).toBe("not_found");
     expect((failure as Error).name).toBe("OriginalSourceError");
-    expect(admin.uploads).toHaveLength(0);
+    expect(storeCalls(store)).toHaveLength(0);
     expect(runner).not.toHaveBeenCalled();
   });
 
@@ -297,5 +322,31 @@ describe("tool_execution executor", () => {
     expect(admin.records[0]?.objectPath).toBe(putCall.ref.key);
     expect(result.asset_id).toBe("asset-9");
     expect(result.object_path).toBe(putCall.ref.key);
+  });
+
+  // T-133 (7th slice): the behaviour contract this slice adds. The executor no
+  // longer builds a store of its own, so a context without one is an ASSEMBLY
+  // error — reported as such, and raised before any work is done.
+  it("T-133 (7th slice): a context without an objectStore is an assembly error", async () => {
+    const runner = vi.fn(async (input: ToolRunnerInput) => ({
+      bytes: input.bytes,
+      mimeType: input.mimeType,
+    }));
+    registerToolRunner("fake_tool", runner);
+    const { ctx, admin, store } = makeContext({ payload: PAYLOAD, objectStore: null });
+    expect(store).toBeNull();
+
+    const failure = await run(ctx).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(ToolRunError);
+    expect((failure as ToolRunError).code).toBe("invalid_input");
+    expect((failure as Error).message).toMatch(/no objectStore.*assembly error/i);
+    // The failure is the wiring, not the work: nothing ran and nothing landed.
+    expect(runner).not.toHaveBeenCalled();
+    expect(admin.uploads).toHaveLength(0);
+    expect(admin.records).toHaveLength(0);
   });
 });

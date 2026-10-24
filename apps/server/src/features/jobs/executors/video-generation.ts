@@ -2,8 +2,6 @@ import { registerExecutor, type ExecutorContext } from "../job-executor.js";
 import { loadExecutorJob } from "./load-executor-job.js";
 import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
 import { ObjectStoreError } from "../../storage/object-store.js";
-import type { SupabaseStorageLike } from "../../storage/supabase-object-store.js";
-import { createSupabaseObjectStore } from "../../storage/supabase-object-store.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateVideo } from "../../../generation/video-generation.js";
 import { resolveVideoProviderName } from "../../../generation/providers/registry.js";
@@ -51,6 +49,21 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
   const model = payload.model ?? "wan-video/wan-2.6";
   const providerName = resolveVideoProviderName(model);
 
+  // T-133 (7th slice): this executor used to build its own Supabase adapter at
+  // the upload step. It now REQUIRES the store on the context — the worker wires
+  // it in (1c), and a context without one is an assembly mistake rather than an
+  // upstream failure. Resolved here, before the heartbeat starts (so a missing
+  // store cannot leak the timer) and outside the catch-all below (so the message
+  // is not relabelled as a failed generation).
+  const objectStore = ctx.objectStore;
+  if (!objectStore) {
+    throw new Error(
+      `Job ${jobId}: the executor context has no objectStore — assembly error, ` +
+        `not a provider failure (this executor writes its output only through ` +
+        `the store the worker injects)`,
+    );
+  }
+
   // VT and heartbeat interval both derived from JOB_TYPE_REGISTRY — see the
   // longer note in the image executor. Was a hard-coded 300 plus 120_000 here.
   const VT_SECONDS = JOB_TYPE_REGISTRY.video_generation.visibilityTimeoutSeconds;
@@ -95,9 +108,7 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     // 43G: the bytes go through the ObjectStore seam; the message the job fails
     // with keeps the backend's own text, read off the adapter's `detail`.
     try {
-      await createSupabaseObjectStore(
-        admin as unknown as SupabaseStorageLike,
-      ).put({ bucket: "project-assets", key: objectPath }, buffer, {
+      await objectStore.put({ bucket: "project-assets", key: objectPath }, buffer, {
         contentType: generated.mimeType ?? "video/mp4",
         upsert: false,
       });

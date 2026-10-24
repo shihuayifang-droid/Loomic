@@ -53,7 +53,7 @@ import type { AssetRecordRepository, RecordProjectAssetInput } from "../../db/as
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { SubscriptionReadRow } from "../../db/credit-read-repository.js";
 import { getExecutor, type ExecutorContext } from "./job-executor.js";
-import { createFakeObjectStore } from "../../test-support/fake-object-store.js";
+import { createFakeObjectStore, type FakeObjectStore } from "../../test-support/fake-object-store.js";
 import type { ObjectStore } from "../storage/object-store.js";
 import { ObjectStoreError } from "../storage/object-store.js";
 
@@ -204,6 +204,21 @@ function makeProvenance(options: { failWith?: Error } = {}) {
 type TestExecutorContext = ExecutorContext & { jobReads: string[] };
 
 /**
+ * T-133 (7th slice): the context also carries the store it was built with, so a
+ * case can assert on what was uploaded without reaching into the admin client's
+ * storage. `null` is the "worker forgot to wire it" shape.
+ */
+type TestContext = TestExecutorContext & { store: ObjectStore | null };
+
+/** The single put the executor made, or a loud failure when it made none. */
+function onlyPut(store: ObjectStore | null) {
+  if (!store) throw new Error("the context carried no objectStore");
+  const call = (store as FakeObjectStore).calls.find((entry) => entry.method === "put");
+  if (call?.method !== "put") throw new Error("the object store received no put call");
+  return call;
+}
+
+/**
  * The executor's ONLY source of a job row. Workorder 21N moved that read onto
  * `JobService.getJobAdmin`, so the substitute carries exactly that one method and
  * the case hands it the row it wants the executor to see. Everything else on
@@ -222,11 +237,13 @@ function makeContext(
   // Default: the repository the admin was made with. `null` leaves the field off
   // the context entirely (the "worker forgot to wire it" shape).
   recorder: Pick<AssetRecordRepository, "recordProjectAsset"> | null | undefined = undefined,
-  // T-133 1b: the ObjectStore the context may carry. `null` (the default) leaves
-  // the field off, which is the shape the worker has until ticket 1c wires it —
-  // those cases go through the executor's transition fallback to the admin client.
-  objectStore: ObjectStore | null = null,
-): TestExecutorContext {
+  // T-133 (7th slice): the ObjectStore the context carries. Omitted → a fresh
+  // fake store, because the executors now REQUIRE one. `null` leaves the field
+  // off entirely — the "worker forgot to wire it" shape the assembly-error cases
+  // below pin.
+  objectStore: ObjectStore | null | undefined = undefined,
+): TestContext {
+  const store = objectStore === undefined ? createFakeObjectStore() : objectStore;
   const assetRecordRepository =
     recorder === undefined ? recorderByClient.get(client) : recorder;
   const jobReads: string[] = [];
@@ -269,9 +286,11 @@ function makeContext(
     // GN-11: same conditional-spread rule; absent unless a case asks for it.
     ...(provenance ? { assetProvenanceRepository: provenance.repository } : {}),
     ...(assetRecordRepository ? { assetRecordRepository } : {}),
-    // T-133 1b: same conditional-spread rule; absent unless a case injects one.
-    ...(objectStore ? { objectStore } : {}),
+    // T-133 (7th slice): same conditional-spread rule; absent only when the case
+    // asked for the unwired shape.
+    ...(store ? { objectStore: store } : {}),
     jobReads,
+    store,
   };
 }
 
@@ -332,7 +351,8 @@ describe("generation executors record project asset ownership", () => {
     const executor = getExecutor("image_generation");
     expect(executor).toBeDefined();
 
-    const result = await executor!("job-1", {}, makeContext(admin.client, jobRow()));
+    const ctx = makeContext(admin.client, jobRow());
+    const result = await executor!("job-1", {}, ctx);
 
     expect(admin.records).toHaveLength(1);
     expect(admin.records[0]).toMatchObject({
@@ -343,28 +363,34 @@ describe("generation executors record project asset ownership", () => {
       mimeType: "image/png",
     });
 
-    // The object path is what the row is keyed by, so it has to be the uploaded one.
-    expect(admin.uploads).toHaveLength(1);
-    expect(admin.records[0]?.objectPath).toBe(admin.uploads[0]?.path);
+    // The object path is what the row is keyed by, so it has to be the uploaded
+    // one. T-133 (7th slice): the upload went through the injected store, so the
+    // bucket, key and byte count are read off what the store received.
+    const put = onlyPut(ctx.store);
+    expect(put.ref.bucket).toBe("project-assets");
+    expect(put.ref.key).toMatch(
+      new RegExp(`^${PERSONAL_WORKSPACE}/generated/[0-9]+-job-1\\.png$`),
+    );
+    expect(put.options).toEqual({ contentType: "image/png", upsert: false });
+    expect(put.size).toBe(32);
+    expect(admin.uploads).toHaveLength(0);
+    expect(admin.records[0]?.objectPath).toBe(put.ref.key);
     expect(result.asset_id).toBe("asset-1");
-    expect(result.object_path).toBe(admin.uploads[0]?.path);
+    expect(result.object_path).toBe(put.ref.key);
   });
 
   it("case 1b: the job result carries a SIGNED url, never a public one", async () => {
     const admin = makeAdmin();
 
-    const result = await getExecutor("image_generation")!(
-      "job-1b",
-      {},
-      makeContext(admin.client, jobRow()),
-    );
+    const ctx = makeContext(admin.client, jobRow());
+    const result = await getExecutor("image_generation")!("job-1b", {}, ctx);
 
     // X-52: the worker signs what it just recorded. A permanent public URL here
     // would survive the bucket going private as a dead link.
     expect(String(result.signed_url)).toContain("token=sig");
     expect(String(result.signed_url)).not.toContain("cdn.test");
     expect(admin.signCalls).toEqual([
-      { bucket: "project-assets", path: admin.uploads[0]?.path, expiresIn: 3600 },
+      { bucket: "project-assets", path: onlyPut(ctx.store).ref.key, expiresIn: 3600 },
     ]);
   });
 
@@ -374,7 +400,8 @@ describe("generation executors record project asset ownership", () => {
     const executor = getExecutor("video_generation");
     expect(executor).toBeDefined();
 
-    const result = await executor!("job-2", {}, makeContext(admin.client, job));
+    const ctx = makeContext(admin.client, job);
+    const result = await executor!("job-2", {}, ctx);
 
     expect(admin.records).toHaveLength(1);
     expect(admin.records[0]).toMatchObject({
@@ -384,13 +411,20 @@ describe("generation executors record project asset ownership", () => {
       projectId: TEAM_PROJECT,
       mimeType: "video/mp4",
     });
-    expect(admin.records[0]?.objectPath).toBe(admin.uploads[0]?.path);
+    const put = onlyPut(ctx.store);
+    expect(put.ref.bucket).toBe("project-assets");
+    expect(put.ref.key).toMatch(
+      new RegExp(`^${PERSONAL_WORKSPACE}/generated/[0-9]+-job-2\\.mp4$`),
+    );
+    expect(put.options).toEqual({ contentType: "video/mp4", upsert: false });
+    expect(admin.uploads).toHaveLength(0);
+    expect(admin.records[0]?.objectPath).toBe(put.ref.key);
 
     // X-52: the video's job result is signed too — same rule as the image.
     expect(String(result.signed_url)).toContain("token=sig");
     expect(String(result.signed_url)).not.toContain("cdn.test");
     expect(admin.signCalls).toEqual([
-      { bucket: "project-assets", path: admin.uploads[0]?.path, expiresIn: 3600 },
+      { bucket: "project-assets", path: put.ref.key, expiresIn: 3600 },
     ]);
   });
 
@@ -428,12 +462,14 @@ describe("generation executors record project asset ownership", () => {
       recordError: { message: "record_project_asset exploded" },
     });
 
+    const ctx = makeContext(admin.client, jobRow());
+
     await expect(
-      getExecutor("image_generation")!("job-5", {}, makeContext(admin.client, jobRow())),
+      getExecutor("image_generation")!("job-5", {}, ctx),
     ).rejects.toThrow(/record asset ownership/i);
 
     // The object was uploaded; the point is that the job did NOT report success.
-    expect(admin.uploads).toHaveLength(1);
+    expect(onlyPut(ctx.store).size).toBe(32);
   });
 
   it("case 5b: a context without the asset record repository fails the image job", async () => {
@@ -552,26 +588,23 @@ describe("BL-40: generated images are never watermarked", () => {
       })),
     );
 
-    const result = await getExecutor("image_generation")!(
-      "job-38a-free",
-      {},
-      makeContext(admin.client, jobRow(), credit),
-    );
+    const ctx = makeContext(admin.client, jobRow(), credit);
+    const result = await getExecutor("image_generation")!("job-38a-free", {}, ctx);
 
     expect(applyWatermark).not.toHaveBeenCalled();
-    expect(admin.uploads).toHaveLength(1);
-    expect(admin.uploads[0]?.bytes).toBe(40);
+    expect(onlyPut(ctx.store).size).toBe(40);
     expect(result.asset_id).toBe("asset-1");
   });
 
   it("BL-40: no subscription row and no repository are not watermarked", async () => {
     // A missing subscription row: the shape the old decision read as "free".
     const noRowAdmin = makeAdmin();
-    await getExecutor("image_generation")!(
-      "job-38a-no-row",
-      {},
-      makeContext(noRowAdmin.client, jobRow(), makeCreditRead({ plan: null })),
+    const noRowCtx = makeContext(
+      noRowAdmin.client,
+      jobRow(),
+      makeCreditRead({ plan: null }),
     );
+    await getExecutor("image_generation")!("job-38a-no-row", {}, noRowCtx);
 
     // No repository wired at all: the field is absent, not present-and-undefined.
     const noRepoAdmin = makeAdmin();
@@ -580,8 +613,8 @@ describe("BL-40: generated images are never watermarked", () => {
     await getExecutor("image_generation")!("job-38a-no-repo", {}, noRepo);
 
     expect(applyWatermark).not.toHaveBeenCalled();
-    expect(noRowAdmin.uploads).toHaveLength(1);
-    expect(noRepoAdmin.uploads).toHaveLength(1);
+    expect(onlyPut(noRowCtx.store).size).toBe(32);
+    expect(onlyPut(noRepo.store).size).toBe(32);
   });
 
   it("BL-40: the image executor no longer reads the plan", async () => {
@@ -729,17 +762,56 @@ describe("GN-02: a finished job result lists its artifacts", () => {
   it("GN-02: the old result fields are still there", async () => {
     const admin = makeAdmin();
 
+    const ctx = makeContext(admin.client, jobRow());
+
     const result = await getExecutor("image_generation")!(
       "job-artifact-old-fields",
       {},
-      makeContext(admin.client, jobRow()),
+      ctx,
     );
 
     expect(result.asset_id).toBe("asset-1");
     expect(String(result.signed_url)).toContain("token=sig");
-    expect(result.object_path).toBe(admin.uploads[0]?.path);
+    expect(result.object_path).toBe(onlyPut(ctx.store).ref.key);
     expect(result.width).toBe(1024);
     expect(result.height).toBe(1024);
     expect(result.mime_type).toBe("image/png");
+  });
+});
+
+// T-133 (7th slice): the behaviour contract this slice adds. The executors no
+// longer build a store of their own, so a context without one is an ASSEMBLY
+// error — reported as such, and raised before any provider call or upload.
+describe("T-133: a context without an objectStore is an assembly error", () => {
+  it("the image executor refuses to generate without a store", async () => {
+    const admin = makeAdmin();
+    // recorder `undefined` keeps the default; the sixth argument is the store,
+    // and `null` is the "worker forgot to wire it" shape.
+    const ctx = makeContext(admin.client, jobRow(), makeCreditRead(), null, undefined, null);
+    expect(ctx.store).toBeNull();
+
+    await expect(
+      getExecutor("image_generation")!("job-no-store-image", {}, ctx),
+    ).rejects.toThrow(/no objectStore.*assembly error/i);
+
+    // Nothing was generated, uploaded or recorded: the failure is the wiring.
+    expect(generateImage).not.toHaveBeenCalled();
+    expect(admin.records).toHaveLength(0);
+    expect(admin.uploads).toHaveLength(0);
+  });
+
+  it("the video executor refuses to generate without a store", async () => {
+    const admin = makeAdmin();
+    const job = jobRow({ payload: { prompt: "a clip", model: "test/video" } });
+    const ctx = makeContext(admin.client, job, makeCreditRead(), null, undefined, null);
+    expect(ctx.store).toBeNull();
+
+    await expect(
+      getExecutor("video_generation")!("job-no-store-video", {}, ctx),
+    ).rejects.toThrow(/no objectStore.*assembly error/i);
+
+    expect(generateVideo).not.toHaveBeenCalled();
+    expect(admin.records).toHaveLength(0);
+    expect(admin.uploads).toHaveLength(0);
   });
 });

@@ -10,9 +10,6 @@ import { registerExecutor, type ExecutorContext } from "../job-executor.js";
 import { loadExecutorJob } from "./load-executor-job.js";
 import { storeJobOutput } from "./store-job-output.js";
 import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
-import type { ObjectStore } from "../../storage/object-store.js";
-import type { SupabaseStorageLike } from "../../storage/supabase-object-store.js";
-import { createSupabaseObjectStore } from "../../storage/supabase-object-store.js";
 import { resolveOriginalSource } from "../../tools/original-source.js";
 import { getToolRunner, ToolRunError } from "../../tools/tool-runners.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
@@ -71,6 +68,20 @@ registerExecutor("tool_execution", async (jobId, _rawPayload, ctx: ExecutorConte
     throw new Error(`Job ${jobId}: the executor context has no assetReadRepository`);
   }
 
+  // T-133 (7th slice): the store the product is uploaded through is a REQUIRED
+  // part of the context now. The worker wires it in (1c); a context without one
+  // is an assembly mistake, not an upstream failure — so it fails here, before
+  // the heartbeat starts, rather than quietly building an adapter of its own.
+  const objectStore = ctx.objectStore;
+  if (!objectStore) {
+    throw new ToolRunError(
+      "invalid_input",
+      `Job ${jobId}: the executor context has no objectStore — assembly error, ` +
+        `not an upstream failure (this executor writes its product only through ` +
+        `the store the worker injects)`,
+    );
+  }
+
   const VT_SECONDS = JOB_TYPE_REGISTRY.tool_execution.visibilityTimeoutSeconds;
   const heartbeatTimer = setInterval(() => {
     ctx.renewVt(VT_SECONDS);
@@ -123,13 +134,8 @@ registerExecutor("tool_execution", async (jobId, _rawPayload, ctx: ExecutorConte
       );
     }
 
-    // T-133 1b TRANSITION BRANCH: the executor context does not carry an
-    // ObjectStore yet (ticket 1c wires the worker up), so a context without one
-    // keeps building the Supabase adapter here exactly as before — same backend,
-    // same errors, zero behaviour change. DELETE THIS FALLBACK AFTER 1c.
-    const objectStore: ObjectStore =
-      ctx.objectStore ??
-      createSupabaseObjectStore(admin as unknown as SupabaseStorageLike);
+    // T-133 (7th slice): the store was resolved from the context before the try
+    // block — this executor no longer builds a backend of its own.
     const { assetId, objectPath } = await storeJobOutput(
       objectStore,
       ctx.assetRecordRepository,

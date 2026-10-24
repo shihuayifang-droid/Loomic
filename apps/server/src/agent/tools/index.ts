@@ -19,9 +19,11 @@ import { createProjectSearchTool } from "./project-search.js";
 import { createScreenshotCanvasTool } from "./screenshot-canvas.js";
 // 45AH / T-133 (2nd slice): the storage backend behind `get_brand_kit` is named
 // HERE, in the tool assembly, so `brand-kit.ts` itself imports no adapter.
+// 45AO (T-133 7th slice): this file no longer NAMES a backend at all. The
+// factory arrives from `deps` and is passed through verbatim; when the assembly
+// forgot it, the tool reports that as an assembly error instead of quietly
+// constructing an adapter of its own.
 import type { ObjectStore } from "../../features/storage/object-store.js";
-import { createSupabaseObjectStore } from "../../features/storage/supabase-object-store.js";
-import type { SupabaseStorageLike } from "../../features/storage/supabase-object-store.js";
 import {
   createVideoGenerateTool,
   type SubmitVideoJobFn,
@@ -61,17 +63,20 @@ export { createManipulateCanvasTool } from "./manipulate-canvas.js";
 // ---------------------------------------------------------------------------
 
 /**
- * 45AH / T-133 (2nd slice): the default assembly of the brand kit tool's storage
- * seam.
+ * 45AO (T-133 7th slice): what the brand kit tool gets when the assembly never
+ * wired a store factory.
  *
- * It reproduces verbatim what `brand-kit.ts` did before this workorder — wrap the
- * CALLER's user-scoped client in the Supabase adapter — and it lives here, at the
- * assembly point, so the tool itself names only the seam. The wrapped client is
- * still the caller's, so Storage answers under the caller's RLS; an admin client
- * must never be substituted here.
+ * It is deliberately NOT an adapter: the tool used to fall back to wrapping the
+ * caller's client in the Supabase backend from here, which made a missing wire
+ * look like a working assembly. A factory that throws the moment the tool needs
+ * a store is the honest shape — the failure names the assembly, not Storage.
  */
-const brandKitObjectStore = (client: any): ObjectStore =>
-  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
+const missingObjectStoreFactory = (): ObjectStore => {
+  throw new Error(
+    "get_brand_kit: no createObjectStore factory was wired into " +
+      "createMainAgentTools — assembly error, not a storage failure",
+  );
+};
 
 export function createMainAgentTools(
   backend: BackendProtocol | BackendFactory,
@@ -102,9 +107,9 @@ export function createMainAgentTools(
      *
      * Optional in THIS type because the callers that assemble it
      * (`deep-agent.ts` → `runtime.ts` → `app.ts`) are not part of this slice's
-     * file set. When it is absent, `brandKitObjectStore` below applies the same
-     * adapter wrap the tool used to do internally, so the behaviour is never
-     * silently different — only the place that names the backend moves.
+     * file set. When it is absent the tool is still built, but asking it for a
+     * store throws an ASSEMBLY error: 45AO removed the adapter wrap that used to
+     * stand in here, because a silent stand-in made a missing wire look wired.
      */
     createObjectStore?: (client: any) => ObjectStore;
     brandKitId?: string | null;
@@ -188,7 +193,7 @@ export function createMainAgentTools(
       createBrandKitTool(
         {
           createUserClient: deps.createUserClient,
-          createObjectStore: deps.createObjectStore ?? brandKitObjectStore,
+          createObjectStore: deps.createObjectStore ?? missingObjectStoreFactory,
           brandKitReadRepository: deps.brandKitReadRepository,
         },
         deps.brandKitId,

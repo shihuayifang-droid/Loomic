@@ -3,9 +3,6 @@ import { registerExecutor, type ExecutorContext } from "../job-executor.js";
 import { loadExecutorJob } from "./load-executor-job.js";
 import { storeJobOutput } from "./store-job-output.js";
 import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
-import type { ObjectStore } from "../../storage/object-store.js";
-import type { SupabaseStorageLike } from "../../storage/supabase-object-store.js";
-import { createSupabaseObjectStore } from "../../storage/supabase-object-store.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateImage } from "../../../generation/image-generation.js";
 import { resolveImageProviderName } from "../../../generation/providers/registry.js";
@@ -116,6 +113,20 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     );
   }
 
+  // T-133 (7th slice): the store the output is uploaded through is a REQUIRED
+  // part of the context now. The worker wires it in (1c); a context without one
+  // is an assembly mistake, not an upstream failure — so it fails here, before
+  // any provider call and before the heartbeat starts, with that stated plainly
+  // instead of quietly building an adapter of its own.
+  const objectStore = ctx.objectStore;
+  if (!objectStore) {
+    throw new Error(
+      `Job ${jobId}: the executor context has no objectStore — assembly error, ` +
+        `not a provider failure (this executor writes its output only through the ` +
+        `store the worker injects)`,
+    );
+  }
+
   // Resolve provider dynamically from model ID via registry
   const model = payload.model ?? DEFAULT_IMAGE_MODEL_ID;
   const providerName = resolveImageProviderName(model, "generate");
@@ -167,13 +178,8 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
 
     // Upload to storage and record ownership (shared with the tool executor).
     const timestamp = Date.now();
-    // T-133 1b TRANSITION BRANCH: the executor context does not carry an
-    // ObjectStore yet (ticket 1c wires the worker up), so a context without one
-    // keeps building the Supabase adapter here exactly as before — same backend,
-    // same errors, zero behaviour change. DELETE THIS FALLBACK AFTER 1c.
-    const objectStore: ObjectStore =
-      ctx.objectStore ??
-      createSupabaseObjectStore(admin as unknown as SupabaseStorageLike);
+    // The store was resolved from the context before the try block: this
+    // executor no longer builds a backend of its own.
     const { assetId, objectPath } = await storeJobOutput(
       objectStore,
       ctx.assetRecordRepository,
