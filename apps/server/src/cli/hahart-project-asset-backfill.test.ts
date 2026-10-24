@@ -17,7 +17,26 @@ import type { AdminSupabaseClient } from "../supabase/admin.js";
 import {
   parseBackfillArgs,
   runProjectAssetBackfill,
+  type SqlExecutor,
 } from "./hahart-project-asset-backfill.js";
+
+/** Positional parameter order of `record_project_asset_if_matches`. */
+const RECORD_PARAM_NAMES = [
+  "p_bucket",
+  "p_object_path",
+  "p_created_by",
+  "p_fallback_workspace_id",
+  "p_project_id",
+  "p_canvas_id",
+  "p_mime_type",
+  "p_byte_size",
+  "p_expected_asset_id",
+  "p_expected_workspace_id",
+  "p_expected_project_id",
+  "p_expected_created_by",
+  "p_expected_mime_type",
+  "p_expected_byte_size",
+];
 
 const TEAM = "ws-team";
 const PROJECT_A = "project-a";
@@ -126,28 +145,41 @@ function makeAdmin(options: {
         },
       }),
     },
-    rpc: async (name: string, params: Record<string, unknown>) => {
+  };
+
+  // The compare-and-write function now runs through `pg`: record the statement,
+  // map its positional params back onto the function's parameter names, and answer
+  // with the same verdicts the old stub produced.
+  const sql: SqlExecutor = {
+    query: async (text: string, values: unknown[] = []) => {
+      const name = /select public\.(\w+)\(/.exec(text)?.[1] ?? "";
+      const params = Object.fromEntries(
+        RECORD_PARAM_NAMES.map((key, index) => [key, values[index]]),
+      );
       rpcs.push({ name, params });
-      if (options.rpcError) return { data: null, error: options.rpcError };
+      if (options.rpcError) throw new Error(options.rpcError.message);
 
       const path = String(params.p_object_path ?? "");
       const verdict = options.rpcResults?.[path];
-      if (verdict) return { data: verdict, error: null };
+      if (verdict) return { rows: [{ result: verdict }] };
 
       // The happy path: the snapshot still matched, so the row was written.
       return {
-        data: {
-          status: "applied",
-          asset_id: `asset-${rpcs.length}`,
-          workspace_id: TEAM,
-          project_id: params.p_project_id ?? null,
-        },
-        error: null,
+        rows: [
+          {
+            result: {
+              status: "applied",
+              asset_id: `asset-${rpcs.length}`,
+              workspace_id: TEAM,
+              project_id: params.p_project_id ?? null,
+            },
+          },
+        ],
       };
     },
   };
 
-  return { client: client as unknown as AdminSupabaseClient, rpcs, writes, reads };
+  return { client: client as unknown as AdminSupabaseClient, rpcs, writes, reads, sql };
 }
 
 /** A job whose own project_id predates the column; the canvas supplies it. */
@@ -170,7 +202,7 @@ describe("project asset backfill", () => {
       objects: [JOB_OBJECT],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: false });
+    const report = await runProjectAssetBackfill(admin.client, { apply: false }, admin.sql);
 
     expect(admin.rpcs).toHaveLength(0);
     expect(admin.writes).toHaveLength(0);
@@ -192,7 +224,7 @@ describe("project asset backfill", () => {
       objects: [JOB_OBJECT],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(report.recorded).toBe(1);
     expect(admin.rpcs).toHaveLength(1);
@@ -227,7 +259,7 @@ describe("project asset backfill", () => {
       objects: [CANVAS_FILE, CANVAS_VIDEO],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: false });
+    const report = await runProjectAssetBackfill(admin.client, { apply: false }, admin.sql);
 
     expect(report.discovered).toBe(2);
     expect(report.recorded).toBe(2);
@@ -242,7 +274,7 @@ describe("project asset backfill", () => {
       objects: [THUMBNAIL],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(admin.rpcs).toHaveLength(1);
     expect(admin.rpcs[0]?.params).toMatchObject({
@@ -272,7 +304,7 @@ describe("project asset backfill", () => {
       objects: [JOB_OBJECT],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(report.conflicts).toEqual([JOB_OBJECT]);
     expect(report.recorded).toBe(0);
@@ -286,7 +318,7 @@ describe("project asset backfill", () => {
       objects: [],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(report.unmatched).toEqual([JOB_OBJECT]);
     expect(admin.rpcs).toHaveLength(0);
@@ -302,7 +334,7 @@ describe("project asset backfill", () => {
       objects: [JOB_OBJECT],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(report.conflicts).toEqual([JOB_OBJECT]);
     expect(report.recorded).toBe(0);
@@ -319,7 +351,7 @@ describe("project asset backfill", () => {
       objects: [JOB_OBJECT],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(report).toMatchObject({ recorded: 0, alreadyCorrect: 1, conflicts: [] });
     expect(admin.rpcs).toHaveLength(0);
@@ -335,7 +367,7 @@ describe("project asset backfill", () => {
       objects: [JOB_OBJECT],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(report.recorded).toBe(1);
     expect(admin.rpcs).toHaveLength(1);
@@ -358,7 +390,7 @@ describe("project asset backfill", () => {
       },
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(admin.rpcs).toHaveLength(1);
     expect(admin.rpcs[0]?.name).toBe("record_project_asset_if_matches");
@@ -385,7 +417,7 @@ describe("project asset backfill", () => {
       },
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(admin.rpcs).toHaveLength(1);
     expect(report.recorded).toBe(0);
@@ -402,7 +434,7 @@ describe("project asset backfill", () => {
       objects: [JOB_OBJECT],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(admin.reads.maybeSingle).toBe(0);
     expect(admin.rpcs).toHaveLength(1);
@@ -427,7 +459,7 @@ describe("project asset backfill", () => {
       objects: [JOB_OBJECT],
     });
 
-    await runProjectAssetBackfill(admin.client, { apply: true });
+    await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(admin.rpcs).toHaveLength(1);
     expect(admin.rpcs[0]?.params).toMatchObject({
@@ -449,7 +481,7 @@ describe("project asset backfill", () => {
       objects: [JOB_OBJECT],
     });
 
-    await runProjectAssetBackfill(admin.client, { apply: true });
+    await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(admin.rpcs[0]?.params).toMatchObject({
       p_expected_asset_id: null,
@@ -471,7 +503,7 @@ describe("project asset backfill", () => {
       },
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(report.recorded).toBe(0);
     expect(report.conflicts).toEqual([JOB_OBJECT]);
@@ -486,7 +518,7 @@ describe("project asset backfill", () => {
       rpcResults: { [JOB_OBJECT]: { unexpected: true } },
     });
 
-    await expect(runProjectAssetBackfill(admin.client, { apply: true })).rejects.toThrow(
+    await expect(runProjectAssetBackfill(admin.client, { apply: true }, admin.sql)).rejects.toThrow(
       /unexpected response/,
     );
   });
@@ -499,7 +531,7 @@ describe("project asset backfill", () => {
       objects: ["ws-team/orphan.png"],
     });
 
-    const report = await runProjectAssetBackfill(admin.client, { apply: true });
+    const report = await runProjectAssetBackfill(admin.client, { apply: true }, admin.sql);
 
     expect(report.unmatched).toEqual(["ws-team/orphan.png"]);
     expect(admin.rpcs).toHaveLength(0);

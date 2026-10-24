@@ -5,6 +5,7 @@ import {
   main,
   parseTeamInitArgs,
   runTeamInit,
+  type SqlExecutor,
   type TeamInitReport,
 } from "./hahart-team-init.js";
 
@@ -17,6 +18,13 @@ const OWNER_ID = "00000000-0000-0000-0000-00000000000f";
 const MEMBER_A_ID = "00000000-0000-0000-0000-00000000000a";
 const MEMBER_B_ID = "00000000-0000-0000-0000-00000000000b";
 const TEAM_ID = "11111111-1111-1111-1111-111111111111";
+
+/** Positional parameter order of each function, as the SQL passes them. */
+const PARAM_NAMES: Record<string, string[]> = {
+  ensure_team_workspace: ["p_owner_user_id", "p_name"],
+  add_team_member: ["p_user_id", "p_role"],
+  migrate_personal_projects_to_team: [],
+};
 
 type RpcCall = { name: string; params: Record<string, unknown> | undefined };
 
@@ -47,16 +55,28 @@ function makeAdminStub(options: StubOptions) {
       };
       return builder;
     },
-    rpc: async (name: string, params?: Record<string, unknown>) => {
-      rpcs.push({ name, params });
+  };
+
+  // The functions now run through `pg`: record the statement, map its positional
+  // params back onto the function signature order, and answer like the old stub.
+  const sql: SqlExecutor = {
+    query: async (text: string, params: unknown[] = []) => {
+      const name = /select public\.(\w+)\(/.exec(text)?.[1] ?? "";
+      const names = PARAM_NAMES[name] ?? [];
+      rpcs.push({
+        name,
+        params:
+          names.length === 0
+            ? undefined
+            : Object.fromEntries(names.map((key, index) => [key, params[index]])),
+      });
       const configured = options.rpc[name];
-      if (!configured) return { data: null, error: null };
-      if (configured.error) return { data: null, error: configured.error };
-      return { data: configured.data ?? null, error: null };
+      if (configured?.error) throw Object.assign(new Error("db error"), configured.error);
+      return { rows: [{ result: configured?.data ?? null }] };
     },
   };
 
-  return { client: client as unknown as AdminSupabaseClient, rpcs };
+  return { client: client as unknown as AdminSupabaseClient, rpcs, sql };
 }
 
 const MIGRATION_RESULT = {
@@ -120,17 +140,21 @@ describe("parseTeamInitArgs", () => {
 
 describe("runTeamInit", () => {
   it("case 1: an unknown owner throws before any RPC", async () => {
-    const { client, rpcs } = makeAdminStub({
+    const { client, rpcs, sql } = makeAdminStub({
       profiles: {},
       rpc: {},
     });
 
     const error = await capture(() =>
-      runTeamInit(client, {
-        ownerEmail: OWNER_EMAIL,
-        memberEmails: [MEMBER_A],
-        migrate: true,
-      }),
+      runTeamInit(
+        client,
+        {
+          ownerEmail: OWNER_EMAIL,
+          memberEmails: [MEMBER_A],
+          migrate: true,
+        },
+        sql,
+      ),
     );
 
     expect(error.message).toContain("owner not found");
@@ -138,13 +162,13 @@ describe("runTeamInit", () => {
   });
 
   it("case 2: the RPC order is ensure -> add*N -> migrate, with the fixed team name", async () => {
-    const { client, rpcs } = makeAdminStub(happyPath());
+    const { client, rpcs, sql } = makeAdminStub(happyPath());
 
     const report = await runTeamInit(client, {
       ownerEmail: OWNER_EMAIL,
       memberEmails: [MEMBER_A, MEMBER_B],
       migrate: true,
-    });
+    }, sql);
 
     expect(rpcs.map((call) => call.name)).toEqual([
       "ensure_team_workspace",
@@ -167,13 +191,13 @@ describe("runTeamInit", () => {
   });
 
   it("case 3: without --migrate the migration function is never called", async () => {
-    const { client, rpcs } = makeAdminStub(happyPath());
+    const { client, rpcs, sql } = makeAdminStub(happyPath());
 
     const report = await runTeamInit(client, {
       ownerEmail: OWNER_EMAIL,
       memberEmails: [MEMBER_A],
       migrate: false,
-    });
+    }, sql);
 
     expect(rpcs.some((call) => call.name === "migrate_personal_projects_to_team")).toBe(
       false,
@@ -182,13 +206,13 @@ describe("runTeamInit", () => {
   });
 
   it("case 4: an unknown member email is reported and does not stop the others", async () => {
-    const { client, rpcs } = makeAdminStub(happyPath());
+    const { client, rpcs, sql } = makeAdminStub(happyPath());
 
     const report = await runTeamInit(client, {
       ownerEmail: OWNER_EMAIL,
       memberEmails: [MEMBER_MISSING, MEMBER_A],
       migrate: false,
-    });
+    }, sql);
 
     expect(report.membersNotFound).toEqual([MEMBER_MISSING]);
     expect(report.membersAdded).toEqual([MEMBER_A]);
@@ -196,13 +220,13 @@ describe("runTeamInit", () => {
   });
 
   it("case 5: a member who is already in goes to membersAlreadyIn", async () => {
-    const { client } = makeAdminStub(happyPath({ add_team_member: { data: false } }));
+    const { client, sql } = makeAdminStub(happyPath({ add_team_member: { data: false } }));
 
     const report = await runTeamInit(client, {
       ownerEmail: OWNER_EMAIL,
       memberEmails: [MEMBER_A, MEMBER_B],
       migrate: false,
-    });
+    }, sql);
 
     expect(report.membersAdded).toEqual([]);
     expect(report.membersAlreadyIn).toEqual([MEMBER_A, MEMBER_B]);
@@ -217,7 +241,7 @@ describe("runTeamInit", () => {
         ownerEmail: OWNER_EMAIL,
         memberEmails: [],
         migrate: false,
-      }),
+      }, ensureFails.sql),
     ).rejects.toThrow(/ensure_team_workspace failed/);
 
     const addFails = makeAdminStub(
@@ -228,7 +252,7 @@ describe("runTeamInit", () => {
         ownerEmail: OWNER_EMAIL,
         memberEmails: [MEMBER_A],
         migrate: false,
-      }),
+      }, addFails.sql),
     ).rejects.toThrow(/add_team_member failed/);
 
     const migrateFails = makeAdminStub(
@@ -239,7 +263,7 @@ describe("runTeamInit", () => {
         ownerEmail: OWNER_EMAIL,
         memberEmails: [],
         migrate: true,
-      }),
+      }, migrateFails.sql),
     ).rejects.toThrow(/migrate_personal_projects_to_team failed/);
   });
 });

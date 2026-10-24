@@ -10,15 +10,26 @@
  *
  * Only the report JSON is printed — never environment variables, URLs or keys.
  * Exit code 0 = all good, 1 = some member emails were not found, 2 = owner not
- * found or an RPC failed.
+ * found or a database function call failed.
  */
 import { pathToFileURL } from "node:url";
 
 import type { AdminSupabaseClient } from "../supabase/admin.js";
 import { createAdminSupabaseClient } from "../supabase/admin.js";
 import { loadServerEnv } from "../config/env.js";
+import { createDatabasePool, resolveDatabaseUrl } from "../db/pool.js";
 
 const TEAM_NAME = "HaHart 团队";
+
+/** The one thing this CLI needs from `pg`: run a statement with positional params. */
+export type SqlExecutor = {
+  query(sql: string, params?: unknown[]): Promise<{ rows: any[] }>;
+};
+
+function sqlErrorCode(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && code !== "" ? code : "no_code";
+}
 
 export type TeamInitReport = {
   teamWorkspaceId: string;
@@ -83,6 +94,7 @@ async function findProfileId(
 export async function runTeamInit(
   admin: AdminSupabaseClient,
   options: TeamInitOptions,
+  sql: SqlExecutor,
 ): Promise<TeamInitReport> {
   const ownerId = await findProfileId(admin, options.ownerEmail);
 
@@ -90,13 +102,23 @@ export async function runTeamInit(
     throw new Error("owner not found");
   }
 
-  const { data: teamWorkspaceId, error: teamError } = await admin.rpc(
-    "ensure_team_workspace",
-    { p_owner_user_id: ownerId, p_name: TEAM_NAME },
-  );
+  // Each function call below is its own auto-committed statement, as it was
+  // when these went through the Supabase client.
+  let teamWorkspaceId: string | null = null;
+  let teamErrorCode: string | null = null;
 
-  if (teamError || !teamWorkspaceId) {
-    throw new Error(`ensure_team_workspace failed (${teamError?.code ?? "no_code"})`);
+  try {
+    const result = await sql.query(
+      "select public.ensure_team_workspace($1::uuid, $2::text) as result",
+      [ownerId, TEAM_NAME],
+    );
+    teamWorkspaceId = (result.rows[0]?.result as string | null | undefined) ?? null;
+  } catch (error) {
+    teamErrorCode = sqlErrorCode(error);
+  }
+
+  if (teamErrorCode !== null || !teamWorkspaceId) {
+    throw new Error(`ensure_team_workspace failed (${teamErrorCode ?? "no_code"})`);
   }
 
   const membersAdded: string[] = [];
@@ -111,13 +133,16 @@ export async function runTeamInit(
       continue;
     }
 
-    const { data: added, error: addError } = await admin.rpc("add_team_member", {
-      p_user_id: memberId,
-      p_role: "member",
-    });
+    let added: unknown = null;
 
-    if (addError) {
-      throw new Error(`add_team_member failed (${addError.code ?? "no_code"})`);
+    try {
+      const result = await sql.query(
+        "select public.add_team_member($1::uuid, $2::public.workspace_member_role) as result",
+        [memberId, "member"],
+      );
+      added = result.rows[0]?.result ?? null;
+    } catch (error) {
+      throw new Error(`add_team_member failed (${sqlErrorCode(error)})`);
     }
 
     if (added) {
@@ -130,10 +155,15 @@ export async function runTeamInit(
   let migration: Record<string, number> | null = null;
 
   if (options.migrate) {
-    const { data, error } = await admin.rpc("migrate_personal_projects_to_team");
+    let data: unknown = null;
 
-    if (error) {
-      throw new Error(`migrate_personal_projects_to_team failed (${error.code ?? "no_code"})`);
+    try {
+      const result = await sql.query(
+        "select public.migrate_personal_projects_to_team() as result",
+      );
+      data = result.rows[0]?.result ?? null;
+    } catch (error) {
+      throw new Error(`migrate_personal_projects_to_team failed (${sqlErrorCode(error)})`);
     }
 
     migration = (data ?? {}) as Record<string, number>;
@@ -160,9 +190,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return 2;
   }
 
+  let pool: ReturnType<typeof createDatabasePool> | null = null;
+
   try {
     const admin = createAdminSupabaseClient(loadServerEnv());
-    const report = await runTeamInit(admin, options);
+    pool = createDatabasePool(resolveDatabaseUrl());
+    const report = await runTeamInit(admin, options, pool);
     process.stdout.write(`${JSON.stringify(report)}\n`);
     return report.membersNotFound.length > 0 ? 1 : 0;
   } catch (error) {
@@ -170,6 +203,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       `team init failed: ${error instanceof Error ? error.message : "unknown error"}\n`,
     );
     return 2;
+  } finally {
+    await pool?.end().catch(() => undefined);
   }
 }
 

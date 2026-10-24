@@ -50,6 +50,7 @@ import { pathToFileURL } from "node:url";
 import type { AdminSupabaseClient } from "../supabase/admin.js";
 import { createAdminSupabaseClient } from "../supabase/admin.js";
 import { loadServerEnv } from "../config/env.js";
+import { createDatabasePool, resolveDatabaseUrl } from "../db/pool.js";
 
 export type ProjectAssetBackfillReport = {
   discovered: number;
@@ -68,6 +69,21 @@ const LIST_PAGE_SIZE = 100;
 const ROW_PAGE_SIZE = 200;
 
 type AdminClient = AdminSupabaseClient;
+
+/** The one thing the write step needs from `pg`: run a statement with positional params. */
+export type SqlExecutor = {
+  query(sql: string, params?: unknown[]): Promise<{ rows: any[] }>;
+};
+
+/**
+ * Same function, same argument order as the original named-parameter call; the
+ * explicit casts are what the named form used to do implicitly.
+ */
+const RECORD_IF_MATCHES_SQL =
+  "select public.record_project_asset_if_matches(" +
+  "$1::text, $2::text, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7::text, $8::bigint, " +
+  "$9::uuid, $10::uuid, $11::uuid, $12::uuid, $13::text, $14::bigint" +
+  ") as result";
 
 type Candidate = {
   objectPath: string;
@@ -228,6 +244,7 @@ async function existingObjects(
 export async function runProjectAssetBackfill(
   admin: AdminClient,
   options: { apply: boolean },
+  sql: SqlExecutor,
 ): Promise<ProjectAssetBackfillReport> {
   // ---- the relations ownership may be derived from -------------------------
   const projects = await loadAllRows<{ id: string; workspace_id: string }>(
@@ -453,26 +470,35 @@ export async function runProjectAssetBackfill(
       // and the write would land on top of the newer state.
       const existing = plan.existing;
 
-      const { data, error } = await admin.rpc("record_project_asset_if_matches", {
-        p_bucket: BUCKET,
-        p_object_path: plan.objectPath,
-        p_created_by: plan.createdBy,
-        p_fallback_workspace_id: projectWorkspace.get(plan.projectId)!,
-        p_project_id: plan.projectId,
-        p_canvas_id: plan.canvasId,
-        p_mime_type: plan.mimeType,
-        p_byte_size: plan.byteSize,
-        // `null` asset id is how "no row existed at plan time" is expressed; the
-        // RPC then refuses to adopt any row that appeared since.
-        p_expected_asset_id: existing?.id ?? null,
-        p_expected_workspace_id: existing?.workspace_id ?? null,
-        p_expected_project_id: existing?.project_id ?? null,
-        p_expected_created_by: existing?.created_by ?? null,
-        p_expected_mime_type: existing?.mime_type ?? null,
-        p_expected_byte_size: existing?.byte_size ?? null,
-      });
+      let data: unknown;
 
-      if (error) throw new Error(`record_project_asset_if_matches failed: ${error.message}`);
+      try {
+        const result = await sql.query(RECORD_IF_MATCHES_SQL, [
+          BUCKET,
+          plan.objectPath,
+          plan.createdBy,
+          projectWorkspace.get(plan.projectId)!,
+          plan.projectId,
+          plan.canvasId,
+          plan.mimeType,
+          plan.byteSize,
+          // `null` asset id is how "no row existed at plan time" is expressed; the
+          // function then refuses to adopt any row that appeared since.
+          existing?.id ?? null,
+          existing?.workspace_id ?? null,
+          existing?.project_id ?? null,
+          existing?.created_by ?? null,
+          existing?.mime_type ?? null,
+          existing?.byte_size ?? null,
+        ]);
+        data = result.rows[0]?.result ?? null;
+      } catch (error) {
+        throw new Error(
+          `record_project_asset_if_matches failed: ${
+            error instanceof Error ? error.message : "unknown error"
+          }`,
+        );
+      }
 
       const status = (data as CompareWriteResult | null)?.status;
 
@@ -515,9 +541,12 @@ export function parseBackfillArgs(argv: string[]): { apply: boolean } {
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   const options = parseBackfillArgs(argv);
 
+  let pool: ReturnType<typeof createDatabasePool> | null = null;
+
   try {
     const admin = createAdminSupabaseClient(loadServerEnv());
-    const report = await runProjectAssetBackfill(admin, options);
+    pool = createDatabasePool(resolveDatabaseUrl());
+    const report = await runProjectAssetBackfill(admin, options, pool);
     process.stdout.write(`${JSON.stringify(report)}\n`);
 
     const needsAttention = report.conflicts.length > 0 || report.unmatched.length > 0;
@@ -529,6 +558,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       }\n`,
     );
     return 2;
+  } finally {
+    await pool?.end().catch(() => undefined);
   }
 }
 
