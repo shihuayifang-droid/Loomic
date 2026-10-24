@@ -55,7 +55,7 @@ select * from public.create_charged_job(
 `;
 
 const READ_JOB_SQL = `
-select id, workspace_id, project_id, canvas_id, session_id, thread_id, queue_name, job_type, status, payload, result, error_code, error_message, attempt_count, max_attempts, created_by, created_at, updated_at, started_at, completed_at, failed_at, canceled_at
+select id, workspace_id, project_id, canvas_id, session_id, thread_id, queue_name, job_type, status, payload, result, error_code, error_message, attempt_count, max_attempts, created_by, to_jsonb(created_at) #>> '{}' as created_at, to_jsonb(updated_at) #>> '{}' as updated_at, to_jsonb(started_at) #>> '{}' as started_at, to_jsonb(completed_at) #>> '{}' as completed_at, to_jsonb(failed_at) #>> '{}' as failed_at, to_jsonb(canceled_at) #>> '{}' as canceled_at
   from public.background_jobs
  where id = $1::uuid
 `;
