@@ -10,6 +10,7 @@ import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
+import type { ObjectStore } from "../../features/storage/object-store.js";
 import {
   AgentProjectAssetError,
   createAgentProjectAssetService,
@@ -68,6 +69,14 @@ export type PersistSandboxFileDeps = {
    */
   assetRecordRepository: Pick<AssetRecordRepository, "recordProjectAsset">;
   createUserClient: (accessToken: string) => SupabaseClient;
+  /**
+   * T-133 6a: 透传占位，6b 起由 agent-project-assets 消费。
+   *
+   * Optional on purpose: the existing deps literals (tests included) must keep
+   * compiling unchanged. Nothing in this file reads it yet — this slice only
+   * carries the factory down to where 6b will consume it.
+   */
+  createObjectStore?: (client: UserSupabaseClient) => ObjectStore;
   /**
    * Sandbox root. Required on purpose: without it there is no range we can
    * prove a path belongs to, and this tool reads a host file and uploads it.

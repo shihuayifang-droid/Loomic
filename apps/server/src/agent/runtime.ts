@@ -40,6 +40,9 @@ import type { ConnectionManager } from "../ws/connection-manager.js";
 import {
   createAgentProjectAssetService,
 } from "../features/storage/agent-project-assets.js";
+// 45AM / T-133 (6a): the per-user object store factory is only typed here — the
+// slice transmits it, it does not consume it.
+import type { ObjectStore } from "../features/storage/object-store.js";
 import {
   PROJECT_ASSET_BUCKET,
   signProjectAssetUrl,
@@ -542,6 +545,13 @@ type CreateAgentRuntimeOptions = {
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => unknown;
   /**
+   * 45AM / T-133 (6a): the per-user object store factory, handed straight through
+   * to `createLoomicDeepAgent` below. Optional on purpose — the existing callers
+   * and tests must keep compiling — and transmitted only: nothing on this path
+   * calls it yet, 6b is where `agent-project-assets` consumes it.
+   */
+  createObjectStore?: (client: UserSupabaseClient) => ObjectStore;
+  /**
    * Workorder 44S: the personal workspace an image / video job is billed and
    * filed under is resolved through the identity read repository.
    */
@@ -903,6 +913,10 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         canvasReadRepository: options.canvasReadRepository,
         ...(options.createUserClient
           ? { createUserClient: options.createUserClient }
+          : {}),
+        // 45AM / T-133 (6a): same optional-shape as the fields around it.
+        ...(options.createObjectStore
+          ? { createObjectStore: options.createObjectStore }
           : {}),
       }));
 

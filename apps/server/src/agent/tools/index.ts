@@ -134,6 +134,13 @@ export function createMainAgentTools(
         assetRecordRepository: deps.assetRecordRepository,
         canvasReadRepository: deps.canvasReadRepository,
         createUserClient: deps.createUserClient,
+        // 45AM / T-133 (6a): carried through as-is — this slice only moves the
+        // factory down, nothing here calls it. Spread conditionally because the
+        // repo compiles with `exactOptionalPropertyTypes: true`, so an explicit
+        // `undefined` is not assignable to the optional property (TS2379).
+        ...(deps.createObjectStore
+          ? { createObjectStore: deps.createObjectStore }
+          : {}),
         sandboxDir: deps.sandboxDir,
       }),
     );

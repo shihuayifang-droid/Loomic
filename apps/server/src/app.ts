@@ -1060,6 +1060,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     canvasContentRepository,
     connectionManager,
     createUserClient,
+    // 45AM / T-133 (6a): the same factory form brand-kit (45AH), uploads (45AI),
+    // canvas (45AJ) and projects (45AK) take above. Transmitted only — nothing
+    // on this path reads it yet; 6b is where agent-project-assets consumes it.
+    createObjectStore: (client) =>
+      createSupabaseObjectStore(client as unknown as SupabaseStorageLike),
     ...(options.agentModel ? { model: options.agentModel } : {}),
     ...(options.mockEventDelayMs === undefined
       ? {}

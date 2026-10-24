@@ -11,6 +11,9 @@ import type { BrandKitReadRepository } from "../db/brand-kit-read-repository.js"
 import type { CanvasContentRepository } from "../db/canvas-content-repository.js";
 import type { CanvasReadRepository } from "../db/canvas-read-repository.js";
 import type { ConnectionManager } from "../ws/connection-manager.js";
+// 45AM / T-133 (6a): the per-user object store factory is only typed here — the
+// slice transmits it, it does not consume it.
+import type { ObjectStore } from "../features/storage/object-store.js";
 import { createAgentBackend, type AgentBackendResult } from "./backends/index.js";
 import { ChatOpenAIImageUrlCompat } from "./openai-image-url-compat.js";
 import { LOOMIC_SYSTEM_PROMPT } from "./prompts/loomic-main.js";
@@ -68,6 +71,8 @@ export function createLoomicDeepAgent(options: {
   checkpointer?: BaseCheckpointSaver;
   connectionManager?: ConnectionManager;
   createUserClient?: (accessToken: string) => any;
+  /** 45AM / T-133 (6a): transmitted through to the tools, consumed from 6b on. */
+  createObjectStore?: (client: any) => ObjectStore;
   env: ServerEnv;
   model?: BaseLanguageModel | string;
   persistImage?: PersistImageFn;
@@ -148,6 +153,10 @@ export function createLoomicDeepAgent(options: {
         : {}),
       canvasReadRepository: options.canvasReadRepository,
       createUserClient,
+      // 45AM / T-133 (6a): same optional-shape as the fields around it.
+      ...(options.createObjectStore
+        ? { createObjectStore: options.createObjectStore }
+        : {}),
       ...(options.brandKitId != null ? { brandKitId: options.brandKitId } : {}),
       ...(options.connectionManager ? { connectionManager: options.connectionManager } : {}),
       ...(options.persistImage ? { persistImage: options.persistImage } : {}),
