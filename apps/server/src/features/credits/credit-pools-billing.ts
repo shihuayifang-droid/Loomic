@@ -1,9 +1,10 @@
 /**
  * The three-pool switch (workorder 37T, BL-04 / BL-41 / BL-45).
  *
- * `LOOMIC_CREDIT_POOLS=on` moves the charge, the refund and the balance
- * pre-check onto the three pools. Anything else leaves the credit service
- * exactly as it was: the wrapper below is only built when the switch is on.
+ * `HAHART_CREDIT_POOLS=on` (legacy: `LOOMIC_CREDIT_POOLS=on`) moves the
+ * charge, the refund and the balance pre-check onto the three pools. Anything
+ * else leaves the credit service exactly as it was: the wrapper below is only
+ * built when the switch is on.
  *
  * The wrapper replaces two methods and adds one optional capability; every
  * other method is the base service's own.
@@ -24,11 +25,20 @@ export const POOL_SQLSTATE = {
   teamPool: "P0404",
 } as const;
 
-/** Only the lowercase value `on` turns the pools on. */
+/**
+ * Only the lowercase value `on` turns the pools on.
+ *
+ * `HAHART_CREDIT_POOLS` is the canonical name; `LOOMIC_CREDIT_POOLS` is kept
+ * as a fallback so existing deployments keep working (same policy workorder
+ * 45S applied to the six variables in `config/env.ts`). The `HAHART_` name
+ * wins when both are set, and neither is widened: anything other than the
+ * exact string `on` — `1`, `true`, `ON`, an empty value — leaves the pools off.
+ */
 export function creditPoolsEnabled(
   source: Record<string, string | undefined> = process.env,
 ): boolean {
-  return source.LOOMIC_CREDIT_POOLS === "on";
+  const raw = source.HAHART_CREDIT_POOLS ?? source.LOOMIC_CREDIT_POOLS;
+  return raw === "on";
 }
 
 export type CreditPoolsDeps = {

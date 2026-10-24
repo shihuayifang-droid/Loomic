@@ -78,6 +78,41 @@ describe("creditPoolsEnabled", () => {
   });
 });
 
+// Workorder 45X: `HAHART_CREDIT_POOLS` is the canonical name, the legacy
+// `LOOMIC_CREDIT_POOLS` still works, and neither widens the value check.
+describe("creditPoolsEnabled: HAHART_CREDIT_POOLS with the LOOMIC_ fallback (45X)", () => {
+  it("HAHART_CREDIT_POOLS=on turns the pools on", () => {
+    expect(creditPoolsEnabled({ HAHART_CREDIT_POOLS: "on" })).toBe(true);
+  });
+
+  it("the legacy LOOMIC_CREDIT_POOLS=on still turns the pools on", () => {
+    expect(creditPoolsEnabled({ LOOMIC_CREDIT_POOLS: "on" })).toBe(true);
+  });
+
+  it("HAHART_CREDIT_POOLS wins when both names are set", () => {
+    expect(
+      creditPoolsEnabled({
+        HAHART_CREDIT_POOLS: "on",
+        LOOMIC_CREDIT_POOLS: "off",
+      }),
+    ).toBe(true);
+    expect(
+      creditPoolsEnabled({
+        HAHART_CREDIT_POOLS: "off",
+        LOOMIC_CREDIT_POOLS: "on",
+      }),
+    ).toBe(false);
+  });
+
+  it("neither set, an empty value, 1 or true all leave the pools off", () => {
+    expect(creditPoolsEnabled({})).toBe(false);
+    expect(creditPoolsEnabled({ HAHART_CREDIT_POOLS: "" })).toBe(false);
+    expect(creditPoolsEnabled({ HAHART_CREDIT_POOLS: "1" })).toBe(false);
+    expect(creditPoolsEnabled({ HAHART_CREDIT_POOLS: "true" })).toBe(false);
+    expect(creditPoolsEnabled({ LOOMIC_CREDIT_POOLS: "1" })).toBe(false);
+  });
+});
+
 describe("withCreditPools", () => {
   it("deduct goes to the team pools", async () => {
     const base = makeBase();
