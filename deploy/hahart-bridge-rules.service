@@ -1,0 +1,17 @@
+[Unit]
+# Re-adds the docker br-* bridge iptables rules after docker starts (see E-034:
+# a cold boot of .37 lost them and every /api/* call returned 504 until they
+# were patched back by hand).
+Description=HaHart docker bridge iptables rules (self-heal, E-034)
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+# Install deploy/fix-bridge-rules.sh to /opt/hahart/ (see deploy/README.md).
+ExecStart=/opt/hahart/fix-bridge-rules.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
