@@ -183,9 +183,16 @@ export function createCanvasService(options: {
 
       const content = (data.content as CanvasContent) ?? { elements: [], appState: {} };
 
+      // T-133 (9th slice): the READ path signs through the same per-request
+      // store the SAVE path uploads with — built by the injected factory from
+      // THIS caller's client, so the signature carries their JWT and the whole
+      // feature has exactly one storage seam. Nothing about which request the
+      // store belongs to changed; only who ends up asking Storage.
+      const objectStore = options.createObjectStore(client);
+
       // Resolve OSS-stored files back to base64 dataURLs for the frontend
       const resolvedContent = await resolveFilesFromStorage(
-        client,
+        objectStore,
         canvasId,
         content,
         options.canvasReadRepository,
@@ -195,7 +202,7 @@ export function createCanvasService(options: {
       // CV-01: attach a playable URL for video markers. Read-time only — the
       // persisted `link` keeps its oss:// marker (see the function's notes).
       const projectedContent = await resolveVideoElementsFromStorage(
-        client,
+        objectStore,
         resolvedContent,
         options.canvasReadRepository,
         user.id,
@@ -664,7 +671,7 @@ function canTransformOnTheFly(mimeType: string): boolean {
 }
 
 async function resolveFilesFromStorage(
-  client: UserSupabaseClient,
+  store: ObjectStore,
   canvasId: string,
   content: CanvasContent,
   repository: CanvasReadRepository | undefined,
@@ -771,10 +778,10 @@ async function resolveFilesFromStorage(
       let storageUrl: string;
 
       try {
-        original = await signProjectAssetUrl(client, entry.objectPath, { bucket });
+        original = await signProjectAssetUrl(store, entry.objectPath, { bucket });
         storageUrl = transformable
           ? withWebpFormat(
-              await signProjectAssetUrl(client, entry.objectPath, {
+              await signProjectAssetUrl(store, entry.objectPath, {
                 bucket,
                 transform: {
                   width: CANVAS_DISPLAY_MAX_PX,
@@ -953,7 +960,7 @@ export function isMarkerOwned(
 }
 
 async function resolveVideoElementsFromStorage(
-  client: UserSupabaseClient,
+  store: ObjectStore,
   content: CanvasContent,
   repository: CanvasReadRepository | undefined,
   actorId: string,
@@ -1041,7 +1048,7 @@ async function resolveVideoElementsFromStorage(
     try {
       // Signed, and nothing else: `resolvedVideoUrl` is a read-time projection
       // that the client may play but never persists (the marker stays in `link`).
-      const resolvedVideoUrl = await signProjectAssetUrl(client, objectPath, {
+      const resolvedVideoUrl = await signProjectAssetUrl(store, objectPath, {
         bucket,
       });
       changed = true;

@@ -32,6 +32,8 @@ import { readCanvasRow, replaceCanvasContent } from "./canvas-version.js";
 import { createCanvasService } from "./canvas-service.js";
 import { ObjectStoreError } from "../storage/object-store.js";
 import type { ObjectStore } from "../storage/object-store.js";
+import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 
 const USER = {
   id: "user-1",
@@ -55,15 +57,24 @@ const WORKSPACE = "ws-team";
 const PROJECT = "project-1";
 
 /**
- * 45AJ: the read-path fixtures below never upload — the service builds its store
- * only on the SAVE path, and every case using this factory reads a canvas. It is
- * required by the service's options, so it is supplied here and throws rather than
- * answering a stub: an upload creeping into these cases must fail loudly instead
- * of passing against a store that silently does nothing.
+ * 45AJ: the fixtures below that never reach Storage supply this factory so the
+ * required option is always present. T-133 (9th slice) made the READ path build
+ * its store too, so a case that signs now passes `readPathStore` instead; this
+ * one is left to the cases that fail before any store would be built.
  */
 const noObjectStoreOnTheReadPath = (): ObjectStore => {
   throw new Error("the canvas read path must not build an object store");
 };
+
+/**
+ * T-133 (9th slice): the read path is handed the same store the save path
+ * uploads with, so the fixtures build it with the factory `app.ts` passes —
+ * `createSupabaseObjectStore` over the caller's own client. The signatures
+ * therefore still reach the stub client below (same bucket, key, TTL and
+ * transform), which is what the URL-shape assertions here observe.
+ */
+const readPathStore = (client: UserSupabaseClient): ObjectStore =>
+  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
 
 const PNG_BASE64 =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -493,7 +504,7 @@ function makeReadStub(options: {
 
   const service = createCanvasService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
-    createObjectStore: noObjectStoreOnTheReadPath,
+    createObjectStore: readPathStore,
     canvasContentRepository: fakeContentRepository,
     getAdminClient: () =>
       ({ rpc: async () => ({ data: null, error: null }) }) as unknown as AdminSupabaseClient,

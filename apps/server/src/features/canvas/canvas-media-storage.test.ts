@@ -23,6 +23,8 @@ import { insertVideoElementForJobResult } from "../../agent/runtime.js";
 import { createCanvasService } from "./canvas-service.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
 import type { ObjectStore } from "../storage/object-store.js";
+import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 import { insertVideoElement } from "./canvas-element-writer.js";
 import { createRepositoryCanvasStore } from "./canvas-version.js";
 
@@ -35,15 +37,15 @@ const MARKER = "oss://project-assets/ws-team/gen/v1.mp4";
  * injected per-user FACTORY, the same form brand-kit (45AH) and uploads (45AI)
  * take, and the option is required so no save path can silently skip an upload.
  *
- * Every case in this file READS a canvas (or writes through the content
- * repository): the factory is only reached on the save path's extraction step, so
- * it is never called here. It throws instead of answering a stub, so an upload
- * creeping into these cases fails loudly rather than passing against a store that
- * does nothing.
+ * T-133 (9th slice): the READ path now signs through that same store instead of
+ * the raw client, so the cases below build it the way `app.ts` does —
+ * `createSupabaseObjectStore` over the caller's own client. The signatures still
+ * reach the stub client's `createSignedUrl`, which is what `signedCalls` /
+ * `resolvedUrls` observe, so the URL shape, TTL and transform assertions below
+ * are unchanged in what they pin.
  */
-const noObjectStoreUploads = (): ObjectStore => {
-  throw new Error("canvas-media-storage does not upload objects");
-};
+const storeFrom = (client: UserSupabaseClient): ObjectStore =>
+  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
 
 type CanvasContentLike = {
   elements: Array<Record<string, any>>;
@@ -203,10 +205,10 @@ describe("CV-01 video object keys", () => {
       ],
     });
     // X-52 工单12: the service records asset metadata through the admin client on
-    // the SAVE path; these cases read canvases, so it is never called.
+    // the SAVE path; these cases only read, so the factory signs but never uploads.
     const service = createCanvasService({
       createUserClient: () => fake.client,
-      createObjectStore: noObjectStoreUploads,
+      createObjectStore: storeFrom,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -243,7 +245,7 @@ describe("CV-01 video object keys", () => {
     });
     const service = createCanvasService({
       createUserClient: () => fake.client,
-      createObjectStore: noObjectStoreUploads,
+      createObjectStore: storeFrom,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -323,10 +325,10 @@ describe("CV-01 video object keys", () => {
       elements: [legacy, nonVideo, emptyObjectPath, emptyBucket, noSlash, good],
     });
     // X-52 工单12: the service records asset metadata through the admin client on
-    // the SAVE path; these cases read canvases, so it is never called.
+    // the SAVE path; these cases only read, so the factory signs but never uploads.
     const service = createCanvasService({
       createUserClient: () => fake.client,
-      createObjectStore: noObjectStoreUploads,
+      createObjectStore: storeFrom,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -359,7 +361,7 @@ describe("CV-01 video object keys", () => {
     });
     const service = createCanvasService({
       createUserClient: () => fake.client,
-      createObjectStore: noObjectStoreUploads,
+      createObjectStore: storeFrom,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -386,7 +388,7 @@ describe("CV-01 video object keys", () => {
     });
     const service = createCanvasService({
       createUserClient: () => fake.client,
-      createObjectStore: noObjectStoreUploads,
+      createObjectStore: storeFrom,
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository({
         rows: [{ id: "asset-v1", bucket: "project-assets", object_path: "legacy-root/v1.mp4" }],
