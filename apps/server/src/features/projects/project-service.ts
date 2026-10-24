@@ -28,7 +28,7 @@ import {
   isTransportFailure,
   withTransportRetry,
 } from "../../supabase/transport-retry.js";
-import { ObjectStoreError } from "../storage/object-store.js";
+import { ObjectStoreError, type ObjectStore } from "../storage/object-store.js";
 import {
   ProjectAssetUrlError,
   signProjectAssetUrl,
@@ -36,8 +36,6 @@ import {
   storageRenderTransformEnabled,
   withWebpFormat,
 } from "../storage/project-asset-urls.js";
-import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
-import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -124,6 +122,21 @@ export class ProjectServiceError extends Error {
 
 export function createProjectService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
+  /**
+   * 45AK / T-133 (5th slice): a FACTORY, not a single shared store.
+   *
+   * A project thumbnail is written for the CALLER who is saving it, so the store is
+   * built from THAT user's client and Storage answers under that user's RLS —
+   * the same per-user scoping this service applied itself when it wrapped the
+   * caller's client inline, and the same form brand-kit (45AH), uploads (45AI)
+   * and canvas (45AJ) take. Handing the service one store built from the
+   * server's/admin's client would widen the permission on this feature: the
+   * object key's first segment is the project's workspace and the asset row that
+   * owns it is recorded per user, none of which is enforced if the write itself
+   * bypasses RLS. Required means a missing wire is a compile error instead of a
+   * service that silently cannot write a thumbnail.
+   */
+  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
   viewerService: ViewerService;
   /**
    * Workorder 44C: the thumbnail's asset row is recorded through the asset record
@@ -463,11 +476,16 @@ export function createProjectService(options: {
       const objectPath = `${proj.workspace_id}/${projectId}/thumbnail.${ext}`;
 
       // 43H: the thumbnail write goes through the `ObjectStore` seam instead of
-      // the raw SDK.
+      // the raw SDK. Since 45AK (T-133 5th slice) that store comes from the
+      // injected per-user FACTORY, built from THIS user's client right before the
+      // bytes are written — not once at construction, and never from the
+      // server's/admin's client. The upload therefore carries the saver's JWT and
+      // Storage answers under that user's RLS; the service no longer names a
+      // backend, the assembly point does.
+      const objectStore = options.createObjectStore(client);
+
       try {
-        await createSupabaseObjectStore(
-          client as unknown as SupabaseStorageLike,
-        ).put(
+        await objectStore.put(
           { bucket: THUMBNAIL_BUCKET, key: objectPath },
           buffer,
           { contentType: mimeType, upsert: true },

@@ -641,6 +641,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.projectService ??
     createProjectService({
       createUserClient,
+      // 45AK / T-133 (5th slice): a FACTORY, not a shared store — the same form
+      // brand-kit (45AH), uploads (45AI) and canvas (45AJ) take. A project
+      // thumbnail is uploaded by whoever is saving that project, so the store is
+      // built from the caller's own client and Storage answers under that user's
+      // RLS. Handing the service the server's/admin's store would widen the
+      // permission on this feature (a security regression, and 44C's ownership
+      // rule on the asset row would be applied to a write that already bypassed
+      // it). The service itself no longer names a backend; this factory is where
+      // it is named, and in `fs` mode the client it wraps is already the volume
+      // adapter, so the wrap is the same one the service applied before.
+      createObjectStore: (client) =>
+        createSupabaseObjectStore(client as unknown as SupabaseStorageLike),
       viewerService,
       assetRecordRepository,
       projectReadRepository,

@@ -23,6 +23,7 @@ import type {
   ProjectCreateRepository,
 } from "../../db/project-create-repository.js";
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
+import type { ObjectStore } from "../storage/object-store.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -297,6 +298,65 @@ function makeStorageOnlyClient(options: {
 }
 
 /**
+ * 45AK / T-133 (5th slice): the thumbnail's store is built by the injected
+ * `createObjectStore` factory instead of the service wrapping the user client
+ * itself, so the observation point moves here. The fake records exactly what the
+ * service hands a backend — bucket, key, bytes and options — which is what the
+ * assertions below look at; `putError` makes the write fail the way a backend
+ * failure reaches the service.
+ */
+type RecordedPut = {
+  bucket: string;
+  key: string;
+  bytes: Buffer;
+  options: { contentType?: string; upsert?: boolean } | undefined;
+};
+
+function makeObjectStoreStub(
+  config: { putError?: (put: RecordedPut) => Error | null } = {},
+) {
+  const puts: RecordedPut[] = [];
+
+  const store = {
+    async put(
+      ref: { bucket: string; key: string },
+      bytes: Buffer,
+      options?: { contentType?: string; upsert?: boolean },
+    ) {
+      const recorded: RecordedPut = {
+        bucket: ref.bucket,
+        key: ref.key,
+        bytes,
+        options,
+      };
+      puts.push(recorded);
+      const error = config.putError?.(recorded);
+      if (error) throw error;
+      return { path: ref.key };
+    },
+    async remove() {
+      return;
+    },
+    async signedReadUrls() {
+      return new Map<string, string>();
+    },
+    async get() {
+      throw new Error("the thumbnail write path must not read an object");
+    },
+  };
+
+  return { store: store as unknown as ObjectStore, puts };
+}
+
+/**
+ * The create / list / archive cases never touch an object, so they are handed a
+ * factory that fails loudly rather than a store nobody needs.
+ */
+const noObjectStoreOnTheReadPath = (): ObjectStore => {
+  throw new Error("this project path must not build an object store");
+};
+
+/**
  * Workorder 44C: the thumbnail's asset row is recorded through the asset record
  * repository; this fake records the camelCase input.
  */
@@ -420,6 +480,7 @@ describe("createProjectService with the team workspace", () => {
     const create = makeCreateRepositoryStub();
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       // These cases exercise create/list only, so no asset is ever recorded.
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -461,6 +522,7 @@ describe("createProjectService with the team workspace", () => {
     });
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -493,6 +555,7 @@ describe("createProjectService with the team workspace", () => {
     const create = makeCreateRepositoryStub();
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(null),
       projectWriteRepository: makeWriteRepositoryStub().repository,
       projectCreateRepository: create.repository,
@@ -516,6 +579,7 @@ describe("createProjectService with the team workspace", () => {
     });
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
       projectCreateRepository: create.repository,
@@ -538,6 +602,7 @@ describe("createProjectService with the team workspace", () => {
     });
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
       projectCreateRepository: create.repository,
@@ -558,6 +623,7 @@ describe("createProjectService with the team workspace", () => {
     const create = makeCreateRepositoryStub({ result: null });
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
       projectCreateRepository: create.repository,
@@ -577,6 +643,7 @@ describe("createProjectService with the team workspace", () => {
     const { client } = makeClientStub({});
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
@@ -605,6 +672,7 @@ describe("getProject delegating to the project read repository", () => {
     const writeStub = makeWriteRepositoryStub();
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       ...(options.withRepository
         ? { projectReadRepository: stub.repository }
@@ -699,6 +767,7 @@ describe("listProjects delegating to the project read repository", () => {
     });
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -728,6 +797,7 @@ describe("listProjects delegating to the project read repository", () => {
     const { client, signed } = makeSigningClient();
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -746,6 +816,7 @@ describe("listProjects delegating to the project read repository", () => {
     const { client } = makeClientStub({});
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -769,6 +840,7 @@ describe("listProjects delegating to the project read repository", () => {
     const { client } = makeClientStub({});
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -793,6 +865,7 @@ describe("listProjects delegating to the project read repository", () => {
     const { client, signed } = makeSigningClient();
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -812,6 +885,7 @@ describe("listProjects delegating to the project read repository", () => {
     const { client, queries } = makeClientStub({});
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
     });
@@ -844,12 +918,15 @@ describe("saveThumbnail answers with a signed URL", () => {
     // 工单20E: the workspace lookup is the repository's now, so the fixture has to
     // answer it — a client stub can no longer carry the lookup.
     const lookupCalls: Array<{ actorId: string; projectId: string }> = [];
+    // 45AK: the object write itself is the fake store's below, so this client stub
+    // deliberately carries NO `upload` — a regression that writes through the raw
+    // SDK again would fail here instead of passing quietly.
+    const store = makeObjectStoreStub();
 
     const client = {
       storage: {
         from(bucket: string) {
           return {
-            upload: async (path: string) => ({ data: { path }, error: null }),
             createSignedUrl: async (path: string, expiresIn: number) => {
               signedCalls.push({ bucket, path, expiresIn });
               if (options.signError) return { data: null, error: options.signError };
@@ -889,13 +966,16 @@ describe("saveThumbnail answers with a signed URL", () => {
 
     const service = createProjectService({
       createUserClient: () => client as unknown as UserSupabaseClient,
+      // 45AK: the thumbnail store is the fake's, built per call from the user
+      // client the service was handed — the observation point moved here.
+      createObjectStore: () => store.store,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       assetRecordRepository: makeRecordRepositoryStub().repository,
       projectReadRepository: repository as unknown as ProjectReadRepository,
       projectWriteRepository: writeStub.repository,
     });
 
-    return { service, signedCalls, lookupCalls, writeCalls: writeStub.calls };
+    return { service, signedCalls, lookupCalls, writeCalls: writeStub.calls, puts: store.puts };
   }
 
   it("case 4: the thumbnail URL is a signature, not a public URL", async () => {
@@ -927,6 +1007,16 @@ describe("saveThumbnail answers with a signed URL", () => {
           projectId: "project-1",
           thumbnailPath: `${TEAM_ID}/project-1/thumbnail.png`,
         },
+      },
+    ]);
+    // 45AK: the bytes went to the store the injected factory built — the same
+    // bucket, the same key and the same upsert that the wrapped client used to see.
+    expect(stub.puts).toEqual([
+      {
+        bucket: "project-assets",
+        key: `${TEAM_ID}/project-1/thumbnail.png`,
+        bytes: Buffer.from("thumb"),
+        options: { contentType: "image/png", upsert: true },
       },
     ]);
   });
@@ -1091,6 +1181,7 @@ describe("archiveProject delegating to the project read repository", () => {
 
     const service = createProjectService({
       createUserClient: () => client.client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       ...(config.withRepository === false
         ? {}
@@ -1225,6 +1316,7 @@ describe("updateProject delegating to the project write repository", () => {
 
     const service = createProjectService({
       createUserClient: () => client.client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: writeStub.repository,
     });
@@ -1362,11 +1454,15 @@ describe("saveThumbnail lookup retry", () => {
 
     // ADR-0001 / workorder 21AA: the reference write is the write repository's, and
     // the client below carries ONLY Storage and the RPC — its table accessor throws.
+    // 45AK: the object write is the injected factory's store, so `uploads` below is
+    // what that store received (bucket + key), not what the client stub saw.
     const client = makeStorageOnlyClient();
+    const store = makeObjectStoreStub();
     const writeStub = makeWriteRepositoryStub();
 
     const service = createProjectService({
       createUserClient: () => client.client,
+      createObjectStore: () => store.store,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       assetRecordRepository: recordStub.repository,
       projectReadRepository: repository as unknown as ProjectReadRepository,
@@ -1377,7 +1473,11 @@ describe("saveThumbnail lookup retry", () => {
       service,
       attempts,
       inputs,
-      uploads: client.uploads,
+      // Read through the fake store's live list, so the assertions still describe
+      // what the write path did rather than a snapshot taken when it started.
+      get uploads() {
+        return store.puts.map((put) => put.key);
+      },
       recordCalls: recordStub.calls,
       writeCalls: writeStub.calls,
     };
@@ -1525,6 +1625,7 @@ describe("GN-14 list thumbnails go through the storage renderer", () => {
     });
     const service = createProjectService({
       createUserClient: () => client,
+      createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -1553,6 +1654,7 @@ describe("GN-14 list thumbnails go through the storage renderer", () => {
       });
       const service = createProjectService({
         createUserClient: () => client,
+        createObjectStore: noObjectStoreOnTheReadPath,
         viewerService: makeViewerStub(TEAM_WORKSPACE),
         projectReadRepository: repository,
         projectWriteRepository: makeWriteRepositoryStub().repository,

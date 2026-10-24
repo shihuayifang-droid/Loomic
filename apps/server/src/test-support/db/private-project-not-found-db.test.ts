@@ -147,6 +147,11 @@ beforeAll(async () => {
     createUserClient: () => {
       throw new Error("getProject must not build a user client");
     },
+    // 45AK / T-133 (5th slice): the thumbnail store is a per-user factory now,
+    // and `getProject` must not build one either.
+    createObjectStore: () => {
+      throw new Error("getProject must not build an object store");
+    },
     viewerService: {} as unknown as ViewerService,
     projectReadRepository: repository,
     projectWriteRepository: {} as unknown as ProjectWriteRepository,

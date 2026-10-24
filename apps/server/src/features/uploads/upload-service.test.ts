@@ -536,8 +536,15 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
       },
     };
 
+    // 45AK / T-133 (5th slice): the thumbnail store is injected as a per-user
+    // FACTORY, so the double is a fake STORE instead of a fake SDK underneath a
+    // real adapter. `put` records the same bucket / key / byte count the SDK
+    // double used to see; signing still goes through `userClient` above.
+    const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
+
     const service = createProjectService({
       createUserClient: () => userClient as unknown as UserSupabaseClient,
+      createObjectStore: () => createFakeStore({ uploads }),
       viewerService: {} as ViewerService,
       // 工单20E: the workspace lookup is the repository's now.
       projectReadRepository: {
