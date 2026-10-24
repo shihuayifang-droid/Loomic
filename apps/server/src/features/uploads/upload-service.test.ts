@@ -23,6 +23,8 @@ import {
 import type { ProjectReadRepository } from "../../db/project-read-repository.js";
 import type { ProjectWriteRepository } from "../../db/project-write-repository.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
+import type { ObjectStore } from "../storage/object-store.js";
+import { ObjectStoreError } from "../storage/object-store.js";
 import { createUploadService, UploadServiceError } from "./upload-service.js";
 
 const USER = { id: "user-1", accessToken: "token", email: "a@t", userMetadata: {} } as AuthenticatedUser;
@@ -36,6 +38,71 @@ type RecordCall = Record<string, unknown>;
 /** ED-05: what the signing SDK was told about a download, kept beside `signedCalls`. */
 type SignedOptions = { transform?: unknown; download?: unknown } | undefined;
 
+/**
+ * 45AI / T-133 (3rd slice): object storage is injected as a FACTORY keyed on the
+ * user client, so these doubles hand the service a fake STORE instead of a fake
+ * SDK underneath a real adapter. Every `put` records the bucket, the key and the
+ * byte count; every `delete` records the key — the same observation points the
+ * SDK double used to offer, one layer in. The two failures the upload path has to
+ * survive are switchable, and every method the service does NOT use throws, so a
+ * regression is loud rather than silent.
+ */
+function createFakeStore(record: {
+  uploads?: Array<{ bucket: string; path: string; bytes: number }> | undefined;
+  removals?: string[] | undefined;
+  events?: string[] | undefined;
+  /** `put` fails before anything is written; the message is the backend detail. */
+  failPut?: { message: string } | null | undefined;
+  /** `delete` fails AFTER recording, so "the removal was attempted" stays visible. */
+  failDelete?: { message: string } | null | undefined;
+}): ObjectStore {
+  const uploads = record.uploads ?? [];
+  const removals = record.removals ?? [];
+  const events = record.events ?? [];
+
+  return {
+    async put(ref, body) {
+      if (record.failPut) {
+        throw new ObjectStoreError(
+          "backend_failed",
+          "the object could not be written",
+          record.failPut.message,
+        );
+      }
+      uploads.push({ bucket: ref.bucket, path: ref.key, bytes: body.length });
+      events.push(`upload:${ref.key}`);
+    },
+    async delete(refs) {
+      for (const ref of refs) {
+        removals.push(ref.key);
+        events.push(`remove:${ref.key}`);
+      }
+      if (record.failDelete) {
+        throw new ObjectStoreError(
+          "backend_failed",
+          "the object could not be removed",
+          record.failDelete.message,
+        );
+      }
+    },
+    async get() {
+      throw new Error("the upload service must not read an object");
+    },
+    async head() {
+      throw new Error("the upload service must not head an object");
+    },
+    async copy() {
+      throw new Error("the upload service must not copy an object");
+    },
+    async signedReadUrl() {
+      throw new Error("signing stays on the user client, not the store");
+    },
+    async signedReadUrls() {
+      throw new Error("signing stays on the user client, not the store");
+    },
+  };
+}
+
 function makeStubs(options: {
   project?: { workspace_id: string } | null;
   projectError?: { code?: string; message: string } | null;
@@ -43,6 +110,8 @@ function makeStubs(options: {
   /** 44C: build the service without the asset record repository (fail closed). */
   omitRecordRepository?: boolean;
   uploadError?: { message: string } | null;
+  /** 45AI: a removal the (fake) store refuses; `removeQuietly` must swallow it. */
+  deleteError?: { message: string } | null;
   assetRow?: Record<string, unknown> | null;
   assetReadError?: { message: string } | null;
   assetDeleteError?: { message: string } | null;
@@ -178,20 +247,12 @@ function makeStubs(options: {
     get from(): never {
       throw new Error("the upload write flows must not touch a table");
     },
+    // 45AI: only signing is left on the user client. `upload` / `remove` moved to
+    // the fake store below, so a regression back to the raw SDK has nothing to
+    // call here.
     storage: {
       from(bucket: string) {
         return {
-          upload: async (path: string, buffer: { length: number }) => {
-            if (options.uploadError) return { data: null, error: options.uploadError };
-            uploads.push({ bucket, path, bytes: buffer.length });
-            events.push(`upload:${path}`);
-            return { data: { path }, error: null };
-          },
-          remove: async (paths: string[]) => {
-            removals.push(...paths);
-            for (const path of paths) events.push(`remove:${path}`);
-            return { data: null, error: null };
-          },
           // X-52: asset URLs are signed through this call. `getPublicUrl` is kept
           // only so the stub would visibly explode if production code used it.
           createSignedUrl: async (
@@ -219,6 +280,17 @@ function makeStubs(options: {
     },
   };
 
+  // 45AI: the store the injected factory answers with, and the clients the factory
+  // was handed (so "the same user client, never the admin's" is provable).
+  const objectStore = createFakeStore({
+    uploads,
+    removals,
+    events,
+    failPut: options.uploadError,
+    failDelete: options.deleteError,
+  });
+  const storeClients: UserSupabaseClient[] = [];
+
   // Workorder 44C: the asset record is the repository's now; the fake records the
   // camelCase input and can be made to throw. `omitRecordRepository` leaves it out.
   const assetRecordRepository = {
@@ -232,6 +304,12 @@ function makeStubs(options: {
 
   const service = createUploadService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
+    // 45AI: the factory, handed the user-scoped client exactly as the service
+    // would have wrapped it itself before this ticket.
+    createObjectStore: (client) => {
+      storeClients.push(client);
+      return objectStore;
+    },
     ...(options.omitRecordRepository
       ? {}
       : {
@@ -271,6 +349,8 @@ function makeStubs(options: {
     displayNameCalls,
     displayNameReads,
     userClient,
+    objectStore,
+    storeClients,
   };
 }
 
@@ -835,6 +915,89 @@ describe("the migrated lookups of the upload write flows", () => {
   });
 });
 
+// 45AI / T-133 (3rd slice): storage is observed on the fake store the injected
+// factory answers with — the SDK double no longer carries upload/remove at all.
+describe("45AI: object storage arrives through the injected factory", () => {
+  it("45AI: the factory is handed the caller's own user client, never an admin one", async () => {
+    const stub = makeStubs({ project: { workspace_id: TEAM_WORKSPACE } });
+
+    await stub.service.uploadFile(USER, {
+      ...FILE,
+      workspaceId: TEAM_WORKSPACE,
+      projectId: PROJECT,
+    });
+
+    expect(stub.storeClients).toHaveLength(1);
+    expect(stub.storeClients[0]).toBe(stub.userClient);
+  });
+
+  it("45AI: the store sees the bucket, the object key and the bytes", async () => {
+    const stub = makeStubs({ project: { workspace_id: TEAM_WORKSPACE } });
+
+    await stub.service.uploadFile(USER, {
+      ...FILE,
+      workspaceId: TEAM_WORKSPACE,
+      projectId: PROJECT,
+    });
+
+    expect(stub.uploads).toHaveLength(1);
+    expect(stub.uploads[0]).toEqual({
+      bucket: "project-assets",
+      path: stub.recordCalls[0]?.objectPath,
+      bytes: FILE.fileBuffer.length,
+    });
+    expect(stub.events).toEqual([
+      `upload:${stub.uploads[0]?.path}`,
+      "record",
+      `sign:${stub.uploads[0]?.path}`,
+    ]);
+  });
+
+  it("45AI: a store write failure keeps the fixed 500 and its backend detail", async () => {
+    const stub = makeStubs({
+      project: { workspace_id: TEAM_WORKSPACE },
+      uploadError: { message: "backend said no" },
+    });
+
+    const error = await stub.service
+      .uploadFile(USER, { ...FILE, workspaceId: TEAM_WORKSPACE, projectId: PROJECT })
+      .then(() => null)
+      .catch((thrown: unknown) => thrown as UploadServiceError);
+
+    expect(error).toBeInstanceOf(UploadServiceError);
+    expect(error?.statusCode).toBe(500);
+    expect(error?.code).toBe("upload_failed");
+    expect(error?.message).toBe("Storage upload failed: backend said no");
+    expect(stub.uploads).toEqual([]);
+    expect(stub.recordCalls).toEqual([]);
+  });
+
+  it("45AI: a removal the store refuses is ignored and the row delete still runs", async () => {
+    const stub = makeStubs({
+      assetRow: {
+        id: "asset-1",
+        bucket: "canvases",
+        object_path: "canvases/legacy.png",
+        mime_type: "image/png",
+        byte_size: 12,
+        workspace_id: TEAM_WORKSPACE,
+        project_id: PROJECT,
+        created_at: "2026-10-02T00:00:00.000Z",
+      },
+      deleteError: { message: "the backend said no" },
+    });
+
+    await stub.service.deleteAsset(USER, "asset-1");
+
+    expect(stub.removals).toEqual(["canvases/legacy.png"]);
+    expect(stub.events).toEqual([
+      "remove:canvases/legacy.png",
+      "delete-row:asset-1",
+    ]);
+    expect(stub.assetDeletes).toEqual([{ actorId: "user-1", assetId: "asset-1" }]);
+  });
+});
+
 // GN-11 / X-P7: an upload records where its artifact came from. A plain upload is
 // a `user_upload`; a caller that relays an artifact it produced itself (the
 // generate route does) names the real source, so relaying does not change it.
@@ -1050,6 +1213,9 @@ function makeZipStubs(options: {
 
   const service = createUploadService({
     createUserClient: () => userClient as unknown as UserSupabaseClient,
+    // 45AI: the zip path signs and fetches over HTTP; the store seam is wired so
+    // the service can be built, and nothing in these cases may need it.
+    createObjectStore: () => createFakeStore({}),
     assetReadRepository: {
       async findReadableAsset(input: { actorId: string; assetId: string }) {
         const row = options.rows[input.assetId];

@@ -27,8 +27,6 @@ import {
   signProjectAssetUrl,
   signProjectAssetUrls,
 } from "../storage/project-asset-urls.js";
-import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
-import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
 
 export class UploadServiceError extends Error {
   readonly statusCode: number;
@@ -158,6 +156,25 @@ export type UploadService = {
 export function createUploadService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
   /**
+   * 45AI / T-133 (3rd slice): object storage arrives as a FACTORY keyed on the
+   * user-scoped client — `(client) => ObjectStore`, never a shared instance.
+   *
+   * Why a factory and not the single `ObjectStore` injected elsewhere: an upload
+   * and a delete are per USER. The bytes have always travelled to Storage through
+   * `createUserClient(user.accessToken)`, so Storage answered under that user's
+   * RLS. A shared store would write with whatever identity its own client carries
+   * (the server's / the admin's), which widens the permission on this feature — a
+   * security regression, not a tidy-up. So every call site below hands the
+   * factory the SAME user-scoped client this file used to wrap itself, and this
+   * file no longer names a backend (OP-05 / 43J: the `ObjectStore` seam only).
+   *
+   * REQUIRED on purpose, like `createUserClient` above: this service has exactly
+   * one assembly point (`app.ts`), and an OPTIONAL dependency fails silently when
+   * its one wiring line is dropped — the type check still exits 0 and the upload
+   * only breaks at runtime. Required makes a missing wire a compile error.
+   */
+  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
+  /**
    * Workorder 44C: the asset row for an uploaded object is recorded through the
    * repository. Optional in the type only; absent means the upload fails closed
    * with the existing "Failed to record asset metadata." 500.
@@ -264,7 +281,7 @@ export function createUploadService(options: {
       );
 
       try {
-        await storeFor(client).put(
+        await options.createObjectStore(client).put(
           { bucket: input.bucket, key: objectPath },
           input.fileBuffer,
           { contentType: input.mimeType, upsert: false },
@@ -306,7 +323,7 @@ export function createUploadService(options: {
 
       if (!assetId) {
         // Clean up the uploaded file if its metadata could not be recorded.
-        await removeQuietly(storeFor(client), {
+        await removeQuietly(options.createObjectStore(client), {
           bucket: input.bucket,
           key: objectPath,
         });
@@ -341,7 +358,7 @@ export function createUploadService(options: {
       }
 
       if (!asset) {
-        await removeQuietly(storeFor(client), {
+        await removeQuietly(options.createObjectStore(client), {
           bucket: input.bucket,
           key: objectPath,
         });
@@ -747,7 +764,7 @@ export function createUploadService(options: {
       }
 
       // The order is part of the contract: the object first, the row second.
-      await removeQuietly(storeFor(client), {
+      await removeQuietly(options.createObjectStore(client), {
         bucket: assetRow.bucket,
         key: assetRow.object_path,
       });
@@ -775,12 +792,10 @@ export function createUploadService(options: {
   return service;
 }
 
-/**
- * 43F: every object operation in this file goes through the `ObjectStore` seam,
- * with the user client wrapped as they were doing before with the raw SDK.
- */
-const storeFor = (client: UserSupabaseClient): ObjectStore =>
-  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
+// 45AI: every object operation in this file goes through the `ObjectStore` seam,
+// built by the injected `createObjectStore` factory from the SAME user-scoped
+// client the call site already holds. The local `storeFor` that used to wrap the
+// client here is gone: naming the backend is the assembly point's job now.
 
 /**
  * 43F: the compensation paths (an upload whose row could not be recorded, a

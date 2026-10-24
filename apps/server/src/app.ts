@@ -764,6 +764,17 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.uploadService ??
     createUploadService({
       createUserClient,
+      // 45AI / T-133 (3rd slice): a FACTORY, not a shared store — the same form
+      // the brand-kit service above takes. An upload and a delete are per USER:
+      // the bytes have always gone to Storage through `createUserClient`, with
+      // the caller's own access token, so Storage answered under that user's RLS.
+      // Handing the service the server's/admin's store would widen the
+      // permission on this feature (a security regression). The service itself
+      // no longer names a backend; this factory is where it is named, and in
+      // `fs` mode the client it wraps is already the volume adapter, so the wrap
+      // is the same one the service applied before.
+      createObjectStore: (client) =>
+        createSupabaseObjectStore(client as unknown as SupabaseStorageLike),
       assetRecordRepository,
       projectReadRepository,
       assetReadRepository,
