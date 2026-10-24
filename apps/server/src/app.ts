@@ -1186,6 +1186,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     auth,
     creditService,
     viewerService,
+    // Workorder 45Q / U-23: `POST /api/credits/admin/set-plan` is admin-only now,
+    // so this route set takes the same membership lookup the other admin surfaces
+    // take.
+    teamMembership: teamMembershipService,
     // BL-45 / workorder 37Q: the three pools ride along on the balance.
     // BL-45 / workorder 37R: and today's daily grant is placed before the read.
     // BL-06 / workorder 38U: and the transaction list is read out of the team

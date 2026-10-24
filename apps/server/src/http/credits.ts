@@ -1,5 +1,9 @@
 // @credits-system — Credit API routes: balance, transactions, daily claim, admin plan override
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type {
+  FastifyInstance,
+  FastifyReply,
+  FastifyRequest,
+} from "fastify";
 
 import {
   creditTransactionsResponseSchema,
@@ -20,8 +24,19 @@ import type { ViewerService } from "../features/bootstrap/ensure-user-foundation
 import type { PoolBalanceReadRepository } from "../db/pool-balance-read-repository.js";
 import type { PoolGrantWriteRepository } from "../db/pool-grant-write-repository.js";
 import type { PoolTransactionReadRepository } from "../db/pool-transaction-read-repository.js";
-import type { RequestAuthenticator } from "../supabase/user.js";
+import type { TeamMembershipService } from "../features/team/team-membership.js";
+import type {
+  AuthenticatedUser,
+  RequestAuthenticator,
+} from "../supabase/user.js";
 import { sendValidationError } from "./validation-error.js";
+
+/**
+ * Workorder 45Q / U-23: the two messages are the ones `admin-team.ts` sends, kept
+ * verbatim so the set-plan refusal reads exactly like every other admin refusal.
+ */
+const FORBIDDEN_MESSAGE = "Only team admins can manage team members.";
+const UNAVAILABLE_MESSAGE = "Unable to verify team membership.";
 
 export async function registerCreditRoutes(
   app: FastifyInstance,
@@ -46,8 +61,63 @@ export async function registerCreditRoutes(
     // a team workspace, the list is the member's lines out of THAT workspace —
     // which is where 37N / 37S write every pool charge and refund.
     poolTransactionReadRepository?: PoolTransactionReadRepository;
+    // Workorder 45Q / U-23: required on purpose. `POST /api/credits/admin/set-plan`
+    // is an admin route and now checks it, so a caller cannot wire the route
+    // without the membership lookup that makes the check possible.
+    teamMembership: TeamMembershipService;
   },
 ) {
+  /**
+   * Workorder 45Q / U-23: the same 401 / 503 / 403 gate `admin-team.ts` applies,
+   * with the same codes and the same messages. The route below is the one place
+   * in this file that changes somebody's plan, so it is the one place that has to
+   * prove the caller is an admin of the team first — being logged in is not it.
+   */
+  async function requireAdmin(
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<AuthenticatedUser | null> {
+    const user = await options.auth.authenticate(request);
+
+    if (!user) {
+      reply.code(401).send(
+        unauthenticatedErrorResponseSchema.parse({
+          error: {
+            code: "unauthorized",
+            message: "Missing or invalid bearer token.",
+          },
+        }),
+      );
+      return null;
+    }
+
+    let membership;
+    try {
+      membership = await options.teamMembership.get(user.id);
+    } catch {
+      reply.code(503).send(
+        applicationErrorResponseSchema.parse({
+          error: { code: "application_error", message: UNAVAILABLE_MESSAGE },
+        }),
+      );
+      return null;
+    }
+
+    if (
+      !membership ||
+      (membership.role !== "admin" && membership.role !== "owner")
+    ) {
+      reply.code(403).send(
+        applicationErrorResponseSchema.parse({
+          error: { code: "forbidden", message: FORBIDDEN_MESSAGE },
+        }),
+      );
+      return null;
+    }
+
+    return user;
+  }
+
   // GET /api/credits — balance info
   app.get("/api/credits", async (request, reply) => {
     try {
@@ -258,13 +328,17 @@ export async function registerCreditRoutes(
   });
 
   // POST /api/credits/admin/set-plan — dev-only plan change
+  //
+  // Workorder 45Q / U-23 (the 「留」 half): the route stays, and the `admin` in its
+  // name becomes true. The gate runs BEFORE the body is parsed and before the
+  // plan is written, so a refused caller leaves plan and balance untouched.
   app.post("/api/credits/admin/set-plan", async (request, reply) => {
     try {
-      const user = await options.auth.authenticate(request);
-      if (!user) return sendUnauthenticated(reply);
+      const admin = await requireAdmin(request, reply);
+      if (!admin) return reply;
 
       const body = setPlanRequestSchema.parse(request.body);
-      const viewer = await options.viewerService.ensureViewer(user);
+      const viewer = await options.viewerService.ensureViewer(admin);
 
       await options.creditService.updatePlan(viewer.workspace.id, body.plan);
 

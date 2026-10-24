@@ -5,6 +5,7 @@ import type { PoolBalanceReadRepository } from "../db/pool-balance-read-reposito
 import type { PoolGrantWriteRepository } from "../db/pool-grant-write-repository.js";
 import type { ViewerService } from "../features/bootstrap/ensure-user-foundation.js";
 import type { CreditService } from "../features/credits/credit-service.js";
+import type { TeamMembershipService } from "../features/team/team-membership.js";
 import type {
   AuthenticatedUser,
   RequestAuthenticator,
@@ -93,6 +94,34 @@ function buildCreditService(): CreditService {
   } as unknown as CreditService;
 }
 
+/**
+ * Workorder 45Q / U-23: the membership answer the set-plan gate reads.
+ *
+ * `null` is "not a member at all" — the same 403 as a `member` role, which is
+ * what `admin-team.ts` does. Every `registerCreditRoutes` call site needs one of
+ * these now: the option is required, not optional, precisely so a route set
+ * cannot be wired without the lookup that makes the admin gate possible.
+ */
+function buildTeamMembership(
+  role: "owner" | "admin" | "member" | null,
+): TeamMembershipService {
+  return {
+    async get() {
+      if (role === null) return null;
+      return {
+        workspace: {
+          id: TEAM_WORKSPACE_ID,
+          name: "Team",
+          type: "team",
+          ownerUserId: USER.id,
+        },
+        role,
+      };
+    },
+    invalidate() {},
+  };
+}
+
 let apps: FastifyInstance[] = [];
 
 async function buildApp(options: {
@@ -105,6 +134,8 @@ async function buildApp(options: {
     auth,
     creditService: buildCreditService(),
     viewerService: buildViewerService(options.teamWorkspace ?? true),
+    // 45Q: the admin gate on set-plan needs it; these tests never touch set-plan.
+    teamMembership: buildTeamMembership("owner"),
     ...(options.repository
       ? { poolBalanceReadRepository: options.repository }
       : {}),
@@ -346,6 +377,8 @@ async function buildLedgerApp(options: {
     auth,
     creditService,
     viewerService: buildViewerService(options.teamWorkspace),
+    // 45Q: the admin gate on set-plan needs it; these tests never touch set-plan.
+    teamMembership: buildTeamMembership("owner"),
     ...(options.ledger
       ? { poolTransactionReadRepository: options.ledger }
       : {}),
@@ -533,5 +566,83 @@ describe("GET /api/credits/transactions — BL-06 admin adjustment details", () 
     expect(body.transactions[0].entry_type).toBe("admin_adjust");
     expect(body.transactions[0].operator).toBeUndefined();
     expect(body.transactions[0].admin_reason).toBeUndefined();
+  });
+});
+
+// ── Workorder 45Q / U-23: `POST /api/credits/admin/set-plan` is admin-only ──
+//
+// The route is named `admin`; what is pinned below is that the name is now true.
+// A refusal is checked TOGETHER WITH "nothing changed", so a gate written after
+// the write cannot pass by returning 403 at the end of a plan it already changed.
+// The admin case is pinned too: the 「留」 half of U-23 keeps this route working.
+
+/** A set-plan app whose plan and balance are real state, so "unchanged" is readable. */
+async function buildSetPlanApp(role: "admin" | "member") {
+  const state = { plan: "free" as "free" | "pro", balance: 1234 };
+  const updatePlan = vi.fn(
+    async (_workspaceId: string, plan: "free" | "pro") => {
+      state.plan = plan;
+    },
+  );
+  const getBalance = vi.fn(async () => ({
+    balance: state.balance,
+    plan: state.plan,
+    dailyClaimed: false,
+  }));
+
+  const app = Fastify();
+  await registerCreditRoutes(app, {
+    auth,
+    creditService: { getBalance, updatePlan } as unknown as CreditService,
+    viewerService: buildViewerService(false),
+    teamMembership: buildTeamMembership(role),
+  });
+  await app.ready();
+  apps.push(app);
+
+  return { app, state, updatePlan };
+}
+
+function callSetPlan(app: FastifyInstance, plan: "free" | "pro") {
+  return app.inject({
+    method: "POST",
+    url: "/api/credits/admin/set-plan",
+    headers: { authorization: `Bearer ${TOKEN}` },
+    payload: { plan },
+  });
+}
+
+describe("POST /api/credits/admin/set-plan — 45Q admin gate", () => {
+  it("45Q: POST /api/credits/admin/set-plan refuses a member with 403 and leaves the plan and balance alone", async () => {
+    const { app, state, updatePlan } = await buildSetPlanApp("member");
+
+    const response = await callSetPlan(app, "pro");
+
+    // The same refusal every other admin surface sends (admin-team.ts).
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toEqual({
+      error: {
+        code: "forbidden",
+        message: "Only team admins can manage team members.",
+      },
+    });
+
+    // And the thing the caller came to change did not change.
+    expect(state.plan).toBe("free");
+    expect(state.balance).toBe(1234);
+    expect(updatePlan).toHaveBeenCalledTimes(0);
+  });
+
+  it("45Q: POST /api/credits/admin/set-plan changes the plan for an admin", async () => {
+    const { app, state, updatePlan } = await buildSetPlanApp("admin");
+
+    const response = await callSetPlan(app, "pro");
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().plan).toBe("pro");
+    expect(state.plan).toBe("pro");
+    // The write went to the caller's own workspace, once.
+    expect(updatePlan).toHaveBeenCalledTimes(1);
+    expect(updatePlan).toHaveBeenCalledWith(PERSONAL_WORKSPACE_ID, "pro");
   });
 });
