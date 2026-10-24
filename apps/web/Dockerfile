@@ -26,11 +26,16 @@ COPY packages/config/package.json packages/config/
 ARG NPM_NETWORK_CONCURRENCY=8
 ARG NPM_FETCH_RETRIES=6
 ARG NPM_FETCH_TIMEOUT=120000
+# The default registry stays the official one; pass
+# `--build-arg NPM_REGISTRY=<mirror>` to build against a mirror instead
+# (measured on .37: the official registry serves only ~30 KiB/s).
+ARG NPM_REGISTRY=https://registry.npmjs.org
 
 RUN pnpm install --frozen-lockfile --ignore-scripts \
     --network-concurrency=$NPM_NETWORK_CONCURRENCY \
     --fetch-retries=$NPM_FETCH_RETRIES \
-    --fetch-timeout=$NPM_FETCH_TIMEOUT
+    --fetch-timeout=$NPM_FETCH_TIMEOUT \
+    --registry=$NPM_REGISTRY
 
 COPY packages/shared/ packages/shared/
 COPY packages/config/ packages/config/
