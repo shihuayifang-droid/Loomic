@@ -216,6 +216,7 @@ export function createUploadService(options: {
   const service: UploadService = {
     async uploadFile(user, input) {
       const client = options.createUserClient(user.accessToken);
+      const store = options.createObjectStore(client);
 
       // A project upload belongs to the workspace that actually owns the project.
       // The client sends both ids, and both are used to build the object path and
@@ -281,7 +282,7 @@ export function createUploadService(options: {
       );
 
       try {
-        await options.createObjectStore(client).put(
+        await store.put(
           { bucket: input.bucket, key: objectPath },
           input.fileBuffer,
           { contentType: input.mimeType, upsert: false },
@@ -323,7 +324,7 @@ export function createUploadService(options: {
 
       if (!assetId) {
         // Clean up the uploaded file if its metadata could not be recorded.
-        await removeQuietly(options.createObjectStore(client), {
+        await removeQuietly(store, {
           bucket: input.bucket,
           key: objectPath,
         });
@@ -358,7 +359,7 @@ export function createUploadService(options: {
       }
 
       if (!asset) {
-        await removeQuietly(options.createObjectStore(client), {
+        await removeQuietly(store, {
           bucket: input.bucket,
           key: objectPath,
         });
@@ -411,7 +412,7 @@ export function createUploadService(options: {
         }
       }
 
-      const url = await getAssetUrl(client, input.bucket, objectPath);
+      const url = await getAssetUrl(store, input.bucket, objectPath);
 
       return {
         asset: {
@@ -520,8 +521,10 @@ export function createUploadService(options: {
 
       const client = options.createUserClient(user.accessToken);
 
+      const store = options.createObjectStore(client);
+
       if (!signOptions?.download) {
-        return getAssetUrl(client, assetRow.bucket, assetRow.object_path);
+        return getAssetUrl(store, assetRow.bucket, assetRow.object_path);
       }
 
       // ED-05: a download is named after what the user called the file, not after
@@ -542,7 +545,7 @@ export function createUploadService(options: {
       }
 
       return getAssetUrl(
-        client,
+        store,
         assetRow.bucket,
         assetRow.object_path,
         storedName ?? lastPathSegment(assetRow.object_path),
@@ -605,13 +608,14 @@ export function createUploadService(options: {
       }
 
       const client = options.createUserClient(user.accessToken);
+      const store = options.createObjectStore(client);
       const signedByBucket = new Map<string, Map<string, string>>();
 
       await Promise.all(
         [...pathsByBucket].map(async ([bucket, paths]) => {
           signedByBucket.set(
             bucket,
-            await signProjectAssetUrls(client, paths, { bucket }),
+            await signProjectAssetUrls(store, paths, { bucket }),
           );
         }),
       );
@@ -633,6 +637,7 @@ export function createUploadService(options: {
 
     async prepareZipDownload(user, input) {
       const client = options.createUserClient(user.accessToken);
+      const store = options.createObjectStore(client);
       const repository = options.assetReadRepository;
       const uniqueIds = [...new Set(input.assetIds)];
 
@@ -703,7 +708,7 @@ export function createUploadService(options: {
             if (!row) continue;
 
             try {
-              const url = await signProjectAssetUrl(client, row.object_path, {
+              const url = await signProjectAssetUrl(store, row.object_path, {
                 bucket: row.bucket,
               });
               const res = await fetch(url);
@@ -847,13 +852,13 @@ function lastPathSegment(objectPath: string): string {
  * is the plain one this always produced.
  */
 async function getAssetUrl(
-  client: UserSupabaseClient,
+  store: ObjectStore,
   bucket: string,
   objectPath: string,
   download?: string,
 ): Promise<string> {
   try {
-    return await signProjectAssetUrl(client, objectPath, {
+    return await signProjectAssetUrl(store, objectPath, {
       bucket,
       ...(download ? { download } : {}),
     });

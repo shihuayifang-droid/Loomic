@@ -24,6 +24,8 @@ import type { ProjectReadRepository } from "../../db/project-read-repository.js"
 import type { ProjectWriteRepository } from "../../db/project-write-repository.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
 import type { ObjectStore } from "../storage/object-store.js";
+import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 import { ObjectStoreError } from "../storage/object-store.js";
 import { createUploadService, UploadServiceError } from "./upload-service.js";
 
@@ -99,6 +101,40 @@ function createFakeStore(record: {
     },
     async signedReadUrls() {
       throw new Error("signing stays on the user client, not the store");
+    },
+  };
+}
+
+/**
+ * T-133 (9th slice): the service signs through the injected store instead of the
+ * user client, so the fake store forwards signing to the same stub client the
+ * cases already observe — through the adapter the assembly point builds it with.
+ * `signedCalls` / `signedOptions` / `events` therefore keep recording exactly what
+ * they recorded before the call sites changed hands.
+ */
+function withClientSigning(
+  store: ObjectStore,
+  client: UserSupabaseClient,
+): ObjectStore {
+  const signing = createSupabaseObjectStore(
+    client as unknown as SupabaseStorageLike,
+  );
+
+  return {
+    ...store,
+    signedReadUrl: (ref, options) => signing.signedReadUrl(ref, options),
+    // The batch contract is the helper's: a key that cannot be signed is simply
+    // absent from the map, so it is signed one by one against the same stub.
+    async signedReadUrls(bucket, keys, options) {
+      const signed = new Map<string, string>();
+      for (const key of [...new Set(keys)]) {
+        try {
+          signed.set(key, await signing.signedReadUrl({ bucket, key }, options));
+        } catch {
+          // absent is the answer, exactly as `signProjectAssetUrls` documents
+        }
+      }
+      return signed;
     },
   };
 }
@@ -282,13 +318,16 @@ function makeStubs(options: {
 
   // 45AI: the store the injected factory answers with, and the clients the factory
   // was handed (so "the same user client, never the admin's" is provable).
-  const objectStore = createFakeStore({
-    uploads,
-    removals,
-    events,
-    failPut: options.uploadError,
-    failDelete: options.deleteError,
-  });
+  const objectStore = withClientSigning(
+    createFakeStore({
+      uploads,
+      removals,
+      events,
+      failPut: options.uploadError,
+      failDelete: options.deleteError,
+    }),
+    userClient as unknown as UserSupabaseClient,
+  );
   const storeClients: UserSupabaseClient[] = [];
 
   // Workorder 44C: the asset record is the repository's now; the fake records the
@@ -544,7 +583,11 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
 
     const service = createProjectService({
       createUserClient: () => userClient as unknown as UserSupabaseClient,
-      createObjectStore: () => createFakeStore({ uploads }),
+      createObjectStore: () =>
+        withClientSigning(
+          createFakeStore({ uploads }),
+          userClient as unknown as UserSupabaseClient,
+        ),
       viewerService: {} as ViewerService,
       // 工单20E: the workspace lookup is the repository's now.
       projectReadRepository: {
@@ -1222,7 +1265,11 @@ function makeZipStubs(options: {
     createUserClient: () => userClient as unknown as UserSupabaseClient,
     // 45AI: the zip path signs and fetches over HTTP; the store seam is wired so
     // the service can be built, and nothing in these cases may need it.
-    createObjectStore: () => createFakeStore({}),
+    createObjectStore: () =>
+      withClientSigning(
+        createFakeStore({}),
+        userClient as unknown as UserSupabaseClient,
+      ),
     assetReadRepository: {
       async findReadableAsset(input: { actorId: string; assetId: string }) {
         const row = options.rows[input.assetId];

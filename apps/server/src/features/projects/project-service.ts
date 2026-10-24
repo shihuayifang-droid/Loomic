@@ -574,7 +574,7 @@ export function createProjectService(options: {
       // caller gets an error for the thumbnail, not a permanent public URL.
       let thumbnailUrl: string;
       try {
-        thumbnailUrl = await signProjectAssetUrl(client, objectPath, {
+        thumbnailUrl = await signProjectAssetUrl(objectStore, objectPath, {
           bucket: THUMBNAIL_BUCKET,
         });
       } catch (error) {

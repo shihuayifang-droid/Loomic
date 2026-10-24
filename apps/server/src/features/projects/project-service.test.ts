@@ -24,6 +24,8 @@ import type {
 } from "../../db/project-create-repository.js";
 import type { ViewerService } from "../bootstrap/ensure-user-foundation.js";
 import type { ObjectStore } from "../storage/object-store.js";
+import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 import type {
   AuthenticatedUser,
   UserSupabaseClient,
@@ -346,6 +348,27 @@ function makeObjectStoreStub(
   };
 
   return { store: store as unknown as ObjectStore, puts };
+}
+
+/**
+ * T-133 (9th slice): `saveThumbnail` signs through the injected store now, so the
+ * fake store forwards signing to the same stub client the cases already observe —
+ * via the adapter the assembly point builds it with. The signature therefore keeps
+ * reaching `createSignedUrl` with the same bucket, key and TTL it did before the
+ * call site changed hands.
+ */
+function withSigningStore(
+  store: ObjectStore,
+  client: UserSupabaseClient,
+): ObjectStore {
+  const signing = createSupabaseObjectStore(
+    client as unknown as SupabaseStorageLike,
+  );
+
+  return {
+    ...store,
+    signedReadUrl: (ref, options) => signing.signedReadUrl(ref, options),
+  };
 }
 
 /**
@@ -968,7 +991,10 @@ describe("saveThumbnail answers with a signed URL", () => {
       createUserClient: () => client as unknown as UserSupabaseClient,
       // 45AK: the thumbnail store is the fake's, built per call from the user
       // client the service was handed — the observation point moved here.
-      createObjectStore: () => store.store,
+      // T-133 (9th slice): signing is the store's too, so the fake store signs
+      // through the stub client above.
+      createObjectStore: () =>
+        withSigningStore(store.store, client as unknown as UserSupabaseClient),
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       assetRecordRepository: makeRecordRepositoryStub().repository,
       projectReadRepository: repository as unknown as ProjectReadRepository,
@@ -1462,7 +1488,9 @@ describe("saveThumbnail lookup retry", () => {
 
     const service = createProjectService({
       createUserClient: () => client.client,
-      createObjectStore: () => store.store,
+      // T-133 (9th slice): the thumbnail is signed through the store now, so the
+      // fake store signs through the same storage-only client.
+      createObjectStore: () => withSigningStore(store.store, client.client),
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       assetRecordRepository: recordStub.repository,
       projectReadRepository: repository as unknown as ProjectReadRepository,
