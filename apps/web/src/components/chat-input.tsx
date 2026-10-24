@@ -188,11 +188,44 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
    * document" is the wrong anchor — it would reopen the picker when the user
    * edits earlier text.
    */
+  /**
+   * Text before the caret as of the last report, and the one a user dismissed.
+   *
+   * WHY it is remembered here: Esc closes the picker on keydown (the parent sets
+   * its query to null), but the very next keyup re-reads the unchanged text,
+   * still finds the `/品牌` trigger and reopens the list. Whoever closes the list
+   * therefore has to be remembered, and that is only knowable at the input: the
+   * dismissal is recorded by an Esc keydown CAPTURE listener on the wrapper (it
+   * never stops propagation, so the picker's own Esc handler still runs) rather
+   * than via a parent-to-child `dismissTrigger()` call, which would need every
+   * picker close path in chat-sidebar to remember to call it.
+   *
+   * The memory is cleared as soon as the text before the caret differs, so typing
+   * on, deleting, or moving the caret elsewhere restores normal detection.
+   */
+  const lastTextBeforeCaretRef = useRef("");
+  const dismissedTextRef = useRef<string | null>(null);
+
+  const handleEscapeCapture = useCallback((e: React.KeyboardEvent) => {
+    if (e.key !== "Escape") return;
+    const last = lastTextBeforeCaretRef.current;
+    if (triggerBeforeCaret(last)) dismissedTextRef.current = last;
+  }, []);
+
   const handleTextBeforeCaret = useCallback(
     (textBeforeCaret: string) => {
+      lastTextBeforeCaretRef.current = textBeforeCaret;
       if (!onAtQuery && !onSlashQuery) return;
 
-      const trigger = triggerBeforeCaret(textBeforeCaret);
+      let trigger = triggerBeforeCaret(textBeforeCaret);
+      if (dismissedTextRef.current !== null) {
+        if (dismissedTextRef.current === textBeforeCaret) {
+          // Same text the user closed the list on: keep it closed.
+          trigger = null;
+        } else {
+          dismissedTextRef.current = null;
+        }
+      }
       if (trigger?.char === "@") {
         onAtQuery?.(trigger.query);
         onSlashQuery?.(null);
@@ -313,6 +346,7 @@ export const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function Ch
         className="flex min-h-[120px] flex-col justify-between gap-2 rounded-xl border-[0.5px] border-border bg-card p-2 transition-[border] focus-within:border-border"
         onDrop={handleDrop}
         onDragOver={handleDragOver}
+        onKeyDownCapture={handleEscapeCapture}
       >
         {attachments && onRemoveAttachment && (
           <ImageAttachmentBar
