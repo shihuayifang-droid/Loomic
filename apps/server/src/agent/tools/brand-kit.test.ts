@@ -10,8 +10,11 @@
 //   * the owner predicate is load-bearing (T-55) — an administrator can read every
 //     project of their workspace, so a `brand_kit_id` belonging to somebody else
 //     is reachable input, and it must answer "not found";
-//   * no table read is issued at all: the caller's client keeps only its storage
-//     surface, a table read through it THROWS, and the counter stays at zero.
+//   * no table read is issued at all: a table read through the caller's client
+//     THROWS, and the counter stays at zero;
+//   * 45AH: Storage is observed on the fake store the injected `createObjectStore`
+//     factory answers — and that factory is handed the CALLER's client, not a
+//     shared/admin one.
 import { describe, expect, it } from "vitest";
 
 import type {
@@ -19,6 +22,7 @@ import type {
   BrandKitReadRepository,
   KitDetailRow,
 } from "../../db/brand-kit-read-repository.js";
+import type { ObjectStore } from "../../features/storage/object-store.js";
 import { createBrandKitTool } from "./brand-kit.js";
 
 const KIT_ID = "00000000-0000-0000-0000-0000000000b1";
@@ -150,20 +154,45 @@ function makeHarness(
       tableReads += 1;
       throw new Error(`unexpected table read in brand-kit test: ${table}`);
     },
-    storage: {
-      from: (bucket: string) => ({
-        createSignedUrls: async (paths: string[], expiresIn: number) => {
-          signCalls.push({ bucket, paths: [...paths], expiresIn });
-          if (options.signError) return { data: null, error: options.signError };
-          return {
-            data: paths.map((path) => ({
-              path,
-              signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
-            })),
-            error: null,
-          };
-        },
-      }),
+  };
+
+  // 45AH: the tool no longer builds a backend wrapper itself — every Storage call
+  // lands on this fake store, which is where the signature batch is observed.
+  const store: ObjectStore = {
+    async put() {
+      throw new Error("get_brand_kit must not write objects");
+    },
+    async get() {
+      throw new Error("get_brand_kit must not read objects");
+    },
+    async head() {
+      throw new Error("get_brand_kit must not head objects");
+    },
+    async delete() {
+      throw new Error("get_brand_kit must not delete objects");
+    },
+    async copy() {
+      throw new Error("get_brand_kit must not copy objects");
+    },
+    async signedReadUrl() {
+      throw new Error("get_brand_kit signs in one batch, never one key at a time");
+    },
+    async signedReadUrls(bucket, paths, signOptions) {
+      signCalls.push({ bucket, paths: [...paths], expiresIn: signOptions.ttlSeconds });
+
+      const signed = new Map<string, string>();
+      // A failed batch is "nothing could be signed" and the caller keeps its own
+      // values — the same answer the SDK's null data produced.
+      if (options.signError) return signed;
+
+      for (const path of paths) {
+        signed.set(
+          path,
+          `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+        );
+      }
+
+      return signed;
     },
   };
 
@@ -171,6 +200,12 @@ function makeHarness(
     tool: createBrandKitTool(
       {
         createUserClient: () => client,
+        createObjectStore: (suppliedClient) => {
+          // The factory must be handed the CALLER's client: that is what keeps the
+          // signature in the user's RLS scope instead of widening it to the server's.
+          expect(suppliedClient).toBe(client);
+          return store;
+        },
         brandKitReadRepository: repository,
       },
       KIT_ID,

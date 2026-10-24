@@ -27,8 +27,6 @@ import type {
 } from "../../db/brand-kit-write-repository.js";
 import { ObjectStoreError } from "../storage/object-store.js";
 import type { ObjectRef, ObjectStore } from "../storage/object-store.js";
-import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
-import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 
 const BRAND_KIT_BUCKET = "brand-kit-assets";
 const SIGNED_URL_EXPIRY_SECONDS = 3600;
@@ -63,15 +61,6 @@ export class BrandKitServiceError extends Error {
     this.code = code;
     this.statusCode = statusCode;
   }
-}
-
-/**
- * OP-05 / 43J: the brand kit reaches object storage through the `ObjectStore`
- * seam only. The backend is the Supabase wrapper, so every call below maps onto
- * the exact SDK call this file used to make, in the same order.
- */
-function storeFor(client: UserSupabaseClient): ObjectStore {
-  return createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
 }
 
 /**
@@ -135,6 +124,27 @@ export type BrandKitService = {
 
 export function createBrandKitService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
+  /**
+   * 45AH / T-133 (2nd slice): object storage arrives as a FACTORY keyed on the
+   * user-scoped client — `(client) => ObjectStore`, never a shared instance.
+   *
+   * Why not the single `ObjectStore` the first slice injected elsewhere: brand
+   * kit signing is per USER. The signed URL used to come from
+   * `createUserClient(accessToken)`, so Storage answered under that user's RLS.
+   * A shared store would sign with whatever identity its own client carries
+   * (the server's/admin's), which widens the permission on this feature — a
+   * security regression, not a tidy-up. Hence the factory keeps the SAME
+   * user-scoped client at every call site below, and this file no longer knows
+   * which backend builds the store (OP-05 / 43J: the `ObjectStore` seam only —
+   * every call maps onto the exact SDK call this file used to make).
+   *
+   * REQUIRED on purpose, like the two repositories below: this service has
+   * exactly one assembly point (`app.ts`), and workorder 21X measured that an
+   * OPTIONAL dependency fails silently when its one wiring line is dropped (the
+   * type check still exits 0, the failure is only at runtime). Required means a
+   * missing wire is a compile error instead.
+   */
+  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
   /**
    * ADR-0001 / workorder 21Y: the PostgreSQL home of the two reads behind
    * `listKits`. REQUIRED on purpose — this service has exactly one assembly
@@ -218,7 +228,7 @@ export function createBrandKitService(options: {
     if (fileAssets.length > 0) {
       const client = options.createUserClient(user.accessToken);
       const paths = fileAssets.map((a) => a.file_url!);
-      const signed = await storeFor(client).signedReadUrls(
+      const signed = await options.createObjectStore(client).signedReadUrls(
         BRAND_KIT_BUCKET,
         paths,
         { ttlSeconds: SIGNED_URL_EXPIRY_SECONDS },
@@ -439,7 +449,7 @@ export function createBrandKitService(options: {
       if (paths.length > 0) {
         const client = options.createUserClient(user.accessToken);
         await removeQuietly(
-          storeFor(client),
+          options.createObjectStore(client),
           paths.map((path) => ({ bucket: BRAND_KIT_BUCKET, key: path })),
         );
       }
@@ -643,7 +653,7 @@ export function createBrandKitService(options: {
       // on the path that still needs a user-scoped client.
       if (existing.file_url) {
         const client = options.createUserClient(user.accessToken);
-        await removeQuietly(storeFor(client), [
+        await removeQuietly(options.createObjectStore(client), [
           { bucket: BRAND_KIT_BUCKET, key: existing.file_url },
         ]);
       }
@@ -692,7 +702,7 @@ export function createBrandKitService(options: {
 
       // Storage: the ONLY reason this method still creates a user-scoped client.
       const client = options.createUserClient(user.accessToken);
-      const store = storeFor(client);
+      const store = options.createObjectStore(client);
 
       // Upload to storage
       const timestamp = Date.now();
@@ -851,7 +861,7 @@ export function createBrandKitService(options: {
         // Storage is the ONLY reason this path creates a user-scoped client, and
         // it is created only when there is at least one asset to look at.
         const client = options.createUserClient(user.accessToken);
-        const store = storeFor(client);
+        const store = options.createObjectStore(client);
         const copies: BrandKitAssetCopy[] = [];
 
         for (const asset of assets) {

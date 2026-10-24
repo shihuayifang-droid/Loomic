@@ -17,6 +17,11 @@ import {
 } from "./image-generate.js";
 import { createProjectSearchTool } from "./project-search.js";
 import { createScreenshotCanvasTool } from "./screenshot-canvas.js";
+// 45AH / T-133 (2nd slice): the storage backend behind `get_brand_kit` is named
+// HERE, in the tool assembly, so `brand-kit.ts` itself imports no adapter.
+import type { ObjectStore } from "../../features/storage/object-store.js";
+import { createSupabaseObjectStore } from "../../features/storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../../features/storage/supabase-object-store.js";
 import {
   createVideoGenerateTool,
   type SubmitVideoJobFn,
@@ -55,6 +60,19 @@ export { createManipulateCanvasTool } from "./manipulate-canvas.js";
 //   default      → FilesystemBackend            — 临时文件（无 execute）
 // ---------------------------------------------------------------------------
 
+/**
+ * 45AH / T-133 (2nd slice): the default assembly of the brand kit tool's storage
+ * seam.
+ *
+ * It reproduces verbatim what `brand-kit.ts` did before this workorder — wrap the
+ * CALLER's user-scoped client in the Supabase adapter — and it lives here, at the
+ * assembly point, so the tool itself names only the seam. The wrapped client is
+ * still the caller's, so Storage answers under the caller's RLS; an admin client
+ * must never be substituted here.
+ */
+const brandKitObjectStore = (client: any): ObjectStore =>
+  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
+
 export function createMainAgentTools(
   backend: BackendProtocol | BackendFactory,
   deps: {
@@ -76,6 +94,19 @@ export function createMainAgentTools(
       "readCanvasRow" | "writeIfUnchanged"
     >;
     createUserClient: (accessToken: string) => any;
+    /**
+     * 45AH / T-133 (2nd slice): Storage for `get_brand_kit` arrives as a FACTORY
+     * over the CALLER's client — `(client) => ObjectStore` — not as a shared
+     * store. The tool signs as the caller, which is exactly what RLS on Storage
+     * enforced before the `ObjectStore` seam existed.
+     *
+     * Optional in THIS type because the callers that assemble it
+     * (`deep-agent.ts` → `runtime.ts` → `app.ts`) are not part of this slice's
+     * file set. When it is absent, `brandKitObjectStore` below applies the same
+     * adapter wrap the tool used to do internally, so the behaviour is never
+     * silently different — only the place that names the backend moves.
+     */
+    createObjectStore?: (client: any) => ObjectStore;
     brandKitId?: string | null;
     connectionManager?: ConnectionManager;
     persistImage?: PersistImageFn;
@@ -146,7 +177,16 @@ export function createMainAgentTools(
     );
   }
   if (deps.brandKitId) {
-    tools.push(createBrandKitTool(deps, deps.brandKitId));
+    tools.push(
+      createBrandKitTool(
+        {
+          createUserClient: deps.createUserClient,
+          createObjectStore: deps.createObjectStore ?? brandKitObjectStore,
+          brandKitReadRepository: deps.brandKitReadRepository,
+        },
+        deps.brandKitId,
+      ),
+    );
   }
   if (deps.connectionManager) {
     tools.push(createScreenshotCanvasTool({

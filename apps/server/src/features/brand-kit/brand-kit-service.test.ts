@@ -23,6 +23,7 @@ import type {
   AuthenticatedUser,
   UserSupabaseClient,
 } from "../../supabase/user.js";
+import type { ObjectStore } from "../storage/object-store.js";
 
 /**
  * The brand kit service after workorder 21Z: every TABLE read and write is a
@@ -47,8 +48,11 @@ import type {
  *   all, and `getKit` / `createKit` / `updateKit` / `duplicateKit` do so only when
  *   a file path needs signing.
  *
- * The fake user client has `storage` and a `.from` that THROWS: any leftover table
- * access fails loudly instead of quietly returning `undefined`.
+ * 45AH (T-133 2nd slice): the user client is now a bare marker whose `.from`
+ * THROWS — any leftover table access fails loudly instead of quietly returning
+ * `undefined` — and every Storage observation is made on the fake store the
+ * injected `createObjectStore` FACTORY answers. The factory is handed the
+ * caller's client, so the signature stays in that user's RLS scope.
  */
 
 const ACTOR_ID = "00000000-0000-0000-0000-0000000000b1";
@@ -237,73 +241,97 @@ function writeRepository(overrides: Partial<BrandKitWriteRepository> = {}) {
 type StorageCall = { op: string; args: unknown[] };
 
 /**
- * A user client with `storage` and NOTHING else: the `.from` getter throws, so a
- * leftover table call fails the test instead of returning `undefined`.
+ * 45AH / T-133 (2nd slice): Storage is observed on the FAKE STORE that the
+ * injected FACTORY answers — not on the user client's `storage` methods.
+ *
+ * The factory is still keyed on the user-scoped client the service built, and
+ * `clients` lists every client it was handed, so "the store comes from the
+ * CALLER's client" stays measurable: a shared/createUserClient-free store would
+ * have nothing to record here.
+ *
+ * The recorded `{op, args}` shapes are the ones the removed SDK fake produced, so
+ * every behaviour assertion below (which keys were signed, which bytes were
+ * uploaded, how many removes) is carried over unchanged.
  */
-function fakeUserClient(options: {
+function fakeObjectStoreFactory(options: {
   calls: StorageCall[];
   uploadError?: Error;
   copyError?: Error;
-  signedUrlMissing?: boolean;
-}): (accessToken: string) => UserSupabaseClient {
-  const client = {
-    get from(): never {
-      throw new Error(
-        "the brand kit service must not use the PostgREST table client any more",
-      );
-    },
-    storage: {
-      from(bucket: string) {
-        expect(bucket).toBe(BUCKET);
+}) {
+  const clients: UserSupabaseClient[] = [];
 
-        return {
-          async createSignedUrls(paths: string[], expiresIn: number) {
-            options.calls.push({ op: "createSignedUrls", args: [paths, expiresIn] });
+  const createObjectStore = (client: UserSupabaseClient): ObjectStore => {
+    clients.push(client);
 
-            return {
-              data: options.signedUrlMissing
-                ? null
-                : paths.map((path) => ({
-                    path,
-                    signedUrl: `https://signed.test/${path}?exp=${expiresIn}`,
-                  })),
-            };
-          },
-          async createSignedUrl(path: string, expiresIn: number) {
-            options.calls.push({ op: "createSignedUrl", args: [path, expiresIn] });
+    return {
+      async put(ref, body, putOptions) {
+        expect(ref.bucket).toBe(BUCKET);
+        options.calls.push({
+          op: "upload",
+          args: [
+            ref.key,
+            body,
+            {
+              contentType: putOptions.contentType,
+              upsert: putOptions.upsert ?? false,
+            },
+          ],
+        });
 
-            return {
-              data: options.signedUrlMissing
-                ? null
-                : { signedUrl: `https://signed.test/${path}?exp=${expiresIn}` },
-            };
-          },
-          async remove(paths: string[]) {
-            options.calls.push({ op: "remove", args: [paths] });
-            return { data: null, error: null };
-          },
-          async upload(path: string, buffer: Buffer, opts: unknown) {
-            options.calls.push({ op: "upload", args: [path, buffer, opts] });
-
-            return { error: options.uploadError ?? null };
-          },
-          async copy(from: string, to: string) {
-            options.calls.push({ op: "copy", args: [from, to] });
-            return { error: options.copyError ?? null };
-          },
-        };
+        if (options.uploadError) throw options.uploadError;
       },
-    },
+      async get() {
+        throw new Error("the brand kit service must not read objects");
+      },
+      async head() {
+        throw new Error("the brand kit service must not head objects");
+      },
+      async delete(refs) {
+        for (const ref of refs) {
+          expect(ref.bucket).toBe(BUCKET);
+        }
+        options.calls.push({ op: "remove", args: [refs.map((ref) => ref.key)] });
+      },
+      async copy(from, to) {
+        expect(from.bucket).toBe(BUCKET);
+        expect(to.bucket).toBe(BUCKET);
+        options.calls.push({ op: "copy", args: [from.key, to.key] });
+        if (options.copyError) throw options.copyError;
+      },
+      async signedReadUrl(ref, signOptions) {
+        expect(ref.bucket).toBe(BUCKET);
+        options.calls.push({
+          op: "createSignedUrl",
+          args: [ref.key, signOptions.ttlSeconds],
+        });
+
+        return `https://signed.test/${ref.key}?exp=${signOptions.ttlSeconds}`;
+      },
+      async signedReadUrls(bucket, keys, signOptions) {
+        expect(bucket).toBe(BUCKET);
+        options.calls.push({
+          op: "createSignedUrls",
+          args: [[...keys], signOptions.ttlSeconds],
+        });
+
+        const signed = new Map<string, string>();
+        for (const key of keys) {
+          signed.set(key, `https://signed.test/${key}?exp=${signOptions.ttlSeconds}`);
+        }
+
+        return signed;
+      },
+    };
   };
 
-  return () => client as unknown as UserSupabaseClient;
+  return { createObjectStore, clients };
 }
 
 function serviceWith(
   options: {
     read?: Partial<BrandKitReadRepository>;
     write?: Partial<BrandKitWriteRepository>;
-    storage?: Parameters<typeof fakeUserClient>[0];
+    storage?: Parameters<typeof fakeObjectStoreFactory>[0];
   } = {},
 ) {
   const read = readRepository(options.read);
@@ -312,13 +340,24 @@ function serviceWith(
   const clientTokens: string[] = [];
 
   const storageOptions = options.storage ?? { calls: storageCalls };
-  const factory = fakeUserClient(storageOptions);
+  const store = fakeObjectStoreFactory(storageOptions);
+  // 45AH: the user client is still built (once per Storage use, as before), but the
+  // service no longer calls Storage on it — the injected factory receives it. The
+  // `.from` getter still THROWS, so a leftover table call fails loudly.
+  const userClient = {
+    get from(): never {
+      throw new Error(
+        "the brand kit service must not use the PostgREST table client any more",
+      );
+    },
+  } as unknown as UserSupabaseClient;
 
   const service = createBrandKitService({
     createUserClient: (accessToken: string) => {
       clientTokens.push(accessToken);
-      return factory(accessToken);
+      return userClient;
     },
+    createObjectStore: (client) => store.createObjectStore(client),
     brandKitReadRepository: read.repository,
     brandKitWriteRepository: write.repository,
   });

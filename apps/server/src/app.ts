@@ -228,6 +228,11 @@ import { registerJobRoutes } from "./http/jobs.js";
 import { createObjectStore } from "./features/storage/object-store-factory.js";
 import { objectUrlSecretFrom } from "./features/storage/object-url-signature.js";
 import { createObjectStoreStorageClient } from "./features/storage/object-store-storage-client.js";
+// 45AH / T-133 (2nd slice): the backend behind the brand kit's storage seam is
+// named HERE, at the assembly point — `brand-kit-service.ts` no longer imports an
+// adapter of its own.
+import { createSupabaseObjectStore } from "./features/storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "./features/storage/supabase-object-store.js";
 import { registerAdminTeamRoutes } from "./http/admin-team.js";
 import { registerObjectRoutes } from "./http/object-routes.js";
 import { registerBrandKitRoutes } from "./http/brand-kits.js";
@@ -679,6 +684,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.brandKitService ??
     createBrandKitService({
       createUserClient,
+      // 45AH / T-133 (2nd slice): a FACTORY, not a shared store. Brand kit
+      // signing is per USER — the store is built from the caller's own client so
+      // Storage answers under that user's RLS, exactly as the service's removed
+      // local `storeFor(client)` did. Handing it the server's/admin's store would
+      // widen the permission on this feature (a security regression). The service
+      // itself no longer names a backend; this factory is where it is named, and
+      // in `fs` mode the client it wraps is already the volume adapter, so the
+      // wrap is the same one the service applied before.
+      createObjectStore: (client) =>
+        createSupabaseObjectStore(client as unknown as SupabaseStorageLike),
       brandKitReadRepository,
       brandKitWriteRepository: createBrandKitWriteRepository({
         getTransactionPool: () => getTransactionPool(databaseEnv),

@@ -7,8 +7,7 @@ import type {
   KitDetailRow,
 } from "../../db/brand-kit-read-repository.js";
 import { readSubject } from "./persist-sandbox-file.js";
-import { createSupabaseObjectStore } from "../../features/storage/supabase-object-store.js";
-import type { SupabaseStorageLike } from "../../features/storage/supabase-object-store.js";
+import type { ObjectStore } from "../../features/storage/object-store.js";
 
 const brandKitSchema = z.object({});
 
@@ -43,6 +42,15 @@ const brandKitSchema = z.object({});
 export function createBrandKitTool(
   deps: {
     createUserClient: (accessToken: string) => any;
+    /**
+     * 45AH / T-133 (2nd slice): Storage arrives as a FACTORY keyed on the
+     * user-scoped client, exactly as `createBrandKitService` takes it. A shared
+     * `ObjectStore` would sign with the identity its own client carries, and
+     * this tool must sign as the CALLER (that is what RLS on Storage enforced
+     * before the `ObjectStore` seam existed). This module therefore no longer
+     * imports a backend at all — it only names the seam's type.
+     */
+    createObjectStore: (client: any) => ObjectStore;
     /** 工单21AC: the kit and its assets are reads of this repository. */
     brandKitReadRepository: BrandKitReadRepository;
   },
@@ -114,10 +122,11 @@ export function createBrandKitTool(
       if (fileAssets.length > 0) {
         const paths = fileAssets.map((a) => a.file_url as string);
         // OP-05 / 43J: the signature batch goes through the `ObjectStore` seam, so
-        // this tool names no storage client method of its own.
-        const signed = await createSupabaseObjectStore(
-          client as unknown as SupabaseStorageLike,
-        ).signedReadUrls("brand-kit-assets", paths, { ttlSeconds: 3600 });
+        // this tool names no storage client method of its own — and 45AH: the store
+        // is built from the CALLER's client, not from a shared one.
+        const signed = await deps
+          .createObjectStore(client)
+          .signedReadUrls("brand-kit-assets", paths, { ttlSeconds: 3600 });
 
         for (const asset of fileAssets) {
           const url = signed.get(asset.file_url as string);
