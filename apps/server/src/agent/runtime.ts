@@ -900,6 +900,27 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
     options.runIdFactory ??
     (() => randomUUID());
 
+  /**
+   * 45BG (T-133 第 10b 片): the storage seams under the agent are keyed on the
+   * CALLER's access token now (brand-kit since 45BB, and both agent-asset paths
+   * from this slice). This runtime still RECEIVES the client-based form from its
+   * assembly (`app.ts`, outside this slice's file set), so the factory handed
+   * down is re-keyed here — built from the caller's own client, which is the
+   * authority the write always carried — and ONLY when the assembly wired both
+   * halves, so a missing wire still surfaces exactly as it did before.
+   */
+  function storeFactoryKeyedByToken():
+    | ((accessToken: string) => ObjectStore)
+    | undefined {
+    const createClient = options.createUserClient;
+    const createStore = options.createObjectStore;
+    if (!createClient || !createStore) return undefined;
+    return (accessToken: string) =>
+      createStore(createClient(accessToken) as UserSupabaseClient);
+  }
+
+  const createObjectStoreForToken = storeFactoryKeyedByToken();
+
   const resolvedAgentFactory: LoomicAgentFactory =
     options.agentFactory ??
     ((agentOptions) =>
@@ -920,9 +941,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         ...(options.createUserClient
           ? { createUserClient: options.createUserClient }
           : {}),
-        // 45AM / T-133 (6a): same optional-shape as the fields around it.
-        ...(options.createObjectStore
-          ? { createObjectStore: options.createObjectStore }
+        // T-133 第 10b 片: the store factory travels keyed by the caller's token.
+        ...(createObjectStoreForToken
+          ? { createObjectStore: createObjectStoreForToken }
           : {}),
       }));
 
@@ -2021,12 +2042,19 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
         let persistImage: PersistImageFn | undefined;
         if (
           options.createUserClient &&
+          options.createObjectStore &&
           options.assetRecordRepository &&
           run.accessToken &&
           run.canvasId &&
           run.userId
         ) {
           const createClient = options.createUserClient;
+          // T-133 第 10b 片: the asset service takes ONE store factory, keyed on
+          // the caller's access token. The assembly still hands this runtime the
+          // client-based form, so the store is built here from the same caller
+          // client the other branches of this file use. No adapter fallback: an
+          // unwired factory is stated by the guard above rather than papered over.
+          const createStore = options.createObjectStore;
           const accessToken = run.accessToken;
           const canvasId = run.canvasId;
           const createdBy = run.userId;
@@ -2048,16 +2076,12 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
               ...(options.assetRecordRepository
                 ? { assetRecordRepository: options.assetRecordRepository }
                 : {}),
-              createUserClient: (token) =>
-                createClient(token) as UserSupabaseClient,
-              // 45AN (T-133 6b): this service is built here as well as in the
-              // tools, so the factory has to reach it here too — otherwise the
-              // image-persist path would keep the adapter while the sandbox-file
-              // path used the injected store. Same optional shape as the fields
-              // above (`exactOptionalPropertyTypes`).
-              ...(options.createObjectStore
-                ? { createObjectStore: options.createObjectStore }
-                : {}),
+              // 45BG (T-133 第 10b 片): the pass-through is the store factory now,
+              // keyed on the caller's access token — the same token the service is
+              // handed below for the upload, the compensating deletes and the
+              // signature.
+              createObjectStore: (token: string) =>
+                createStore(createClient(token) as UserSupabaseClient),
             });
 
             // LOCAL FORK: retry. Storage latency on a free instance (ours is

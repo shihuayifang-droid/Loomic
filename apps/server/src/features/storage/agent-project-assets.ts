@@ -44,7 +44,6 @@ import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
-import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { ObjectStore } from "./object-store.js";
 import { ObjectStoreError } from "./object-store.js";
 import {
@@ -52,31 +51,14 @@ import {
   ProjectAssetUrlError,
   signProjectAssetUrl,
 } from "./project-asset-urls.js";
-import type { SupabaseStorageLike } from "./supabase-object-store.js";
-import { createSupabaseObjectStore } from "./supabase-object-store.js";
 
 /**
- * 43G: every object operation in this file goes through the `ObjectStore` seam,
- * with the user client wrapped exactly as it used to be reached directly.
+ * 45BG (T-133 第 10b 片): every object operation in this file speaks the
+ * `ObjectStore` seam, and the store is resolved ONCE per operation by the
+ * injected factory from the CALLER's own access token. There is no local adapter
+ * and no fallback branch here any more: the store this module is handed is the
+ * one that uploads, deletes and signs, so a backend swap follows the whole path.
  */
-const storeFor = (client: UserSupabaseClient): ObjectStore =>
-  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
-
-/**
- * 45AN (T-133 6b): resolve the `ObjectStore` for ONE operation.
- *
- * A supplied factory wins; absent one, the operation falls back to the adapter
- * above. The fallback is a TRANSITION, not a supported shape: the slice that
- * deletes it is 第 8 片, at which point `createObjectStore` becomes required and
- * `storeFor` / `createSupabaseObjectStore` go away with it.
- */
-const storeFrom = (
-  client: UserSupabaseClient,
-  createObjectStore?: (client: UserSupabaseClient) => ObjectStore,
-): ObjectStore =>
-  // TRANSITION (第 8 片删): no factory supplied -> today's adapter, byte-for-byte
-  // the same wrapping as before this slice.
-  createObjectStore ? createObjectStore(client) : storeFor(client);
 
 export type AgentProjectAssetErrorCode =
   | "no_canvas"
@@ -171,15 +153,17 @@ export function createAgentProjectAssetService(options: {
   assetWriteRepository: AssetWriteRepository;
   /** Records the asset's ownership (44F). A missing repository fails closed. */
   assetRecordRepository?: Pick<AssetRecordRepository, "recordProjectAsset">;
-  createUserClient: (accessToken: string) => UserSupabaseClient;
   /**
-   * 45AN (T-133 6b): the per-user object-store factory. Optional on purpose —
-   * every existing deps literal (tests included) keeps compiling unchanged, and
-   * a caller that does not supply one keeps the adapter path via `storeFrom`.
-   * It is always handed the USER client: reaching for another one here would
-   * upload with a privilege the caller's own RLS never granted.
+   * 45BG (T-133 第 10b 片): the per-user object-store factory, keyed on the
+   * CALLER's access token — the same form brand-kit (45BB), uploads (45BC),
+   * canvas (45BC), projects (45BE) and chat (45BF) take.
+   *
+   * REQUIRED, not optional: every step of the sequence below needs a store, so an
+   * unwired factory would fail silently at the one moment that matters. It is
+   * always handed the CALLER's own token: building the store from any other
+   * identity here would upload with a privilege the caller's RLS never granted.
    */
-  createObjectStore?: (client: UserSupabaseClient) => ObjectStore;
+  createObjectStore: (accessToken: string) => ObjectStore;
 }): AgentProjectAssetService {
   return {
     async persist(input) {
@@ -193,13 +177,11 @@ export function createAgentProjectAssetService(options: {
         );
       }
 
-      const client = options.createUserClient(input.accessToken);
-      // T-133 slice 9: resolve the store ONCE for this operation and let BOTH
-      // the upload and the signature below speak the same seam. Signing used to
-      // reach the caller's Supabase client directly, which made it the last step
-      // in this file that could not follow a backend swap — the store was
-      // already in hand three lines up, it just was not handed over.
-      const store = storeFrom(client, options.createObjectStore);
+      // T-133 第 10b 片: resolve the store ONCE for this operation, from the
+      // caller's own access token, and let the upload, both compensation deletes
+      // and the signature below speak the same seam. There is no second source
+      // for a store any more, so a backend swap cannot leave one step behind.
+      const store = options.createObjectStore(input.accessToken);
       const workspaceId = await resolveCanvasWorkspaceId(
         options.canvasReadRepository,
         { actorId: input.createdBy, canvasId },
@@ -273,13 +255,7 @@ export function createAgentProjectAssetService(options: {
         // there would create exactly the un-authorisable object X-52 exists to
         // eliminate, so remove it — best effort, but the failure is reported
         // either way, including when the cleanup itself fails.
-        await removeUploadedObject(
-          client,
-          objectPath,
-          recordFailure,
-          undefined,
-          options.createObjectStore,
-        );
+        await removeUploadedObject(store, objectPath, recordFailure);
         throw new AgentProjectAssetError(
           "metadata_failed",
           `Could not record asset metadata for the uploaded object: ${
@@ -318,13 +294,7 @@ export function createAgentProjectAssetService(options: {
           { actorId: input.createdBy, assetId },
           objectPath,
         );
-        await removeUploadedObject(
-          client,
-          objectPath,
-          "sign_failed",
-          assetId,
-          options.createObjectStore,
-        );
+        await removeUploadedObject(store, objectPath, "sign_failed", assetId);
         throw new AgentProjectAssetError(
           "sign_failed",
           error instanceof ProjectAssetUrlError
@@ -387,21 +357,17 @@ async function resolveCanvasWorkspaceId(
 }
 
 async function removeUploadedObject(
-  client: UserSupabaseClient,
+  store: ObjectStore,
   objectPath: string,
   reason: string | undefined,
   assetId?: string,
-  createObjectStore?: (client: UserSupabaseClient) => ObjectStore,
 ): Promise<void> {
   try {
-    // 43G: the removal goes through the `ObjectStore` seam. The adapter turns a
-    // backend refusal into an `ObjectStoreError`, so it lands in the catch below
-    // and this cleanup keeps reporting the failure instead of passing silently.
-    // 45AN (6b): the same seam, resolved through the caller's factory when one
-    // was supplied — the cleanup must not outlive the store that wrote the bytes.
-    await storeFrom(client, createObjectStore).delete([
-      { bucket: PROJECT_ASSET_BUCKET, key: objectPath },
-    ]);
+    // The removal goes through the `ObjectStore` seam, on the SAME store that
+    // wrote the bytes (10b): the cleanup must not outlive the store that served
+    // the write. A backend refusal lands in the catch below, so this cleanup
+    // keeps reporting the failure instead of passing silently.
+    await store.delete([{ bucket: PROJECT_ASSET_BUCKET, key: objectPath }]);
   } catch (error) {
     console.error(
       `[agent-project-assets] cleanup of an unowned object FAILED ` +

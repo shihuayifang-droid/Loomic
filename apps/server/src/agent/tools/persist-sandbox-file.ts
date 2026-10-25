@@ -6,7 +6,6 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { decodeJwt } from "jose";
 import { z } from "zod";
 
-import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { CanvasReadRepository } from "../../db/canvas-read-repository.js";
@@ -15,6 +14,8 @@ import {
   AgentProjectAssetError,
   createAgentProjectAssetService,
 } from "../../features/storage/agent-project-assets.js";
+import type { SupabaseStorageLike } from "../../features/storage/supabase-object-store.js";
+import { createSupabaseObjectStore } from "../../features/storage/supabase-object-store.js";
 
 const MIME_MAP: Record<string, string> = {
   ".png": "image/png",
@@ -70,14 +71,15 @@ export type PersistSandboxFileDeps = {
   assetRecordRepository: Pick<AssetRecordRepository, "recordProjectAsset">;
   createUserClient: (accessToken: string) => SupabaseClient;
   /**
-   * T-133 6a → 6b: the per-user object-store factory, carried down to
-   * `agent-project-assets` where 6b consumes it (a supplied factory serves the
-   * upload; absent one that service keeps its adapter fallback).
+   * 45BG (T-133 第 10b 片): the per-user object-store factory, keyed on the
+   * CALLER's access token — the form every storage seam takes from 10a on — and
+   * handed straight to `agent-project-assets`, which requires one.
    *
-   * Optional on purpose: the existing deps literals (tests included) must keep
-   * compiling unchanged.
+   * Optional here only: without it this tool wraps the caller's own client in the
+   * adapter itself, which is the same store that service used to build for
+   * itself, so an assembly that has not been re-keyed yet behaves as it did.
    */
-  createObjectStore?: (client: UserSupabaseClient) => ObjectStore;
+  createObjectStore?: (accessToken: string) => ObjectStore;
   /**
    * Sandbox root. Required on purpose: without it there is no range we can
    * prove a path belongs to, and this tool reads a host file and uploads it.
@@ -126,15 +128,17 @@ export function createPersistSandboxFileTool(deps: PersistSandboxFileDeps) {
     canvasReadRepository: deps.canvasReadRepository,
     assetWriteRepository: deps.assetWriteRepository,
     assetRecordRepository: deps.assetRecordRepository,
-    createUserClient: (accessToken) =>
-      deps.createUserClient(accessToken) as unknown as UserSupabaseClient,
-    // T-133 6b: handed straight to the asset service, so the object store this
-    // tool writes through is the one the composition root chose. Conditional
-    // spread because `exactOptionalPropertyTypes: true` rejects an explicit
-    // `undefined` for an optional property (TS2379).
-    ...(deps.createObjectStore
-      ? { createObjectStore: deps.createObjectStore }
-      : {}),
+    // 45BG (T-133 第 10b 片): the service takes ONE store factory, keyed on the
+    // CALLER's access token — the token every call below hands it. Without one
+    // wired, the adapter wrap over that same caller's client is built here, which
+    // is the store the service used to build for itself, so this tool behaves as
+    // it did while an assembly is still being re-keyed.
+    createObjectStore:
+      deps.createObjectStore ??
+      ((accessToken: string) =>
+        createSupabaseObjectStore(
+          deps.createUserClient(accessToken) as unknown as SupabaseStorageLike,
+        )),
   });
 
   return tool(

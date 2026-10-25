@@ -30,7 +30,6 @@ import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
-import type { UserSupabaseClient } from "../../supabase/user.js";
 import type { ObjectStore } from "./object-store.js";
 import {
   AgentProjectAssetError,
@@ -39,6 +38,8 @@ import {
   sanitizeAgentFileName,
 } from "./agent-project-assets.js";
 import { ObjectStoreError } from "./object-store.js";
+import type { SupabaseStorageLike } from "./supabase-object-store.js";
+import { createSupabaseObjectStore } from "./supabase-object-store.js";
 import { PROJECT_ASSET_URL_TTL_SECONDS } from "./project-asset-urls.js";
 
 const WORKSPACE = "ws-team";
@@ -66,8 +67,11 @@ function makeHarness(options: {
   canvasHidden?: boolean;
   canvasError?: { message: string } | null;
   /**
-   * 45AN (T-133 6b): supply an `ObjectStore` factory, so the case measures the
-   * "factory was given" path. Absent → the transition branch (the adapter).
+   * 45BG (T-133 第 10b 片): the store factory is REQUIRED and keyed on the
+   * caller's access token, so every case writes through one. This flag only says
+   * WHICH fake it answers with: `factoryStore` (the case observes its calls) or
+   * the store built over the caller's own client, which is the surface the cases
+   * written before 10b measure.
    */
   withFactory?: boolean;
 }) {
@@ -80,10 +84,9 @@ function makeHarness(options: {
   const events: string[] = [];
   let signedPaths: string[] = [];
   let tableReads = 0;
-  // 45AN (T-133 6b): what a supplied factory was handed and what the store it
-  // returned was asked to do. Kept apart from `uploads`, because the property
-  // being measured is WHICH of the two paths served the write.
-  const factoryClients: unknown[] = [];
+  // 45BG (T-133 第 10b 片): the ACCESS TOKENS the factory was handed — never a
+  // client (10a re-keyed every storage seam on the caller's own token).
+  const factoryTokens: string[] = [];
   const factoryPuts: {
     bucket: string;
     key: string;
@@ -254,18 +257,18 @@ function makeHarness(options: {
   const service = createAgentProjectAssetService({
     canvasReadRepository,
     assetWriteRepository,
-    createUserClient: () => userClient as unknown as UserSupabaseClient,
     assetRecordRepository,
-    // 45AN (T-133 6b): only the cases that ask for it inject the factory, so the
-    // other cases keep measuring the transition branch (the adapter).
-    ...(options.withFactory
-      ? {
-          createObjectStore: (client: UserSupabaseClient) => {
-            factoryClients.push(client);
-            return factoryStore;
-          },
-        }
-      : {}),
+    // 45BG (T-133 第 10b 片): the factory is REQUIRED and keyed on the caller's
+    // access token, so every case resolves its store here. `withFactory` picks
+    // WHICH fake it answers with — the one a case can observe call-by-call, or
+    // the one built over the caller's own client, whose storage surface is what
+    // the cases written before 10b assert on.
+    createObjectStore: (accessToken: string) => {
+      factoryTokens.push(accessToken);
+      return options.withFactory
+        ? factoryStore
+        : createSupabaseObjectStore(userClient as unknown as SupabaseStorageLike);
+    },
   });
 
   return {
@@ -281,7 +284,7 @@ function makeHarness(options: {
     tableReads: () => tableReads,
     /** 45AN (6b): the clients a supplied factory was handed, and its writes. */
     userClient,
-    factoryClients,
+    factoryTokens,
     factoryPuts,
     factoryDeletes,
     factorySigns,
@@ -541,13 +544,14 @@ describe("agent project asset persistence (T1)", () => {
     expect(result.objectPath).not.toContain(" ");
   });
 
-  it("case 13: a supplied factory serves the upload, and is handed the USER client", async () => {
+  it("case 13: a supplied factory serves the upload, and is handed the CALLER's token", async () => {
     const h = makeHarness({ withFactory: true });
     const result = await persist(h);
 
-    // 45AN (T-133 6b): the factory is called with the caller's own client, never
-    // a second one — the upload must carry the JWT's authority, not more.
-    expect(h.factoryClients).toEqual([h.userClient]);
+    // 45BG (T-133 第 10b 片): the factory is keyed on the caller's own ACCESS
+    // TOKEN — never a client, never a second identity — so the upload carries the
+    // JWT's authority and nothing more.
+    expect(h.factoryTokens).toEqual([TOKEN]);
     // The write went through the factory's store, and the record IS the upload:
     // same bucket, same key, same byte count the caller is told about.
     expect(h.factoryPuts).toHaveLength(1);
@@ -581,12 +585,14 @@ describe("agent project asset persistence (T1)", () => {
     expect(h.records).toHaveLength(1);
   });
 
-  it("case 14: no factory supplied keeps the adapter path (transition branch)", async () => {
+  it("case 14: the store is resolved ONCE per persist, from the caller's token", async () => {
     const h = makeHarness({});
     const result = await persist(h);
 
-    // The factory was never asked for, so today's adapter served the write.
-    expect(h.factoryClients).toHaveLength(0);
+    // 45BG (T-133 第 10b 片): the transition branch is gone — there is no
+    // adapter left to fall back to — so the factory is asked exactly once, with
+    // the caller's access token, and the store it answered is the one that wrote.
+    expect(h.factoryTokens).toEqual([TOKEN]);
     expect(h.factoryPuts).toHaveLength(0);
     expect(h.uploads).toHaveLength(1);
     expect(h.uploads[0]).toMatchObject({
@@ -595,6 +601,9 @@ describe("agent project asset persistence (T1)", () => {
       bytes: PNG.length,
       contentType: "image/png",
     });
+    // ...and that write is what the caller is handed: same identity, same bytes.
+    expect(result.byteSize).toBe(PNG.length);
+    expect(h.records[0]?.objectPath).toBe(result.objectPath);
   });
 
   it("case 15: with a factory, the compensation delete goes through the same store", async () => {

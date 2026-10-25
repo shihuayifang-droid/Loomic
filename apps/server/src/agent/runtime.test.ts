@@ -1154,6 +1154,12 @@ describe("工单21AC: the Agent-side repositories are wired to the tools", () =>
       canvasReadRepository: {} as unknown as CanvasReadRepository,
       brandKitId: WIRING_KIT_ID,
       createUserClient: () => signingClient as unknown as UserSupabaseClient,
+      // 45BG: since 45AH `get_brand_kit` REQUIRES a store factory keyed on the
+      // caller's token, and `createMainAgentTools` substitutes a throwing
+      // stand-in when the assembly forgets it — so this deps literal has to wire
+      // one, exactly like `app.ts` does. A fake store (not the signing client)
+      // is the honest double here: the tool never touches a table through it.
+      createObjectStore: () => createFakeObjectStore(),
     });
 
     const kitTool = tools.find((entry) => entry.name === "get_brand_kit");
