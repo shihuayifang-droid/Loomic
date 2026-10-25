@@ -41,7 +41,7 @@
     "build": "next build",
     "dev": "next dev -p 3000",
     "test": "vitest run test",
-    "e2e": "playwright test -c e2e/playwright.config.ts",
+    "e2e": "node -e \"require('node:fs').accessSync('out/index.html')\" && playwright test -c e2e/playwright.config.ts",
     "typecheck": "next typegen && tsc -p tsconfig.json --noEmit"
   }
 }
