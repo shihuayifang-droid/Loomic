@@ -31,6 +31,12 @@
  */
 
 import { createJobService, type JobService } from "./features/jobs/job-service.js";
+import { pruneFinishedJobs } from "./features/jobs/job-retention.js";
+import {
+  jobRetentionApplyEnabled,
+  startJobRetentionSchedule,
+} from "./features/jobs/job-retention-schedule.js";
+import { getDatabasePool } from "./db/pool.js";
 import { createJobAttemptRepository } from "./db/job-attempt-repository.js";
 import { createJobTransitionRepository } from "./db/job-transition-repository.js";
 import {
@@ -286,6 +292,31 @@ export function buildWorkerComposition(
         markLinkRefunded: false,
       });
     },
+  });
+
+  // OP-11 / workorder 45CB: the retention sweep, beside the stuck-job reaper.
+  // Started here rather than in `worker.ts` because that is the file the ticket
+  // allows, and because the composition is the one place every collaborator is
+  // built: the sweep needs the same pool as everything else and nothing that the
+  // per-message context holds.
+  //
+  // Three properties, all in `features/jobs/job-retention-schedule.ts`: it does
+  // NOT run at start (a deploy must not sweep the table — the rows it looks at
+  // are 180 days old and can wait a day), overlapping ticks are dropped, and a
+  // failed pass is logged instead of ending the schedule.
+  //
+  // Whether it deletes anything is `HAHART_JOB_RETENTION_APPLY`, read once per
+  // pass by `jobRetentionApplyEnabled()`: only the exact value `"true"` turns a
+  // count into a delete, so the approved default (count only) survives an unset
+  // variable or a typo. Nothing here connects: `getDatabasePool()` is lazy and is
+  // only reached on the first pass a day from now, which is also why this line
+  // opens no socket during a test that merely builds the composition.
+  startJobRetentionSchedule({
+    prune: () =>
+      pruneFinishedJobs(getDatabasePool(), {
+        dryRun: !jobRetentionApplyEnabled(),
+      }),
+    log: (m) => console.log(`[job-retention] ${m}`),
   });
 
   // Base context — per-message fields (queue, msgId, renewVt) are added per message below
