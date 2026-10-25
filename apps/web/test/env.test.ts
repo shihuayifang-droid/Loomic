@@ -28,6 +28,25 @@ describe("@loomic/web env helpers", () => {
     expect(() => loadWebEnv()).toThrow(/NEXT_PUBLIC_SUPABASE_ANON_KEY/);
   });
 
+  it("does not require the Supabase env when the provider is self", () => {
+    vi.stubEnv("NEXT_PUBLIC_HAHART_AUTH_PROVIDER", "self");
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "");
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", "");
+
+    const env = loadWebEnv();
+
+    expect(env.supabaseUrl).toBe("");
+    expect(env.supabaseAnonKey).toBe("");
+  });
+
+  it("still requires the Supabase env when the provider is supabase", () => {
+    vi.stubEnv("NEXT_PUBLIC_HAHART_AUTH_PROVIDER", "supabase");
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "");
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", "");
+
+    expect(() => loadWebEnv()).toThrow(/NEXT_PUBLIC_SUPABASE_URL/);
+  });
+
   it("keeps getServerBaseUrl compatible with the default fallback", () => {
     vi.stubEnv("NEXT_PUBLIC_SERVER_BASE_URL", "");
 
