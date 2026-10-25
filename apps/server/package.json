@@ -56,6 +56,7 @@
     "dev:workers:3": "WORKER_ID=w1 node --watch --env-file=../../.env.local --import tsx ./src/worker.ts & WORKER_ID=w2 node --watch --env-file=../../.env.local --import tsx ./src/worker.ts & WORKER_ID=w3 node --watch --env-file=../../.env.local --import tsx ./src/worker.ts & wait",
     "worker": "node --env-file=../../.env.local --import tsx ./src/worker.ts",
     "test": "vitest run",
+    "test:db": "vitest run src/test-support/db",
     "mail:preview": "node --import tsx ./src/cli/hahart-mail-preview.ts",
     "db:migrate": "node --env-file-if-exists=../../.env.local --import tsx ./src/cli/hahart-db-migrate.ts",
     "db:bootstrap-admin": "node --env-file-if-exists=../../.env.local --import tsx ./src/cli/hahart-bootstrap-admin.ts",
