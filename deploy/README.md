@@ -4,6 +4,29 @@
 
 ---
 
+## 部署到 `.37`（`deploy/deploy-release.sh`）
+
+**为什么写这条**：真正用来部署的脚本以前只存在于 `.37` 的 `C:\Users\Admin\deploy-rel.sh`，仓库里没有 —— 换机器、换人就得靠记忆。现在它在 `deploy/deploy-release.sh`，跟着提交一起走。
+
+三步：
+
+```bash
+# 1) 按提交号打发布包
+git archive --format=tar.gz -o release-<sha>.tar.gz <sha>
+# 2) 上传到 .37 的 Windows 磁盘（WSL 里对应 /mnt/c/...）
+scp release-<sha>.tar.gz Admin@<host>:C:/Users/Admin/
+# 3) 在 WSL `hahart` 里跑部署脚本
+ssh ... 'wsl -d hahart -u root -- bash /mnt/c/Users/Admin/deploy-release.sh <sha> /mnt/c/Users/Admin/release-<sha>.tar.gz'
+```
+
+第 3 步的 `deploy-release.sh` 自己也要先在 `C:\Users\Admin\` 下（随发布包带过去的 `deploy/deploy-release.sh`，或单独 `scp` 一份）：`scp deploy/deploy-release.sh Admin@<host>:C:/Users/Admin/`。
+
+前提：`/opt/hahart/.env.production` 已在机器上（密钥只放那里，不进仓库、不进脚本）；镜像构建走腾讯云 npm / pip 镜像。
+
+脚本会在**任何 docker 调用之前先等 docker 就绪**（冷启动后 docker 要约 1 分钟才起来，最多等 180s，日志里先出现 `docker_ready` 才往下走），然后按 `config → build → up` 走完 7 步，日志在 `/opt/hahart/deploy-<sha>.log`，成功时最后一行是 `DEPLOY_DONE sha=<sha>`。
+
+---
+
 ## 一、网桥自愈单元（`fix-bridge-rules.sh` + `hahart-bridge-rules.service`）
 
 **为什么要有它**：2026-10-24 `.37` 冷启动后，`hahart_default` 网桥的 iptables 规则整段丢失。这台机器开了 `bridge-nf-call-iptables=1`，容器之间的包（nginx → server）会走 iptables，规则没了就撞上 `FORWARD` 默认策略 `DROP`：静态页正常（nginx 自己发），`/api/*` 全 504。`docker.service` 那时已经是 `active`，所以「docker 起来了」不能当就绪判据 —— 由一个 `After=docker.service` 的 oneshot 单元把规则补回去（脚本是幂等的「只补不删」，同机别的项目的网桥不受影响）。
