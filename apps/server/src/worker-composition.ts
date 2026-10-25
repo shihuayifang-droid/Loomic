@@ -36,6 +36,8 @@ import {
   jobRetentionApplyEnabled,
   startJobRetentionSchedule,
 } from "./features/jobs/job-retention-schedule.js";
+import { reconcileCredits } from "./features/credits/daily-reconcile.js";
+import { startDailyReconcileSchedule } from "./features/credits/daily-reconcile-schedule.js";
 import { getDatabasePool } from "./db/pool.js";
 import { createJobAttemptRepository } from "./db/job-attempt-repository.js";
 import { createJobTransitionRepository } from "./db/job-transition-repository.js";
@@ -317,6 +319,24 @@ export function buildWorkerComposition(
         dryRun: !jobRetentionApplyEnabled(),
       }),
     log: (m) => console.log(`[job-retention] ${m}`),
+  });
+
+  // OP-11 / workorder 45CC: the daily credits reconciliation, alongside the
+  // retention sweep. Started here for the same reasons and with the same
+  // laziness: `getDatabasePool()` is inside the thunk, so building the
+  // composition still opens no socket and a test that merely builds it pays
+  // nothing.
+  //
+  // READ ONLY, WARN ONLY. `reconcileCredits` answers "does the ledger still
+  // agree with `background_jobs` and `team_credit_pools`?" with four counts and
+  // writes nothing; the approved behaviour (U-26) is that a drift is reported
+  // for a human, never repaired here. The first pass waits a full 24 hours (see
+  // `features/credits/daily-reconcile-schedule.ts`): a restart inherits nothing,
+  // so a deploy must not put four `count(*)`s on a database it has not touched
+  // yet. A dirty report reaches `console.warn` through the schedule's default
+  // reporter, one `<check>=<count>` per finding.
+  startDailyReconcileSchedule({
+    reconcile: () => reconcileCredits(getDatabasePool()),
   });
 
   // Base context — per-message fields (queue, msgId, renewVt) are added per message below
