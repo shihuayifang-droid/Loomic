@@ -26,8 +26,26 @@
  * directly — `reap` carries all of that.
  */
 
+import { createAlertSink, type Alert } from "../notifications/alert-sink.js";
+
 /** GN-31: how often the worker reclaims stuck jobs. */
 export const STUCK_JOB_REAP_INTERVAL_MS = 5 * 60 * 1000;
+
+/**
+ * OP-11 (45CH): hand one alert to the sink and forget it.
+ *
+ * Built from `process.env` at the moment of failure rather than injected, so
+ * the constructor of this schedule keeps the shape it already had. `notify`
+ * never rejects (see `alert-sink.ts`), but the guard below is this file's own
+ * promise: a broken alert channel must never be the reason a pass dies.
+ */
+function raiseAlert(alert: Alert): void {
+  try {
+    void createAlertSink().notify(alert).catch(() => undefined);
+  } catch {
+    // Reporting is what failed; there is nowhere left to report it to.
+  }
+}
 
 export type StartStuckJobReaperInput = {
   /** One reaping pass. Rejecting or throwing is handled, not propagated. */
@@ -80,6 +98,16 @@ export function startStuckJobReaper(
         // A throwing logger must not turn "a pass failed" into "the schedule
         // died", which is the one thing this module exists to prevent.
       }
+
+      // OP-11 (45CH): only the failure branch raises an alert — a restart that
+      // reclaims nothing is silent, a restart that cannot reclaim is not.
+      raiseAlert({
+        title: "卡死任务回收失败",
+        severity: "error",
+        detail: {
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
     } finally {
       inFlight = false;
     }

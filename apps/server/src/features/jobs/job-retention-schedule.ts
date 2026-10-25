@@ -33,6 +33,8 @@
  * of that, and the scheduling primitives are injected so a test can drive time.
  */
 
+import { createAlertSink, type Alert } from "../notifications/alert-sink.js";
+
 /** 24 hours: the sweep is a housekeeping chore, not an urgent one. */
 export const JOB_RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -47,6 +49,22 @@ export function jobRetentionApplyEnabled(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   return env[JOB_RETENTION_APPLY_ENV] === "true";
+}
+
+/**
+ * OP-11 (45CH): hand one alert to the sink and forget it.
+ *
+ * Built from `process.env` at the moment of failure rather than injected, so
+ * the constructor of this schedule keeps the shape it already had. `notify`
+ * never rejects (see `alert-sink.ts`), but the guard below is this file's own
+ * promise: a broken alert channel must never be the reason a pass dies.
+ */
+function raiseAlert(alert: Alert): void {
+  try {
+    void createAlertSink().notify(alert).catch(() => undefined);
+  } catch {
+    // Reporting is what failed; there is nowhere left to report it to.
+  }
 }
 
 export type StartJobRetentionScheduleInput = {
@@ -101,6 +119,17 @@ export function startJobRetentionSchedule(
         // A throwing logger must not turn "a pass failed" into "the schedule
         // died", which is the one thing this module exists to prevent.
       }
+
+      // OP-11 (45CH): a failed sweep is exactly the case an operator has to
+      // hear about — nobody watches a worker's stdout. The happy path stays
+      // silent; only this branch raises an alert.
+      raiseAlert({
+        title: "任务保留期清理失败",
+        severity: "error",
+        detail: {
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
     } finally {
       inFlight = false;
     }

@@ -24,10 +24,27 @@
  * together would restore exactly the daily false alarm this ticket removed.
  */
 
+import { createAlertSink, type Alert } from "../notifications/alert-sink.js";
 import type { ReconcileReport } from "./daily-reconcile.js";
 
 /** 24 hours: a reconciliation is a daily patrol, not an urgent alarm. */
 export const DAILY_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * OP-11 (45CH): hand one alert to the sink and forget it.
+ *
+ * Built from `process.env` at the moment of failure rather than injected, so
+ * the constructor of this schedule keeps the shape it already had. `notify`
+ * never rejects (see `alert-sink.ts`), but the guard below is this file's own
+ * promise: a broken alert channel must never be the reason a pass dies.
+ */
+function raiseAlert(alert: Alert): void {
+  try {
+    void createAlertSink().notify(alert).catch(() => undefined);
+  } catch {
+    // Reporting is what failed; there is nowhere left to report it to.
+  }
+}
 
 export type StartDailyReconcileScheduleInput = {
   /** One reconciliation pass. Rejecting or throwing is handled, not propagated. */
@@ -82,11 +99,29 @@ export function startDailyReconcileSchedule(
       } else {
         // Alarms only: `ok` ignores informational findings, so a warn line that
         // included them would contradict the `ok` printed right next to it.
-        const counts = report.findings
-          .filter((finding) => finding.severity === "alarm")
+        const alarms = report.findings.filter(
+          (finding) => finding.severity === "alarm",
+        );
+        const counts = alarms
           .map((finding) => `${finding.check}=${finding.count}`)
           .join(" ");
         warn(`[credits-reconcile] drift at ${report.ranAt}: ${counts}`);
+
+        // OP-11 (45CH): a drift nobody reads on a server is not a finding.
+        // Alarms only — the "info" checks are the daily-noise half of the
+        // report and would restore the false alarm this ticket removed.
+        raiseAlert({
+          title: "每日对账发现差异",
+          severity: "warn",
+          detail: {
+            ranAt: report.ranAt,
+            findings: alarms.map((finding) => ({
+              check: finding.check,
+              count: finding.count,
+              severity: finding.severity,
+            })),
+          },
+        });
       }
 
       // Informational findings go out on one line and never touch `ok`. Only the
@@ -112,6 +147,16 @@ export function startDailyReconcileSchedule(
         // A throwing reporter must not turn "a pass failed" into "the schedule
         // died", which is the one thing this module exists to prevent.
       }
+
+      // OP-11 (45CH): a whole pass that could not run is louder than a drift —
+      // the daily patrol is blind, which nobody would learn from a log line.
+      raiseAlert({
+        title: "每日对账执行失败",
+        severity: "error",
+        detail: {
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
     } finally {
       inFlight = false;
     }
