@@ -44,8 +44,6 @@ import {
   createUserSupabaseClientFactory,
   type UserSupabaseClient,
 } from "./supabase/user.js";
-import { createObjectStore } from "./features/storage/object-store-factory.js";
-import { createObjectStoreStorageClient } from "./features/storage/object-store-storage-client.js";
 
 // Import executors to trigger registration via side effects
 import "./features/jobs/executors/image-generation.js";
@@ -80,32 +78,30 @@ async function main() {
   registerToolRunners(env);
 
   const pgmq = createQueueClient(env)!;
-  // Workorder 45C: in fs mode both clients are the volume adapter (no hosted
-  // storage exists), the same wiring app.ts uses.
-  const fsStorageClient =
-    env.storageProvider === "fs"
-      ? createObjectStoreStorageClient(
-          createObjectStore(env, {
-            supabaseClient: () => {
-              throw new Error("unused in fs mode");
-            },
-          }),
-        )
-      : undefined;
-  const createUserClient = fsStorageClient
-    ? (_accessToken: string) => fsStorageClient as unknown as UserSupabaseClient
+  // Workorder 45BL (T-133): fs mode has no hosted Supabase client to hand out, so
+  // nothing is faked for it any more — 45C used to route both thunks through the
+  // volume adapter. Both stay thunks, and in fs mode they throw when called, with
+  // a message that says why, instead of letting `createAdminSupabaseClient` fail
+  // on a missing SUPABASE_URL with an internal field name in the error.
+  const isFsMode = env.storageProvider === "fs";
+  const notWired = (what: string) => (): never => {
+    throw new Error(
+      `${what} is not available in fs mode: no hosted Supabase client exists here (T-133).`,
+    );
+  };
+
+  const createUserClient: (accessToken: string) => UserSupabaseClient = isFsMode
+    ? notWired("createUserClient")
     : createUserSupabaseClientFactory(env);
 
   let adminClient: ReturnType<typeof createAdminSupabaseClient> | undefined;
-  const getAdminClient = () => {
-    if (fsStorageClient) {
-      return fsStorageClient as unknown as ReturnType<
-        typeof createAdminSupabaseClient
-      >;
-    }
-    adminClient ??= createAdminSupabaseClient(env);
-    return adminClient;
-  };
+  const getAdminClient: () => ReturnType<typeof createAdminSupabaseClient> =
+    isFsMode
+      ? notWired("getAdminClient")
+      : () => {
+          adminClient ??= createAdminSupabaseClient(env);
+          return adminClient;
+        };
 
   // ADR-0001 / workorder 21X: the whole assembly below used to live here, in
   // `main()`, where nothing could test it. It is unchanged and now lives in
