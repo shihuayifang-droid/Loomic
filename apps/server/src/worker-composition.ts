@@ -103,7 +103,6 @@ export type WorkerCompositionInput = {
 export type WorkerBaseContext = {
   jobService: JobService;
   pgmq: PgmqClient;
-  getAdminClient: () => AdminSupabaseClient;
   env: ServerEnv;
   creditReadRepository: CreditReadRepository;
   assetProvenanceRepository: AssetProvenanceRepository;
@@ -293,7 +292,6 @@ export function buildWorkerComposition(
   const baseCtx: WorkerBaseContext = {
     jobService,
     pgmq,
-    getAdminClient,
     env,
     // Workorder 21W: the image executor's watermark decision reads the plan
     // through this. Optional on `ExecutorContext`, wired here for real.

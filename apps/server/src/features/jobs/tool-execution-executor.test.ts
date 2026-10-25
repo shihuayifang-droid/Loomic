@@ -114,7 +114,6 @@ function makeContext(options: {
         }) as unknown as BackgroundJob,
     } as unknown as ExecutorContext["jobService"],
     pgmq: {} as ExecutorContext["pgmq"],
-    getAdminClient: () => admin.client,
     env: {} as ExecutorContext["env"],
     queue: "tool_execution_jobs",
     msgId: 1,

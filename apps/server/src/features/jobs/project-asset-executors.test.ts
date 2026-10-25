@@ -290,7 +290,6 @@ function makeContext(
       },
     } as unknown as ExecutorContext["jobService"],
     pgmq: {} as ExecutorContext["pgmq"],
-    getAdminClient: () => client,
     env: {} as ExecutorContext["env"],
     queue: "image_generation",
     msgId: 1,

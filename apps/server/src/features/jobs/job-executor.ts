@@ -2,7 +2,6 @@ import type { BackgroundJobType } from "@loomic/shared";
 
 import type { JobService } from "./job-service.js";
 import type { PgmqClient } from "../../queue/pgmq-client.js";
-import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import type { ServerEnv } from "../../config/env.js";
 import type { CreditReadRepository } from "../../db/credit-read-repository.js";
 import type { AssetProvenanceRepository } from "../../db/asset-provenance-repository.js";
@@ -13,7 +12,6 @@ import type { ObjectStore } from "../storage/object-store.js";
 export type ExecutorContext = {
   jobService: JobService;
   pgmq: PgmqClient;
-  getAdminClient: () => AdminSupabaseClient;
   env: ServerEnv;
   /**
    * The workspace's subscription plan, for the executors that need one — the
@@ -52,9 +50,8 @@ export type ExecutorContext = {
    * OP-03 / T-133: the object store the executors write their output through.
    * Same policy as the repositories above — the worker wires the real store in,
    * every other construction site and every test substitute may leave it out.
-   * Absent is NOT an error: until 1c lands the executors keep building their
-   * client from `getAdminClient()` exactly as before, so this field being
-   * optional keeps every existing construction site compiling untouched.
+   * Absent is NOT an error, and this field being optional keeps every existing
+   * construction site compiling untouched.
    */
   objectStore?: ObjectStore;
   /**
