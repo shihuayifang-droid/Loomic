@@ -2,8 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describe, expect, it } from "vitest";
+import { cleanup, render } from "@testing-library/react";
+import { createElement } from "react";
+import { afterEach, describe, expect, it } from "vitest";
 
+import { LandingFooter } from "../src/components/landing/landing-footer";
 import { BRAND } from "../src/lib/brand";
 
 /**
@@ -12,6 +15,10 @@ import { BRAND } from "../src/lib/brand";
  * 45CQ 把 layout.tsx 的字面量换成了 `BRAND`，契约随之从「源码里出现几次
  * HaHart」变成「文案来自 BRAND 这个唯一来源」：文案本身断言 BRAND 的值，
  * layout 只断言它引用了 BRAND（不再复制一份字面量）。
+ *
+ * 45D0-fixup1：页脚不再断言「源码里含某个字面量」——源码字面量不是用户可见
+ * 行为，渲染结果才是。因此改为渲染 `LandingFooter` 后断言可见文本，
+ * 既不再与「组件只能从 BRAND 取品牌名」互斥，也仍然抓得住「文案丢了」。
  */
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -25,6 +32,10 @@ function read(relPath: string): string {
 function readRepo(relPath: string): string {
   return fs.readFileSync(path.join(REPO_ROOT, relPath), "utf8");
 }
+
+afterEach(() => {
+  cleanup();
+});
 
 /** 用户 2026-10-22 确认的站点描述（T-103）。 */
 const SITE_DESCRIPTION = "HaHart · AI 创意画布";
@@ -59,13 +70,16 @@ describe("BR-17 brand copy", () => {
     );
   });
 
-  it("BR-17: the footer carries the brand and the one-line pitch", () => {
-    const source = read("src/components/landing/landing-footer.tsx");
+  it("BR-17: the footer renders the brand and the one-line pitch", () => {
+    // 断言渲染后的可见文本（用户能看到的东西），不断言源码里出现过哪些字。
+    const { container } = render(createElement(LandingFooter));
+    const text = container.textContent ?? "";
 
-    expect(source, "页脚缺一句话介绍").toContain(ONE_LINE_PITCH);
-    expect(source, "页脚缺品牌名版权栏").toContain("HaHart. All rights reserved.");
-    expect(source, "页脚仍含旧品牌名").not.toContain("Loomic");
-    expect(source, "页脚仍含旧一句话介绍").not.toContain("AI 驱动的创意设计平台");
+    expect(text, "页脚没渲染一句话介绍").toContain(ONE_LINE_PITCH);
+    expect(text, "页脚没渲染版权栏").toContain("All rights reserved");
+    expect(text, "页脚没渲染品牌名").toContain(BRAND.name);
+    expect(text, "页脚仍渲染旧品牌名").not.toContain("Loomic");
+    expect(text, "页脚仍渲染旧一句话介绍").not.toContain("AI 驱动的创意设计平台");
   });
 
   it("BR-17: skill docs no longer name the old brand", () => {

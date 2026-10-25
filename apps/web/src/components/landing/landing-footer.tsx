@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { HaHartLogo } from "@/components/icons/hahart-logo";
+import { BRAND } from "@/lib/brand";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -103,7 +104,7 @@ export function LandingFooter() {
             <Link href="/" className="inline-flex items-center gap-2">
               <HaHartLogo className="size-6" />
               <span className="text-base font-semibold text-foreground tracking-tight">
-                HaHart
+                {BRAND.name}
               </span>
             </Link>
 
@@ -168,7 +169,7 @@ export function LandingFooter() {
         {/* Bottom bar */}
         <div className="mt-12 pt-6 border-t border-border flex flex-col sm:flex-row justify-between items-center gap-3">
           <p className="text-sm text-muted-foreground">
-            &copy; {currentYear} HaHart. All rights reserved.
+            &copy; {currentYear} {BRAND.name}. All rights reserved.
           </p>
           <span className="text-sm text-muted-foreground">简体中文</span>
         </div>

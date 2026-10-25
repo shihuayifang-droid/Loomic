@@ -7,6 +7,7 @@ import { useTheme } from "next-themes";
 import { Sun, Moon, Menu, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { HaHartLogo } from "@/components/icons/hahart-logo";
+import { BRAND } from "@/lib/brand";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -118,7 +119,7 @@ export function FloatingNav() {
             className="flex items-center gap-2 shrink-0 group"
           >
             <HaHartLogo className="size-6 transition-transform duration-300 group-hover:scale-110 group-hover:rotate-6" />
-            <span className="font-bold text-lg tracking-tight">HaHart</span>
+            <span className="font-bold text-lg tracking-tight">{BRAND.name}</span>
           </Link>
 
           {/* Desktop Nav Links with underline animation */}

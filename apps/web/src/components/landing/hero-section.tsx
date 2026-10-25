@@ -5,6 +5,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { motion, useScroll, useTransform } from "framer-motion";
 import { Sparkles, ChevronDown, ArrowRight } from "lucide-react";
+import { BRAND } from "@/lib/brand";
 import { cn } from "@/lib/utils";
 import { fadeUp, blurIn, scaleUp } from "@/components/landing/motion";
 import { TypewriterText, useTypewriter } from "@/components/landing/typewriter";
@@ -108,7 +109,7 @@ function HeroMockup() {
             <span className="size-3 rounded-full bg-green-400/80" />
           </div>
           <span className="text-xs text-muted-foreground font-medium">
-            HaHart Canvas
+            {`${BRAND.name} Canvas`}
           </span>
           <div className="w-14" />
         </div>
@@ -118,7 +119,7 @@ function HeroMockup() {
           <MockupCursor />
           <Image
             src="/images/showcase/showcase-12.jpg"
-            alt="HaHart Canvas AI creative workspace"
+            alt={`${BRAND.name} Canvas AI creative workspace`}
             width={1200}
             height={675}
             priority
@@ -268,7 +269,7 @@ export function HeroSection() {
           transition={{ delay: descDelay }}
           className="mt-6 text-base md:text-lg text-muted-foreground max-w-2xl mx-auto leading-relaxed"
         >
-          从灵感到作品，HaHart 是你的 AI 设计伙伴。智能理解你的创意意图，生成专业级设计，让每一个想法都能成为现实。
+          {`从灵感到作品，${BRAND.name} 是你的 AI 设计伙伴。智能理解你的创意意图，生成专业级设计，让每一个想法都能成为现实。`}
         </motion.p>
 
         {/* CTA Buttons */}
