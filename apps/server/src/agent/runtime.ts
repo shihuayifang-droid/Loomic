@@ -43,6 +43,18 @@ import {
 // 45AM / T-133 (6a): the per-user object store factory is only typed here — the
 // slice transmits it, it does not consume it.
 import type { ObjectStore } from "../features/storage/object-store.js";
+
+/**
+ * 45CW (OP-14): outbound fetch timeouts. Every outbound call here has one, so a
+ * hung connection fails the step instead of stalling the whole agent run.
+ *
+ * A signed storage URL serves one object and is answered from the object store,
+ * so it uses the short budget.
+ */
+const SIGNED_URL_FETCH_TIMEOUT_MS = 30_000;
+
+/** 45CW: `persistImage` downloads a generated image from the provider CDN. */
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 60_000;
 import {
   PROJECT_ASSET_BUCKET,
   signProjectAssetUrl,
@@ -465,7 +477,9 @@ export async function resolveAttachmentContent(
       );
     }
 
-    const response = await fetch(signedUrl);
+    const response = await fetch(signedUrl, {
+      signal: AbortSignal.timeout(SIGNED_URL_FETCH_TIMEOUT_MS),
+    });
     if (!response.ok) {
       throw new Error(
         `attachment ${index + 1} could not be fetched from storage (${response.status})`,
@@ -2060,7 +2074,9 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
           const createdBy = run.userId;
 
           persistImage = async (sourceUrl, mimeType, prompt) => {
-            const response = await fetch(sourceUrl);
+            const response = await fetch(sourceUrl, {
+              signal: AbortSignal.timeout(MEDIA_DOWNLOAD_TIMEOUT_MS),
+            });
             if (!response.ok) throw new Error(`Download failed: ${response.status}`);
             const buffer = Buffer.from(await response.arrayBuffer());
             const ext = mimeType === "image/webp" ? "webp" : "png";

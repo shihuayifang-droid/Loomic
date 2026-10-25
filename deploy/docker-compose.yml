@@ -115,6 +115,17 @@ services:
     # Loopback only; the public entry point is the Cloudflare Tunnel (OP-09).
     ports:
       - "127.0.0.1:8080:80"
+    # OP-14 / 45CW: nginx (nginx:1.27-alpine) had no healthcheck of its own.
+    # The probe asks nginx for `/` inside the container; the static export and
+    # the same-origin proxy are what make the web container useful. `wget` is
+    # the busybox applet shipped with the Alpine base of that image (the image
+    # has no curl), so it is present without adding a package.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     depends_on:
       - server
 

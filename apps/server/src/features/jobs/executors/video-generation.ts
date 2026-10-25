@@ -6,6 +6,9 @@ import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateVideo } from "../../../generation/video-generation.js";
 import { resolveVideoProviderName } from "../../../generation/providers/registry.js";
 
+/** 45CW (OP-14): the generated-video CDN download is media-sized, so 60s. */
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 60_000;
+
 registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorContext) => {
   const t0 = Date.now();
 
@@ -91,7 +94,9 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
       if (commaIdx === -1) throw new Error("Invalid data URI: no comma separator");
       buffer = Buffer.from(generated.url.slice(commaIdx + 1), "base64");
     } else {
-      const response = await fetch(generated.url);
+      const response = await fetch(generated.url, {
+        signal: AbortSignal.timeout(MEDIA_DOWNLOAD_TIMEOUT_MS),
+      });
       if (!response.ok) {
         throw new Error(`Failed to download video: ${response.status} ${response.statusText}`);
       }

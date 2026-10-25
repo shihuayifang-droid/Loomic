@@ -25,6 +25,12 @@ import {
   signProjectAssetUrls,
 } from "../storage/project-asset-urls.js";
 
+/**
+ * 45CW (OP-14): the zip fill reads each object through its signed URL. The URL
+ * is a signed storage read of one object, so it uses the short budget.
+ */
+const SIGNED_URL_FETCH_TIMEOUT_MS = 30_000;
+
 export class UploadServiceError extends Error {
   readonly statusCode: number;
   readonly code: "upload_failed" | "asset_not_found";
@@ -704,7 +710,9 @@ export function createUploadService(options: {
               const url = await signProjectAssetUrl(store, row.object_path, {
                 bucket: row.bucket,
               });
-              const res = await fetch(url);
+              const res = await fetch(url, {
+                signal: AbortSignal.timeout(SIGNED_URL_FETCH_TIMEOUT_MS),
+              });
 
               if (!res.ok) {
                 console.warn("[zip-download] an object could not be read; skipped");

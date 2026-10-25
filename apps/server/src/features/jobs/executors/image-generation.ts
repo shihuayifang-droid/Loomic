@@ -11,6 +11,9 @@ import { DEFAULT_IMAGE_MODEL_ID } from "@loomic/shared";
 import { gptImage2SizeOption } from "../../../generation/providers/openai-image.js";
 import type { ImageGenerateParams, ImageQuality } from "../../../generation/types.js";
 
+/** 45CW (OP-14): the generated-image CDN download is media-sized, so 60s. */
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 60_000;
+
 // BL-07: the ledger records what a job was charged for, so the job has to be
 // generated at that same tier. These are the three tiers the price table and the
 // billing guard know about; anything else is not a tier we can have billed for
@@ -165,7 +168,9 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     lap(`${providerName}_call_done`);
 
     // Download the generated image from the provider CDN
-    const response = await fetch(generated.url);
+    const response = await fetch(generated.url, {
+      signal: AbortSignal.timeout(MEDIA_DOWNLOAD_TIMEOUT_MS),
+    });
     if (!response.ok) {
       throw new Error(`Failed to download generated image from ${model}: ${response.status} ${response.statusText}`);
     }

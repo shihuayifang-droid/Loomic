@@ -1,5 +1,8 @@
 import type { FastifyInstance } from "fastify";
 
+/** 45CW (OP-14): the proxy fetches an external image, i.e. media-sized bytes. */
+const MEDIA_DOWNLOAD_TIMEOUT_MS = 60_000;
+
 /**
  * Proxy endpoint for fetching external images server-side, bypassing browser CORS restrictions.
  * Used by the frontend to load generated images into Excalidraw canvas.
@@ -47,7 +50,9 @@ export function registerImageProxyRoute(app: FastifyInstance) {
     }
 
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(MEDIA_DOWNLOAD_TIMEOUT_MS),
+      });
       if (!response.ok) {
         return reply
           .status(response.status)
