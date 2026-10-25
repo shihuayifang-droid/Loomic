@@ -15,12 +15,18 @@
  * removes the long-term dependency on the old Supabase project without deleting
  * anything there: the old bucket stays public and untouched.
  *
- * The URLs the modules export are already projected onto the `home-seeds` bucket
- * (see `apps/web/src/lib/home-seeds-url.ts`), but that bucket does not exist in
- * the old project yet — the bytes still live under
- * `project-assets/home-seeds/<key>`. So a fetch tries the URL it was given, and
- * if that fails tries the legacy location for the SAME key. Both attempts are
- * plain HTTPS GETs with a timeout and one retry.
+ * THE SEED DATA IS EMBEDDED
+ * `./home-seeds-data.ts` is a generated snapshot of the two home seed modules.
+ * Those modules belong to the web workspace, which the server image does not
+ * contain, so importing them at run time failed inside the container. The
+ * snapshot keeps this CLI self-contained: regenerate it (never hand-edit it)
+ * when a seed changes.
+ *
+ * The URLs in that snapshot are already projected onto the `home-seeds` bucket
+ * by the web side, but that bucket does not exist in the old project yet — the
+ * bytes still live under `project-assets/home-seeds/<key>`. So a fetch tries
+ * the URL it was given, and if that fails tries the legacy location for the
+ * SAME key. Both attempts are plain HTTPS GETs with a timeout and one retry.
  *
  * WHAT GOES INTO THE DATABASE
  * Object keys only (`image_urls`, `input_mentions[].imgSrc`, `cover_image_url`,
@@ -52,6 +58,10 @@ import { pathToFileURL } from "node:url";
 
 import { loadServerEnv } from "../config/env.js";
 import { createDatabasePool, resolveDatabaseUrl } from "../db/pool.js";
+import {
+  HOME_DISCOVERY_SEED_CATEGORIES,
+  HOME_EXAMPLE_SEED_CATEGORIES,
+} from "./home-seeds-data.js";
 import { createFsObjectStore } from "../features/storage/fs-object-store.js";
 import { objectUrlSecretFrom } from "../features/storage/object-url-signature.js";
 import type { ObjectStore } from "../features/storage/object-store.js";
@@ -59,7 +69,12 @@ import type { ObjectStore } from "../features/storage/object-store.js";
 /** The bucket the imported seeds live in (same one the seed modules project to). */
 export const HOME_SEEDS_BUCKET = "home-seeds";
 
-/** Public path of the NEW bucket, i.e. the URL shape the seed modules export. */
+/**
+ * Public path of the NEW bucket, i.e. the URL shape the seed snapshot carries.
+ * This mirrors, byte for byte, the projection the web side applies to a seed
+ * key before it reaches the data (same origin, same public object path, same
+ * bucket name). Keep the two in sync if that rule ever changes.
+ */
 const HOME_SEEDS_PUBLIC_PATH = "/storage/v1/object/public/home-seeds/";
 
 /** Public path of the OLD location that still holds the bytes today. */
@@ -73,11 +88,6 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const ATTEMPTS_PER_URL = 2;
 
 const DEFAULT_CONCURRENCY = 8;
-
-const SEED_MODULE_URLS = {
-  examples: "../../../web/src/lib/home-example-seeds.ts",
-  discovery: "../../../web/src/lib/home-discovery-seeds.ts",
-} as const;
 
 // ---------------------------------------------------------------------------
 // Seed module shapes (structural copies of the loader's types)
@@ -748,26 +758,16 @@ export async function runHomeSeedsImport(
 // Wiring
 // ---------------------------------------------------------------------------
 
-function seedModuleUrl(relative: string): string {
-  return new URL(relative, import.meta.url).href;
-}
-
 /**
- * Load the two seed modules. The paths are computed at run time and imported
- * dynamically because they live in another workspace (`apps/web`), which the
- * server's TypeScript project does not include.
+ * The two seed libraries, read from the embedded snapshot rather than from the
+ * web workspace (see `./home-seeds-data.ts` and the header of this file). Still
+ * async so callers keep treating the sources as something that could be loaded
+ * from elsewhere later.
  */
 export async function loadSeedSources(): Promise<HomeSeedSources> {
-  const exampleModule = (await import(seedModuleUrl(SEED_MODULE_URLS.examples))) as {
-    homeExampleSeedCategories: HomeSeedCategory[];
-  };
-  const discoveryModule = (await import(
-    seedModuleUrl(SEED_MODULE_URLS.discovery)
-  )) as { homeDiscoverySeedCategories: HomeSeedDiscoveryCategory[] };
-
   return {
-    exampleCategories: exampleModule.homeExampleSeedCategories,
-    discoveryCategories: discoveryModule.homeDiscoverySeedCategories,
+    exampleCategories: HOME_EXAMPLE_SEED_CATEGORIES,
+    discoveryCategories: HOME_DISCOVERY_SEED_CATEGORIES,
   };
 }
 
