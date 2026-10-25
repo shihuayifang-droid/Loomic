@@ -58,6 +58,34 @@ const SESSION = "s1";
 const INPUT = { content: "hello", role: "assistant" } as never;
 
 const TRANSPORT = { code: "", message: "TypeError: fetch failed" };
+
+const USER_TOKEN = "t";
+
+/**
+ * 45BF / T-133 (10a): `createObjectStore` takes the CALLER's access token now —
+ * `(accessToken: string) => ObjectStore`, the same shape brand-kit, uploads,
+ * canvas and projects take. The fake below is keyed by that token: the caller's
+ * own token maps to the capture client the assertions look at, and any OTHER
+ * token maps to a client that refuses every call, so a service that stopped
+ * forwarding the caller's own token fails loudly instead of quietly signing as
+ * the stub's user.
+ */
+function storeForToken(client: unknown) {
+  return (accessToken: string) =>
+    createSupabaseObjectStore(
+      (accessToken === USER_TOKEN
+        ? client
+        : {
+            storage: {
+              from: () => {
+                throw new Error(
+                  "the object store was built for a token the caller never presented",
+                );
+              },
+            },
+          }) as unknown as SupabaseStorageLike,
+    );
+}
 const PG_DENIED = {
   code: "42501",
   message: "new row violates row-level security policy",
@@ -345,10 +373,11 @@ function sessionWriteRow(
 /**
  * A harness for the session CRUD only (workorder 21C).
  *
- * `createUserClient` THROWS on purpose: the three session writes moved into the
- * repository, so reaching for the caller's PostgREST client here is a regression
- * — there is no fallback transport — and any case that would do it fails loudly
- * instead of quietly succeeding.
+ * `createObjectStore` THROWS on purpose: the three session writes moved into the
+ * repository, so reaching for a caller-scoped store here is a regression
+ * (45BF / T-133 (10a) removed the separate `createUserClient` option this
+ * harness used to guard) — there is no fallback transport — and any case that
+ * would do it fails loudly instead of quietly succeeding.
  *
  * `threadService.createThreadId` is a counter, so a case can prove the id came
  * from the service and was passed through untouched.
@@ -368,14 +397,11 @@ function sessionService(script: SessionWriteScript = {}) {
 
   let threadIds = 0;
   const service = createChatService({
-    createUserClient: () => {
-      throw new Error(
-        "the session CRUD must not reach the user client (21C: the session writes have a repository)",
-      );
-    },
     // T-133 (9th slice): the session CRUD projects no urls, so it must not build
-    // a store either — reaching for one here is a regression.
-    createObjectStore: () => {
+    // a store either — reaching for one here is a regression. 45BF / T-133 (10a)
+    // removed the separate `createUserClient` option, so this factory is the only
+    // client-shaped seam left on the service, and it must stay unreached.
+    createObjectStore: (_accessToken: string) => {
       throw new Error(
         "the session CRUD must not build an object store (the url projection is the only signer)",
       );
@@ -468,11 +494,10 @@ function fakeClient(script: {
 
   return {
     service: createChatService({
-      createUserClient: () => client as never,
-      // T-133 (9th slice): the same factory the assembly point wires, so the
-      // signature travels the real adapter and still lands on this stub client.
-      createObjectStore: (suppliedClient) =>
-        createSupabaseObjectStore(suppliedClient as unknown as SupabaseStorageLike),
+      // 45BF / T-133 (10a): the same factory the assembly point wires, now over
+      // the CALLER's access token, so the token travels the real adapter and
+      // still lands on this stub client.
+      createObjectStore: storeForToken(client),
       chatReadRepository: repository,
       chatWriteRepository,
       chatSessionWriteRepository,
@@ -661,11 +686,10 @@ function fakeReadClient(options: {
   const { repository: chatSessionWriteRepository } = sessionWriteRepositoryStub();
 
   const service = createChatService({
-    createUserClient: () => client as never,
-    // T-133 (9th slice): the same factory the assembly point wires, so the
-    // signature travels the real adapter and still lands on this stub client.
-    createObjectStore: (suppliedClient) =>
-      createSupabaseObjectStore(suppliedClient as unknown as SupabaseStorageLike),
+    // 45BF / T-133 (10a): the same factory the assembly point wires, now over the
+    // CALLER's access token, so the token travels the real adapter and still
+    // lands on this stub client.
+    createObjectStore: storeForToken(client),
     chatReadRepository: repository,
     chatWriteRepository,
     chatSessionWriteRepository,
@@ -1845,8 +1869,8 @@ describe("chat session CRUD through the repository (21C)", () => {
   });
 
   it("case 12: no session write reaches the caller's PostgREST client — there is no fallback", async () => {
-    // `sessionService` builds `createUserClient` to THROW, so all three calls
-    // below would fail if any of them still went out through the user client.
+    // `sessionService` builds `createObjectStore` to THROW, so all three calls
+    // below would fail if any of them still reached for a caller-scoped store.
     const h = sessionService({
       create: { data: sessionWriteRow("s-new", "New Chat", "2026-10-15T00:00:00.000Z") },
     });

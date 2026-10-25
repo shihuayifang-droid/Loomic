@@ -28,7 +28,7 @@ import {
   type ChatWriteRepository,
 } from "../../db/chat-write-repository.js";
 import { isTransportFailure } from "../../supabase/transport-retry.js";
-import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
+import type { AuthenticatedUser } from "../../supabase/user.js";
 // T-133 (9th slice): the signature is minted through the injected `ObjectStore`
 // seam — the same factory form uploads (45AI), canvas (45AJ), brand-kit (45AH)
 // and projects (45AS) take — instead of the service wrapping the user client.
@@ -402,15 +402,18 @@ function synthesizeLegacyBlocks(
 }
 
 export function createChatService(options: {
-  createUserClient: (accessToken: string) => UserSupabaseClient;
   /**
-   * T-133 (9th slice): a FACTORY, not a shared store — the same form uploads
-   * (45AI), canvas (45AJ), brand-kit (45AH) and projects (45AS) take. The chat
-   * projection signs for the caller, so the store is built from the caller's own
-   * client and Storage answers under that user's RLS; handing the service the
-   * server's/admin's store would widen the permission on this feature.
+   * T-133 (9th slice), re-shaped by 45BF / T-133 (10a): a FACTORY over the
+   * CALLER's access token, not a client, and not a shared store — the same form
+   * brand-kit (45BB), uploads (45BC), canvas (45BC) and projects (45BE) take.
+   * The chat projection signs for the caller, so the store is built from the
+   * caller's own token and Storage answers under that user's RLS; handing the
+   * service the server's/admin's store would widen the permission on this
+   * feature. The service no longer names a client: this factory is where the
+   * backend is named, and 10a is a signature change only — both backends behave
+   * exactly as they did.
    */
-  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
+  createObjectStore: (accessToken: string) => ObjectStore;
   chatReadRepository: ChatReadRepository;
   /**
    * Required, never optional: the create path writes through the pure `pg`
@@ -575,7 +578,7 @@ export function createChatService(options: {
     },
 
     async listMessages(user, sessionId) {
-      const client = options.createUserClient(user.accessToken);
+      const store = options.createObjectStore(user.accessToken);
 
       // ADR-0001 / workorder 20D: the history rows come from the pure `pg`
       // repository, so `session → canvas → project` is re-walked inside the
@@ -643,7 +646,7 @@ export function createChatService(options: {
             ...message,
             contentBlocks: await projectBlockUrls(
               options.chatReadRepository,
-              options.createObjectStore(client),
+              store,
               message.contentBlocks,
               { sessionId, actorId: user.id },
             ),
@@ -662,7 +665,7 @@ export function createChatService(options: {
     },
 
     async createMessage(user, sessionId, input) {
-      const client = options.createUserClient(user.accessToken);
+      const store = options.createObjectStore(user.accessToken);
       const safeBlocks = input.contentBlocks
         ? stripProjectedUrls(
             stripInlineImageBytes(input.contentBlocks, {
@@ -836,7 +839,7 @@ export function createChatService(options: {
           ? null
           : await projectBlockUrls(
               options.chatReadRepository,
-              options.createObjectStore(client),
+              store,
               storedBlocks,
               {
                 sessionId,
