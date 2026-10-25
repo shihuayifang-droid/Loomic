@@ -9,8 +9,15 @@
  * module be called by a plain repeating timer and by an ordinary balance read
  * without either of them having to know whether "the grant already happened".
  *
- * Two rules this module keeps, both borrowed from the read beside it
- * (`pool-balance-read-repository.ts`):
+ * Rules this module keeps (the last two are borrowed from the read beside it,
+ * `pool-balance-read-repository.ts`):
+ *
+ * - Workorder 45CT (OP-21): the DAILY grant is now preceded by a cheap
+ *   existence probe inside the same transaction, so a member whose wallet
+ *   already holds today's `daily_date` gets a read-only transaction instead of
+ *   a write. Steady state — the ordinary balance read — therefore commits
+ *   nothing. The monthly grant is unchanged: its `for update` probe is already
+ *   inside the function, and it is not on the request path.
  *
  * - The grants run through the privileged transaction entry point of workorder
  *   19 with a NULL actor. They are system writes performed on behalf of a
@@ -103,6 +110,36 @@ select public.grant_daily_credits($1::uuid, $2::uuid) as granted
 `;
 
 /**
+ * OP-21 "look before you write" for the daily grant (workorder 45CT).
+ *
+ * The "already granted today?" test is the one `grant_daily_credits` itself
+ * uses (0009_credit_admin, line 142): the wallet's `daily_date` already equals
+ * today in Asia/Shanghai. The expression is copied verbatim from the function
+ * (`(now() at time zone 'Asia/Shanghai')::date`) rather than re-derived, so the
+ * probe and the function can never disagree about which day it is.
+ *
+ * `user_credit_wallets.user_id` is the table's primary key (the function's own
+ * `on conflict (user_id)` and `where user_id = ... for update` rely on it), and
+ * `select 1 ... limit 1` projects nothing, so this is an index-only probe.
+ *
+ * A wallet that does not exist yet, a NULL `daily_date` and an older date all
+ * answer ZERO rows, and the grant runs exactly as before — the first grant of
+ * the day, the expiry of yesterday's remainder and the creation of a missing
+ * wallet row are all still performed by the function.
+ *
+ * The probe sits INSIDE the same transaction as the grant, so the two cannot be
+ * separated by a concurrent caller; the function keeps its own `for update`
+ * serialisation and its `daily_date` re-check, i.e. its idempotency is intact.
+ */
+const DAILY_GRANT_ALREADY_GIVEN_SQL = `
+select 1
+  from public.user_credit_wallets
+ where user_id = $1::uuid
+   and daily_date = (now() at time zone 'Asia/Shanghai')::date
+ limit 1
+`;
+
+/**
  * Build the PostgreSQL implementation over a pool getter. Nothing here
  * connects: the getter is called per grant, so a process that never grants (a
  * web process with no team workspace, a worker between months) never opens a
@@ -153,6 +190,15 @@ export function createPoolGrantWriteRepository(options: {
           options.getTransactionPool(),
           null,
           async (client) => {
+            // OP-21: today's grant already happened -> answer the same `false`
+            // the function would answer, without touching a row. A `true` here
+            // would be a lie the ledger does not back.
+            const alreadyGiven = await client.query(
+              DAILY_GRANT_ALREADY_GIVEN_SQL,
+              [userId],
+            );
+            if (alreadyGiven.rows.length > 0) return false;
+
             const result = await client.query(GRANT_DAILY_CREDITS_SQL, [
               userId,
               workspaceId,
