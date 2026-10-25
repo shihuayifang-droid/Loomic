@@ -42,7 +42,11 @@ type ComposeService = {
   environment?: Record<string, string> | string[];
   healthcheck?: { test?: string | string[] };
   image?: string;
+  /** 45CI: the tunnel sidecar joins the `web` container network namespace. */
+  network_mode?: string;
   ports?: string[];
+  /** 45CI: services behind a profile only start with `--profile <name>`. */
+  profiles?: string[];
   volumes?: string[];
 };
 
@@ -159,8 +163,36 @@ function locationBlock(prefix: string): string {
 }
 
 describe("43M deploy/docker-compose.yml", () => {
-  it("43M: declares exactly the four production services", () => {
-    expect(Object.keys(SERVICES).sort()).toEqual(["postgres", "server", "web", "worker"]);
+  it("43M: declares exactly the four production services by default", () => {
+    // 45CI added a fifth service, `cloudflared`, behind `profiles: ["tunnel"]`,
+    // so a plain `docker compose up` still starts exactly these four.
+    const enabledByDefault = Object.keys(SERVICES)
+      .filter((name) => !SERVICES[name]?.profiles)
+      .sort();
+
+    expect(enabledByDefault).toEqual(["postgres", "server", "web", "worker"]);
+  });
+
+  it("45CI: cloudflared is the only profiled service and shares the web network", () => {
+    expect(Object.keys(SERVICES)).toContain("cloudflared");
+
+    const profiled = Object.keys(SERVICES)
+      .filter((name) => SERVICES[name]?.profiles)
+      .sort();
+    expect(profiled).toEqual(["cloudflared"]);
+
+    const cloudflared = service("cloudflared");
+    expect(cloudflared.profiles).toEqual(["tunnel"]);
+    // The tunnel publishes nothing; nginx keeps owning the only host port.
+    expect(cloudflared.ports).toBeUndefined();
+    // Necessary so cloudflared can reach nginx on 127.0.0.1 inside `web`.
+    expect(cloudflared.network_mode).toBe("service:web");
+  });
+
+  it("45CI: the four default services never hide behind a profile", () => {
+    for (const name of ["postgres", "server", "web", "worker"]) {
+      expect(service(name).profiles, `${name} must not declare profiles`).toBeUndefined();
+    }
   });
 
   it("43M: uses compose spec v2 (no top-level version key)", () => {
