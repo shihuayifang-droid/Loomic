@@ -15,10 +15,7 @@ import type {
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
 import type { AssetWriteRepository } from "../../db/asset-write-repository.js";
 import type { ProjectReadRepository } from "../../db/project-read-repository.js";
-import type {
-  AuthenticatedUser,
-  UserSupabaseClient,
-} from "../../supabase/user.js";
+import type { AuthenticatedUser } from "../../supabase/user.js";
 import { planZipDownload } from "../downloads/zip-download-plan.js";
 import type { ObjectRef, ObjectStore } from "../storage/object-store.js";
 import { ObjectStoreError } from "../storage/object-store.js";
@@ -154,26 +151,27 @@ export type UploadService = {
 
 
 export function createUploadService(options: {
-  createUserClient: (accessToken: string) => UserSupabaseClient;
   /**
-   * 45AI / T-133 (3rd slice): object storage arrives as a FACTORY keyed on the
-   * user-scoped client — `(client) => ObjectStore`, never a shared instance.
+   * 45AI / T-133 (3rd slice), re-shaped by 45BC / T-133 (10a): object storage
+   * arrives as a FACTORY keyed on the CALLER's access token —
+   * `(accessToken) => ObjectStore`, never a shared instance and no longer a
+   * Supabase-shaped client.
    *
    * Why a factory and not the single `ObjectStore` injected elsewhere: an upload
-   * and a delete are per USER. The bytes have always travelled to Storage through
-   * `createUserClient(user.accessToken)`, so Storage answered under that user's
+   * and a delete are per USER. The bytes have always travelled to Storage under a
+   * client built for the caller's token, so Storage answered under that user's
    * RLS. A shared store would write with whatever identity its own client carries
    * (the server's / the admin's), which widens the permission on this feature — a
    * security regression, not a tidy-up. So every call site below hands the
-   * factory the SAME user-scoped client this file used to wrap itself, and this
-   * file no longer names a backend (OP-05 / 43J: the `ObjectStore` seam only).
+   * factory the SAME caller's access token, and this file no longer names a
+   * backend nor a client (OP-05 / 43J: the `ObjectStore` seam only).
    *
-   * REQUIRED on purpose, like `createUserClient` above: this service has exactly
-   * one assembly point (`app.ts`), and an OPTIONAL dependency fails silently when
-   * its one wiring line is dropped — the type check still exits 0 and the upload
-   * only breaks at runtime. Required makes a missing wire a compile error.
+   * REQUIRED on purpose: this service has exactly one assembly point (`app.ts`),
+   * and an OPTIONAL dependency fails silently when its one wiring line is
+   * dropped — the type check still exits 0 and the upload only breaks at runtime.
+   * Required makes a missing wire a compile error.
    */
-  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
+  createObjectStore: (accessToken: string) => ObjectStore;
   /**
    * Workorder 44C: the asset row for an uploaded object is recorded through the
    * repository. Optional in the type only; absent means the upload fails closed
@@ -215,8 +213,7 @@ export function createUploadService(options: {
 }): UploadService {
   const service: UploadService = {
     async uploadFile(user, input) {
-      const client = options.createUserClient(user.accessToken);
-      const store = options.createObjectStore(client);
+      const store = options.createObjectStore(user.accessToken);
 
       // A project upload belongs to the workspace that actually owns the project.
       // The client sends both ids, and both are used to build the object path and
@@ -519,9 +516,7 @@ export function createUploadService(options: {
         );
       }
 
-      const client = options.createUserClient(user.accessToken);
-
-      const store = options.createObjectStore(client);
+      const store = options.createObjectStore(user.accessToken);
 
       if (!signOptions?.download) {
         return getAssetUrl(store, assetRow.bucket, assetRow.object_path);
@@ -607,8 +602,7 @@ export function createUploadService(options: {
         else pathsByBucket.set(row.bucket, [row.object_path]);
       }
 
-      const client = options.createUserClient(user.accessToken);
-      const store = options.createObjectStore(client);
+      const store = options.createObjectStore(user.accessToken);
       const signedByBucket = new Map<string, Map<string, string>>();
 
       await Promise.all(
@@ -636,8 +630,7 @@ export function createUploadService(options: {
     },
 
     async prepareZipDownload(user, input) {
-      const client = options.createUserClient(user.accessToken);
-      const store = options.createObjectStore(client);
+      const store = options.createObjectStore(user.accessToken);
       const repository = options.assetReadRepository;
       const uniqueIds = [...new Set(input.assetIds)];
 
@@ -741,7 +734,6 @@ export function createUploadService(options: {
     },
 
     async deleteAsset(user, assetId) {
-      const client = options.createUserClient(user.accessToken);
       const repository = options.assetReadRepository;
 
       // ADR-0001 / workorder 20E: only the locating read moved. Its ACL is the
@@ -769,7 +761,7 @@ export function createUploadService(options: {
       }
 
       // The order is part of the contract: the object first, the row second.
-      await removeQuietly(options.createObjectStore(client), {
+      await removeQuietly(options.createObjectStore(user.accessToken), {
         bucket: assetRow.bucket,
         key: assetRow.object_path,
       });
@@ -797,10 +789,10 @@ export function createUploadService(options: {
   return service;
 }
 
-// 45AI: every object operation in this file goes through the `ObjectStore` seam,
-// built by the injected `createObjectStore` factory from the SAME user-scoped
-// client the call site already holds. The local `storeFor` that used to wrap the
-// client here is gone: naming the backend is the assembly point's job now.
+// 45AI, re-keyed by 45BC / T-133 (10a): every object operation in this file goes
+// through the `ObjectStore` seam, built by the injected `createObjectStore`
+// factory from the CALLER's access token. The local `storeFor` that used to wrap
+// the client here is gone: naming the backend is the assembly point's job now.
 
 /**
  * 43F: the compensation paths (an upload whose row could not be recorded, a

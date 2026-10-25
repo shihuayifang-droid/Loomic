@@ -721,19 +721,22 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const canvasService =
     options.canvasService ??
     createCanvasService({
-      createUserClient,
-      // 45AJ / T-133 (4th slice): a FACTORY, not a shared store — the same form
-      // brand-kit (45AH) and uploads (45AI) take above. A canvas file is uploaded
-      // by whoever is saving that canvas, so the store is built from the caller's
-      // own client and Storage answers under that user's RLS. Handing the service
-      // the server's/admin's store would widen the permission on this feature (a
-      // security regression, and 45D's ownership rules would be enforced on a
-      // write that already bypassed them). The service itself no longer names a
-      // backend; this factory is where it is named, and in `fs` mode the client it
-      // wraps is already the volume adapter, so the wrap is the same one the
-      // service applied before.
-      createObjectStore: (client) =>
-        createSupabaseObjectStore(client as unknown as SupabaseStorageLike),
+      // 45AJ / T-133 (4th slice), re-shaped by 45BC / T-133 (10a): a FACTORY over
+      // the CALLER's access token, not a shared store and no longer a client. The
+      // same form brand-kit (45AH / 45BB) and uploads (45AI / 45BC) take. A canvas
+      // file is uploaded by whoever is saving that canvas, so the store is built
+      // from that caller's token and Storage answers under that user's RLS.
+      // Handing the service the server's/admin's store would widen the permission
+      // on this feature (a security regression, and 45D's ownership rules would be
+      // enforced on a write that already bypassed them). The service itself no
+      // longer names a backend (nor a client): this factory is where Storage is
+      // named, and in `fs` mode the client it wraps is already the volume adapter,
+      // so the wrap is the same one the service applied before — 10a is a
+      // signature change only, the two backends behave exactly as they did.
+      createObjectStore: (accessToken) =>
+        createSupabaseObjectStore(
+          createUserClient(accessToken) as unknown as SupabaseStorageLike,
+        ),
       assetRecordRepository,
       canvasReadRepository,
       canvasContentRepository,
@@ -798,18 +801,21 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const uploadService =
     options.uploadService ??
     createUploadService({
-      createUserClient,
-      // 45AI / T-133 (3rd slice): a FACTORY, not a shared store — the same form
-      // the brand-kit service above takes. An upload and a delete are per USER:
-      // the bytes have always gone to Storage through `createUserClient`, with
+      // 45AI / T-133 (3rd slice), re-shaped by 45BC / T-133 (10a): a FACTORY over
+      // the CALLER's access token, not a shared store and no longer a client. The
+      // same form the brand-kit service above takes. An upload and a delete are
+      // per USER: the bytes have always gone to Storage under a client built for
       // the caller's own access token, so Storage answered under that user's RLS.
-      // Handing the service the server's/admin's store would widen the
-      // permission on this feature (a security regression). The service itself
-      // no longer names a backend; this factory is where it is named, and in
-      // `fs` mode the client it wraps is already the volume adapter, so the wrap
-      // is the same one the service applied before.
-      createObjectStore: (client) =>
-        createSupabaseObjectStore(client as unknown as SupabaseStorageLike),
+      // Handing the service the server's/admin's store would widen the permission
+      // on this feature (a security regression). The service itself no longer
+      // names a backend (nor a client): this factory is where Storage is named,
+      // and in `fs` mode the client it wraps is already the volume adapter, so the
+      // wrap is the same one the service applied before — 10a is a signature
+      // change only, the two backends behave exactly as they did.
+      createObjectStore: (accessToken) =>
+        createSupabaseObjectStore(
+          createUserClient(accessToken) as unknown as SupabaseStorageLike,
+        ),
       assetRecordRepository,
       projectReadRepository,
       assetReadRepository,

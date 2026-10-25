@@ -37,15 +37,21 @@ const MARKER = "oss://project-assets/ws-team/gen/v1.mp4";
  * injected per-user FACTORY, the same form brand-kit (45AH) and uploads (45AI)
  * take, and the option is required so no save path can silently skip an upload.
  *
- * T-133 (9th slice): the READ path now signs through that same store instead of
- * the raw client, so the cases below build it the way `app.ts` does —
- * `createSupabaseObjectStore` over the caller's own client. The signatures still
- * reach the stub client's `createSignedUrl`, which is what `signedCalls` /
- * `resolvedUrls` observe, so the URL shape, TTL and transform assertions below
- * are unchanged in what they pin.
+ * T-133 (9th slice), re-keyed by 45BC (10a): the READ path signs through that
+ * same store instead of the raw client, and the factory is now named by the
+ * caller's ACCESS TOKEN rather than a client. These cases build it the way
+ * `app.ts` builds it in `fs` mode — `createSupabaseObjectStore` over the stub
+ * client they already have — so the token the service hands the factory is
+ * accepted and ignored here while the signatures still reach the stub client's
+ * `createSignedUrl`. That is what `signedCalls` / `resolvedUrls` observe, so the
+ * URL shape, TTL and transform assertions below pin exactly what they did.
  */
-const storeFrom = (client: UserSupabaseClient): ObjectStore =>
-  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
+const storeFrom = (
+  client: UserSupabaseClient,
+): ((accessToken: string) => ObjectStore) => {
+  const storageClient = client as unknown as SupabaseStorageLike;
+  return () => createSupabaseObjectStore(storageClient);
+};
 
 type CanvasContentLike = {
   elements: Array<Record<string, any>>;
@@ -207,8 +213,7 @@ describe("CV-01 video object keys", () => {
     // X-52 工单12: the service records asset metadata through the admin client on
     // the SAVE path; these cases only read, so the factory signs but never uploads.
     const service = createCanvasService({
-      createUserClient: () => fake.client,
-      createObjectStore: storeFrom,
+      createObjectStore: storeFrom(fake.client),
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -244,8 +249,7 @@ describe("CV-01 video object keys", () => {
       },
     });
     const service = createCanvasService({
-      createUserClient: () => fake.client,
-      createObjectStore: storeFrom,
+      createObjectStore: storeFrom(fake.client),
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -327,8 +331,7 @@ describe("CV-01 video object keys", () => {
     // X-52 工单12: the service records asset metadata through the admin client on
     // the SAVE path; these cases only read, so the factory signs but never uploads.
     const service = createCanvasService({
-      createUserClient: () => fake.client,
-      createObjectStore: storeFrom,
+      createObjectStore: storeFrom(fake.client),
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -360,8 +363,7 @@ describe("CV-01 video object keys", () => {
       elements: [foreign],
     });
     const service = createCanvasService({
-      createUserClient: () => fake.client,
-      createObjectStore: storeFrom,
+      createObjectStore: storeFrom(fake.client),
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository(),
       getAdminClient: () => fake.client as unknown as never,
@@ -387,8 +389,7 @@ describe("CV-01 video object keys", () => {
       ],
     });
     const service = createCanvasService({
-      createUserClient: () => fake.client,
-      createObjectStore: storeFrom,
+      createObjectStore: storeFrom(fake.client),
       canvasContentRepository: fake.contentRepository,
       canvasReadRepository: makeReadRepository({
         rows: [{ id: "asset-v1", bucket: "project-assets", object_path: "legacy-root/v1.mp4" }],

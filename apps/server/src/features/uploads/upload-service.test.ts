@@ -316,8 +316,9 @@ function makeStubs(options: {
     },
   };
 
-  // 45AI: the store the injected factory answers with, and the clients the factory
-  // was handed (so "the same user client, never the admin's" is provable).
+  // 45AI, re-keyed by 45BC / T-133 (10a): the store the injected factory answers
+  // with, and the ACCESS TOKENS the factory was handed (so "built for the caller,
+  // never for the admin" stays provable now that no client crosses the seam).
   const objectStore = withClientSigning(
     createFakeStore({
       uploads,
@@ -328,7 +329,7 @@ function makeStubs(options: {
     }),
     userClient as unknown as UserSupabaseClient,
   );
-  const storeClients: UserSupabaseClient[] = [];
+  const storeTokens: string[] = [];
 
   // Workorder 44C: the asset record is the repository's now; the fake records the
   // camelCase input and can be made to throw. `omitRecordRepository` leaves it out.
@@ -342,11 +343,11 @@ function makeStubs(options: {
   };
 
   const service = createUploadService({
-    createUserClient: () => userClient as unknown as UserSupabaseClient,
-    // 45AI: the factory, handed the user-scoped client exactly as the service
-    // would have wrapped it itself before this ticket.
-    createObjectStore: (client) => {
-      storeClients.push(client);
+    // 45BC / T-133 (10a): the service hands the CALLER's access token straight to
+    // the factory — no client is built on this side of the seam any more — so the
+    // token recorded here is exactly the one the store was built for.
+    createObjectStore: (accessToken) => {
+      storeTokens.push(accessToken);
       return objectStore;
     },
     ...(options.omitRecordRepository
@@ -389,7 +390,7 @@ function makeStubs(options: {
     displayNameReads,
     userClient,
     objectStore,
-    storeClients,
+    storeTokens,
   };
 }
 
@@ -968,7 +969,7 @@ describe("the migrated lookups of the upload write flows", () => {
 // 45AI / T-133 (3rd slice): storage is observed on the fake store the injected
 // factory answers with — the SDK double no longer carries upload/remove at all.
 describe("45AI: object storage arrives through the injected factory", () => {
-  it("45AI: the factory is handed the caller's own user client, never an admin one", async () => {
+  it("45AI / 45BC: the factory is handed the caller's own access token, never an admin one", async () => {
     const stub = makeStubs({ project: { workspace_id: TEAM_WORKSPACE } });
 
     await stub.service.uploadFile(USER, {
@@ -977,8 +978,8 @@ describe("45AI: object storage arrives through the injected factory", () => {
       projectId: PROJECT,
     });
 
-    expect(stub.storeClients).toHaveLength(1);
-    expect(stub.storeClients[0]).toBe(stub.userClient);
+    expect(stub.storeTokens).toHaveLength(1);
+    expect(stub.storeTokens[0]).toBe(USER.accessToken);
   });
 
   it("45AI: the store sees the bucket, the object key and the bytes", async () => {
@@ -1262,9 +1263,9 @@ function makeZipStubs(options: {
   };
 
   const service = createUploadService({
-    createUserClient: () => userClient as unknown as UserSupabaseClient,
-    // 45AI: the zip path signs and fetches over HTTP; the store seam is wired so
-    // the service can be built, and nothing in these cases may need it.
+    // 45AI, re-keyed by 45BC (10a): the zip path signs and fetches over HTTP; the
+    // store seam is wired so the service can be built, and nothing in these cases
+    // may need it.
     createObjectStore: () =>
       withClientSigning(
         createFakeStore({}),

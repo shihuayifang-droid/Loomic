@@ -67,14 +67,19 @@ const noObjectStoreOnTheReadPath = (): ObjectStore => {
 };
 
 /**
- * T-133 (9th slice): the read path is handed the same store the save path
- * uploads with, so the fixtures build it with the factory `app.ts` passes —
- * `createSupabaseObjectStore` over the caller's own client. The signatures
- * therefore still reach the stub client below (same bucket, key, TTL and
- * transform), which is what the URL-shape assertions here observe.
+ * T-133 (9th slice), re-keyed by 45BC (10a): the read path is handed the same
+ * store the save path uploads with. The service now names the caller's ACCESS
+ * TOKEN instead of a client, so the read fixtures build the factory around the
+ * stub client they already have — the same adapter `app.ts` builds in `fs` mode.
+ * The signatures therefore still reach the stub client below (same bucket, key,
+ * TTL and transform), which is what the URL-shape assertions here observe.
  */
-const readPathStore = (client: UserSupabaseClient): ObjectStore =>
-  createSupabaseObjectStore(client as unknown as SupabaseStorageLike);
+const readPathStoreOver = (
+  client: UserSupabaseClient,
+): ((accessToken: string) => ObjectStore) => {
+  const storageClient = client as unknown as SupabaseStorageLike;
+  return () => createSupabaseObjectStore(storageClient);
+};
 
 const PNG_BASE64 =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -104,10 +109,11 @@ function makeStubs(options: {
 }) {
   const records: RecordCall[] = [];
   const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
-  // 45AJ: the clients the injected store factory was handed. Recorded so "the
-  // store is built from the caller's OWN client, never the admin's" is observable
-  // instead of assumed.
-  const storeClients: UserSupabaseClient[] = [];
+  // 45AJ, re-keyed by 45BC / T-133 (10a): the ACCESS TOKENS the injected store
+  // factory was handed. Recorded so "the store is built for the caller, never for
+  // the admin" is observable instead of assumed — no client crosses the seam any
+  // more, so a token-free factory would have nothing to record here.
+  const storeTokens: string[] = [];
 
   const userClient = {
     storage: {
@@ -157,8 +163,8 @@ function makeStubs(options: {
     },
   };
 
-  const createObjectStore = (client: UserSupabaseClient): ObjectStore => {
-    storeClients.push(client);
+  const createObjectStore = (accessToken: string): ObjectStore => {
+    storeTokens.push(accessToken);
     return objectStore;
   };
 
@@ -191,7 +197,6 @@ function makeStubs(options: {
   };
 
   const service = createCanvasService({
-    createUserClient: () => userClient as unknown as UserSupabaseClient,
     createObjectStore,
     canvasContentRepository: fakeContentRepository,
     ...(options.withoutRepository ? {} : { assetRecordRepository }),
@@ -207,7 +212,7 @@ function makeStubs(options: {
     service,
     records,
     uploads,
-    storeClients,
+    storeTokens,
     userClient: userClient as unknown as UserSupabaseClient,
     canvasLinkCalls,
     canvasId: options.canvasId,
@@ -248,10 +253,10 @@ describe("canvas file extraction records asset metadata", () => {
     await stub.service.saveCanvasContent(USER, "canvas-a", content, 1);
 
     expect(stub.uploads).toHaveLength(1);
-    // 45AJ: the bytes went through the store the injected factory built, and the
-    // factory was handed the caller's OWN user client — that is what keeps the
-    // upload inside the saver's RLS.
-    expect(stub.storeClients).toEqual([stub.userClient]);
+    // 45AJ, re-keyed by 45BC (10a): the bytes went through the store the injected
+    // factory built, and the factory was handed the CALLER's own access token —
+    // that is what keeps the upload inside the saver's RLS.
+    expect(stub.storeTokens).toEqual([USER.accessToken]);
     expect(stub.records).toHaveLength(1);
     expect(stub.records[0]).toMatchObject({
       bucket: "project-assets",
@@ -503,8 +508,9 @@ function makeReadStub(options: {
   }));
 
   const service = createCanvasService({
-    createUserClient: () => userClient as unknown as UserSupabaseClient,
-    createObjectStore: readPathStore,
+    createObjectStore: readPathStoreOver(
+      userClient as unknown as UserSupabaseClient,
+    ),
     canvasContentRepository: fakeContentRepository,
     getAdminClient: () =>
       ({ rpc: async () => ({ data: null, error: null }) }) as unknown as AdminSupabaseClient,
@@ -794,7 +800,6 @@ describe("canvas read signs only owned markers (45D)", () => {
 describe("canvas content repository is required (44V)", () => {
   it("case 1: without the content repository getCanvas answers 503 service_unavailable", async () => {
     const service = createCanvasService({
-      createUserClient: () => ({}) as unknown as UserSupabaseClient,
       createObjectStore: noObjectStoreOnTheReadPath,
     });
 
@@ -806,7 +811,6 @@ describe("canvas content repository is required (44V)", () => {
 
   it("case 2: without the content repository saveCanvasContent answers 503 service_unavailable", async () => {
     const service = createCanvasService({
-      createUserClient: () => ({}) as unknown as UserSupabaseClient,
       createObjectStore: noObjectStoreOnTheReadPath,
     });
 

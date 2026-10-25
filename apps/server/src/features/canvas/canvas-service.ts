@@ -2,7 +2,7 @@ import type { CanvasContent, CanvasDetail } from "@loomic/shared";
 
 import type { RecoverableArtifact } from "@loomic/shared";
 
-import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
+import type { AuthenticatedUser } from "../../supabase/user.js";
 import type { AdminSupabaseClient } from "../../supabase/admin.js";
 import {
   CanvasReadError,
@@ -97,20 +97,22 @@ export type CanvasService = {
 };
 
 export function createCanvasService(options: {
-  createUserClient: (accessToken: string) => UserSupabaseClient;
   /**
-   * 45AJ / T-133 (4th slice): a FACTORY, not a single shared store.
+   * 45AJ / T-133 (4th slice), re-shaped by 45BC / T-133 (10a): a FACTORY keyed
+   * on the CALLER's access token, not a single shared store and no longer a
+   * Supabase-shaped client.
    *
    * Canvas files are uploaded for the caller who is saving the canvas, so the
-   * store is built from THAT user's client and Storage answers under that user's
+   * store is built from THAT caller's token and Storage answers under that user's
    * RLS — the same per-user scoping this service applied itself when it wrapped
-   * the caller's client inline, and the same form brand-kit (45AH) and uploads
-   * (45AI) take. Handing the service one store built from the server's/admin's
-   * client would widen the permission on this feature: 45D pinned that a canvas
-   * marker is only signed or written when it belongs to this canvas's workspace
-   * or project, and that check is meaningless if the write itself bypasses RLS.
+   * the caller's client inline, and the same form brand-kit (45AH / 45BB) and
+   * uploads (45AI / 45BC) take. Handing the service one store built from the
+   * server's/admin's client would widen the permission on this feature: 45D
+   * pinned that a canvas marker is only signed or written when it belongs to this
+   * canvas's workspace or project, and that check is meaningless if the write
+   * itself bypasses RLS.
    */
-  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
+  createObjectStore: (accessToken: string) => ObjectStore;
   /**
    * Ticket 44D onward this service no longer uses it; kept optional only so
    * existing callers keep compiling. A later cleanup ticket removes it.
@@ -150,7 +152,6 @@ export function createCanvasService(options: {
 }): CanvasService {
   return {
     async getCanvas(user, canvasId) {
-      const client = options.createUserClient(user.accessToken);
       const contentRepository = options.canvasContentRepository;
       if (!contentRepository) {
         throw asCanvasServiceError(
@@ -183,12 +184,13 @@ export function createCanvasService(options: {
 
       const content = (data.content as CanvasContent) ?? { elements: [], appState: {} };
 
-      // T-133 (9th slice): the READ path signs through the same per-request
-      // store the SAVE path uploads with — built by the injected factory from
-      // THIS caller's client, so the signature carries their JWT and the whole
-      // feature has exactly one storage seam. Nothing about which request the
-      // store belongs to changed; only who ends up asking Storage.
-      const objectStore = options.createObjectStore(client);
+      // T-133 (9th slice), re-keyed by 45BC (10a): the READ path signs through
+      // the same per-request store the SAVE path uploads with — built by the
+      // injected factory from THIS caller's access token, so the signature
+      // carries their JWT and the whole feature has exactly one storage seam.
+      // Nothing about which request the store belongs to changed; only who ends
+      // up asking Storage.
+      const objectStore = options.createObjectStore(user.accessToken);
 
       // Resolve OSS-stored files back to base64 dataURLs for the frontend
       const resolvedContent = await resolveFilesFromStorage(
@@ -221,7 +223,6 @@ export function createCanvasService(options: {
     },
 
     async saveCanvasContent(user, canvasId, content, baseVersion) {
-      const client = options.createUserClient(user.accessToken);
       const contentRepository = options.canvasContentRepository;
       if (!contentRepository) {
         throw asCanvasServiceError(
@@ -233,11 +234,12 @@ export function createCanvasService(options: {
       }
       const contentStore = createRepositoryCanvasStore(contentRepository, user.id);
 
-      // 45AJ / T-133 (4th slice): the store is built by the injected factory from
-      // THIS user's client, right before the bytes are written — not once at
-      // construction and not from the admin client. Every upload below therefore
-      // carries the saver's JWT and answers under that user's RLS.
-      const objectStore = options.createObjectStore(client);
+      // 45AJ / T-133 (4th slice), re-keyed by 45BC (10a): the store is built by
+      // the injected factory from THIS user's access token, right before the
+      // bytes are written — not once at construction and not from the admin
+      // client. Every upload below therefore carries the saver's JWT and answers
+      // under that user's RLS.
+      const objectStore = options.createObjectStore(user.accessToken);
 
       // Extract base64 files to Storage, replacing dataURLs with oss:// markers
       const leanContent = await extractFilesToStorage(
