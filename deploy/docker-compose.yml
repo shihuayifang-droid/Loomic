@@ -82,6 +82,25 @@ services:
       - postgres
     volumes:
       - objects:/data/objects
+    # OP-14: the server's liveness probe is `/healthz` (HTTP). The worker
+    # publishes no port, so the same question -- "is the loop still turning" --
+    # is answered by the heartbeat file it rewrites every 15s. `< 60` seconds is
+    # four beats, so an occasional slow tick is not mistaken for a hang.
+    # No new volume: the file lives in the container's own /tmp.
+    #
+    # `$$` is the escape for a literal `$`: without it compose interpolates
+    # `$((` / `$(` itself and warns about an invalid interpolation format, and
+    # the shell inside the container never sees its arithmetic.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /tmp/hahart-worker-heartbeat && test $$(( $$(date +%s) - $$(stat -c %Y /tmp/hahart-worker-heartbeat) )) -lt 60",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   web:
     build:

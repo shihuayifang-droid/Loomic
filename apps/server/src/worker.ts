@@ -11,6 +11,7 @@ if (process.env.GLOBAL_AGENT_HTTP_PROXY) {
 }
 
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { loadServerEnv } from "./config/env.js";
 import {
   createQueueClient,
@@ -138,6 +139,24 @@ async function main() {
   const workerId = env.workerId ?? randomUUID().slice(0, 8);
   const tag = `[worker:${workerId}]`;
 
+  // OP-14: the compose healthcheck for this service reads the heartbeat file
+  // written below -- the worker publishes no port, so a file mtime is the only
+  // observable that says "the loop is still turning". Only the worker writes it;
+  // the server does not (its own probe is `/api/health`).
+  //
+  // The two knobs are read straight from `process.env` instead of `ServerEnv`:
+  // wiring them through `config/env.ts` would mean touching a second file for a
+  // purely operational override. Defaults match the compose healthcheck: 15s
+  // beat, and `-lt 60` in the probe means four beats of tolerance before the
+  // container is marked unhealthy.
+  const heartbeat = startWorkerHeartbeat({
+    file:
+      process.env.HAHART_WORKER_HEARTBEAT_FILE?.trim() ||
+      DEFAULT_WORKER_HEARTBEAT_FILE,
+    intervalMs: heartbeatIntervalMs(process.env.HAHART_WORKER_HEARTBEAT_MS),
+    log: (message) => console.warn(`${tag} ${message}`),
+  });
+
   let running = true;
 
   // OP-11 (workorder 43A): one timer drives every periodic task, and the sheet
@@ -246,6 +265,9 @@ async function main() {
     // that matter, and a tick landing mid-shutdown has nothing left to do. One
     // handle now covers every entry in the catalog (OP-11 / workorder 43A).
     schedules.stop();
+    // OP-14: stop beating as well -- the file is allowed to go stale once this
+    // process is going away, instead of masking a worker that is no longer there.
+    heartbeat.stop();
     const totalInFlight = [...inFlightByQueue.values()].reduce((n, s) => n + s.size, 0);
     console.log(`${tag} Shutting down, waiting for ${totalInFlight} in-flight jobs...`);
     running = false;
@@ -331,6 +353,62 @@ async function main() {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** OP-14 default beat; four of these fit inside the compose probe's 60s window. */
+const DEFAULT_WORKER_HEARTBEAT_MS = 15000;
+/** Container-local path; the compose healthcheck reads exactly this file. */
+const DEFAULT_WORKER_HEARTBEAT_FILE = "/tmp/hahart-worker-heartbeat";
+
+/**
+ * OP-14: `HAHART_WORKER_HEARTBEAT_MS` as a positive integer, or the default.
+ * A malformed value is not a fatal misconfiguration -- a worker that refused to
+ * start over its own heartbeat would stop processing jobs for a cosmetic reason.
+ */
+function heartbeatIntervalMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_WORKER_HEARTBEAT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_WORKER_HEARTBEAT_MS;
+  }
+  return Math.floor(parsed);
+}
+
+/**
+ * OP-14 worker heartbeat: touch `file` immediately and then every `intervalMs`,
+ * so `deploy/docker-compose.yml` can tell a wedged worker from a working one.
+ *
+ * Writing is best effort by design: a read-only `/tmp`, a full disk or a missing
+ * parent directory logs once per failure and the worker keeps consuming jobs.
+ * A heartbeat that cannot be written is an observability gap, not a reason to
+ * drop the work this process exists to do.
+ */
+function startWorkerHeartbeat(options: {
+  file: string;
+  intervalMs: number;
+  log: (message: string) => void;
+}): { stop: () => void } {
+  const beat = () => {
+    try {
+      writeFileSync(options.file, new Date().toISOString());
+    } catch (err) {
+      options.log(`heartbeat write failed for ${options.file}: ${String(err)}`);
+    }
+  };
+
+  // First beat before the first interval: a container that has just started is
+  // alive, and `start_period` in the compose probe is the only grace it gets.
+  beat();
+  const timer = setInterval(beat, options.intervalMs);
+  // The polling loop below is what keeps this process alive; an unref'd timer
+  // never becomes the reason a shutdown hangs.
+  timer.unref();
+
+  return {
+    stop: () => clearInterval(timer),
+  };
 }
 
 main().catch((err) => {
