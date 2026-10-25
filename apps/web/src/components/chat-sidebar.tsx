@@ -346,7 +346,7 @@ export function ChatSidebar({
       .then((kit) => {
         if (cancelled) return;
         setBrandKitMentionItems(
-          kit.assets.map((asset: { id: string; display_name: string; asset_type: string; text_content?: string; file_url?: string }) => ({
+          kit.assets.map((asset) => ({
             kind: "brand-kit-asset" as const,
             id: asset.id,
             label: asset.display_name,
@@ -436,15 +436,21 @@ export function ChatSidebar({
         source: a.source,
         ...(a.name ? { name: a.name } : {}),
       }));
-      const mentionBlocks: ContentBlock[] = currentMentions.map((mention) =>
-        mention.mentionType === "image-model"
-          ? {
+      const mentionBlocks: ContentBlock[] = currentMentions
+        .map((mention): ContentBlock | null => {
+          if (mention.mentionType === "image-model") {
+            return {
               type: "mention" as const,
               mentionType: "image-model" as const,
               id: mention.id,
               label: mention.label,
-            }
-          : {
+            };
+          }
+          // Only brand-kit-asset mentions carry assetType/textContent/fileUrl.
+          // The @ picker only ever puts image-model and brand-kit-asset into
+          // messageMentions, so anything else yields no block.
+          if (mention.mentionType === "brand-kit-asset") {
+            return {
               type: "mention" as const,
               mentionType: "brand-kit-asset" as const,
               id: mention.id,
@@ -456,8 +462,11 @@ export function ChatSidebar({
               ...(mention.fileUrl !== undefined
                 ? { fileUrl: mention.fileUrl }
                 : {}),
-            },
-      );
+            };
+          }
+          return null;
+        })
+        .filter((block): block is ContentBlock => block !== null);
       const userMsg = {
         id: `user-${Date.now()}`,
         role: "user" as const,
