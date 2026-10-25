@@ -13,8 +13,8 @@
 //   * no table read is issued at all: a table read through the caller's client
 //     THROWS, and the counter stays at zero;
 //   * 45AH: Storage is observed on the fake store the injected `createObjectStore`
-//     factory answers — and that factory is handed the CALLER's client, not a
-//     shared/admin one.
+//     factory answers — and 45BB: that factory is handed the CALLER's access
+//     token, not a shared/admin one.
 import { describe, expect, it } from "vitest";
 
 import type {
@@ -97,6 +97,11 @@ type Harness = {
   tool: ReturnType<typeof createBrandKitTool>;
   /** How many table reads the caller's client was asked for — must stay zero. */
   tableReads: () => number;
+  /**
+   * 45BB: the token the storage factory must be handed on the next call — the
+   * token the tool was invoked with, never a shared/admin one.
+   */
+  expectStoreToken: (accessToken: string | undefined) => void;
   /** Every signature batch the storage surface was asked for. */
   signCalls: () => Array<{ bucket: string; paths: string[]; expiresIn: number }>;
   kitAsks: () => Array<{ actorId: string; kitId: string }>;
@@ -118,6 +123,10 @@ function makeHarness(
   const assetAsks: Array<{ actorId: string; kitId: string }> = [];
   const signCalls: Array<{ bucket: string; paths: string[]; expiresIn: number }> = [];
   let tableReads = 0;
+  // 45BB / T-133 (10a): the factory is keyed on the access token of the call in
+  // progress — `invoke` sets it below — so "the store is built from the CALLER's
+  // token" is asserted on every call, including the token with no usable `sub`.
+  let expectedStoreToken: string | undefined = TOKEN;
 
   const repository = {
     async listOwnKits(): Promise<never> {
@@ -199,17 +208,24 @@ function makeHarness(
   return {
     tool: createBrandKitTool(
       {
+        // 45BB / T-133 (10a): the tool no longer builds a client — the factory is
+        // keyed on the access token instead. `client` is still supplied so the
+        // `tableReads` assertions below keep measuring any path that would reach
+        // for a PostgREST table client.
         createUserClient: () => client,
-        createObjectStore: (suppliedClient) => {
-          // The factory must be handed the CALLER's client: that is what keeps the
+        createObjectStore: (suppliedToken) => {
+          // The factory must be handed the CALLER's token: that is what keeps the
           // signature in the user's RLS scope instead of widening it to the server's.
-          expect(suppliedClient).toBe(client);
+          expect(suppliedToken).toBe(expectedStoreToken);
           return store;
         },
         brandKitReadRepository: repository,
       },
       KIT_ID,
     ),
+    expectStoreToken: (accessToken) => {
+      expectedStoreToken = accessToken;
+    },
     tableReads: () => tableReads,
     signCalls: () => signCalls,
     kitAsks: () => kitAsks,
@@ -227,6 +243,7 @@ async function invoke(
   harness: Harness,
   accessToken: string | undefined = TOKEN,
 ): Promise<any> {
+  harness.expectStoreToken(accessToken);
   return JSON.parse(String(await harness.tool.invoke({}, config(accessToken))));
 }
 
@@ -376,14 +393,9 @@ describe("get_brand_kit: the token is the actor", () => {
   it("case 9: a token with no usable `sub` is treated as `Brand kit not found`, never as an anonymous read", async () => {
     const harness = makeHarness();
 
-    const parsed = JSON.parse(
-      String(
-        await harness.tool.invoke(
-          {},
-          { configurable: { access_token: tokenFor(null) } },
-        ),
-      ),
-    );
+    // 45BB: through the shared `invoke` helper, so the store factory's "handed the
+    // CALLER's token" assertion also holds for a token with no usable `sub`.
+    const parsed = await invoke(harness, tokenFor(null));
 
     // The same answer an unusable token produced through RLS — and no repository
     // was asked, so there is no "read as nobody" path at all.

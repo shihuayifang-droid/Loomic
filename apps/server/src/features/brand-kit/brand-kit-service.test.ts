@@ -19,10 +19,7 @@ import {
   INSERT_OWN_KIT,
   type BrandKitWriteRepository,
 } from "../../db/brand-kit-write-repository.js";
-import type {
-  AuthenticatedUser,
-  UserSupabaseClient,
-} from "../../supabase/user.js";
+import type { AuthenticatedUser } from "../../supabase/user.js";
 import type { ObjectStore } from "../storage/object-store.js";
 
 /**
@@ -43,16 +40,21 @@ import type { ObjectStore } from "../storage/object-store.js";
  *   detail path is `brand_kit_not_found` / 500; a failed empty-payload asset read
  *   is `brand_kit_asset_not_found` / 500) and the FOUR places that swallowed a
  *   failure on purpose;
- * - `createUserClient` is reached only when Storage is really used, so
- *   `createAsset` / `updateAsset` / `deleteAsset` never open a PostgREST client at
+ * - a store is built only when Storage is really used, so
+ *   `createAsset` / `updateAsset` / `deleteAsset` never build one at
  *   all, and `getKit` / `createKit` / `updateKit` / `duplicateKit` do so only when
  *   a file path needs signing.
  *
- * 45AH (T-133 2nd slice): the user client is now a bare marker whose `.from`
- * THROWS — any leftover table access fails loudly instead of quietly returning
- * `undefined` — and every Storage observation is made on the fake store the
- * injected `createObjectStore` FACTORY answers. The factory is handed the
- * caller's client, so the signature stays in that user's RLS scope.
+ * 45AH (T-133 2nd slice): every Storage observation is made on the fake store
+ * the injected `createObjectStore` FACTORY answers, so the signature stays in
+ * that user's RLS scope.
+ *
+ * 45BB (T-133 10a): the factory is now keyed on the caller's ACCESS TOKEN, not
+ * on a client — the service names no client type at all (the `UserSupabaseClient`
+ * marker that used to fail loudly on `.from` is gone with it). Every
+ * `clientTokens` assertion below therefore still measures the same thing it
+ * measured before: which token a store was built for (and where NO store was
+ * built).
  */
 
 const ACTOR_ID = "00000000-0000-0000-0000-0000000000b1";
@@ -241,13 +243,13 @@ function writeRepository(overrides: Partial<BrandKitWriteRepository> = {}) {
 type StorageCall = { op: string; args: unknown[] };
 
 /**
- * 45AH / T-133 (2nd slice): Storage is observed on the FAKE STORE that the
- * injected FACTORY answers — not on the user client's `storage` methods.
+ * 45AH / T-133 (2nd slice), re-keyed by 45BB / T-133 (10a): Storage is observed
+ * on the FAKE STORE that the injected FACTORY answers — not on a user client's
+ * `storage` methods.
  *
- * The factory is still keyed on the user-scoped client the service built, and
- * `clients` lists every client it was handed, so "the store comes from the
- * CALLER's client" stays measurable: a shared/createUserClient-free store would
- * have nothing to record here.
+ * The factory is keyed on the caller's ACCESS TOKEN, and `tokens` lists every
+ * token it was handed, so "the store is built for the CALLER" stays measurable:
+ * a shared, token-free store would have nothing to record here.
  *
  * The recorded `{op, args}` shapes are the ones the removed SDK fake produced, so
  * every behaviour assertion below (which keys were signed, which bytes were
@@ -258,10 +260,10 @@ function fakeObjectStoreFactory(options: {
   uploadError?: Error;
   copyError?: Error;
 }) {
-  const clients: UserSupabaseClient[] = [];
+  const tokens: string[] = [];
 
-  const createObjectStore = (client: UserSupabaseClient): ObjectStore => {
-    clients.push(client);
+  const createObjectStore = (accessToken: string): ObjectStore => {
+    tokens.push(accessToken);
 
     return {
       async put(ref, body, putOptions) {
@@ -324,7 +326,7 @@ function fakeObjectStoreFactory(options: {
     };
   };
 
-  return { createObjectStore, clients };
+  return { createObjectStore, tokens };
 }
 
 function serviceWith(
@@ -341,23 +343,16 @@ function serviceWith(
 
   const storageOptions = options.storage ?? { calls: storageCalls };
   const store = fakeObjectStoreFactory(storageOptions);
-  // 45AH: the user client is still built (once per Storage use, as before), but the
-  // service no longer calls Storage on it — the injected factory receives it. The
-  // `.from` getter still THROWS, so a leftover table call fails loudly.
-  const userClient = {
-    get from(): never {
-      throw new Error(
-        "the brand kit service must not use the PostgREST table client any more",
-      );
-    },
-  } as unknown as UserSupabaseClient;
 
   const service = createBrandKitService({
-    createUserClient: (accessToken: string) => {
+    // 45BB / T-133 (10a): the service hands the CALLER's access token straight to
+    // the factory — no client is built anywhere on this side of the seam — so the
+    // token recorded here is exactly the one the store was built for, and a path
+    // that never builds a store records nothing.
+    createObjectStore: (accessToken) => {
       clientTokens.push(accessToken);
-      return userClient;
+      return store.createObjectStore(accessToken);
     },
-    createObjectStore: (client) => store.createObjectStore(client),
     brandKitReadRepository: read.repository,
     brandKitWriteRepository: write.repository,
   });

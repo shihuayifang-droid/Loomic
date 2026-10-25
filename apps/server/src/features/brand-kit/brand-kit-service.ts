@@ -8,10 +8,7 @@ import type {
   BrandKitUpdateRequest,
 } from "@loomic/shared";
 
-import type {
-  AuthenticatedUser,
-  UserSupabaseClient,
-} from "../../supabase/user.js";
+import type { AuthenticatedUser } from "../../supabase/user.js";
 import type {
   BrandKitAssetRow,
   BrandKitListResult,
@@ -123,20 +120,24 @@ export type BrandKitService = {
 };
 
 export function createBrandKitService(options: {
-  createUserClient: (accessToken: string) => UserSupabaseClient;
   /**
-   * 45AH / T-133 (2nd slice): object storage arrives as a FACTORY keyed on the
-   * user-scoped client — `(client) => ObjectStore`, never a shared instance.
+   * 45AH / T-133 (2nd slice), re-shaped by 45BB / T-133 (10a): object storage
+   * arrives as a FACTORY keyed on the CALLER's access token —
+   * `(accessToken) => ObjectStore`, never a shared instance and no longer a
+   * Supabase-shaped client.
    *
    * Why not the single `ObjectStore` the first slice injected elsewhere: brand
-   * kit signing is per USER. The signed URL used to come from
-   * `createUserClient(accessToken)`, so Storage answered under that user's RLS.
+   * kit signing is per USER. The signed URL used to come from a user-scoped
+   * client built for the caller's token, so Storage answered under that user's
+   * RLS.
    * A shared store would sign with whatever identity its own client carries
    * (the server's/admin's), which widens the permission on this feature — a
-   * security regression, not a tidy-up. Hence the factory keeps the SAME
-   * user-scoped client at every call site below, and this file no longer knows
-   * which backend builds the store (OP-05 / 43J: the `ObjectStore` seam only —
-   * every call maps onto the exact SDK call this file used to make).
+   * security regression, not a tidy-up. The caller's token is therefore passed
+   * at every call site below and the assembly point decides how a store is
+   * built from it; this file no longer names a client type at all, so it no
+   * longer knows which backend builds the store (OP-05 / 43J: the `ObjectStore`
+   * seam only — every call maps onto the exact SDK call this file used to
+   * make).
    *
    * REQUIRED on purpose, like the two repositories below: this service has
    * exactly one assembly point (`app.ts`), and workorder 21X measured that an
@@ -144,7 +145,7 @@ export function createBrandKitService(options: {
    * type check still exits 0, the failure is only at runtime). Required means a
    * missing wire is a compile error instead.
    */
-  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
+  createObjectStore: (accessToken: string) => ObjectStore;
   /**
    * ADR-0001 / workorder 21Y: the PostgreSQL home of the two reads behind
    * `listKits`. REQUIRED on purpose — this service has exactly one assembly
@@ -170,10 +171,10 @@ export function createBrandKitService(options: {
    * user-scoped client.
    *
    * The two reads moved to `BrandKitReadRepository` (owner-only ACL written into
-   * the SQL), and a user-scoped client is created only when there really is a
-   * file asset whose path needs a signed URL. The signing logic itself is
-   * unchanged — this method is still the reason `createKit`, `updateKit` and
-   * `getKit` can end up creating a client.
+   * the SQL), and a store is built only when there really is a file asset whose
+   * path needs a signed URL. The signing logic itself is unchanged — this method
+   * is still the reason `createKit`, `updateKit` and `getKit` can end up building
+   * one.
    */
   async function fetchKitDetail(
     user: AuthenticatedUser,
@@ -226,9 +227,9 @@ export function createBrandKitService(options: {
     // Resolve signed URLs for file-based assets (logo/image)
     const fileAssets = mappedAssets.filter((a) => a.file_url);
     if (fileAssets.length > 0) {
-      const client = options.createUserClient(user.accessToken);
+      const store = options.createObjectStore(user.accessToken);
       const paths = fileAssets.map((a) => a.file_url!);
-      const signed = await options.createObjectStore(client).signedReadUrls(
+      const signed = await store.signedReadUrls(
         BRAND_KIT_BUCKET,
         paths,
         { ttlSeconds: SIGNED_URL_EXPIRY_SECONDS },
@@ -447,9 +448,9 @@ export function createBrandKitService(options: {
       const paths = fileUrls.filter((path) => !!path);
 
       if (paths.length > 0) {
-        const client = options.createUserClient(user.accessToken);
+        const store = options.createObjectStore(user.accessToken);
         await removeQuietly(
-          options.createObjectStore(client),
+          store,
           paths.map((path) => ({ bucket: BRAND_KIT_BUCKET, key: path })),
         );
       }
@@ -652,8 +653,8 @@ export function createBrandKitService(options: {
       // Clean up storage object if this asset has a file. This is the only step
       // on the path that still needs a user-scoped client.
       if (existing.file_url) {
-        const client = options.createUserClient(user.accessToken);
-        await removeQuietly(options.createObjectStore(client), [
+        const store = options.createObjectStore(user.accessToken);
+        await removeQuietly(store, [
           { bucket: BRAND_KIT_BUCKET, key: existing.file_url },
         ]);
       }
@@ -700,9 +701,8 @@ export function createBrandKitService(options: {
         );
       }
 
-      // Storage: the ONLY reason this method still creates a user-scoped client.
-      const client = options.createUserClient(user.accessToken);
-      const store = options.createObjectStore(client);
+      // Storage: the ONLY reason this method still builds a store.
+      const store = options.createObjectStore(user.accessToken);
 
       // Upload to storage
       const timestamp = Date.now();
@@ -858,10 +858,9 @@ export function createBrandKitService(options: {
       }
 
       if (assets.length > 0) {
-        // Storage is the ONLY reason this path creates a user-scoped client, and
-        // it is created only when there is at least one asset to look at.
-        const client = options.createUserClient(user.accessToken);
-        const store = options.createObjectStore(client);
+        // Storage is the ONLY reason this path builds a store, and it is built
+        // only when there is at least one asset to look at.
+        const store = options.createObjectStore(user.accessToken);
         const copies: BrandKitAssetCopy[] = [];
 
         for (const asset of assets) {

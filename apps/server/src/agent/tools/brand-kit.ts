@@ -41,16 +41,23 @@ const brandKitSchema = z.object({});
  */
 export function createBrandKitTool(
   deps: {
-    createUserClient: (accessToken: string) => any;
     /**
-     * 45AH / T-133 (2nd slice): Storage arrives as a FACTORY keyed on the
-     * user-scoped client, exactly as `createBrandKitService` takes it. A shared
-     * `ObjectStore` would sign with the identity its own client carries, and
-     * this tool must sign as the CALLER (that is what RLS on Storage enforced
-     * before the `ObjectStore` seam existed). This module therefore no longer
-     * imports a backend at all — it only names the seam's type.
+     * No longer read by this tool (45BB / T-133 10a): the store factory below is
+     * keyed on the access token, so nothing here builds a client. It stays in
+     * the type because `agent/tools/index.ts` — which is not part of this
+     * slice's file set — still supplies it alongside the sibling tools.
      */
-    createObjectStore: (client: any) => ObjectStore;
+    createUserClient?: (accessToken: string) => any;
+    /**
+     * 45AH / T-133 (2nd slice), re-keyed by 45BB / T-133 (10a): Storage arrives
+     * as a FACTORY over the CALLER's access token — `(accessToken) => ObjectStore`
+     * — not as a shared store and no longer as a client. The tool signs as the
+     * caller, which is exactly what RLS on Storage enforced before the
+     * `ObjectStore` seam existed; how a store is built from that token is the
+     * assembly's business (`app.ts`). This module therefore no longer imports a
+     * backend at all — it only names the seam's type.
+     */
+    createObjectStore: (accessToken: string) => ObjectStore;
     /** 工单21AC: the kit and its assets are reads of this repository. */
     brandKitReadRepository: BrandKitReadRepository;
   },
@@ -63,9 +70,9 @@ export function createBrandKitTool(
         return JSON.stringify({ error: "No access token available" });
       }
 
-      // The client is only needed for storage signing, and it is built here rather
+      // The store is only needed for storage signing, and it is built here rather
       // than lazily so a broken factory fails at the same point it used to.
-      const client = deps.createUserClient(accessToken);
+      const store = deps.createObjectStore(accessToken);
 
       const actorId = readSubject(accessToken);
       if (!actorId) {
@@ -122,11 +129,11 @@ export function createBrandKitTool(
       if (fileAssets.length > 0) {
         const paths = fileAssets.map((a) => a.file_url as string);
         // OP-05 / 43J: the signature batch goes through the `ObjectStore` seam, so
-        // this tool names no storage client method of its own — and 45AH: the store
-        // is built from the CALLER's client, not from a shared one.
-        const signed = await deps
-          .createObjectStore(client)
-          .signedReadUrls("brand-kit-assets", paths, { ttlSeconds: 3600 });
+        // this tool names no storage client method of its own — and 45AH/45BB: the
+        // store is built from the CALLER's access token, not from a shared one.
+        const signed = await store.signedReadUrls("brand-kit-assets", paths, {
+          ttlSeconds: 3600,
+        });
 
         for (const asset of fileAssets) {
           const url = signed.get(asset.file_url as string);
