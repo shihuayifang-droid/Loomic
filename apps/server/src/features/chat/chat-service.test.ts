@@ -49,6 +49,8 @@ import {
   type ChatMessageWriteRow,
   type ChatWriteRepository,
 } from "../../db/chat-write-repository.js";
+import { createSupabaseObjectStore } from "../storage/supabase-object-store.js";
+import type { SupabaseStorageLike } from "../storage/supabase-object-store.js";
 import { createChatService, ChatServiceError } from "./chat-service.js";
 
 const USER = { accessToken: "t", id: "u1" } as never;
@@ -371,6 +373,13 @@ function sessionService(script: SessionWriteScript = {}) {
         "the session CRUD must not reach the user client (21C: the session writes have a repository)",
       );
     },
+    // T-133 (9th slice): the session CRUD projects no urls, so it must not build
+    // a store either — reaching for one here is a regression.
+    createObjectStore: () => {
+      throw new Error(
+        "the session CRUD must not build an object store (the url projection is the only signer)",
+      );
+    },
     chatReadRepository,
     chatWriteRepository,
     chatSessionWriteRepository,
@@ -428,6 +437,20 @@ function fakeClient(script: {
             error: null,
           };
         },
+        // T-133 (9th slice): the projection signs through the injected store now,
+        // and the store's batch spelling is one request per bucket. Same answer
+        // per path: a refused key carries no url and the adapter drops it, which
+        // is exactly the "absent from the map" the service already handles.
+        createSignedUrls: async (paths: string[]) => ({
+          data: paths.map((path) => ({
+            path,
+            signedUrl: script.unsignable?.has(path)
+              ? null
+              : `${SIGNED}&bucket=${bucket}&path=${path}`,
+            error: null,
+          })),
+          error: null,
+        }),
       }),
     },
   };
@@ -446,6 +469,10 @@ function fakeClient(script: {
   return {
     service: createChatService({
       createUserClient: () => client as never,
+      // T-133 (9th slice): the same factory the assembly point wires, so the
+      // signature travels the real adapter and still lands on this stub client.
+      createObjectStore: (suppliedClient) =>
+        createSupabaseObjectStore(suppliedClient as unknown as SupabaseStorageLike),
       chatReadRepository: repository,
       chatWriteRepository,
       chatSessionWriteRepository,
@@ -593,6 +620,19 @@ function fakeReadClient(options: {
           }
           return { data: { signedUrl: `${SIGNED}&bucket=${bucket}&path=${path}` }, error: null };
         },
+        // T-133 (9th slice): signing goes through the injected store's batch
+        // spelling. A refused key answers without a url and the adapter drops it,
+        // so the block still ends up with NO url rather than the stored one.
+        createSignedUrls: async (paths: string[]) => ({
+          data: paths.map((path) => ({
+            path,
+            signedUrl: options.unsignable?.has(path)
+              ? null
+              : `${SIGNED}&bucket=${bucket}&path=${path}`,
+            error: null,
+          })),
+          error: null,
+        }),
       }),
     },
   };
@@ -622,6 +662,10 @@ function fakeReadClient(options: {
 
   const service = createChatService({
     createUserClient: () => client as never,
+    // T-133 (9th slice): the same factory the assembly point wires, so the
+    // signature travels the real adapter and still lands on this stub client.
+    createObjectStore: (suppliedClient) =>
+      createSupabaseObjectStore(suppliedClient as unknown as SupabaseStorageLike),
     chatReadRepository: repository,
     chatWriteRepository,
     chatSessionWriteRepository,

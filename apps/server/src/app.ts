@@ -741,6 +741,14 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.chatService ??
     createChatService({
       createUserClient,
+      // 45AV / T-133 (9th slice): a FACTORY, not a shared store — the same form
+      // the project and canvas services above take. A chat block's url is signed
+      // for the caller who is reading the conversation, so the store is built
+      // from that caller's own client and Storage answers under their RLS.
+      // Handing the service the server's/admin's store would widen the permission
+      // on this feature.
+      createObjectStore: (client) =>
+        createSupabaseObjectStore(client as unknown as SupabaseStorageLike),
       chatReadRepository,
       chatWriteRepository,
       chatSessionWriteRepository,

@@ -131,6 +131,19 @@ function makeSigningClient() {
               error: null,
             };
           },
+          // T-133 (9th slice): the list's batch signature is observed the same
+          // way, one entry per requested path.
+          createSignedUrls: async (paths: string[]) => {
+            for (const path of paths) signed.push({ bucket, path });
+            return {
+              data: paths.map((path) => ({
+                path,
+                signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+                error: null,
+              })),
+              error: null,
+            };
+          },
         };
       },
     },
@@ -161,6 +174,19 @@ function makeTransformSigningClient() {
               data: {
                 signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
               },
+              error: null,
+            };
+          },
+          // T-133 (9th slice): the renderer-off list takes the batch spelling,
+          // which carries no transform, so `options` is recorded as undefined.
+          createSignedUrls: async (paths: string[]) => {
+            for (const path of paths) calls.push({ bucket, path, options: undefined });
+            return {
+              data: paths.map((path) => ({
+                path,
+                signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig`,
+                error: null,
+              })),
               error: null,
             };
           },
@@ -368,6 +394,11 @@ function withSigningStore(
   return {
     ...store,
     signedReadUrl: (ref, options) => signing.signedReadUrl(ref, options),
+    // T-133 (9th slice): the list's batch signature reaches the same backend the
+    // single one does, so the batch spelling is forwarded too. Without it the
+    // plain (renderer off) list case would observe an empty map.
+    signedReadUrls: (bucket, keys, options) =>
+      signing.signedReadUrls(bucket, keys, options),
   };
 }
 
@@ -778,7 +809,7 @@ describe("getProject delegating to the project read repository", () => {
 });
 
 describe("listProjects delegating to the project read repository", () => {
-  it("case 10: thumbnails are signed through the user client, and only the own ids reach the canvas read", async () => {
+  it("case 10: thumbnails are signed through the injected store, and only the own ids reach the canvas read", async () => {
     const withThumbnail = {
       ...PROJECT_ROW,
       thumbnail_path: `${TEAM_ID}/project-1/thumbnail.webp`,
@@ -790,7 +821,10 @@ describe("listProjects delegating to the project read repository", () => {
     });
     const service = createProjectService({
       createUserClient: () => client,
-      createObjectStore: noObjectStoreOnTheReadPath,
+      // T-133 (9th slice): the list thumbnail is signed through the injected
+      // store; the fake forwards to the same stub client, so the bucket/path this
+      // case has always asserted are still what the backend receives.
+      createObjectStore: () => withSigningStore(makeObjectStoreStub().store, client),
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -1653,7 +1687,9 @@ describe("GN-14 list thumbnails go through the storage renderer", () => {
     });
     const service = createProjectService({
       createUserClient: () => client,
-      createObjectStore: noObjectStoreOnTheReadPath,
+      // T-133 (9th slice): the list signs through the injected store; the fake
+      // forwards to the same stub client the transform is observed on.
+      createObjectStore: () => withSigningStore(makeObjectStoreStub().store, client),
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -1682,7 +1718,8 @@ describe("GN-14 list thumbnails go through the storage renderer", () => {
       });
       const service = createProjectService({
         createUserClient: () => client,
-        createObjectStore: noObjectStoreOnTheReadPath,
+        // T-133 (9th slice): store-signed, same stub client observed.
+        createObjectStore: () => withSigningStore(makeObjectStoreStub().store, client),
         viewerService: makeViewerStub(TEAM_WORKSPACE),
         projectReadRepository: repository,
         projectWriteRepository: makeWriteRepositoryStub().repository,

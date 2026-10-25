@@ -29,6 +29,10 @@ import {
 } from "../../db/chat-write-repository.js";
 import { isTransportFailure } from "../../supabase/transport-retry.js";
 import type { AuthenticatedUser, UserSupabaseClient } from "../../supabase/user.js";
+// T-133 (9th slice): the signature is minted through the injected `ObjectStore`
+// seam — the same factory form uploads (45AI), canvas (45AJ), brand-kit (45AH)
+// and projects (45AS) take — instead of the service wrapping the user client.
+import type { ObjectStore } from "../storage/object-store.js";
 import { signProjectAssetUrls } from "../storage/project-asset-urls.js";
 import type { ThreadService } from "./thread-service.js";
 
@@ -166,8 +170,9 @@ function collectBlockAssetIds(blocks: ContentBlock[]): string[] {
  * The ASSET IDENTITIES are read through the chat read repository (workorder
  * 20D), so the authorization is the SQL's own project ACL — the reader must be a
  * member of the session's project and either its author or an admin/owner. The
- * SIGNATURE is still minted through the CALLER's storage client, so the storage
- * layer keeps deciding what it will sign.
+ * SIGNATURE is minted through the CALLER's storage client, reached through the
+ * injected `ObjectStore` factory (T-133 9th slice), so the storage layer keeps
+ * deciding what it will sign.
  *
  * Two rules, and the second is the one that is easy to get wrong:
  *   * an asset that resolves is signed fresh for this caller;
@@ -182,7 +187,7 @@ function collectBlockAssetIds(blocks: ContentBlock[]): string[] {
  */
 async function projectBlockUrls(
   repository: ChatReadRepository,
-  client: UserSupabaseClient,
+  store: ObjectStore,
   blocks: ContentBlock[],
   context: { sessionId: string; actorId: string },
 ): Promise<ContentBlock[]> {
@@ -244,7 +249,7 @@ async function projectBlockUrls(
   const signedByAssetId = new Map<string, string>();
   await Promise.all(
     rows.map(async (row) => {
-      const signed = await signProjectAssetUrls(client, [row.object_path], {
+      const signed = await signProjectAssetUrls(store, [row.object_path], {
         bucket: row.bucket,
       });
       const url = signed.get(row.object_path);
@@ -398,6 +403,14 @@ function synthesizeLegacyBlocks(
 
 export function createChatService(options: {
   createUserClient: (accessToken: string) => UserSupabaseClient;
+  /**
+   * T-133 (9th slice): a FACTORY, not a shared store — the same form uploads
+   * (45AI), canvas (45AJ), brand-kit (45AH) and projects (45AS) take. The chat
+   * projection signs for the caller, so the store is built from the caller's own
+   * client and Storage answers under that user's RLS; handing the service the
+   * server's/admin's store would widen the permission on this feature.
+   */
+  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
   chatReadRepository: ChatReadRepository;
   /**
    * Required, never optional: the create path writes through the pure `pg`
@@ -630,7 +643,7 @@ export function createChatService(options: {
             ...message,
             contentBlocks: await projectBlockUrls(
               options.chatReadRepository,
-              client,
+              options.createObjectStore(client),
               message.contentBlocks,
               { sessionId, actorId: user.id },
             ),
@@ -821,10 +834,15 @@ export function createChatService(options: {
       const contentBlocks =
         storedBlocks === null
           ? null
-          : await projectBlockUrls(options.chatReadRepository, client, storedBlocks, {
-              sessionId,
-              actorId: user.id,
-            });
+          : await projectBlockUrls(
+              options.chatReadRepository,
+              options.createObjectStore(client),
+              storedBlocks,
+              {
+                sessionId,
+                actorId: user.id,
+              },
+            );
 
       return {
         id: data.id,

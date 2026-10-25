@@ -370,12 +370,15 @@ export function createProjectService(options: {
         canvases.map((canvas) => [canvas.project_id, canvas]),
       );
 
-      // Signed thumbnail URLs for projects that have them (X-52). Signing stays
-      // on the user client: the storage signature is not a table read.
-      const thumbnailUrls = await generateThumbnailUrls(
-        client,
-        projects.filter((p) => p.thumbnail_path),
-      );
+      // Signed thumbnail URLs for projects that have them (X-52). T-133 (9th
+      // slice): the signature is minted through the injected store factory, the
+      // same seam `saveThumbnail` uses below, instead of the service wrapping the
+      // user client itself. A list with no thumbnail at all builds no store: an
+      // object-free read must not touch storage.
+      const thumbnails = projects.filter((p) => p.thumbnail_path);
+      const thumbnailUrls = thumbnails.length
+        ? await generateThumbnailUrls(options.createObjectStore(client), thumbnails)
+        : new Map<string, string>();
 
       return projects.map((project) => {
         const canvas = primaryCanvasByProjectId.get(project.id);
@@ -755,7 +758,7 @@ function slugify(value: string) {
  * entitled to. One unreadable thumbnail must not cost the whole list either.
  */
 async function generateThumbnailUrls(
-  client: UserSupabaseClient,
+  store: ObjectStore,
   projects: Array<{ id: string; thumbnail_path: string | null }>,
 ): Promise<Map<string, string>> {
   const urlMap = new Map<string, string>();
@@ -770,7 +773,7 @@ async function generateThumbnailUrls(
   const transformEnabled = storageRenderTransformEnabled();
 
   const signed = await signProjectAssetUrls(
-    client,
+    store,
     withThumbnail.map((project) => project.thumbnail_path),
     transformEnabled
       ? {
