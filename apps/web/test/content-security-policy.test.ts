@@ -19,11 +19,14 @@ const WEB_ROOT = path.resolve(HERE, "..");
 const POLICY = buildContentSecurityPolicy({
   serverBaseUrl: "https://api.hahart.test/base",
   supabaseUrl: "https://abc.supabase.co",
+  // 显式钉住生产策略：下面断言的是上线时要下发的字符串，不随跑测试的 NODE_ENV 变
+  isDev: false,
 });
 
 /** 取出单条 directive 的源列表 */
-function sourcesOf(directive: string): string[] {
-  const match = POLICY.split("; ")
+function sourcesOf(directive: string, policy: string = POLICY): string[] {
+  const match = policy
+    .split("; ")
     .map((part) => part.trim())
     .find((part) => part.startsWith(`${directive} `));
 
@@ -42,6 +45,36 @@ describe("buildContentSecurityPolicy", () => {
     // 路径不许泄漏进策略：CSP 里带 /base 只会放行该路径下的请求
     expect(sources).not.toContain("/base");
     expect(POLICY).not.toContain("/base");
+  });
+
+  it("生产策略（isDev: false）的 script-src 不含 'unsafe-eval'", () => {
+    // `next dev` 的客户端运行时才需要 eval；上线策略必须保持收紧
+    expect(sourcesOf("script-src")).toEqual(["'self'", "'unsafe-inline'"]);
+    expect(POLICY).not.toContain("'unsafe-eval'");
+  });
+
+  it("开发环境（isDev: true）script-src 追加 'unsafe-eval'，其它指令不变", () => {
+    const devPolicy = buildContentSecurityPolicy({
+      serverBaseUrl: "https://api.hahart.test/base",
+      supabaseUrl: "https://abc.supabase.co",
+      isDev: true,
+    });
+
+    expect(devPolicy).toContain("'unsafe-eval'");
+    expect(sourcesOf("script-src", devPolicy)).toEqual([
+      "'self'",
+      "'unsafe-inline'",
+      "'unsafe-eval'",
+    ]);
+
+    // 只有 script-src 该变：把这段摘掉后，两条策略必须逐字相同
+    const withoutScriptSrc = (policy: string): string =>
+      policy
+        .split("; ")
+        .filter((part) => !part.trim().startsWith("script-src "))
+        .join("; ");
+
+    expect(withoutScriptSrc(devPolicy)).toBe(withoutScriptSrc(POLICY));
   });
 
   it("frame-ancestors / object-src 收紧到 'none'", () => {

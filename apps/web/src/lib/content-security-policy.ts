@@ -14,6 +14,8 @@
 type CspInput = {
   serverBaseUrl: string;
   supabaseUrl?: string | undefined;
+  /** 显式指定是否开发环境；缺省按 `NODE_ENV !== "production"` 推断。 */
+  isDev?: boolean | undefined;
 };
 
 /** `new URL(x).origin`；空串 / 非法 URL 返回 null。 */
@@ -58,11 +60,17 @@ export function buildContentSecurityPolicy(input: CspInput): string {
   const serverWebSocket = server ? toWebSocketOrigin(server) : null;
   const supabase = toOrigin(input.supabaseUrl);
 
+  // `next dev` 的客户端运行时把字符串当 JS 求值，策略里没有 'unsafe-eval' 就抛
+  // EvalError、整页白屏；`next build` 出来的静态包不需要 eval。放行 'unsafe-eval'
+  // 会明显加宽 script-src（等于允许任意字符串求值），属于安全风险，所以只在
+  // 非生产环境追加，生产策略仍是 'self' 'unsafe-inline'。
+  const isDev = input.isDev ?? process.env.NODE_ENV !== "production";
+
   // 源列表里允许 null（服务端 / Supabase 配缺失就是 null），由 unique 过滤掉
   const directives: ReadonlyArray<readonly [string, ReadonlyArray<string | null>]> = [
     ["default-src", ["'self'"]],
     // Next 静态导出的启动脚本是内联的；去掉 'unsafe-inline' 页面直接白屏
-    ["script-src", ["'self'", "'unsafe-inline'"]],
+    ["script-src", ["'self'", "'unsafe-inline'", isDev ? "'unsafe-eval'" : null]],
     // fonts.googleapis.com 是品牌套件的字体预览样式表
     ["style-src", ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"]],
     ["font-src", ["'self'", "data:", "https://fonts.gstatic.com"]],
