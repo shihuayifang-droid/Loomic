@@ -7,14 +7,15 @@ import { Providers } from "../components/providers";
 import { DevErrorReporter } from "../components/dev-error-reporter";
 import { buildContentSecurityPolicy } from "../lib/content-security-policy";
 import { getServerBaseUrl } from "../lib/env";
+import { BRAND } from "../lib/brand";
 
 import "./globals.css";
 
 const geist = Geist({ subsets: ["latin"], variable: "--font-sans" });
 
 export const metadata: Metadata = {
-  title: "HaHart",
-  description: "HaHart · AI 创意画布",
+  title: BRAND.name,
+  description: BRAND.description,
   icons: {
     icon: [
       { url: "/favicon.ico", sizes: "any" },
@@ -23,14 +24,14 @@ export const metadata: Metadata = {
     apple: "/apple-touch-icon.png",
   },
   openGraph: {
-    title: "HaHart",
-    description: "HaHart · AI 创意画布",
+    title: BRAND.name,
+    description: BRAND.description,
     images: [{ url: "/og-image.png", width: 1200, height: 630 }],
   },
   twitter: {
     card: "summary_large_image",
-    title: "HaHart",
-    description: "HaHart · AI 创意画布",
+    title: BRAND.name,
+    description: BRAND.description,
     images: ["/og-image.png"],
   },
 };

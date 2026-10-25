@@ -19,6 +19,7 @@ import { useCreateProject } from "@/hooks/use-create-project";
 import { useDeleteProject } from "@/hooks/use-delete-project";
 import { useImageAttachments } from "@/hooks/use-image-attachments";
 import { useAuth } from "@/lib/auth-context";
+import { BRAND } from "@/lib/brand";
 import { loadHomeDiscoveryCategories } from "@/lib/home-discovery-library";
 import type {
   HomeDiscoveryCategory,
@@ -259,7 +260,7 @@ export default function HomePage() {
         >
           <HaHartLogo className="size-7 text-foreground md:size-8" />
           <span className="text-lg font-semibold text-foreground md:text-xl">
-            HaHart
+            {BRAND.name}
           </span>
         </motion.div>
 

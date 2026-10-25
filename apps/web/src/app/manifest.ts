@@ -1,5 +1,7 @@
 import type { MetadataRoute } from "next";
 
+import { BRAND } from "@/lib/brand";
+
 // output: "export" 下元数据路由必须声明为静态，否则 next build 失败——见 45A
 export const dynamic = "force-static";
 
@@ -10,9 +12,9 @@ export const dynamic = "force-static";
  */
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "HaHart",
-    short_name: "HaHart",
-    description: "HaHart · AI 创意画布",
+    name: BRAND.name,
+    short_name: BRAND.name,
+    description: BRAND.description,
     start_url: "/",
     display: "standalone",
     background_color: "#111111",
