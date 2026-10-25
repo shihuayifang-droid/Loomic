@@ -583,7 +583,6 @@ describe("saveThumbnail records the thumbnail as a project asset", () => {
     const uploads: Array<{ bucket: string; path: string; bytes: number }> = [];
 
     const service = createProjectService({
-      createUserClient: () => userClient as unknown as UserSupabaseClient,
       createObjectStore: () =>
         withClientSigning(
           createFakeStore({ uploads }),

@@ -142,13 +142,11 @@ beforeAll(async () => {
   });
 
   // `getProject` reads the repository and nothing else. The doubles below would
-  // throw if a future change made it reach for a client, a viewer or a write.
+  // throw if a future change made it reach for an object store, a viewer or a write.
   service = createProjectService({
-    createUserClient: () => {
-      throw new Error("getProject must not build a user client");
-    },
-    // 45AK / T-133 (5th slice): the thumbnail store is a per-user factory now,
-    // and `getProject` must not build one either.
+    // 45AK / T-133 (5th slice), re-shaped by 45BE / T-133 (10a): the thumbnail
+    // store is a per-user FACTORY over the caller's token now, and `getProject`
+    // must not build one either.
     createObjectStore: () => {
       throw new Error("getProject must not build an object store");
     },

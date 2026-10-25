@@ -36,10 +36,7 @@ import {
   storageRenderTransformEnabled,
   withWebpFormat,
 } from "../storage/project-asset-urls.js";
-import type {
-  AuthenticatedUser,
-  UserSupabaseClient,
-} from "../../supabase/user.js";
+import type { AuthenticatedUser } from "../../supabase/user.js";
 
 const THUMBNAIL_BUCKET = "project-assets";
 /** GN-14: a list card shows a thumbnail, never the stored original. */
@@ -121,12 +118,12 @@ export class ProjectServiceError extends Error {
 }
 
 export function createProjectService(options: {
-  createUserClient: (accessToken: string) => UserSupabaseClient;
   /**
-   * 45AK / T-133 (5th slice): a FACTORY, not a single shared store.
+   * 45AK / T-133 (5th slice), re-shaped by 45BE / T-133 (10a): a FACTORY over the
+   * caller's ACCESS TOKEN, not a single shared store and no longer a client.
    *
    * A project thumbnail is written for the CALLER who is saving it, so the store is
-   * built from THAT user's client and Storage answers under that user's RLS —
+   * built from THAT user's token and Storage answers under that user's RLS —
    * the same per-user scoping this service applied itself when it wrapped the
    * caller's client inline, and the same form brand-kit (45AH), uploads (45AI)
    * and canvas (45AJ) take. Handing the service one store built from the
@@ -136,7 +133,7 @@ export function createProjectService(options: {
    * bypasses RLS. Required means a missing wire is a compile error instead of a
    * service that silently cannot write a thumbnail.
    */
-  createObjectStore: (client: UserSupabaseClient) => ObjectStore;
+  createObjectStore: (accessToken: string) => ObjectStore;
   viewerService: ViewerService;
   /**
    * Workorder 44C: the thumbnail's asset row is recorded through the asset record
@@ -322,7 +319,6 @@ export function createProjectService(options: {
         user,
         "project_query_failed",
       );
-      const client = options.createUserClient(user.accessToken);
       const workspace = requireTeamWorkspace(viewer, "project_query_failed");
       const repository = options.projectReadRepository;
 
@@ -376,8 +372,14 @@ export function createProjectService(options: {
       // user client itself. A list with no thumbnail at all builds no store: an
       // object-free read must not touch storage.
       const thumbnails = projects.filter((p) => p.thumbnail_path);
+      // T-133 (10a): the factory takes the caller's ACCESS TOKEN itself, so this
+      // service no longer builds a user client. Still built lazily: a list with no
+      // thumbnail at all must not touch storage.
       const thumbnailUrls = thumbnails.length
-        ? await generateThumbnailUrls(options.createObjectStore(client), thumbnails)
+        ? await generateThumbnailUrls(
+            options.createObjectStore(user.accessToken),
+            thumbnails,
+          )
         : new Map<string, string>();
 
       return projects.map((project) => {
@@ -401,8 +403,6 @@ export function createProjectService(options: {
     },
 
     async saveThumbnail(user, projectId, buffer, mimeType) {
-      const client = options.createUserClient(user.accessToken);
-
       // Resolve workspace_id — the object key's first segment is the workspace
       // UUID, so it has to come from the project row rather than from the client.
       //
@@ -480,12 +480,12 @@ export function createProjectService(options: {
 
       // 43H: the thumbnail write goes through the `ObjectStore` seam instead of
       // the raw SDK. Since 45AK (T-133 5th slice) that store comes from the
-      // injected per-user FACTORY, built from THIS user's client right before the
-      // bytes are written — not once at construction, and never from the
+      // injected per-user FACTORY, built from THIS user's ACCESS TOKEN right before
+      // the bytes are written — not once at construction, and never from the
       // server's/admin's client. The upload therefore carries the saver's JWT and
       // Storage answers under that user's RLS; the service no longer names a
       // backend, the assembly point does.
-      const objectStore = options.createObjectStore(client);
+      const objectStore = options.createObjectStore(user.accessToken);
 
       try {
         await objectStore.put(

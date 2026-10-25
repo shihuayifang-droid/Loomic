@@ -533,7 +533,6 @@ describe("createProjectService with the team workspace", () => {
     const { client } = makeClientStub({});
     const create = makeCreateRepositoryStub();
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       // These cases exercise create/list only, so no asset is ever recorded.
@@ -575,7 +574,6 @@ describe("createProjectService with the team workspace", () => {
       canvases: [CANVAS_ROW],
     });
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
@@ -608,7 +606,6 @@ describe("createProjectService with the team workspace", () => {
     const { client } = makeClientStub({});
     const create = makeCreateRepositoryStub();
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(null),
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -632,7 +629,6 @@ describe("createProjectService with the team workspace", () => {
       failWith: Object.assign(new Error("duplicate"), { code: "23505" }),
     });
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -655,7 +651,6 @@ describe("createProjectService with the team workspace", () => {
       failWith: Object.assign(new Error("boom"), { code: "42501" }),
     });
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -676,7 +671,6 @@ describe("createProjectService with the team workspace", () => {
     const { client } = makeClientStub({});
     const create = makeCreateRepositoryStub({ result: null });
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -696,7 +690,6 @@ describe("createProjectService with the team workspace", () => {
   it("case 3e: a service built without the create repository answers 500 project_create_failed", async () => {
     const { client } = makeClientStub({});
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -725,7 +718,6 @@ describe("getProject delegating to the project read repository", () => {
     const stub = makeRepositoryStub(config);
     const writeStub = makeWriteRepositoryStub();
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       ...(options.withRepository
@@ -820,7 +812,6 @@ describe("listProjects delegating to the project read repository", () => {
       canvases: [CANVAS_ROW],
     });
     const service = createProjectService({
-      createUserClient: () => client,
       // T-133 (9th slice): the list thumbnail is signed through the injected
       // store; the fake forwards to the same stub client, so the bucket/path this
       // case has always asserted are still what the backend receives.
@@ -853,7 +844,6 @@ describe("listProjects delegating to the project read repository", () => {
     const { repository, calls } = makeRepositoryStub({ projects: [] });
     const { client, signed } = makeSigningClient();
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
@@ -872,7 +862,6 @@ describe("listProjects delegating to the project read repository", () => {
     });
     const { client } = makeClientStub({});
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
@@ -896,7 +885,6 @@ describe("listProjects delegating to the project read repository", () => {
     });
     const { client } = makeClientStub({});
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
@@ -921,7 +909,6 @@ describe("listProjects delegating to the project read repository", () => {
     });
     const { client, signed } = makeSigningClient();
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectReadRepository: repository,
@@ -941,7 +928,6 @@ describe("listProjects delegating to the project read repository", () => {
   it("case 15: a service built without the repository answers 500 and reads nothing", async () => {
     const { client, queries } = makeClientStub({});
     const service = createProjectService({
-      createUserClient: () => client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: makeWriteRepositoryStub().repository,
@@ -1022,7 +1008,6 @@ describe("saveThumbnail answers with a signed URL", () => {
     });
 
     const service = createProjectService({
-      createUserClient: () => client as unknown as UserSupabaseClient,
       // 45AK: the thumbnail store is the fake's, built per call from the user
       // client the service was handed — the observation point moved here.
       // T-133 (9th slice): signing is the store's too, so the fake store signs
@@ -1240,7 +1225,6 @@ describe("archiveProject delegating to the project read repository", () => {
     });
 
     const service = createProjectService({
-      createUserClient: () => client.client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       ...(config.withRepository === false
@@ -1375,7 +1359,6 @@ describe("updateProject delegating to the project write repository", () => {
     });
 
     const service = createProjectService({
-      createUserClient: () => client.client,
       createObjectStore: noObjectStoreOnTheReadPath,
       viewerService: makeViewerStub(TEAM_WORKSPACE),
       projectWriteRepository: writeStub.repository,
@@ -1521,7 +1504,6 @@ describe("saveThumbnail lookup retry", () => {
     const writeStub = makeWriteRepositoryStub();
 
     const service = createProjectService({
-      createUserClient: () => client.client,
       // T-133 (9th slice): the thumbnail is signed through the store now, so the
       // fake store signs through the same storage-only client.
       createObjectStore: () => withSigningStore(store.store, client.client),
@@ -1686,7 +1668,6 @@ describe("GN-14 list thumbnails go through the storage renderer", () => {
       canvases: [CANVAS_ROW],
     });
     const service = createProjectService({
-      createUserClient: () => client,
       // T-133 (9th slice): the list signs through the injected store; the fake
       // forwards to the same stub client the transform is observed on.
       createObjectStore: () => withSigningStore(makeObjectStoreStub().store, client),
@@ -1717,7 +1698,6 @@ describe("GN-14 list thumbnails go through the storage renderer", () => {
         canvases: [CANVAS_ROW],
       });
       const service = createProjectService({
-        createUserClient: () => client,
         // T-133 (9th slice): store-signed, same stub client observed.
         createObjectStore: () => withSigningStore(makeObjectStoreStub().store, client),
         viewerService: makeViewerStub(TEAM_WORKSPACE),
