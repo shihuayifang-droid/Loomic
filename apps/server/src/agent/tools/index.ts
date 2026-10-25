@@ -78,6 +78,19 @@ const missingObjectStoreFactory = (): ObjectStore => {
   );
 };
 
+/**
+ * 45BK (T-133 10b): the same honest shape for `persist_sandbox_file`, which now
+ * REQUIRES a token-keyed store factory. Its adapter wrap over the caller's
+ * client was deleted in that slice, so a missing wire must throw — and name the
+ * assembly — rather than fall back to building a store of its own.
+ */
+const missingPersistObjectStoreFactory = (): ObjectStore => {
+  throw new Error(
+    "persist_sandbox_file: no createObjectStore factory was wired into " +
+      "createMainAgentTools — assembly error, not a storage failure",
+  );
+};
+
 export function createMainAgentTools(
   backend: BackendProtocol | BackendFactory,
   deps: {
@@ -138,14 +151,13 @@ export function createMainAgentTools(
         assetWriteRepository: deps.assetWriteRepository,
         assetRecordRepository: deps.assetRecordRepository,
         canvasReadRepository: deps.canvasReadRepository,
-        createUserClient: deps.createUserClient,
-        // 45AM / T-133 (6a): carried through as-is — this slice only moves the
-        // factory down, nothing here calls it. Spread conditionally because the
-        // repo compiles with `exactOptionalPropertyTypes: true`, so an explicit
-        // `undefined` is not assignable to the optional property (TS2379).
-        ...(deps.createObjectStore
-          ? { createObjectStore: deps.createObjectStore }
-          : {}),
+        // 45BK / T-133 (10b): the store factory is REQUIRED here now, and it is
+        // handed over keyed on the caller's access token — the same shape
+        // `runtime.ts` already produces for this path. `createUserClient` is no
+        // longer passed (that wrap is gone). A throwing stand-in when the
+        // assembly wired none, so a missing wire is an assembly error.
+        createObjectStore:
+          deps.createObjectStore ?? missingPersistObjectStoreFactory,
         sandboxDir: deps.sandboxDir,
       }),
     );

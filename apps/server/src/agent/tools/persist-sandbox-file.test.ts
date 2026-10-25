@@ -1,7 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SupabaseClient } from "@supabase/supabase-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
@@ -10,6 +9,8 @@ import type {
   CanvasProjectLinkRow,
   CanvasReadRepository,
 } from "../../db/canvas-read-repository.js";
+import type { SupabaseStorageLike } from "../../features/storage/supabase-object-store.js";
+import { createSupabaseObjectStore } from "../../features/storage/supabase-object-store.js";
 import {
   createPersistSandboxFileTool,
   type PersistSandboxFileDeps,
@@ -129,7 +130,12 @@ function makeHarness(
     deps: {
       canvasReadRepository,
       assetWriteRepository,
-      createUserClient: () => client as unknown as SupabaseClient,
+      // 45BK (T-133 10b): the tool takes a token-keyed store factory and no
+      // longer wraps a client itself, so the harness supplies the factory. The
+      // adapter is built over the SAME fake client, which keeps every assertion
+      // below about `upload` / `createSignedUrl` / `remove` unchanged.
+      createObjectStore: () =>
+        createSupabaseObjectStore(client as unknown as SupabaseStorageLike),
       assetRecordRepository,
       sandboxDir,
     },
