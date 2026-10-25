@@ -28,6 +28,7 @@ const mockFetch = vi.fn();
 globalThis.fetch = mockFetch;
 
 import ProjectsPage from "../src/app/(workspace)/projects/page";
+import { ToastProvider } from "../src/components/toast";
 
 const viewerResponse = {
   profile: { id: "u1", email: "test@test.com", displayName: "Test", avatarUrl: null },
@@ -74,6 +75,18 @@ function mockSuccessfulLoad(projectsOverride?: unknown) {
   });
 }
 
+/**
+ * The page is mounted inside `Providers` in production, which supplies
+ * `ToastProvider`. Render it the same way here instead of bare.
+ */
+function renderProjectsPage() {
+  return render(
+    <ToastProvider>
+      <ProjectsPage />
+    </ToastProvider>,
+  );
+}
+
 describe("Projects page", () => {
   afterEach(() => {
     cleanup();
@@ -86,7 +99,7 @@ describe("Projects page", () => {
 
   it("renders sidebar with workspace name and project list", async () => {
     mockSuccessfulLoad();
-    render(<ProjectsPage />);
+    renderProjectsPage();
 
     expect(await screen.findByText("My Workspace")).toBeInTheDocument();
     // Project names appear in both sidebar (recent) and project list
@@ -98,14 +111,14 @@ describe("Projects page", () => {
 
   it("shows empty state when no projects", async () => {
     mockSuccessfulLoad({ projects: [] });
-    render(<ProjectsPage />);
+    renderProjectsPage();
 
     expect(await screen.findByText(/no projects yet/i)).toBeInTheDocument();
   });
 
   it("opens create dialog on + New Project click", async () => {
     mockSuccessfulLoad();
-    render(<ProjectsPage />);
+    renderProjectsPage();
 
     const button = await screen.findByRole("button", { name: /new project/i });
     await userEvent.click(button);
@@ -123,7 +136,7 @@ describe("Projects page", () => {
       return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
     });
 
-    render(<ProjectsPage />);
+    renderProjectsPage();
     await waitFor(() => {
       expect(mockSignOut).toHaveBeenCalled();
       expect(mockReplace).toHaveBeenCalledWith("/login");
@@ -141,7 +154,7 @@ describe("Projects page", () => {
       return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
     });
 
-    render(<ProjectsPage />);
+    renderProjectsPage();
     expect(await screen.findByText(/failed to load/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
     expect(mockReplace).not.toHaveBeenCalled();
@@ -161,7 +174,7 @@ describe("Projects page", () => {
       return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
     });
 
-    render(<ProjectsPage />);
+    renderProjectsPage();
     await waitFor(() => {
       expect(mockSignOut).toHaveBeenCalled();
       expect(mockReplace).toHaveBeenCalledWith("/login");
@@ -170,7 +183,7 @@ describe("Projects page", () => {
 
   it("shows inline error on 409 project_slug_taken during create", async () => {
     mockSuccessfulLoad();
-    render(<ProjectsPage />);
+    renderProjectsPage();
 
     const newBtn = await screen.findByRole("button", { name: /new project/i });
     await userEvent.click(newBtn);
@@ -203,7 +216,7 @@ describe("Projects page", () => {
 
   it("shows inline error on 500 project_create_failed during create", async () => {
     mockSuccessfulLoad();
-    render(<ProjectsPage />);
+    renderProjectsPage();
 
     const newBtn = await screen.findByRole("button", { name: /new project/i });
     await userEvent.click(newBtn);
