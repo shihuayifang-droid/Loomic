@@ -11,6 +11,7 @@
     "test:packages": "turbo run test",
     "test": "pnpm run test:workspace && pnpm run test:packages",
     "seed": "node scripts/seed-test-accounts.mjs",
+    "check:invariants": "node scripts/check-invariants.mjs",
     "typecheck": "turbo run typecheck"
   },
   "devDependencies": {

@@ -57,16 +57,20 @@
  *   `config.unknownSupabaseEnvTokens` so a new name cannot slip in silently.
  * - Active SQL is `supabase/migrations/**`. Rollbacks, snippets and the test
  *   support stub are counted separately.
- * - Active tooling is `apps/server/scripts/**` (minus the two files named
+ * - Active tooling is `apps/server/scripts/**` (minus the files named
  *   below) and the repository-root `scripts/**`: JS/TS files that run in this
  *   repository but are not production source. They get their own `tooling.*`
  *   metrics, so a Supabase call in a script cannot hide behind an exclusion.
  * - Excluded from every counter: archives, vendored docs and scratch output -
  *   `node_modules`, `.git`, `dist`, `.next`, `out`, `.turbo`, `coverage`,
  *   `docs`, `.agents`, `skills`, `semantic-review`, `.j-can-see`. Inside the
- *   tooling scope exactly two files are excluded, both by identity: this script
- *   itself and the baseline file in use (counting the baseline would make the
- *   audit depend on its own output). Every exclusion is printed as a
+ *   tooling scope three files are excluded, all by identity: this script
+ *   itself, the baseline file in use (counting the baseline would make the
+ *   audit depend on its own output), and the invariant-check entry point
+ *   `scripts/check-invariants.mjs` - that file is the entry point that runs the
+ *   checks, and the commands it lists name environment variables
+ *   (`SUPABASE_URL`, ...), which is a tooling reference, not runtime code.
+ *   Every exclusion is printed as a
  *   `[tooling] excluded=` line. Archive Supabase mentions are still reported as
  *   `excluded.archiveDocSupabaseMentions`, so moving code into an excluded
  *   archive area raises a problem instead of hiding a hit.
@@ -124,14 +128,27 @@ const TOOLING_EXTENSIONS = [
 ];
 
 /**
- * The only two tooling files that are never counted: the auditor itself and
- * the baseline. Matching happens both by absolute path and by position
- * relative to the default repository root, so a mirror root that carries a
- * copy of either file still behaves like the real root.
+ * The invariant-check entry point (ticket 45CO). This is a verification entry
+ * point, not runtime code: the check commands it lists contain environment
+ * variable NAMES (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, ...), which is a
+ * tooling reference, not a Supabase coupling. It is therefore excluded by
+ * identity, like the auditor and the baseline - the baseline is NOT raised for
+ * it, because raising a frozen number would hide the reference instead of
+ * declaring it.
+ */
+const INVARIANTS_ENTRY_RELATIVE_PATH = "scripts/check-invariants.mjs";
+
+/**
+ * The three tooling files that are never counted: the auditor itself, the
+ * baseline, and the invariant-check entry point above. Matching happens both by
+ * absolute path and by position relative to the default repository root, so a
+ * mirror root that carries a copy of any of them still behaves like the real
+ * root.
  */
 const TOOLING_EXCLUDED_RELATIVE_PATHS = [
   normalizeRelPath(relative(REPO_ROOT_DEFAULT, SCRIPT_SELF)),
   normalizeRelPath(relative(REPO_ROOT_DEFAULT, BASELINE_DEFAULT)),
+  INVARIANTS_ENTRY_RELATIVE_PATH,
 ];
 
 /**
@@ -707,6 +724,10 @@ function collect(root, baselinePath) {
     { label: "auditor", abs: SCRIPT_SELF },
     { label: "baseline", abs: BASELINE_DEFAULT },
     { label: "baseline in use", abs: baselinePath },
+    {
+      label: "invariant entry",
+      abs: resolve(root, INVARIANTS_ENTRY_RELATIVE_PATH),
+    },
   ];
   const toolingExcludedAbsolute = new Set(
     toolingExclusionTargets.map((entry) => resolve(entry.abs)),

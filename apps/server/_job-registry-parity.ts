@@ -26,6 +26,17 @@ const OLD_QUEUE_MAP = {
 
 const OLD_QUEUES = ["image_generation_jobs", "video_generation_jobs"] as const;
 
+// 45-series tool execution introduced a THIRD queue. It is a real production
+// queue (JOB_TYPE_REGISTRY.tool_execution in
+// src/features/jobs/job-registry.ts, the executor in
+// src/features/jobs/executors/tool-execution.ts, enqueued by src/http/tools.ts)
+// and it has no counterpart in the pre-refactor tables above, so it is appended
+// to the expected poll order instead of being edited into `OLD_QUEUES` (which
+// stays the verbatim two-queue list). Order still matters: it is the poll order.
+const ADDED_QUEUES = ["tool_execution_jobs"] as const;
+
+const EXPECTED_QUEUES = [...OLD_QUEUES, ...ADDED_QUEUES];
+
 const OLD_QUEUE_TO_TYPE = {
   image_generation_jobs: "image_generation",
   video_generation_jobs: "video_generation",
@@ -58,8 +69,8 @@ for (const [type, queue] of Object.entries(OLD_QUEUE_MAP)) {
   check(type, queueForJobType(type as keyof typeof OLD_QUEUE_MAP), queue);
 }
 
-console.log("\nJOB_QUEUES vs QUEUES (order matters -- poll order):");
-check("queue list", [...JOB_QUEUES], [...OLD_QUEUES]);
+console.log("\nJOB_QUEUES vs QUEUES + the third queue added after the refactor (order matters -- poll order):");
+check("queue list", [...JOB_QUEUES], [...EXPECTED_QUEUES]);
 
 console.log("\njobTypeForQueue vs QUEUE_TO_TYPE:");
 for (const [queue, type] of Object.entries(OLD_QUEUE_TO_TYPE)) {
