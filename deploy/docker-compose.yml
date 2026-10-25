@@ -99,6 +99,21 @@ services:
     depends_on:
       - server
 
+  # OP-09: public entry point. Off by default; enable with
+  #   docker compose --profile tunnel up -d
+  # Requires CLOUDFLARE_TUNNEL_TOKEN (see deploy/.env.production.example).
+  #   Enabling the tunnel profile REQUIRES CLOUDFLARE_TUNNEL_TOKEN; with it unset the
+  #   container starts and cloudflared itself exits with a clear error (compose must not
+  #   fail here, or the default deployment would break before the tunnel is ever used).
+  cloudflared:
+    image: cloudflare/cloudflared:2024.10.0
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:-}"]
+    depends_on:
+      - web
+    network_mode: service:web
+
 volumes:
   pgdata: {}
   objects: {}
