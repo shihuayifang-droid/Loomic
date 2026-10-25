@@ -20,7 +20,6 @@
  */
 import { getServerBaseUrl } from "./env";
 import * as selfAuth from "./self-auth-client";
-import { getSupabaseBrowserClient } from "./supabase-browser";
 
 /** One `@mention` capsule of an example card, as the read API sends it. */
 export type HomeContentExampleMention = {
@@ -264,18 +263,17 @@ export async function fetchHomeDiscovery(
 /**
  * The bearer token of the signed-in reader, or `null` when there is none.
  *
- * Mirrors `auth-context`'s own session source: with `NEXT_PUBLIC_HAHART_AUTH_PROVIDER=self`
- * the token lives in `self-auth-client`, otherwise in the Supabase browser
- * client. Both are plain modules, so this works without a React context — the
- * home loaders are called from inside a component but are not components.
+ * Only the self-auth provider exposes its session here: with
+ * `NEXT_PUBLIC_HAHART_AUTH_PROVIDER=self` the token lives in
+ * `self-auth-client`. Any other provider yields `null` (treated as "not signed
+ * in"); callers that already hold a session pass it in explicitly instead.
  */
 export async function resolveHomeContentAccessToken(): Promise<string | null> {
   try {
     if (selfAuth.authProvider() === "self") {
       return selfAuth.getSession()?.access_token ?? null;
     }
-    const { data } = await getSupabaseBrowserClient().auth.getSession();
-    return data.session?.access_token ?? null;
+    return null;
   } catch {
     // No configured client / storage unavailable: identical to "not signed in".
     return null;

@@ -145,10 +145,18 @@ export default function HomePage() {
     }
 
     let cancelled = false;
+    // Pass the current session token explicitly so the loaders do not have to
+    // resolve it themselves (they fall back to their own resolution only when
+    // no token is available).
+    const accessToken = session.access_token;
 
     void Promise.all([
-      loadHomeExampleCategories(),
-      loadHomeDiscoveryCategories(),
+      accessToken
+        ? loadHomeExampleCategories(accessToken)
+        : loadHomeExampleCategories(),
+      accessToken
+        ? loadHomeDiscoveryCategories(accessToken)
+        : loadHomeDiscoveryCategories(),
     ])
       .then(([exampleCategories, discoveryCategories]) => {
         if (cancelled) {
