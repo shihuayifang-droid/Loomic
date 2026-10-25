@@ -88,10 +88,12 @@ registerExecutor("tool_execution", async (jobId, _rawPayload, ctx: ExecutorConte
   }, (VT_SECONDS / 2) * 1000);
 
   try {
-    // ED-00j: the original object, read as the job's owner. Throws
-    // OriginalSourceError when the artifact is not readable.
+    // ED-00j: the original object, read as the job's owner and signed through
+    // the store the worker injected (T-133 slice 9 — the same `objectStore` this
+    // executor uploads its product through, resolved and checked above).
+    // Throws OriginalSourceError when the artifact is not readable.
     const source = await resolveOriginalSource(
-      { assetReadRepository: ctx.assetReadRepository, signingClient: admin },
+      { assetReadRepository: ctx.assetReadRepository, objectStore },
       { actorId: createdBy, artifactId },
     );
 

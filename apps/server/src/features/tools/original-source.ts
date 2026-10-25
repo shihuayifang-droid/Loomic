@@ -14,6 +14,7 @@
 // does not match the original pixels. There is no URL-shaped input on this API;
 // the resolver owns the address, the caller owns only the id.
 import type { AssetReadRow, AssetReadRepository } from "../../db/asset-read-repository.js";
+import type { ObjectStore } from "../storage/object-store.js";
 import { signProjectAssetUrl } from "../storage/project-asset-urls.js";
 
 /** Every way resolving an original can fail, and nothing else. */
@@ -45,9 +46,12 @@ export type OriginalSource = {
   objectPath: string;
 };
 
+// T-133 slice 9: the resolver signs through the ONE object-storage seam, so a
+// tool's original comes from the same place every other object does. The store
+// is REQUIRED: a caller without one is an assembly mistake, not a fallback case.
 export type ResolveOriginalSourceDeps = {
   assetReadRepository: Pick<AssetReadRepository, "findReadableAsset">;
-  signingClient: Parameters<typeof signProjectAssetUrl>[0];
+  objectStore: ObjectStore;
 };
 
 export type ResolveOriginalSourceInput = {
@@ -86,7 +90,8 @@ export async function resolveOriginalSource(
   let url: string;
   try {
     // No `transform`, no `download`: the stored object, exactly as uploaded.
-    url = await signProjectAssetUrl(deps.signingClient, row.object_path, {
+    // T-133 slice 9: signed through the injected store, same bucket and TTL.
+    url = await signProjectAssetUrl(deps.objectStore, row.object_path, {
       bucket: row.bucket,
     });
   } catch {
