@@ -26,7 +26,6 @@ type ToolExecutionPayload = {
 };
 
 registerExecutor("tool_execution", async (jobId, _rawPayload, ctx: ExecutorContext) => {
-  const admin = ctx.getAdminClient();
   const jobRow = await loadExecutorJob(ctx, jobId);
   const payload = (jobRow.payload ?? {}) as ToolExecutionPayload;
 

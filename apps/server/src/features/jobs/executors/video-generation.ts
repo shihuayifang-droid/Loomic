@@ -9,7 +9,6 @@ import { resolveVideoProviderName } from "../../../generation/providers/registry
 registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorContext) => {
   const t0 = Date.now();
 
-  const admin = ctx.getAdminClient();
   const jobRow = await loadExecutorJob(ctx, jobId);
 
   // Build log tag with traceability context: jobId + sessionId (if available)

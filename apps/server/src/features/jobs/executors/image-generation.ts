@@ -75,7 +75,6 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
   // Read the full job row including payload from the database.
   // The PGMQ message only contains { job_id, job_type, workspace_id },
   // so we must fetch prompt/model/aspect_ratio from background_jobs.payload.
-  const admin = ctx.getAdminClient();
   const jobRow = await loadExecutorJob(ctx, jobId);
 
   // Build log tag with traceability context: jobId + sessionId (if available)
