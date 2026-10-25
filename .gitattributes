@@ -1,0 +1,7 @@
+# Line ending policy (OP-01 cold start: CRLF in .sh broke Linux systemd units)
+* text=auto eol=lf
+*.sh text eol=lf
+*.service text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
