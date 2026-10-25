@@ -4,10 +4,14 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
+import { BRAND } from "../src/lib/brand";
+
 /**
  * BR-17 品牌文案（工单 40I）
  *
- * 源码断言，不渲染组件：本单只替换文案字面值，其余字符一字不改。
+ * 45CQ 把 layout.tsx 的字面量换成了 `BRAND`，契约随之从「源码里出现几次
+ * HaHart」变成「文案来自 BRAND 这个唯一来源」：文案本身断言 BRAND 的值，
+ * layout 只断言它引用了 BRAND（不再复制一份字面量）。
  */
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -30,11 +34,29 @@ const ONE_LINE_PITCH = "对话即可出图、改图的 AI 设计画布";
 
 describe("BR-17 brand copy", () => {
   it("BR-17: the site description is the confirmed copy", () => {
-    const source = read("src/app/layout.tsx");
+    // 文案的唯一来源是 BRAND（BR-19）；layout.tsx 只负责把它交给 metadata。
+    expect(BRAND.name, "BRAND.name 不是确认的品牌名").toBe("HaHart");
+    expect(BRAND.description, "BRAND.description 不是确认的站点描述").toBe(
+      SITE_DESCRIPTION,
+    );
 
-    const occurrences = source.split(SITE_DESCRIPTION).length - 1;
-    expect(occurrences, `layout.tsx 里 ${SITE_DESCRIPTION} 出现 ${occurrences} 次，应为 3 次`).toBe(3);
-    expect(source, "layout.tsx 仍含旧描述").not.toContain("AI-powered creative workspace");
+    const source = read("src/app/layout.tsx");
+    expect(source, "layout.tsx 没把 title 交给 BRAND").toContain("title: BRAND.name");
+    expect(source, "layout.tsx 没把 description 交给 BRAND").toContain(
+      "description: BRAND.description",
+    );
+    // metadata / openGraph / twitter 三处都要走 BRAND，漏一处就会有一处文案漂移。
+    expect(
+      source.split("title: BRAND.name").length - 1,
+      "layout.tsx 的 title 引用 BRAND.name 不是 3 处",
+    ).toBe(3);
+    expect(
+      source.split("description: BRAND.description").length - 1,
+      "layout.tsx 的 description 引用 BRAND.description 不是 3 处",
+    ).toBe(3);
+    expect(source, "layout.tsx 仍含旧描述").not.toContain(
+      "AI-powered creative workspace",
+    );
   });
 
   it("BR-17: the footer carries the brand and the one-line pitch", () => {

@@ -38,6 +38,7 @@ import { checkUploadConstraint, toolListResponseSchema } from "@loomic/shared";
 import { publishPoolBalance } from "./credit-balance-events";
 import { dedupeRequest } from "./dedupe-request";
 import { getServerBaseUrl } from "./env";
+import { dedupeRequest as dedupeCachedRequest } from "./request-dedupe";
 import * as selfAuth from "./self-auth-client";
 import { getSupabaseBrowserClient } from "./supabase-browser";
 
@@ -233,11 +234,18 @@ export function confirmationOf(err: unknown): {
 export async function fetchViewer(
   accessToken: string,
 ): Promise<ViewerResponse> {
-  const response = await fetch(`${getServerBaseUrl()}/api/viewer`, {
-    headers: authHeaders(accessToken),
-  });
-  if (!response.ok) return handleErrorResponse(response);
-  return (await response.json()) as ViewerResponse;
+  // T-165 / 45CV-fixup1: several components (sidebar, page, access gate) ask for the
+  // viewer in the same pass, so the in-flight request is shared. Nothing is cached
+  // once it settles (`ttlMs: 0`) and the key carries the token: a token that went
+  // invalid a moment ago must still reach the server and surface as ApiAuthError
+  // instead of being answered from the previous caller's result.
+  // `/api/viewer/profile` below keeps its own path and its own behaviour.
+  const url = `${getServerBaseUrl()}/api/viewer`;
+  return dedupeCachedRequest(`viewer:${accessToken}`, async () => {
+    const response = await fetch(url, { headers: authHeaders(accessToken) });
+    if (!response.ok) return handleErrorResponse(response);
+    return (await response.json()) as ViewerResponse;
+  }, 0);
 }
 
 export async function fetchProjects(

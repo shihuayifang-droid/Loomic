@@ -7,6 +7,7 @@ import type {
 } from "@loomic/shared";
 
 import { getServerBaseUrl } from "./env";
+import { dedupeRequest } from "./request-dedupe";
 import { ApiAuthError, ApiApplicationError } from "./server-api";
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -37,11 +38,16 @@ async function handleErrorResponse(response: Response): Promise<never> {
 export async function fetchCredits(
   accessToken: string,
 ): Promise<CreditBalanceResponse> {
-  const response = await fetch(`${getServerBaseUrl()}/api/credits`, {
-    headers: authHeaders(accessToken),
+  // T-165 / 45CV-fixup1: read-only endpoint, asked for by both the sidebar and the
+  // page, so the duplicate fetch is collapsed here and the balance is reused for a
+  // short TTL. The key carries the token (45CV-fixup1): two tokens must never share
+  // one balance, and a rotated token starts from a fresh request.
+  const url = `${getServerBaseUrl()}/api/credits`;
+  return dedupeRequest(`credits:${accessToken}`, async () => {
+    const response = await fetch(url, { headers: authHeaders(accessToken) });
+    if (!response.ok) return handleErrorResponse(response);
+    return (await response.json()) as CreditBalanceResponse;
   });
-  if (!response.ok) return handleErrorResponse(response);
-  return (await response.json()) as CreditBalanceResponse;
 }
 
 export async function fetchCreditTransactions(
