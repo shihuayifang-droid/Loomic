@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import type { ReactNode } from "react";
 
 import { HaHartLogoInverted } from "../icons/hahart-logo";
+import { BRAND } from "../../lib/brand";
 
 const fadeUp = {
   hidden: { opacity: 0, y: 20 },
@@ -39,7 +40,7 @@ export function AuthShell({
             className="mb-4 flex items-center gap-4"
           >
             <HaHartLogoInverted className="size-14" />
-            <h1 className="text-4xl font-bold tracking-tight">HaHart</h1>
+            <h1 className="text-4xl font-bold tracking-tight">{BRAND.name}</h1>
           </motion.div>
 
           <motion.p variants={fadeUp} custom={1} className="mb-3 text-3xl font-semibold tracking-tight">

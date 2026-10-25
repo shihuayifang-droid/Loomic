@@ -4,6 +4,7 @@ import Link from "next/link";
 import { motion } from "framer-motion";
 import { HaHartLogo } from "@/components/icons/hahart-logo";
 import { buttonVariants } from "@/components/ui/button";
+import { BRAND } from "@/lib/brand";
 
 export function PricingNav() {
   return (
@@ -17,7 +18,7 @@ export function PricingNav() {
         <Link href="/" className="flex items-center gap-2">
           <HaHartLogo className="size-7 text-foreground" />
           <span className="text-base font-semibold tracking-tight">
-            HaHart
+            {BRAND.name}
           </span>
         </Link>
 

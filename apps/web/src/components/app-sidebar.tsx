@@ -7,6 +7,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { HaHartLogo } from "@/components/icons/hahart-logo";
 import { CreditBalance } from "@/components/credits/credit-balance";
 import { useAuth } from "@/lib/auth-context";
+import { BRAND } from "@/lib/brand";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -199,7 +200,7 @@ export function AppSidebar() {
         {/* Logo */}
         <Link
           href="/home"
-          title="HaHart"
+          title={BRAND.name}
           className="mb-1 flex h-9 w-9 items-center justify-center"
         >
           <motion.div
