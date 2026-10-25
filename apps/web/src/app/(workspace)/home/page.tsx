@@ -20,14 +20,14 @@ import { useDeleteProject } from "@/hooks/use-delete-project";
 import { useImageAttachments } from "@/hooks/use-image-attachments";
 import { useAuth } from "@/lib/auth-context";
 import { loadHomeDiscoveryCategories } from "@/lib/home-discovery-library";
-import {
-  homeDiscoverySeedCategories,
-  type HomeDiscoverySelection,
+import type {
+  HomeDiscoveryCategory,
+  HomeDiscoverySelection,
 } from "@/lib/home-discovery-seeds";
 import { loadHomeExampleCategories } from "@/lib/home-example-library";
-import {
-  homeExampleSeedCategories,
-  type HomeExampleSelection,
+import type {
+  HomeExampleCategory,
+  HomeExampleSelection,
 } from "@/lib/home-example-seeds";
 import { ApiAuthError, fetchProjects } from "@/lib/server-api";
 import { formatDate } from "@/lib/utils";
@@ -77,12 +77,17 @@ export default function HomePage() {
     useDeleteProject({ onDeleted: handleDeleted });
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
-  const [homeDiscoveryCategories, setHomeDiscoveryCategories] = useState(
-    homeDiscoverySeedCategories,
-  );
-  const [homeExampleCategories, setHomeExampleCategories] = useState(
-    homeExampleSeedCategories,
-  );
+  // 工单45BZ: the home page renders the server's content only. Starting from an
+  // empty list (instead of the seed constants) keeps the first paint from
+  // requesting images that live on the legacy project's public storage.
+  const [homeDiscoveryCategories, setHomeDiscoveryCategories] = useState<
+    HomeDiscoveryCategory[]
+  >([]);
+  const [homeExampleCategories, setHomeExampleCategories] = useState<
+    HomeExampleCategory[]
+  >([]);
+  const [homeExamplesLoading, setHomeExamplesLoading] = useState(true);
+  const [homeDiscoveryLoading, setHomeDiscoveryLoading] = useState(true);
   const [selectedExample, setSelectedExample] =
     useState<HomeExampleSelection | null>(null);
 
@@ -141,6 +146,10 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!session) {
+      // 工单45BZ: nothing to load without a session — stop showing the loading
+      // placeholders instead of leaving them up forever.
+      setHomeExamplesLoading(false);
+      setHomeDiscoveryLoading(false);
       return;
     }
 
@@ -168,6 +177,14 @@ export default function HomePage() {
       })
       .catch((error) => {
         console.warn("[home] failed to load home page seed content", error);
+      })
+      .finally(() => {
+        if (cancelled) {
+          return;
+        }
+
+        setHomeExamplesLoading(false);
+        setHomeDiscoveryLoading(false);
       });
 
     return () => {
@@ -278,11 +295,27 @@ export default function HomePage() {
         </motion.div>
 
         <motion.div variants={fadeUp} custom={4} className="w-full">
-          <HomeExampleBrowser
-            categories={homeExampleCategories}
-            selectedExample={selectedExample}
-            onExampleSelect={handleExampleSelect}
-          />
+          {homeExamplesLoading ? (
+            // 工单45BZ: placeholder while the server content loads — no seed data
+            // is rendered as a stand-in.
+            <div
+              aria-hidden
+              className="mt-4 flex w-full flex-wrap items-center justify-center gap-2"
+            >
+              {[0, 1, 2, 3, 4].map((index) => (
+                <span
+                  key={index}
+                  className="h-8 w-20 animate-pulse rounded-full bg-muted"
+                />
+              ))}
+            </div>
+          ) : (
+            <HomeExampleBrowser
+              categories={homeExampleCategories}
+              selectedExample={selectedExample}
+              onExampleSelect={handleExampleSelect}
+            />
+          )}
         </motion.div>
       </motion.div>
 
@@ -410,10 +443,24 @@ export default function HomePage() {
         )}
       </div>
 
-      <HomeDiscoveryGallery
-        categories={homeDiscoveryCategories}
-        onCaseSelect={handleDiscoverySelect}
-      />
+      {homeDiscoveryLoading ? (
+        <section aria-hidden className="mt-14 w-full">
+          <div className="mb-5 h-6 w-28 animate-pulse rounded bg-muted" />
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            {[0, 1, 2, 3].map((index) => (
+              <div
+                key={index}
+                className="aspect-[4/5] animate-pulse rounded-2xl bg-muted"
+              />
+            ))}
+          </div>
+        </section>
+      ) : (
+        <HomeDiscoveryGallery
+          categories={homeDiscoveryCategories}
+          onCaseSelect={handleDiscoverySelect}
+        />
+      )}
 
       {/* Delete confirmation dialog */}
       <DeleteProjectDialog
