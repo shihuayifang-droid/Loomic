@@ -407,12 +407,18 @@ export async function resolveAttachmentContent(
     repository: AssetReadRepository | undefined;
     /** The run's own user id — the actor the row has to be readable by. */
     actorId: string | undefined;
-    /** Mints the storage signature for the caller. Reads no table of its own. */
-    signingClient: UserSupabaseClient;
+    /**
+     * Mints the storage signature for the caller (45AZ / T-133 slice 9). This is
+     * the `ObjectStore` seam the rest of the storage call sites already use, not
+     * the caller's Supabase client: the store built from the RUN's own user
+     * client keeps the signature under that user's RLS, and slice 10 can then
+     * delete the client-shaped adapter hop. Reads no table of its own.
+     */
+    objectStore: ObjectStore;
   },
   attachments: ImageAttachment[],
 ): Promise<ResolvedAttachments> {
-  const { repository, actorId, signingClient } = input;
+  const { repository, actorId, objectStore } = input;
   const imageBlocks: ResolvedAttachments["imageBlocks"] = [];
   const downloaded: ResolvedAttachments["downloaded"] = [];
 
@@ -449,7 +455,7 @@ export async function resolveAttachmentContent(
     let signedUrl: string;
     try {
       signedUrl = await signProjectAssetUrl(
-        signingClient,
+        objectStore,
         assetRow.object_path,
         { bucket: assetRow.bucket },
       );
@@ -2250,11 +2256,22 @@ export function createAgentRunService(options: CreateAgentRuntimeOptions) {
             run.accessToken ?? "",
           ) as UserSupabaseClient;
 
+          // 45AZ / T-133 slice 9: the SAME user client is wrapped into the store
+          // seam, so the signature is still minted under the run's own identity
+          // and RLS. No factory means the wiring is missing — refusal, never a
+          // fallback to the client-shaped adapter, which slice 10 deletes.
+          const attachmentStore = options.createObjectStore?.(attachmentClient) ?? null;
+          if (!attachmentStore) {
+            throw new Error(
+              "Cannot resolve image attachments: object store factory not wired for attachment resolution.",
+            );
+          }
+
           const { imageBlocks, downloaded } = await resolveAttachmentContent(
             {
               repository: options.assetReadRepository,
               actorId: run.userId,
-              signingClient: attachmentClient,
+              objectStore: attachmentStore,
             },
             run.attachments!,
           );

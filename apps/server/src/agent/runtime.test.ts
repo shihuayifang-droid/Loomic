@@ -75,6 +75,11 @@ import type { ServerEnv } from "../config/env.js";
 import type { UserSupabaseClient } from "../supabase/user.js";
 import { createLoomicDeepAgent } from "./deep-agent.js";
 import {
+  ObjectStoreError,
+  type ObjectStore,
+} from "../features/storage/object-store.js";
+import { createFakeObjectStore } from "../test-support/fake-object-store.js";
+import {
   eventAfterPersistFailure,
   readCanvasProjectLinkForRun,
   readCanvasSummaryForRun,
@@ -96,50 +101,45 @@ const ASSET_DRIVER_ERROR = new Error(
 );
 
 /**
- * A SIGNING client, and only that: it mints a storage signature and nothing else.
+ * The signing seam 45AZ moved `resolveAttachmentContent` onto: the shared
+ * in-memory `ObjectStore` double, plus the two readings these cases make of it —
+ * WHICH bucket/key was handed to `signedReadUrl`, and how many signatures were
+ * minted. Everything else is the double's own behaviour, so "only a signature
+ * happened on this path" stays measured instead of assumed: a store call that is
+ * not a signature is counted by `otherCalls` and has to stay zero.
  *
- * The row read now belongs to the asset repository (工单21S), so a table read
- * through this object THROWS and is counted. That is what turns "the row no
- * longer comes from here" into a measurement: a runtime that reached for a table
- * again would fail the case on the throw instead of passing on a stub that still
- * answered.
+ * `signError` makes the signature refuse, which is the one thing the shared
+ * double never does — a refusal is an answer from the backend, not fake state.
  */
-function makeClient(options: { signError?: { message: string } | null } = {}) {
-  const signCalls: string[] = [];
+function makeSigningStore(
+  options: { signError?: { message: string } | null } = {},
+) {
+  const store = createFakeObjectStore();
+  const signCalls: Array<{ bucket: string; key: string }> = [];
   let signSeq = 0;
-  let tableReads = 0;
 
-  const client = {
-    from: (table: string) => {
-      tableReads += 1;
-      throw new Error(`unexpected table read in runtime test: ${table}`);
-    },
-    storage: {
-      from: (bucket: string) => ({
-        createSignedUrl: async (path: string) => {
-          signCalls.push(path);
-          if (options.signError) {
-            return { data: null, error: options.signError };
-          }
-          signSeq += 1;
-          return {
-            data: {
-              signedUrl: `https://proj.test/storage/v1/object/sign/${bucket}/${path}?token=sig-${signSeq}`,
-            },
-            error: null,
-          };
-        },
-      }),
-    },
+  store.signedReadUrl = async (ref, urlOptions) => {
+    signCalls.push({ bucket: ref.bucket, key: ref.key });
+    if (options.signError) {
+      // A signing refusal is the backend saying no, which is `backend_failed` in
+      // the store vocabulary.
+      throw new ObjectStoreError("backend_failed", options.signError.message);
+    }
+    signSeq += 1;
+    return (
+      `https://proj.test/storage/v1/object/sign/${ref.bucket}/${ref.key}` +
+      `?token=sig-${signSeq}&ttl=${urlOptions.ttlSeconds}`
+    );
   };
 
   return {
-    client: client as unknown as UserSupabaseClient,
+    store,
     signCalls,
     /** How many signatures were minted — rotation made visible. */
     signCount: () => signSeq,
-    /** How many table reads this client was asked for — must stay zero. */
-    tableReads: () => tableReads,
+    /** Storage calls that were NOT a signature — must stay zero on this path. */
+    otherCalls: () =>
+      store.calls.filter((call) => call.method !== "signedReadUrl").length,
   };
 }
 
@@ -347,25 +347,28 @@ async function refusal(promise: Promise<unknown>): Promise<Error> {
 
 describe("resolveAttachmentContent treats assetId as the authority (T1)", () => {
   it("case 1: an expired/rotated preview URL still succeeds, and the model gets the NEW signature's bytes", async () => {
-    const h = makeClient();
+    const h = makeSigningStore();
     const a = assetRepository({ readable: { "asset-1": assetRow() } });
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
 
     const { attachment, reads } = attachmentWithUrlSpy(EXPIRED);
     const resolved = await resolveAttachmentContent(
-      { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+      { repository: a.repository, actorId: ACTOR, objectStore: h.store },
       [attachment],
     );
 
-    // The row came from the repository, asked for the RUN's actor — and not from
-    // the signing client, which was never asked for a table.
+    // The row came from the repository, asked for the RUN's actor — not through
+    // the store, which was only ever asked to sign.
     expect(a.calls).toEqual([{ actorId: ACTOR, assetId: "asset-1" }]);
-    expect(h.tableReads()).toBe(0);
+    expect(h.otherCalls()).toBe(0);
 
     // The preview is a DIFFERENT string from what this read minted — that is the
     // rotation, and it must not be a refusal.
     expect(h.signCount()).toBe(1);
+    // What the fake store was handed: the row's own bucket and object path, and
+    // nothing the request carried (45AZ: signing goes through the store seam).
+    expect(h.signCalls).toEqual([{ bucket: BUCKET, key: OBJECT_PATH }]);
     expect(f.calls).toHaveLength(1);
     expect(f.calls[0]).not.toBe(EXPIRED);
     expect(f.calls[0]).toContain("token=sig-1");
@@ -383,14 +386,14 @@ describe("resolveAttachmentContent treats assetId as the authority (T1)", () => 
   });
 
   it("case 2: a forged external URL still succeeds — and is NEVER fetched", async () => {
-    const h = makeClient();
+    const h = makeSigningStore();
     const a = assetRepository({ readable: { "asset-1": assetRow() } });
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
 
     const { attachment, reads } = attachmentWithUrlSpy(FORGED);
     const resolved = await resolveAttachmentContent(
-      { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+      { repository: a.repository, actorId: ACTOR, objectStore: h.store },
       [attachment],
     );
 
@@ -404,7 +407,7 @@ describe("resolveAttachmentContent treats assetId as the authority (T1)", () => 
     // The authority for what may be read is the repository, and it was asked
     // with the run's actor — never through the signing client.
     expect(a.calls).toEqual([{ actorId: ACTOR, assetId: "asset-1" }]);
-    expect(h.tableReads()).toBe(0);
+    expect(h.otherCalls()).toBe(0);
   });
 
   it("case 3: an absent assetId and an invisible one fail IDENTICALLY, with no fetch", async () => {
@@ -415,11 +418,11 @@ describe("resolveAttachmentContent treats assetId as the authority (T1)", () => 
     // but it is not yours" are one answer in the statement, never an error.
     const absent = assetRepository({ readable: {} });
     const invisible = assetRepository({ readable: { "asset-1": assetRow() } });
-    const h = makeClient();
+    const h = makeSigningStore();
 
     const absentError = await refusal(
       resolveAttachmentContent(
-        { repository: absent.repository, actorId: ACTOR, signingClient: h.client },
+        { repository: absent.repository, actorId: ACTOR, objectStore: h.store },
         [{ assetId: "asset-missing", mimeType: "image/png" }],
       ),
     );
@@ -432,7 +435,7 @@ describe("resolveAttachmentContent treats assetId as the authority (T1)", () => 
         {
           repository: invisible.repository,
           actorId: ACTOR,
-          signingClient: h.client,
+          objectStore: h.store,
         },
         [{ assetId: "asset-not-mine", mimeType: "image/png" }],
       ),
@@ -453,19 +456,19 @@ describe("resolveAttachmentContent treats assetId as the authority (T1)", () => 
     // Nothing was signed, nothing was fetched, no model input was built — and no
     // table was reached through the client.
     expect(h.signCalls).toHaveLength(0);
-    expect(h.tableReads()).toBe(0);
+    expect(h.otherCalls()).toBe(0);
     expect(f.calls).toHaveLength(0);
   });
 
   it("case 4: a signing refusal stops the run and returns no URL of any kind", async () => {
-    const h = makeClient({ signError: { message: "permission denied" } });
+    const h = makeSigningStore({ signError: { message: "permission denied" } });
     const a = assetRepository({ readable: { "asset-1": assetRow() } });
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
 
     const error = await refusal(
       resolveAttachmentContent(
-        { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+        { repository: a.repository, actorId: ACTOR, objectStore: h.store },
         [{ assetId: "asset-1", mimeType: "image/png" }],
       ),
     );
@@ -477,7 +480,7 @@ describe("resolveAttachmentContent treats assetId as the authority (T1)", () => 
     // The row WAS readable, so this refusal comes from the signing step and not
     // from the read — the two must not be confused when this is debugged.
     expect(a.calls).toEqual([{ actorId: ACTOR, assetId: "asset-1" }]);
-    expect(h.tableReads()).toBe(0);
+    expect(h.otherCalls()).toBe(0);
   });
 });
 
@@ -494,7 +497,7 @@ async function refusalFor(
   input: {
     repository: AssetReadRepository | undefined;
     actorId: string | undefined;
-    signingClient: UserSupabaseClient;
+    objectStore: ObjectStore;
   },
   assetId = "asset-1",
 ): Promise<Error> {
@@ -505,26 +508,26 @@ async function refusalFor(
 
 describe("resolveAttachmentContent reads the asset row through the repository (21S)", () => {
   it("case 1: a missing repository refuses with the same sentence and reaches nothing else", async () => {
-    const h = makeClient();
+    const h = makeSigningStore();
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
 
     const error = await refusalFor({
       repository: undefined,
       actorId: ACTOR,
-      signingClient: h.client,
+      objectStore: h.store,
     });
 
     expect(error.message).toBe(
       "attachment 1 references an asset that is not available to this user",
     );
     expect(h.signCalls).toHaveLength(0);
-    expect(h.tableReads()).toBe(0);
+    expect(h.otherCalls()).toBe(0);
     expect(f.calls).toHaveLength(0);
   });
 
   it("case 2: a missing actor id refuses the same way and never asks the repository", async () => {
-    const h = makeClient();
+    const h = makeSigningStore();
     const a = assetRepository({ readable: { "asset-1": assetRow() } });
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
@@ -532,7 +535,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
     const error = await refusalFor({
       repository: a.repository,
       actorId: undefined,
-      signingClient: h.client,
+      objectStore: h.store,
     });
 
     expect(error.message).toBe(
@@ -546,7 +549,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
   });
 
   it("case 3: a throwing read refuses the same way and never echoes the driver text", async () => {
-    const h = makeClient();
+    const h = makeSigningStore();
     const a = assetRepository({ error: ASSET_DRIVER_ERROR });
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
@@ -554,7 +557,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
     const error = await refusalFor({
       repository: a.repository,
       actorId: ACTOR,
-      signingClient: h.client,
+      objectStore: h.store,
     });
 
     expect(error.message).toBe(
@@ -575,7 +578,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
   });
 
   it("case 4: no repository, no actor, a thrown read and an unreadable row are ONE answer", async () => {
-    const h = makeClient();
+    const h = makeSigningStore();
     const f = makeFetch({ [OBJECT_PATH]: PNG });
     vi.stubGlobal("fetch", f.impl);
 
@@ -583,34 +586,34 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
     const missing = assetRepository({ readable: {} });
     const throwing = assetRepository({ error: ASSET_DRIVER_ERROR });
 
-    const signedClient = h.client;
+    const signedStore = h.store;
     const messages = [
       (
         await refusalFor({
           repository: undefined,
           actorId: ACTOR,
-          signingClient: signedClient,
+          objectStore: signedStore,
         })
       ).message,
       (
         await refusalFor({
           repository: mine.repository,
           actorId: undefined,
-          signingClient: signedClient,
+          objectStore: signedStore,
         })
       ).message,
       (
         await refusalFor({
           repository: throwing.repository,
           actorId: ACTOR,
-          signingClient: signedClient,
+          objectStore: signedStore,
         })
       ).message,
       (
         await refusalFor({
           repository: missing.repository,
           actorId: ACTOR,
-          signingClient: signedClient,
+          objectStore: signedStore,
         })
       ).message,
       // `mine` holds a row this caller MAY read and is asked for a DIFFERENT id:
@@ -621,7 +624,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
           {
             repository: mine.repository,
             actorId: ACTOR,
-            signingClient: signedClient,
+            objectStore: signedStore,
           },
           "asset-not-mine",
         )
@@ -635,12 +638,12 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
     );
     expect(messages[0]).not.toContain("public.");
     expect(h.signCalls).toHaveLength(0);
-    expect(h.tableReads()).toBe(0);
+    expect(h.otherCalls()).toBe(0);
     expect(f.calls).toHaveLength(0);
   });
 
   it("case 5: the repository is asked with EXACTLY the actor and the asset id", async () => {
-    const h = makeClient();
+    const h = makeSigningStore();
     const a = assetRepository({
       readable: { "asset-9": assetRow({ id: "asset-9" }) },
     });
@@ -651,7 +654,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
     // the request carried, the recorded ask below would show it.
     const { attachment } = attachmentWithUrlSpy(FORGED, "asset-9");
     await resolveAttachmentContent(
-      { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+      { repository: a.repository, actorId: ACTOR, objectStore: h.store },
       [attachment],
     );
 
@@ -661,7 +664,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
   });
 
   it("case 6: a null mime_type falls through to the response content-type", async () => {
-    const h = makeClient();
+    const h = makeSigningStore();
     // The response says webp, so an answer of `image/png` could only have come
     // from somewhere else — that is what makes the fallback observable.
     const f = makeFetch({ [OBJECT_PATH]: PNG }, "image/webp");
@@ -674,7 +677,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
       {
         repository: noRowMime.repository,
         actorId: ACTOR,
-        signingClient: h.client,
+        objectStore: h.store,
       },
       [attachmentWithoutMime()],
     );
@@ -685,21 +688,21 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
       readable: { "asset-1": assetRow({ mime_type: "image/png" }) },
     });
     const fromRow = await resolveAttachmentContent(
-      { repository: rowMime.repository, actorId: ACTOR, signingClient: h.client },
+      { repository: rowMime.repository, actorId: ACTOR, objectStore: h.store },
       [attachmentWithoutMime()],
     );
     expect(fromRow.downloaded[0]!.mimeType).toBe("image/png");
 
     // …and the attachment's own mime wins over both.
     const fromAttachment = await resolveAttachmentContent(
-      { repository: rowMime.repository, actorId: ACTOR, signingClient: h.client },
+      { repository: rowMime.repository, actorId: ACTOR, objectStore: h.store },
       [{ assetId: "asset-1", mimeType: "image/gif" }],
     );
     expect(fromAttachment.downloaded[0]!.mimeType).toBe("image/gif");
   });
 
   it("case 7: every attachment is read on its own, and the refusal names its position", async () => {
-    const h = makeClient();
+    const h = makeSigningStore();
     const a = assetRepository({
       readable: { "asset-a": assetRow({ id: "asset-a" }) },
     });
@@ -708,7 +711,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
 
     const error = await refusal(
       resolveAttachmentContent(
-        { repository: a.repository, actorId: ACTOR, signingClient: h.client },
+        { repository: a.repository, actorId: ACTOR, objectStore: h.store },
         [
           { assetId: "asset-a", mimeType: "image/png" },
           { assetId: "asset-b", mimeType: "image/png" },
@@ -727,6 +730,7 @@ describe("resolveAttachmentContent reads the asset row through the repository (2
     ]);
     // The first attachment was fully processed before the second was refused.
     expect(h.signCount()).toBe(1);
+    expect(h.signCalls).toEqual([{ bucket: BUCKET, key: OBJECT_PATH }]);
     expect(f.calls).toHaveLength(1);
   });
 });
