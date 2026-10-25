@@ -58,6 +58,7 @@
     "test": "vitest run",
     "db:migrate": "node --env-file-if-exists=../../.env.local --import tsx ./src/cli/hahart-db-migrate.ts",
     "db:bootstrap-admin": "node --env-file-if-exists=../../.env.local --import tsx ./src/cli/hahart-bootstrap-admin.ts",
+    "home:seeds:import": "node --env-file-if-exists=../../.env.local --import tsx ./src/cli/hahart-home-seeds-import.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }
