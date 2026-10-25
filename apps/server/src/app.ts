@@ -241,6 +241,11 @@ import { registerGenerateRoutes } from "./http/generate.js";
 import { registerHealthRoutes } from "./http/health.js";
 import { registerDevClientErrorRoutes } from "./http/dev-client-errors.js";
 import { registerImageProxyRoute } from "./http/image-proxy.js";
+// 工单45BR / T-128 (OP-04 second slice): the home page's two read routes. The
+// plain `pg` pool is resolved lazily inside the route, like every read
+// repository below, so this import connects nothing at build time.
+import { registerHomeRoutes } from "./http/home.js";
+import { getDatabasePool } from "./db/pool.js";
 import { registerModelRoutes } from "./http/models.js";
 import { registerImageModelRoutes } from "./http/image-models.js";
 import { registerVideoModelRoutes } from "./http/video-models.js";
@@ -1208,6 +1213,21 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   void registerDevClientErrorRoutes(app);
   void registerFontsRoutes(app, { env });
   void registerImageProxyRoute(app);
+  // 工单45BR / T-128 (OP-04 second slice): the home page's seed content. The
+  // store is the one this assembly already built: in `fs` mode the volume store
+  // (`fsStore`), otherwise the same lazy store factory the services above use,
+  // over the admin client — the signed link only ever covers the `home-seeds`
+  // bucket, and the caller's own token cannot sign seed objects.
+  void registerHomeRoutes(app, {
+    auth,
+    pool: () => getDatabasePool(databaseEnv),
+    store:
+      fsStore ??
+      createObjectStore(env, {
+        supabaseClient: () =>
+          getAdminClient() as unknown as SupabaseStorageLike,
+      }),
+  });
   void registerRunRoutes(app, agentRuns, {
     agentRunMetadataService,
     auth,
