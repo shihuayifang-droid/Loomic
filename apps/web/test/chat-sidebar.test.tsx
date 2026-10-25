@@ -7,6 +7,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { WebSocketHandle } from "../src/hooks/use-websocket";
 import { ChatSidebar } from "../src/components/chat-sidebar";
+// The composer placeholder is product copy, not a snapshot: import the constant
+// the component itself renders (src/components/chat-input.tsx:387) so a wording
+// change never reds this test.
+import { AGENT_INPUT_PLACEHOLDER } from "../src/lib/composer-copy";
 import { TierLimitToastProvider } from "../src/components/credits/tier-limit-toast";
 import { ToastProvider } from "../src/components/toast";
 
@@ -141,9 +145,12 @@ describe("ChatSidebar", () => {
       </ToastProvider>,
     );
 
-    const input = await screen.findByPlaceholderText(
-      /start with an idea/i,
-    );
+    // The composer is a contenteditable surface (src/components/chat-composer.tsx:328-351),
+    // so the copy sits in `data-placeholder` rather than in a `placeholder`
+    // attribute; locate it by role and keep the expected text as the imported
+    // constant the component renders (src/components/chat-input.tsx:387).
+    const input = await screen.findByRole("textbox");
+    expect(input).toHaveAttribute("data-placeholder", AGENT_INPUT_PLACEHOLDER);
     await userEvent.type(input, "hello loom{Enter}");
 
     await waitFor(() =>

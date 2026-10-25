@@ -55,23 +55,58 @@ const projectsResponse = {
   ],
 };
 
+/** Body shape `createProject` expects (see the POST branch of `createProject`). */
+const createdProjectResponse = {
+  project: {
+    id: "p-new",
+    name: "Untitled",
+    slug: "untitled",
+    description: null,
+    workspace,
+    primaryCanvas: { id: "c-new", name: "Main Canvas", isPrimary: true },
+    createdAt: "2026-03-24T00:00:00Z",
+    updatedAt: "2026-03-24T00:00:00Z",
+  },
+};
+
+type MockResponse = {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+};
+
+function jsonOk(body: unknown, status = 200): MockResponse {
+  return { ok: true, status, json: async () => body };
+}
+
+function jsonFail(status: number, code: string, message: string): MockResponse {
+  return {
+    ok: false,
+    status,
+    json: async () => ({ error: { code, message } }),
+  };
+}
+
 /**
- * URL-based mock that always returns success for viewer/projects.
+ * URL + method aware mock: GET /api/viewer and GET /api/projects succeed,
+ * POST /api/projects answers `onCreate()` (defaults to a created project).
  * Handles React 19 double-effect invocation in tests.
  */
-function mockSuccessfulLoad(projectsOverride?: unknown) {
-  mockFetch.mockImplementation((url: string) => {
+function mockApi(opts?: {
+  projects?: unknown;
+  onCreate?: () => MockResponse;
+}) {
+  mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+    if (url.includes("/api/projects") && init?.method === "POST") {
+      return Promise.resolve(opts?.onCreate?.() ?? jsonOk(createdProjectResponse, 201));
+    }
     if (url.includes("/api/viewer")) {
-      return Promise.resolve({ ok: true, status: 200, json: async () => viewerResponse });
+      return Promise.resolve(jsonOk(viewerResponse));
     }
     if (url.includes("/api/projects")) {
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: async () => (projectsOverride ?? projectsResponse),
-      });
+      return Promise.resolve(jsonOk(opts?.projects ?? projectsResponse));
     }
-    return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
+    return Promise.resolve(jsonFail(404, "not_found", "Not found"));
   });
 }
 
@@ -87,9 +122,19 @@ function renderProjectsPage() {
   );
 }
 
+/**
+ * `useCreateProject` opens a preview tab with `window.open`; jsdom implements
+ * it as "not implemented" and returns null. Null forces the in-page
+ * `router.push` fallback, which is what these tests assert on.
+ */
+function stubWindowOpen() {
+  return vi.spyOn(window, "open").mockReturnValue(null);
+}
+
 describe("Projects page", () => {
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
   });
 
   beforeEach(() => {
@@ -97,43 +142,102 @@ describe("Projects page", () => {
     vi.stubEnv("NEXT_PUBLIC_SERVER_BASE_URL", "http://localhost:3001");
   });
 
-  it("renders sidebar with workspace name and project list", async () => {
-    mockSuccessfulLoad();
+  /**
+   * The page renders only `<ProjectList>` — there is no sidebar and no
+   * component in apps/web renders `workspace.name` (checked with a repo-wide
+   * search for `workspace.name` / `workspaceName` / `工作区` in src/**\/*.tsx:
+   * no match), so the old "My Workspace" assertion has no implementation left
+   * to cover. The list itself is asserted instead: one card per project.
+   */
+  it("renders one project card per project returned by the API", async () => {
+    mockApi();
     renderProjectsPage();
 
-    expect(await screen.findByText("My Workspace")).toBeInTheDocument();
-    // Project names appear in both sidebar (recent) and project list
-    const brandItems = await screen.findAllByText("Brand System");
-    expect(brandItems.length).toBeGreaterThanOrEqual(1);
-    const redesignItems = await screen.findAllByText("App Redesign");
-    expect(redesignItems.length).toBeGreaterThanOrEqual(1);
+    // One delete affordance per card — apps/web/src/components/project-list.tsx:81
+    await waitFor(() => {
+      expect(screen.getAllByTestId("projects-card-delete")).toHaveLength(
+        projectsResponse.projects.length,
+      );
+    });
+
+    // Card title — apps/web/src/components/project-list.tsx:111
+    expect(screen.getByText("Brand System")).toBeInTheDocument();
+    expect(screen.getByText("App Redesign")).toBeInTheDocument();
+
+    // Each card links to its own primary canvas — project-list.tsx:75
+    const hrefs = screen.getAllByRole("link").map((a) => a.getAttribute("href"));
+    expect(hrefs).toContain("/canvas?id=c1");
+    expect(hrefs).toContain("/canvas?id=c2");
   });
 
-  it("shows empty state when no projects", async () => {
-    mockSuccessfulLoad({ projects: [] });
+  /**
+   * `ProjectList` has no dedicated empty-state element: with an empty array it
+   * renders the "+ 新建项目" card and zero project cards. That is the current
+   * behaviour, so it is what is asserted.
+   */
+  it("renders no project cards when the API returns none", async () => {
+    mockApi({ projects: { projects: [] } });
     renderProjectsPage();
 
-    expect(await screen.findByText(/no projects yet/i)).toBeInTheDocument();
+    // Heading — apps/web/src/components/project-list.tsx:32
+    expect(
+      await screen.findByRole("heading", { name: "项目" }),
+    ).toBeInTheDocument();
+    expect(screen.queryAllByTestId("projects-card-delete")).toHaveLength(0);
+    expect(screen.queryAllByRole("link")).toHaveLength(0);
   });
 
-  it("opens create dialog on + New Project click", async () => {
-    mockSuccessfulLoad();
+  /**
+   * There is no create dialog any more: the create card calls
+   * `useCreateProject().create()` straight away, which POSTs an "Untitled"
+   * project and then navigates to the new canvas.
+   */
+  it("creates an Untitled project and navigates to its canvas on create-card click", async () => {
+    mockApi();
+    const openSpy = stubWindowOpen();
     renderProjectsPage();
 
-    const button = await screen.findByRole("button", { name: /new project/i });
-    await userEvent.click(button);
-    expect(await screen.findByLabelText(/name/i)).toBeInTheDocument();
+    // Create card — apps/web/src/components/project-list.tsx:39
+    const createCard = await screen.findByRole("button", { name: /新建项目/ });
+    await userEvent.click(createCard);
+
+    // apps/web/src/hooks/use-create-project.ts:105
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/api/projects"),
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ name: "Untitled" }),
+        }),
+      );
+    });
+
+    // apps/web/src/hooks/use-create-project.ts:108-116
+    await waitFor(() => {
+      expect(mockPush).toHaveBeenCalledWith("/canvas?id=c-new");
+    });
+    openSpy.mockRestore();
   });
 
+  /**
+   * 401 from fetchViewer: `ApiAuthError` -> signOut + replace("/login").
+   *
+   * GET /api/projects must not fail in this case. The page loads both with
+   * `Promise.all` (app/(workspace)/projects/page.tsx:50-55); a non-401 failure
+   * from the parallel projects call rejects first and the catch sees an
+   * `ApiApplicationError` instead of the `ApiAuthError` under test.
+   */
   it("calls signOut and redirects on 401 from fetchViewer", async () => {
     mockFetch.mockImplementation((url: string) => {
       if (url.includes("/api/viewer")) {
-        return Promise.resolve({
-          ok: false, status: 401,
-          json: async () => ({ error: { code: "unauthorized", message: "Bad token" } }),
-        });
+        return Promise.resolve(
+          jsonFail(401, "unauthorized", "Bad token"),
+        );
       }
-      return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
+      if (url.includes("/api/projects")) {
+        return Promise.resolve(jsonOk(projectsResponse));
+      }
+      return Promise.resolve(jsonFail(404, "not_found", "Not found"));
     });
 
     renderProjectsPage();
@@ -155,23 +259,24 @@ describe("Projects page", () => {
     });
 
     renderProjectsPage();
+    // Banner text — app/(workspace)/projects/page.tsx:79
     expect(await screen.findByText(/failed to load/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    // Retry button — app/(workspace)/projects/page.tsx:80
+    expect(screen.getByTestId("projects-list-retry")).toBeInTheDocument();
     expect(mockReplace).not.toHaveBeenCalled();
   });
 
   it("calls signOut and redirects on 401 from fetchProjects", async () => {
     mockFetch.mockImplementation((url: string) => {
       if (url.includes("/api/viewer")) {
-        return Promise.resolve({ ok: true, status: 200, json: async () => viewerResponse });
+        return Promise.resolve(jsonOk(viewerResponse));
       }
       if (url.includes("/api/projects")) {
-        return Promise.resolve({
-          ok: false, status: 401,
-          json: async () => ({ error: { code: "unauthorized", message: "Bad token" } }),
-        });
+        return Promise.resolve(
+          jsonFail(401, "unauthorized", "Bad token"),
+        );
       }
-      return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
+      return Promise.resolve(jsonFail(404, "not_found", "Not found"));
     });
 
     renderProjectsPage();
@@ -181,68 +286,41 @@ describe("Projects page", () => {
     });
   });
 
-  it("shows inline error on 409 project_slug_taken during create", async () => {
-    mockSuccessfulLoad();
+  /**
+   * A failed create keeps the user on the page and surfaces `toastError`
+   * instead of an inline field error — apps/web/src/hooks/use-create-project.ts:127.
+   */
+  it("surfaces a toast on 409 project_slug_taken during create", async () => {
+    mockApi({
+      onCreate: () => jsonFail(409, "project_slug_taken", "Slug taken."),
+    });
+    const openSpy = stubWindowOpen();
     renderProjectsPage();
 
-    const newBtn = await screen.findByRole("button", { name: /new project/i });
-    await userEvent.click(newBtn);
+    const createCard = await screen.findByRole("button", { name: /新建项目/ });
+    await userEvent.click(createCard);
 
-    const nameInput = await screen.findByLabelText(/name/i);
-    await userEvent.type(nameInput, "Duplicate");
-
-    // Override fetch for the create call
-    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
-      if (url.includes("/api/projects") && init?.method === "POST") {
-        return Promise.resolve({
-          ok: false, status: 409,
-          json: async () => ({ error: { code: "project_slug_taken", message: "Slug taken." } }),
-        });
-      }
-      // Keep returning success for any background refetch
-      if (url.includes("/api/viewer")) {
-        return Promise.resolve({ ok: true, status: 200, json: async () => viewerResponse });
-      }
-      if (url.includes("/api/projects")) {
-        return Promise.resolve({ ok: true, status: 200, json: async () => projectsResponse });
-      }
-      return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
-    });
-
-    const submitBtn = screen.getByRole("button", { name: /create/i });
-    await userEvent.click(submitBtn);
-    expect(await screen.findByText(/already exists/i)).toBeInTheDocument();
+    const toast = await screen.findByTestId("toast-item");
+    // 文案来源：apps/web/src/hooks/use-create-project.ts:127
+    expect(toast).toHaveTextContent("项目创建失败");
+    expect(mockReplace).not.toHaveBeenCalled();
+    openSpy.mockRestore();
   });
 
-  it("shows inline error on 500 project_create_failed during create", async () => {
-    mockSuccessfulLoad();
+  it("surfaces a toast on 500 project_create_failed during create", async () => {
+    mockApi({
+      onCreate: () => jsonFail(500, "project_create_failed", "Create failed."),
+    });
+    const openSpy = stubWindowOpen();
     renderProjectsPage();
 
-    const newBtn = await screen.findByRole("button", { name: /new project/i });
-    await userEvent.click(newBtn);
+    const createCard = await screen.findByRole("button", { name: /新建项目/ });
+    await userEvent.click(createCard);
 
-    const nameInput = await screen.findByLabelText(/name/i);
-    await userEvent.type(nameInput, "Failing");
-
-    // Override fetch for the create call
-    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
-      if (url.includes("/api/projects") && init?.method === "POST") {
-        return Promise.resolve({
-          ok: false, status: 500,
-          json: async () => ({ error: { code: "project_create_failed", message: "Create failed." } }),
-        });
-      }
-      if (url.includes("/api/viewer")) {
-        return Promise.resolve({ ok: true, status: 200, json: async () => viewerResponse });
-      }
-      if (url.includes("/api/projects")) {
-        return Promise.resolve({ ok: true, status: 200, json: async () => projectsResponse });
-      }
-      return Promise.resolve({ ok: false, status: 404, json: async () => ({}) });
-    });
-
-    const submitBtn = screen.getByRole("button", { name: /create/i });
-    await userEvent.click(submitBtn);
-    expect(await screen.findByText(/failed to create/i)).toBeInTheDocument();
+    const toast = await screen.findByTestId("toast-item");
+    // 文案来源：apps/web/src/hooks/use-create-project.ts:127
+    expect(toast).toHaveTextContent("项目创建失败");
+    expect(mockReplace).not.toHaveBeenCalled();
+    openSpy.mockRestore();
   });
 });
