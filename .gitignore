@@ -66,3 +66,5 @@ docs/tech/replicate-models-pricing.md
 
 # local env backups (may contain secrets)
 .env*.bak*
+# local scratch: exec-tree working copies and ad-hoc probe scripts
+scripts/temp/
