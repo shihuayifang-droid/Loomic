@@ -14,6 +14,12 @@ import {
 
 const INPUT_NAME = "输入消息";
 
+/**
+ * 明确放宽 picker 的等待窗口：`@` 列表里的画布对象来自 Excalidraw 场景数据，
+ * 冷启动初始化可能超过 Playwright 默认 5s，靠默认值会偶发数到 0。
+ */
+const PICKER_TIMEOUT = 15_000;
+
 async function openCanvas(page: Page): Promise<ApiLog> {
   await seedSession(page);
   const log = await mockApi(page);
@@ -38,7 +44,9 @@ test("AG-02 验收1-a: 输入 / 出现技能列表，过滤与 Esc", async ({ pa
   }
 
   await page.keyboard.type("品牌");
-  await expect(page.getByTestId("canvas-image-picker-item")).toHaveCount(1);
+  await expect(page.getByTestId("canvas-image-picker-item")).toHaveCount(1, {
+    timeout: PICKER_TIMEOUT,
+  });
   await expect(page.getByTestId("canvas-image-picker-item").first()).toContainText("品牌海报");
 
   await page.keyboard.press("Escape");
@@ -53,14 +61,29 @@ test("AG-02 验收1-b: 输入 @ 出现分组，选中后插入胶囊", async ({ 
 
   // 组件实际渲染的 @ 分组是 画布对象 / 我的素材 / 模型（技能只走 `/`；
   // 「本轮已上传文件」这一组在 canvas-image-picker.tsx 里不存在，见回传「阻塞/偏差」）。
-  await expect(page.getByTestId("agent-mention-group").first()).toBeVisible();
+  await expect(page.getByTestId("agent-mention-group").first()).toBeVisible({
+    timeout: PICKER_TIMEOUT,
+  });
   const groups = page.getByTestId("agent-mention-group");
-  await expect(groups.filter({ hasText: "画布对象" })).toHaveCount(1);
-  await expect(groups.filter({ hasText: "我的素材" })).toHaveCount(1);
-  await expect(groups.filter({ hasText: "模型" })).toHaveCount(1);
-  await expect(groups.filter({ hasText: CANVAS_IMAGE_TITLE })).toHaveCount(1);
-  await expect(groups.filter({ hasText: BRAND_ASSET_NAME })).toHaveCount(1);
-  await expect(groups.filter({ hasText: MODEL_NAME })).toHaveCount(1);
+  // 每个分组各自依赖一份异步数据（画布对象 / 品牌素材 / 图片模型），逐个显式放宽窗口。
+  await expect(groups.filter({ hasText: "画布对象" })).toHaveCount(1, {
+    timeout: PICKER_TIMEOUT,
+  });
+  await expect(groups.filter({ hasText: "我的素材" })).toHaveCount(1, {
+    timeout: PICKER_TIMEOUT,
+  });
+  await expect(groups.filter({ hasText: "模型" })).toHaveCount(1, {
+    timeout: PICKER_TIMEOUT,
+  });
+  await expect(groups.filter({ hasText: CANVAS_IMAGE_TITLE })).toHaveCount(1, {
+    timeout: PICKER_TIMEOUT,
+  });
+  await expect(groups.filter({ hasText: BRAND_ASSET_NAME })).toHaveCount(1, {
+    timeout: PICKER_TIMEOUT,
+  });
+  await expect(groups.filter({ hasText: MODEL_NAME })).toHaveCount(1, {
+    timeout: PICKER_TIMEOUT,
+  });
 
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("Enter");
@@ -76,13 +99,24 @@ test("AG-02 验收2: 拖 PNG 到对话区出现附件，画布对象数不变", 
   // 拖放前先数画布对象：@ 列表里「画布对象」组的条目数。
   await input(page).click();
   await page.keyboard.type("@");
-  const canvasItems = page
+  // 「画布对象」分组在 section 为空时整组不渲染（canvas-image-picker.tsx）
+  // 且 picker 只在 items 非空时挂载（chat-sidebar.tsx），所以「分组可见」
+  // 等价于「画布对象数据已到」；先等分组出现，再数条目。
+  const canvasGroup = page
     .getByTestId("agent-mention-group")
-    .filter({ hasText: "画布对象" })
-    .getByTestId("canvas-image-picker-item");
-  await expect(canvasItems).toHaveCount(1);
+    .filter({ hasText: "画布对象" });
+  await expect(canvasGroup).toBeVisible({ timeout: PICKER_TIMEOUT });
+  const canvasItems = canvasGroup.getByTestId("canvas-image-picker-item");
+  await expect(canvasItems).toHaveCount(1, { timeout: PICKER_TIMEOUT });
+  // 关闭面板并把输入框里的 "@" 真的清掉：chat-input 会把「Esc 关闭时的那段文本」
+  // 记成 dismissed（chat-input.tsx:191-241），输入框里若还留着同一个 "@"，
+  // 下一次输入 "@" 会被当成「刚被关掉的那一次」而不弹面板 —— 后面第 2 次打开
+  // 就会一直等不到分组。Esc 之后焦点也可能已不在输入框上，Backspace 会落空，
+  // 所以先点回输入框，再确认文本确实清空。
   await page.keyboard.press("Escape");
+  await input(page).click();
   await page.keyboard.press("Backspace");
+  await expect(input(page)).not.toContainText("@", { timeout: PICKER_TIMEOUT });
 
   const savesBefore = log.filter((e) => e.method === "PUT" && e.path.startsWith("/api/canvases/")).length;
   const uploadsBefore = log.filter((e) => e.method === "POST" && e.path === "/api/uploads").length;
@@ -115,7 +149,8 @@ test("AG-02 验收2: 拖 PNG 到对话区出现附件，画布对象数不变", 
   // 画布对象数不变：@ 列表里的画布对象仍是 1 个，且没有任何画布保存请求。
   await input(page).click();
   await page.keyboard.type("@");
-  await expect(canvasItems).toHaveCount(1);
+  await expect(canvasGroup).toBeVisible({ timeout: PICKER_TIMEOUT });
+  await expect(canvasItems).toHaveCount(1, { timeout: PICKER_TIMEOUT });
   await page.keyboard.press("Escape");
   expect(log.filter((e) => e.method === "PUT" && e.path.startsWith("/api/canvases/")).length).toBe(savesBefore);
 });
