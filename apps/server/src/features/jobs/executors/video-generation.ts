@@ -172,7 +172,7 @@ registerExecutor("video_generation", async (jobId, _rawPayload, ctx: ExecutorCon
       }
     }
 
-    const signedUrl = await signProjectAssetUrl(admin, objectPath);
+    const signedUrl = await signProjectAssetUrl(objectStore, objectPath);
 
     lap("total");
     // GN-02 (5): see the image executor — the result lists its artifacts, and a

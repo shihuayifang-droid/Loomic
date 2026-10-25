@@ -224,7 +224,7 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     // its admin client: it just recorded ownership of this object itself, and the
     // URL is a convenience for the job's consumer — `object_path` and `asset_id`
     // remain the stable identity.
-    const signedUrl = await signProjectAssetUrl(admin, objectPath);
+    const signedUrl = await signProjectAssetUrl(objectStore, objectPath);
 
     lap("total");
     // GN-02 (5): the result also lists its artifacts. One job produces one

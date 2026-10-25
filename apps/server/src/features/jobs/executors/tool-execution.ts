@@ -174,7 +174,7 @@ registerExecutor("tool_execution", async (jobId, _rawPayload, ctx: ExecutorConte
       }
     }
 
-    const signedUrl = await signProjectAssetUrl(admin, objectPath);
+    const signedUrl = await signProjectAssetUrl(objectStore, objectPath);
 
     return {
       asset_id: assetId,

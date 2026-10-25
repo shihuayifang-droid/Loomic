@@ -219,6 +219,22 @@ function onlyPut(store: ObjectStore | null) {
 }
 
 /**
+ * T-133 (9th slice): the single signature the executor asked the store for, or a
+ * loud failure when it asked for none. The signature used to travel through the
+ * admin client's `storage`, so the cases assert the store received it instead.
+ */
+function onlySignedReadUrl(store: ObjectStore | null) {
+  if (!store) throw new Error("the context carried no objectStore");
+  const call = (store as FakeObjectStore).calls.find(
+    (entry) => entry.method === "signedReadUrl",
+  );
+  if (call?.method !== "signedReadUrl") {
+    throw new Error("the object store received no signedReadUrl call");
+  }
+  return call;
+}
+
+/**
  * The executor's ONLY source of a job row. Workorder 21N moved that read onto
  * `JobService.getJobAdmin`, so the substitute carries exactly that one method and
  * the case hands it the row it wants the executor to see. Everything else on
@@ -386,12 +402,17 @@ describe("generation executors record project asset ownership", () => {
     const result = await getExecutor("image_generation")!("job-1b", {}, ctx);
 
     // X-52: the worker signs what it just recorded. A permanent public URL here
-    // would survive the bucket going private as a dead link.
-    expect(String(result.signed_url)).toContain("token=sig");
+    // would survive the bucket going private as a dead link. T-133 (9th slice):
+    // the signature goes through the injected store, so the key it was handed is
+    // what this case asserts on — and the admin client signs nothing.
+    const key = onlyPut(ctx.store).ref.key;
+    expect(String(result.signed_url)).toContain("?ttl=3600");
     expect(String(result.signed_url)).not.toContain("cdn.test");
-    expect(admin.signCalls).toEqual([
-      { bucket: "project-assets", path: onlyPut(ctx.store).ref.key, expiresIn: 3600 },
-    ]);
+    expect(onlySignedReadUrl(ctx.store)).toMatchObject({
+      ref: { bucket: "project-assets", key },
+      options: { ttlSeconds: 3600 },
+    });
+    expect(admin.signCalls).toHaveLength(0);
   });
 
   it("case 2: the video executor does the same for video objects", async () => {
@@ -420,12 +441,16 @@ describe("generation executors record project asset ownership", () => {
     expect(admin.uploads).toHaveLength(0);
     expect(admin.records[0]?.objectPath).toBe(put.ref.key);
 
-    // X-52: the video's job result is signed too — same rule as the image.
-    expect(String(result.signed_url)).toContain("token=sig");
+    // X-52: the video's job result is signed too — same rule as the image, and
+    // since the 9th slice the same injected store produces the signature.
+    const videoKey = put.ref.key;
+    expect(String(result.signed_url)).toContain("?ttl=3600");
     expect(String(result.signed_url)).not.toContain("cdn.test");
-    expect(admin.signCalls).toEqual([
-      { bucket: "project-assets", path: put.ref.key, expiresIn: 3600 },
-    ]);
+    expect(onlySignedReadUrl(ctx.store)).toMatchObject({
+      ref: { bucket: "project-assets", key: videoKey },
+      options: { ttlSeconds: 3600 },
+    });
+    expect(admin.signCalls).toHaveLength(0);
   });
 
   it("case 3: billing stays personal while ownership follows the team project", async () => {
@@ -771,7 +796,8 @@ describe("GN-02: a finished job result lists its artifacts", () => {
     );
 
     expect(result.asset_id).toBe("asset-1");
-    expect(String(result.signed_url)).toContain("token=sig");
+    // T-133 (9th slice): a signature is still produced, now through the store.
+    expect(String(result.signed_url)).toContain("?ttl=3600");
     expect(result.object_path).toBe(onlyPut(ctx.store).ref.key);
     expect(result.width).toBe(1024);
     expect(result.height).toBe(1024);
