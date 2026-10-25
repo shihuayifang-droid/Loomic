@@ -227,7 +227,6 @@ import { registerFontsRoutes } from "./http/fonts.js";
 import { registerJobRoutes } from "./http/jobs.js";
 import { createObjectStore } from "./features/storage/object-store-factory.js";
 import { objectUrlSecretFrom } from "./features/storage/object-url-signature.js";
-import { createObjectStoreStorageClient } from "./features/storage/object-store-storage-client.js";
 // 45AH / T-133 (2nd slice): the backend behind the brand kit's storage seam is
 // named HERE, at the assembly point — `brand-kit-service.ts` no longer imports an
 // adapter of its own.
@@ -404,9 +403,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       viewerService,
     });
   });
-  // Workorder 45C: with the file volume as the storage backend there is no
-  // hosted storage client at all, so the services get an adapter that sends every
-  // bucket call to the volume. The same store also serves the `/objects` route.
+  // Workorder 45C, re-shaped by 45BM / T-133 (10b): with the file volume as the
+  // storage backend there is no hosted storage client at all, so every service
+  // below is handed the volume store ITSELF, as a factory that ignores the
+  // caller's token. The same store also serves the `/objects` route.
   const fsStore =
     env.storageProvider === "fs"
       ? createObjectStore(env, {
@@ -415,23 +415,34 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           },
         })
       : undefined;
-  const fsStorageClient = fsStore
-    ? createObjectStoreStorageClient(fsStore)
-    : undefined;
+  // 45BM / T-133 (10b): in `fs` mode no service needs a Supabase-SHAPED client any
+  // more — the store factories below hand out the volume store, and the two
+  // consumers that used to take a client (job-service, the Agent runtime) no
+  // longer receive one. The two stubs stay only because the option types still
+  // name those fields (`getAdminClient` is REQUIRED by job-service); both throw,
+  // so an assembly that ever reaches them fails loudly instead of quietly talking
+  // to the wrong backend.
   const createUserClient =
     options.createUserClient ??
-    (fsStorageClient
-      ? (_accessToken: string) =>
-          fsStorageClient as unknown as UserSupabaseClient
+    (fsStore
+      ? (_accessToken: string): UserSupabaseClient => {
+          throw new Error(
+            "fs mode has no user-scoped Supabase client; reaching this is an assembly error",
+          );
+        }
       : createUserSupabaseClientFactory(env));
   let adminClient:
     | ReturnType<typeof createAdminSupabaseClient>
     | undefined;
   const getAdminClient = () => {
-    if (fsStorageClient) {
-      return fsStorageClient as unknown as ReturnType<
-        typeof createAdminSupabaseClient
-      >;
+    if (fsStore) {
+      // `job-service.ts` declares `getAdminClient` as required but never reads it
+      // (the field at job-service.ts:171 is its only occurrence in that file), so
+      // in `fs` mode this is a stub that throws: if it is ever called, the
+      // assembly is wrong.
+      throw new Error(
+        "fs mode has no hosted admin client; if this is reached the assembly is wrong",
+      );
     }
     adminClient ??= createAdminSupabaseClient(env);
     return adminClient;
@@ -653,10 +664,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       // client it wraps is already the volume adapter, so the wrap is the same one
       // the service applied before — 10a is a signature change only, the two
       // backends behave exactly as they did.
-      createObjectStore: (accessToken) =>
-        createSupabaseObjectStore(
-          createUserClient(accessToken) as unknown as SupabaseStorageLike,
-        ),
+      createObjectStore: fsStore
+        ? () => fsStore!
+        : (accessToken) =>
+            createSupabaseObjectStore(
+              createUserClient(accessToken) as unknown as SupabaseStorageLike,
+            ),
       viewerService,
       assetRecordRepository,
       projectReadRepository,
@@ -709,10 +722,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       // is named, and in `fs` mode the client it wraps is already the volume
       // adapter, so the wrap is the same one the service applied before — 10a is a
       // signature change only, the two backends behave exactly as they did.
-      createObjectStore: (accessToken) =>
-        createSupabaseObjectStore(
-          createUserClient(accessToken) as unknown as SupabaseStorageLike,
-        ),
+      createObjectStore: fsStore
+        ? () => fsStore!
+        : (accessToken) =>
+            createSupabaseObjectStore(
+              createUserClient(accessToken) as unknown as SupabaseStorageLike,
+            ),
       brandKitReadRepository,
       brandKitWriteRepository: createBrandKitWriteRepository({
         getTransactionPool: () => getTransactionPool(databaseEnv),
@@ -737,10 +752,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       // named, and in `fs` mode the client it wraps is already the volume adapter,
       // so the wrap is the same one the service applied before — 10a is a
       // signature change only, the two backends behave exactly as they did.
-      createObjectStore: (accessToken) =>
-        createSupabaseObjectStore(
-          createUserClient(accessToken) as unknown as SupabaseStorageLike,
-        ),
+      createObjectStore: fsStore
+        ? () => fsStore!
+        : (accessToken) =>
+            createSupabaseObjectStore(
+              createUserClient(accessToken) as unknown as SupabaseStorageLike,
+            ),
       assetRecordRepository,
       canvasReadRepository,
       canvasContentRepository,
@@ -762,10 +779,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       // volume adapter, so the wrap is the same one the service applied before —
       // 10a is a signature change only, the two backends behave exactly as they
       // did.
-      createObjectStore: (accessToken) =>
-        createSupabaseObjectStore(
-          createUserClient(accessToken) as unknown as SupabaseStorageLike,
-        ),
+      createObjectStore: fsStore
+        ? () => fsStore!
+        : (accessToken) =>
+            createSupabaseObjectStore(
+              createUserClient(accessToken) as unknown as SupabaseStorageLike,
+            ),
       chatReadRepository,
       chatWriteRepository,
       chatSessionWriteRepository,
@@ -823,10 +842,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       // and in `fs` mode the client it wraps is already the volume adapter, so the
       // wrap is the same one the service applied before — 10a is a signature
       // change only, the two backends behave exactly as they did.
-      createObjectStore: (accessToken) =>
-        createSupabaseObjectStore(
-          createUserClient(accessToken) as unknown as SupabaseStorageLike,
-        ),
+      createObjectStore: fsStore
+        ? () => fsStore!
+        : (accessToken) =>
+            createSupabaseObjectStore(
+              createUserClient(accessToken) as unknown as SupabaseStorageLike,
+            ),
       assetRecordRepository,
       projectReadRepository,
       assetReadRepository,
@@ -838,7 +859,11 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     options.jobService ??
     (pgmq
       ? createJobService({
-          createUserClient,
+          // 45BM / T-133 (10b): `createUserClient` is OPTIONAL there and the
+          // service no longer uses it, so `fs` mode (which has no such client)
+          // just omits it. `getAdminClient` is required, and in `fs` mode it is
+          // the throwing stub above — the service never reads it.
+          ...(fsStore ? {} : { createUserClient }),
           getAdminClient,
           pgmq,
           jobAttemptRepository,
@@ -1087,7 +1112,12 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     // Workorder 44X: inspect_canvas / manipulate_canvas read and write through it.
     canvasContentRepository,
     connectionManager,
-    createUserClient,
+    // 45BM / T-133 (10b): `createUserClient` is OPTIONAL on the runtime
+    // (runtime.ts:552) and every use of it is behind a truthiness guard
+    // (`options.createUserClient && …`, runtime.ts:915/941/1093/1176/2044/2134/
+    // 2273), so `fs` mode must OMIT the field rather than pass a throwing stub —
+    // a stub would satisfy the guard and then be CALLED.
+    ...(fsStore ? {} : { createUserClient }),
     // 45AM / T-133 (6a): the same factory form brand-kit (45AH), uploads (45AI),
     // canvas (45AJ) and projects (45AK) take above. Transmitted only — nothing
     // on this path reads it yet; 6b is where agent-project-assets consumes it.

@@ -1020,7 +1020,10 @@ describe("audit-supabase-dependencies: real repository root", () => {
     // fixtures above are assembled the same way (`UNTYPED_FROM_CALL`), so a
     // literal token there cannot inflate this counter either - the two server
     // counters below still agree exactly.
-    expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(1);
+    // Ticket 45BN (T-133 10b): the storage seam stopped handing out Supabase
+    // clients, so this test-scope counter really dropped 1 -> 0. Still pinned
+    // with an exact equality, only at the new (lower) value.
+    expect(metricValue(run.stdout, "server.testSupabaseSdkImportHits")).toBe(0);
     // 43J: the brand kit goes through the ObjectStore adapter; the rest are one-off CLIs.
     expect(metricValue(run.stdout, "server.fromCallsIncludingTests")).toBe(
       baseline.metrics["server.fromCallsIncludingTests"],
@@ -1074,7 +1077,9 @@ describe("audit-supabase-dependencies: real repository root", () => {
       baseline.metrics["server.storageCalls"],
     );
     expect(metricValue(run.stdout, "server.authGetUserCalls")).toBe(1);
-    expect(metricValue(run.stdout, "server.supabaseSdkImportHits")).toBe(3);
+    // Ticket 45BN (T-133 10b): two supabase-js imports disappeared from the
+    // server scope (3 -> 2) for the same reason as the test counter above.
+    expect(metricValue(run.stdout, "server.supabaseSdkImportHits")).toBe(2);
   }, AUDIT_TEST_TIMEOUT_MS);
 
   it("baseline fromCalls / rpcCallsRuntime / storageCalls equal the measured values", () => {
