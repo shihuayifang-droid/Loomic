@@ -38,6 +38,8 @@ import {
   createAgentProjectAssetService,
   sanitizeAgentFileName,
 } from "./agent-project-assets.js";
+import { ObjectStoreError } from "./object-store.js";
+import { PROJECT_ASSET_URL_TTL_SECONDS } from "./project-asset-urls.js";
 
 const WORKSPACE = "ws-team";
 const CANVAS = "canvas-1";
@@ -89,6 +91,14 @@ function makeHarness(options: {
     contentType?: string;
   }[] = [];
   const factoryDeletes: { bucket: string; key: string }[] = [];
+  // T-133 slice 9: what the supplied store was asked to SIGN. The observation
+  // point of the signing step moved here with the call: the factory's store is
+  // now the thing that mints the URL when a factory is supplied.
+  const factorySigns: {
+    bucket: string;
+    key: string;
+    ttlSeconds: number;
+  }[] = [];
   const factoryStore = {
     async put(
       ref: { bucket: string; key: string },
@@ -118,8 +128,25 @@ function makeHarness(options: {
     async copy(): Promise<never> {
       throw new Error("ObjectStore.copy is not used by this path");
     },
-    async signedReadUrl(): Promise<never> {
-      throw new Error("ObjectStore.signedReadUrl is not used by this path");
+    async signedReadUrl(
+      ref: { bucket: string; key: string },
+      signOptions: { ttlSeconds: number },
+    ): Promise<string> {
+      // T-133 slice 9: the signature now arrives here when a factory supplied
+      // this store, so the case records the ref and TTL it was handed instead of
+      // failing as an unreachable method.
+      factorySigns.push({
+        bucket: ref.bucket,
+        key: ref.key,
+        ttlSeconds: signOptions.ttlSeconds,
+      });
+      if (options.signError) {
+        throw new ObjectStoreError(
+          "backend_failed",
+          `Could not sign the stored object (${options.signError.message}).`,
+        );
+      }
+      return `https://proj.test/storage/v1/object/sign/${ref.bucket}/${ref.key}?token=store-sig`;
     },
     async signedReadUrls(): Promise<never> {
       throw new Error("ObjectStore.signedReadUrls is not used by this path");
@@ -257,6 +284,7 @@ function makeHarness(options: {
     factoryClients,
     factoryPuts,
     factoryDeletes,
+    factorySigns,
   };
 }
 
@@ -535,7 +563,21 @@ describe("agent project asset persistence (T1)", () => {
     // Everything after the upload is unchanged — same identity, same read.
     expect(result.bucket).toBe("project-assets");
     expect(result.byteSize).toBe(PNG.length);
-    expect(h.signedPaths()).toEqual([result.objectPath]);
+    // T-133 slice 9: the SIGNATURE also goes through the factory's store, so the
+    // read follows the write across a backend swap. The ref and the TTL it was
+    // handed are what the call always asked for; only the receiver changed.
+    expect(h.factorySigns).toEqual([
+      {
+        bucket: "project-assets",
+        key: result.objectPath,
+        ttlSeconds: PROJECT_ASSET_URL_TTL_SECONDS,
+      },
+    ]);
+    // ...and the URL handed back is still a URL for this very object.
+    expect(result.signedUrl).toContain(result.objectPath);
+    // The adapter path signed nothing either: the client's own storage surface
+    // was never reached for a signature.
+    expect(h.signedPaths()).toHaveLength(0);
     expect(h.records).toHaveLength(1);
   });
 
@@ -565,6 +607,36 @@ describe("agent project asset persistence (T1)", () => {
 
     expect(h.factoryPuts).toHaveLength(1);
     // The object removed is the one this store wrote — not looked up elsewhere.
+    expect(h.factoryDeletes).toEqual([
+      { bucket: "project-assets", key: h.factoryPuts[0]?.key },
+    ]);
+    expect(h.removes).toHaveLength(0);
+  });
+
+  it("case 16: with a factory, a refused signature still undoes BOTH halves", async () => {
+    const h = makeHarness({
+      signError: { message: "permission denied" },
+      withFactory: true,
+    });
+
+    const error = await refusal(persist(h));
+
+    // T-133 slice 9: the same `sign_failed` contract, now reached through the
+    // factory's store rather than through the caller's client.
+    expect(error.code).toBe("sign_failed");
+    expect(error.message).toContain("permission denied");
+    expect(h.factorySigns).toEqual([
+      {
+        bucket: "project-assets",
+        key: h.factoryPuts[0]?.key,
+        ttlSeconds: PROJECT_ASSET_URL_TTL_SECONDS,
+      },
+    ]);
+    // No URL was produced, so none can be handed back or rolled back.
+    expect(h.signedPaths()).toHaveLength(0);
+    // Cleanup semantics unchanged: the row first, then the bytes the same store
+    // wrote. Nothing half-created survives a refusal to sign.
+    expect(h.metadataDeletes).toEqual([{ actorId: USER, assetId: "asset-1" }]);
     expect(h.factoryDeletes).toEqual([
       { bucket: "project-assets", key: h.factoryPuts[0]?.key },
     ]);

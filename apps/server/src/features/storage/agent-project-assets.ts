@@ -194,6 +194,12 @@ export function createAgentProjectAssetService(options: {
       }
 
       const client = options.createUserClient(input.accessToken);
+      // T-133 slice 9: resolve the store ONCE for this operation and let BOTH
+      // the upload and the signature below speak the same seam. Signing used to
+      // reach the caller's Supabase client directly, which made it the last step
+      // in this file that could not follow a backend swap — the store was
+      // already in hand three lines up, it just was not handed over.
+      const store = storeFrom(client, options.createObjectStore);
       const workspaceId = await resolveCanvasWorkspaceId(
         options.canvasReadRepository,
         { actorId: input.createdBy, canvasId },
@@ -217,7 +223,7 @@ export function createAgentProjectAssetService(options: {
       // client. 43G: the write goes through the `ObjectStore` seam; the message
       // keeps the backend's own text, read off the adapter's `detail`.
       try {
-        await storeFrom(client, options.createObjectStore).put(
+        await store.put(
           { bucket: PROJECT_ASSET_BUCKET, key: objectPath },
           buffer,
           { contentType: input.mimeType, upsert: false },
@@ -284,9 +290,13 @@ export function createAgentProjectAssetService(options: {
 
       // Sign for THIS read. No public-URL fallback: a signature that cannot be
       // minted is an error the caller sees, not a silent degradation.
+      // T-133 slice 9: signed through the SAME store that wrote the bytes (which
+      // is the caller's factory when one was supplied), so the read follows the
+      // write across a backend swap. Bucket and TTL are the ones this call always
+      // asked for; only the receiver changed.
       let signedUrl: string;
       try {
-        signedUrl = await signProjectAssetUrl(client, objectPath, {
+        signedUrl = await signProjectAssetUrl(store, objectPath, {
           bucket: PROJECT_ASSET_BUCKET,
         });
       } catch (error) {
