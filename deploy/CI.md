@@ -64,6 +64,16 @@ stage('Unit tests') {
 - `environment`：`CI=true`、`NEXT_PUBLIC_HAHART_AUTH_PROVIDER=self`、`NEXT_PUBLIC_SERVER_BASE_URL=http://127.0.0.1:3001`
 - `post { always { ... } }` 只打印 `job / build / result` 三件事，不放任何凭据。
 
+### 邮件环境变量 `HAHART_MAIL_FROM`（U-28 发件人，工单 45D9）
+
+`HAHART_MAIL_FROM=` —— 发件人地址，交给 `apps/server/src/features/notifications/mailer.ts` 的 http 传输：
+配了就在 POST body 里加一个 `from` 字段，不配则 body 与 45D9 之前逐字一致（老网关不受影响）。它**不参与**
+「是否走 http 传输」的判定，那个判定仍只看 `HAHART_MAIL_API_URL` + `HAHART_MAIL_API_TOKEN`。
+
+**本流水线不设置它**：CI 里 `HAHART_MAIL_API_URL` / `HAHART_MAIL_API_TOKEN` 都没设，mailer 是 `noop`，不发任何信。
+需要真发信的部署（Resend 的 `POST /emails` 缺 `from` 会 422）在容器环境里配
+`HAHART_MAIL_FROM=noreply@hahart.design`；域名验证完成前先用 `onboarding@resend.dev` 做通道验证。
+
 ### 每步对应哪个需求
 
 | Stage | 对应需求项 | 说明 |

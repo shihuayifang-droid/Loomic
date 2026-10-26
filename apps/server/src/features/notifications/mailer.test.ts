@@ -5,6 +5,7 @@ import {
   createMailerFromEnv,
   MAIL_API_TOKEN_ENV,
   MAIL_API_URL_ENV,
+  MAIL_FROM_ENV,
   MAIL_REQUEST_TIMEOUT_MS,
   type MailMessage,
 } from "./mailer.js";
@@ -140,5 +141,94 @@ describe("BR-09 mailer: http", () => {
 
     expect(calls).toHaveLength(2);
     expect(JSON.parse(String(calls[1]?.init?.body))).toMatchObject({ to: "other@example.com" });
+  });
+});
+
+/**
+ * Workorder 45D9: Resend's `POST /emails` answers 422 without a `from`, so the
+ * optional sender travels in the body. The two cases that matter are "set adds
+ * exactly one field" and "unset changes nothing at all".
+ */
+describe("45D9 mailer: from", () => {
+  const URL = "https://gateway.example.com/mail";
+  const TOKEN = "secret";
+  const FROM = "noreply@hahart.design";
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("45D9: a configured from is added to the JSON body", async () => {
+    const calls = stubFetch(() => new Response("", { status: 200 }));
+    const mailer = createMailer({ url: URL, token: TOKEN, from: FROM });
+
+    await expect(mailer.send(MESSAGE)).resolves.toBeUndefined();
+
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
+      from: FROM,
+      to: MESSAGE.to,
+      subject: MESSAGE.subject,
+      html: MESSAGE.html,
+      text: MESSAGE.text,
+    });
+  });
+
+  it("45D9: the environment helper passes HAHART_MAIL_FROM through to the body", async () => {
+    const calls = stubFetch(() => new Response("", { status: 200 }));
+    const mailer = createMailerFromEnv({
+      [MAIL_API_URL_ENV]: URL,
+      [MAIL_API_TOKEN_ENV]: TOKEN,
+      [MAIL_FROM_ENV]: FROM,
+    });
+
+    expect(mailer.kind).toBe("http");
+
+    await mailer.send(MESSAGE);
+
+    expect(JSON.parse(String(calls[0]?.init?.body))).toMatchObject({ from: FROM });
+  });
+
+  it("45D9: without from the body is byte-identical to the pre-45D9 body", async () => {
+    const calls = stubFetch(() => new Response("", { status: 200 }));
+    const mailer = createMailer({ url: URL, token: TOKEN });
+
+    await mailer.send(MESSAGE);
+
+    const sent = JSON.parse(String(calls[0]?.init?.body)) as Record<string, unknown>;
+
+    expect(Object.keys(sent)).toEqual(["to", "subject", "html", "text"]);
+    expect(sent).not.toHaveProperty("from");
+    expect(String(calls[0]?.init?.body)).toBe(
+      JSON.stringify({
+        to: MESSAGE.to,
+        subject: MESSAGE.subject,
+        html: MESSAGE.html,
+        text: MESSAGE.text,
+      }),
+    );
+  });
+
+  it("45D9: a blank from is treated as unset, not as an empty sender", async () => {
+    const calls = stubFetch(() => new Response("", { status: 200 }));
+
+    await createMailer({ url: URL, token: TOKEN, from: "   " }).send(MESSAGE);
+    await createMailerFromEnv({
+      [MAIL_API_URL_ENV]: URL,
+      [MAIL_API_TOKEN_ENV]: TOKEN,
+      [MAIL_FROM_ENV]: "  ",
+    }).send(MESSAGE);
+
+    expect(calls).toHaveLength(2);
+
+    for (const call of calls) {
+      expect(JSON.parse(String(call.init?.body))).not.toHaveProperty("from");
+    }
+  });
+
+  it("45D9: from alone does not make the mailer http", () => {
+    expect(createMailer({ from: FROM }).kind).toBe("noop");
+    expect(createMailerFromEnv({ [MAIL_FROM_ENV]: FROM }).kind).toBe("noop");
   });
 });

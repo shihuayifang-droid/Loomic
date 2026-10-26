@@ -17,8 +17,17 @@
  * behind it must accept `{ to, subject, html, text }` and answer 2xx. Resend,
  * Alibaba Cloud DirectMail (邮件推送) and friends each get a thin adapter on the
  * gateway side, so this server never learns a provider's schema and a provider
- * swap stays a config change. Anything the provider needs beyond those four
- * fields (a from-address, a template id, signing) belongs to that adapter.
+ * swap stays a config change.
+ *
+ * THE ONE EXCEPTION IS THE SENDER ADDRESS (U-28, workorder 45D9)
+ * Resend's `POST /emails` rejects a request that has no `from` (422), so a
+ * from-address cannot stay purely on the adapter side. It is therefore an
+ * opaque, optional string taken from `HAHART_MAIL_FROM`: when it is set the
+ * body gains a `from` field, when it is not the body is byte-for-byte what it
+ * always was (older gateways that reject unknown fields keep working). The
+ * value itself is not interpreted here — no default, no address validation, no
+ * vendor knowledge. Anything else a provider needs (a template id, signing)
+ * still belongs to the adapter.
  *
  * FAILURE POLICY
  * A non-2xx response from a configured gateway is a configuration or provider
@@ -31,6 +40,12 @@ export const MAIL_API_URL_ENV = "HAHART_MAIL_API_URL";
 
 /** Environment variable holding the gateway bearer token. */
 export const MAIL_API_TOKEN_ENV = "HAHART_MAIL_API_TOKEN";
+
+/**
+ * Environment variable holding the optional sender address (U-28 / workorder
+ * 45D9). Unset means "send no `from` field at all", not "send a default".
+ */
+export const MAIL_FROM_ENV = "HAHART_MAIL_FROM";
 
 /** Ticket contract: a configured gateway gets ten seconds, then the request is aborted. */
 export const MAIL_REQUEST_TIMEOUT_MS = 10_000;
@@ -50,6 +65,11 @@ export interface Mailer {
 export type MailerEnv = {
   url?: string;
   token?: string;
+  /**
+   * Optional sender. Absent/blank leaves the body exactly as it was before
+   * workorder 45D9; present adds one `from` field (see `MAIL_FROM_ENV`).
+   */
+  from?: string;
 };
 
 function configured(value: string | undefined): string | undefined {
@@ -73,22 +93,31 @@ function createNoopMailer(): Mailer {
 }
 
 /** The configured transport: one JSON POST per message, ten-second ceiling. */
-function createHttpMailer(url: string, token: string): Mailer {
+function createHttpMailer(url: string, token: string, from: string | undefined): Mailer {
   return {
     kind: "http",
     async send(msg: MailMessage): Promise<void> {
+      const body: Record<string, string> = {
+        to: msg.to,
+        subject: msg.subject,
+        html: msg.html,
+        text: msg.text,
+      };
+
+      // Only when configured: an unconditional `from: undefined` would drop the
+      // key anyway, but keeping the branch explicit is what makes the "unset
+      // means byte-identical body" promise reviewable.
+      if (from !== undefined) {
+        body.from = from;
+      }
+
       const response = await fetch(url, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({
-          to: msg.to,
-          subject: msg.subject,
-          html: msg.html,
-          text: msg.text,
-        }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(MAIL_REQUEST_TIMEOUT_MS),
       });
 
@@ -102,27 +131,31 @@ function createHttpMailer(url: string, token: string): Mailer {
 /**
  * Pick a transport from explicit configuration. `url` and `token` are both
  * required for the HTTP transport: a half-configured gateway falls back to
- * `noop` rather than sending unauthenticated requests somewhere.
+ * `noop` rather than sending unauthenticated requests somewhere. `from` is
+ * optional and never changes which transport is picked — it only annotates the
+ * body of a transport that is already going to send.
  */
 export function createMailer(env: MailerEnv): Mailer {
   const url = configured(env.url);
   const token = configured(env.token);
+  const from = configured(env.from);
 
   if (url === undefined || token === undefined) {
     return createNoopMailer();
   }
 
-  return createHttpMailer(url, token);
+  return createHttpMailer(url, token, from);
 }
 
-/** `createMailer` reading the two documented variables out of an environment. */
+/** `createMailer` reading the documented variables out of an environment. */
 export function createMailerFromEnv(source: NodeJS.ProcessEnv = process.env): Mailer {
   const url = configured(source[MAIL_API_URL_ENV]);
   const token = configured(source[MAIL_API_TOKEN_ENV]);
+  const from = configured(source[MAIL_FROM_ENV]);
 
   if (url === undefined || token === undefined) {
     return createMailer({});
   }
 
-  return createMailer({ url, token });
+  return createMailer({ url, token, ...(from === undefined ? {} : { from }) });
 }
