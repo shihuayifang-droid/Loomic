@@ -55,11 +55,17 @@ pipeline {
         // would make CI permanently red. See deploy/CI.md for the debt + plan.
         stage('Unit tests') {
             steps {
-                // Run files serially: on the .37 Windows node, file parallelism
-                // makes the vitest worker->main IPC time out ("Timeout calling
-                // \"onTaskUpdate\"") and fails the stage even when every test
-                // passes. See deploy/CI.md.
-                sh 'pnpm --filter @loomic/server test -- --no-file-parallelism'
+                // Call the vitest binary directly instead of going through
+                // `pnpm --filter @loomic/server test`: the CI pnpm version does
+                // not forward `-- <args>` correctly and leaks a literal `--`
+                // into vitest's argv (ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL,
+                // build 12). See deploy/CI.md.
+                // Also force the forks pool with a single fork: on the .37
+                // Windows node the default `threads` pool still times out on
+                // the worker->main IPC ("Timeout calling \"onTaskUpdate\"")
+                // even with file parallelism off, failing the stage while every
+                // test passes. See deploy/CI.md.
+                sh 'cd apps/server && pnpm exec vitest run --no-file-parallelism --pool=forks --poolOptions.forks.singleFork'
             }
         }
 

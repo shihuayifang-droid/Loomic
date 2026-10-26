@@ -13,14 +13,31 @@
 | 1 | Install | `pnpm install --frozen-lockfile` |
 | 2 | Build shared | `pnpm --filter @loomic/shared build` |
 | 3 | Typecheck | `pnpm --filter @loomic/server typecheck` **且** `pnpm --filter @loomic/web exec tsc --noEmit` |
-| 4 | Unit tests | `pnpm --filter @loomic/server test -- --no-file-parallelism` |
+| 4 | Unit tests | `cd apps/server && pnpm exec vitest run --no-file-parallelism --pool=forks --poolOptions.forks.singleFork` |
 | 5 | Invariants | `node scripts/check-invariants.mjs --allow-skips` |
 | 6 | Web build + E2E | `pnpm --filter @loomic/web build` → `pnpm --filter @loomic/web e2e` |
 
-> **Unit tests 为什么串行（`--no-file-parallelism`）**：`.37` 这台 Windows 节点上，vitest 的文件并行会触发
-> worker→主进程 IPC 超时（`Error: [vitest-worker]: Timeout calling "onTaskUpdate"`），表现为「用例全过但构建红」
-> （build 11：`Test Files 185 passed (185)` 同时 `Errors 1 error`）。所以 CI 里文件串行跑；
-> 本机开发不受影响 —— 不动 `vitest.config.ts` 的全局并行度。
+### 为什么 CI 特殊（Unit tests 直调 vitest + forks 池）
+
+CI 的 Unit tests **不经过 `pnpm run test`**，而是 `cd apps/server` 后直接 `pnpm exec vitest run`。
+两条理由各自独立，缺一条流水线都会红：
+
+1. **参数透传不可靠** —— `pnpm --filter @loomic/server test -- --no-file-parallelism` 在这台节点的 pnpm 版本下
+   没有正确透传参数，把 `--` 本身也当成了 vitest 的参数，build 12 报：
+   ```
+   ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL @loomic/server@0.0.0 test: `vitest run "--" "--no-file-parallelism"`
+   ```
+   直接调 vitest 二进制就没有这一层转手，参数原样到达。
+2. **`threads` 池的 IPC 超时** —— 即便文件串行，vitest 默认的 `threads` 池在这台 Windows 节点上依然会
+   worker→主进程 IPC 超时，表现为「用例全过但构建红」：
+   ```
+   Test Files 185 passed / Tests 2658 passed / Errors 1
+   Error: [vitest-worker]: Timeout calling "onTaskUpdate"
+   ```
+   所以显式换 `--pool=forks --poolOptions.forks.singleFork`（单 fork，进程而非线程）。
+
+`--no-file-parallelism` 仍然保留：它和池类型是两件事，文件级串行本来就是这台节点要的。
+本机开发不受影响 —— 不动 `vitest.config.ts` 的全局并行度与默认池。
 
 全局设置：
 - `options { timestamps(); disableConcurrentBuilds(); timeout(time: 45, unit: 'MINUTES') }`
