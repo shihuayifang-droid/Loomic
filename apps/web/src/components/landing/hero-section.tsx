@@ -181,9 +181,15 @@ function AnimatedSubtitle({ show }: { show: boolean }) {
 // HeroSection
 // ---------------------------------------------------------------------------
 
+/**
+ * 页面唯一的 h1 文案。打字机动画首帧是空串，所以 h1 里另放一份 `sr-only`
+ * 的静态文本当可访问名，也让静态导出的 HTML 里 h1 不是空标签。
+ */
+const HEADLINE = "让创意，自由生长";
+
 export function HeroSection() {
   const { isComplete } = useTypewriter({
-    text: "让创意，自由生长",
+    text: HEADLINE,
     speed: 60,
     delay: 200,
   });
@@ -255,7 +261,11 @@ export function HeroSection() {
           transition={{ delay: 0.1 }}
           className="mt-6 text-5xl sm:text-6xl md:text-7xl lg:text-8xl font-bold tracking-tighter bg-gradient-to-r from-foreground via-foreground to-muted-foreground bg-clip-text text-transparent"
         >
-          <TypewriterText text="让创意，自由生长" speed={60} delay={200} />
+          {/* 静态文本供读屏器与静态导出：打字机首帧是空串，可视动画标 aria-hidden */}
+          <span className="sr-only">{HEADLINE}</span>
+          <span aria-hidden="true">
+            <TypewriterText text={HEADLINE} speed={60} delay={200} />
+          </span>
         </motion.h1>
 
         {/* English subtitle -- editorial style */}

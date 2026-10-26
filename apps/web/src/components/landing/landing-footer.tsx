@@ -102,7 +102,7 @@ export function LandingFooter() {
           {/* Brand column */}
           <div className="col-span-2 md:col-span-1">
             <Link href="/" className="inline-flex items-center gap-2">
-              <HaHartLogo className="size-6" />
+              <HaHartLogo aria-hidden="true" className="size-6" />
               <span className="text-base font-semibold text-foreground tracking-tight">
                 {BRAND.name}
               </span>
