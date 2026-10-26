@@ -17,6 +17,7 @@ import { useEffect, useRef, useState } from "react";
 import type { DragEvent, JSX } from "react";
 import type { ImageArtifact } from "@loomic/shared";
 
+import { EmptyState } from "@/components/states/empty-state";
 import { useToast } from "@/components/toast";
 import { fetchProjectUploads, uploadFile } from "@/lib/server-api";
 import type { ProjectUploadItem } from "@/lib/server-api";
@@ -248,11 +249,12 @@ export function ReferencePanel(props: {
         ))}
       </ul>
 
-      {!loading && uploads.length === 0 ? (
-        <p data-testid="ref-empty" className="py-6 text-center text-xs text-muted-foreground">
-          还没有参考图，拖入或点击上传
-        </p>
-      ) : null}
+      {/* 工单 45DP · BR-13：空列表改用共享 EmptyState（无素材），定位名沿用 ref-empty。 */}
+      <EmptyState
+        isEmpty={!loading && uploads.length === 0}
+        testId="ref-empty"
+        title="还没有参考图，拖入或点击上传"
+      />
     </section>
   );
 }

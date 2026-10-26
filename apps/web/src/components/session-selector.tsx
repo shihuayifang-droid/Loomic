@@ -3,6 +3,8 @@
 import type { ChatSessionSummary } from "@loomic/shared";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { EmptyState } from "@/components/states/empty-state";
+
 type SessionSelectorProps = {
   sessions: ChatSessionSummary[];
   activeSessionId: string | null;
@@ -152,11 +154,12 @@ export function SessionSelector({
 
             {/* Session list */}
             <div className="max-h-[240px] overflow-y-auto px-1 pb-1">
-              {filtered.length === 0 && (
-                <p className="px-3 py-4 text-center text-xs text-muted-foreground/70">
-                  {search ? "无匹配结果" : "暂无对话"}
-                </p>
-              )}
+              {/* 工单 45DP · BR-13：空列表改用共享 EmptyState（无对话）。 */}
+              <EmptyState
+                isEmpty={filtered.length === 0}
+                testId="chat-session-empty"
+                title={search ? "无匹配结果" : "暂无对话"}
+              />
               {filtered.map((s) => (
                 <div
                   key={s.id}
