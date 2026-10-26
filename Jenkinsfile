@@ -55,7 +55,11 @@ pipeline {
         // would make CI permanently red. See deploy/CI.md for the debt + plan.
         stage('Unit tests') {
             steps {
-                sh 'pnpm --filter @loomic/server test'
+                // Run files serially: on the .37 Windows node, file parallelism
+                // makes the vitest worker->main IPC time out ("Timeout calling
+                // \"onTaskUpdate\"") and fails the stage even when every test
+                // passes. See deploy/CI.md.
+                sh 'pnpm --filter @loomic/server test -- --no-file-parallelism'
             }
         }
 

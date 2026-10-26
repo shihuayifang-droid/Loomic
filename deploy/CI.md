@@ -13,9 +13,14 @@
 | 1 | Install | `pnpm install --frozen-lockfile` |
 | 2 | Build shared | `pnpm --filter @loomic/shared build` |
 | 3 | Typecheck | `pnpm --filter @loomic/server typecheck` **且** `pnpm --filter @loomic/web exec tsc --noEmit` |
-| 4 | Unit tests | `pnpm --filter @loomic/server test` |
+| 4 | Unit tests | `pnpm --filter @loomic/server test -- --no-file-parallelism` |
 | 5 | Invariants | `node scripts/check-invariants.mjs --allow-skips` |
 | 6 | Web build + E2E | `pnpm --filter @loomic/web build` → `pnpm --filter @loomic/web e2e` |
+
+> **Unit tests 为什么串行（`--no-file-parallelism`）**：`.37` 这台 Windows 节点上，vitest 的文件并行会触发
+> worker→主进程 IPC 超时（`Error: [vitest-worker]: Timeout calling "onTaskUpdate"`），表现为「用例全过但构建红」
+> （build 11：`Test Files 185 passed (185)` 同时 `Errors 1 error`）。所以 CI 里文件串行跑；
+> 本机开发不受影响 —— 不动 `vitest.config.ts` 的全局并行度。
 
 全局设置：
 - `options { timestamps(); disableConcurrentBuilds(); timeout(time: 45, unit: 'MINUTES') }`
