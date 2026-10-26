@@ -264,12 +264,22 @@ export function ImageGeneratorPanel({
   );
   /**
    * 进入一个模型（首次选中或切换模型）时把 `paramValues` 重置为各参数的下发默认值：
-   * 新模型不支持的旧取值不能带过来。`paramDefaults` 的身份只在换模型时变一次，
-   * 所以这个 effect 不会每帧重跑。
+   * 新模型不支持的旧取值不能带过来。`paramDefaults` 的身份只在换模型时变一次
+   * （`useMemo` 依赖 `paramDefs`），所以按身份比较即可，不会每帧重跑。
+   *
+   * 工单 45DG：这一步必须在**渲染期**调整，不能留在 effect 里。effect 要等这次
+   * commit 之后才 flush，而「模型刚到的那一帧」选项按钮已经可以点了（渲染时
+   * `effectiveParamValues` 会回落默认值，看起来和已选中一样）——在这个窗口里点下
+   * 的取值会被随后 flush 的重置覆盖回默认值。全量并发跑时 `AG-07` 套件就是这样
+   * 偶发失败的：`switching model` 断到 `aria-selected="false"`、`16:9 · 4K` 的询价
+   * 一直等不到 `size`。渲染期 setState 由 React 当场重渲染，重置与选项出现在同一帧，
+   * 这个窗口就消失了（React 文档里「依据 prop 调整 state」的写法）。
    */
-  useEffect(() => {
+  const [defaultsFor, setDefaultsFor] = useState<ParamValues | null>(null);
+  if (paramDefaults !== defaultsFor) {
+    setDefaultsFor(paramDefaults);
     setParamValues(paramDefaults);
-  }, [paramDefaults]);
+  }
   /**
    * AG-07: the count control exists only for a model that allows more than one
    * image; switching models always goes back to 1.

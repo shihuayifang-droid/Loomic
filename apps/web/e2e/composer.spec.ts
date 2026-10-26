@@ -20,11 +20,24 @@ const INPUT_NAME = "输入消息";
  */
 const PICKER_TIMEOUT = 15_000;
 
+/**
+ * `canvas-empty-hint.tsx` 只在 Excalidraw 场景里没有元素时渲染，它每 500ms 采一次
+ * `api.getSceneElements()`，有元素就 return null。fixtures.ts 的 mock 画布固定带
+ * 1 张图，所以「这条提示消失」等价于「画布场景已经从服务端落到 Excalidraw」。
+ */
+const EMPTY_CANVAS_HINT = "输入你的想法开始创作";
+
 async function openCanvas(page: Page): Promise<ApiLog> {
   await seedSession(page);
   const log = await mockApi(page);
   await page.goto(CANVAS_URL);
   await page.getByRole("textbox", { name: INPUT_NAME }).first().waitFor({ timeout: 45_000 });
+  // 工单 45DG：@ 列表里的「画布对象」组读的是 Excalidraw 场景快照
+  // （`app/canvas/page.tsx` 的 `handleRequestCanvasImages` → `api.getSceneElements()`）。
+  // 场景没到就敲 `@`，这一组不会渲染，而且之后不会自己补上 —— `AG-02 验收2` 之前
+  // 偶发就卡在这里（`--repeat-each=3` 复现：等到 15s 超时，失败快照里只剩
+  // 「我的素材 / 模型」两组）。等的是「场景已落地」这个具体可见状态，不是固定时长。
+  await expect(page.getByText(EMPTY_CANVAS_HINT)).toHaveCount(0, { timeout: 45_000 });
   return log;
 }
 
