@@ -14,6 +14,13 @@ import "./globals.css";
 const geist = Geist({ subsets: ["latin"], variable: "--font-sans" });
 
 export const metadata: Metadata = {
+  /**
+   * BR-07：`output: "export"` 下没有运行时，分享图只能是构建期就存在于
+   * `public/` 的静态文件；`metadataBase` 负责给出站点域名，让
+   * `openGraph.url` / og:image 解析成绝对地址（缺了它 Next 会输出相对路径，
+   * 抓取方拿不到图）。说明见 `docs/brand/og.md`。
+   */
+  metadataBase: new URL("https://hahart.design"),
   title: BRAND.name,
   description: BRAND.description,
   icons: {
@@ -26,13 +33,23 @@ export const metadata: Metadata = {
   openGraph: {
     title: BRAND.name,
     description: BRAND.description,
-    images: [{ url: "/og-image.png", width: 1200, height: 630 }],
+    url: "/",
+    siteName: BRAND.name,
+    type: "website",
+    images: [
+      {
+        url: "/og/og-default.png",
+        width: 1200,
+        height: 630,
+        alt: BRAND.name,
+      },
+    ],
   },
   twitter: {
     card: "summary_large_image",
     title: BRAND.name,
     description: BRAND.description,
-    images: ["/og-image.png"],
+    images: ["/og/og-default.png"],
   },
 };
 
