@@ -24,6 +24,8 @@ export const DEFAULT_ILLUSTRATION_TESTID = "state-illustration-placeholder";
 export type StatePageProps = {
   /** 必填：一屏的主标题（一般是一句中文；404 这类页面写「404 · 页面不存在」）。 */
   title: string;
+  /** 可选：标题元素自己的 testid，默认 `state-page-title`（调用方要保留原有定位名时给）。 */
+  titleTestId?: string | undefined;
   /** 可选：标题下面的一段说明，讲清「发生了什么」。 */
   description?: ReactNode;
   /** 可选：说明下面的小字，讲清「接下来能做什么」。 */
@@ -40,6 +42,7 @@ export type StatePageProps = {
 
 export function StatePage({
   title,
+  titleTestId,
   description,
   hint,
   illustrationSlot,
@@ -47,6 +50,9 @@ export function StatePage({
   action,
   testId,
 }: StatePageProps) {
+  // `testid-lint` 只放行 testid/testId/*Testid/*TestId 标识符与同文件常量，不接受任意表达式；
+  // 先把默认值折进一个 `*TestId` 结尾的局部量，再挂到标题元素上。
+  const resolvedTitleTestId = titleTestId ?? "state-page-title";
   return (
     <div
       data-testid={testId}
@@ -63,7 +69,12 @@ export function StatePage({
       )}
 
       <div className="flex flex-col items-center gap-2">
-        <h1 className="text-2xl font-semibold text-foreground">{title}</h1>
+        <h1
+          data-testid={resolvedTitleTestId}
+          className="text-2xl font-semibold text-foreground"
+        >
+          {title}
+        </h1>
         {description ? (
           <p className="max-w-[420px] text-sm text-muted-foreground">{description}</p>
         ) : null}
@@ -106,10 +117,17 @@ export function CanvasLoadErrorState({
 export const PENDING_REVIEW_TITLE = "已提交申请，等待管理员审核";
 export const PENDING_REVIEW_DESCRIPTION = "管理员把你加入团队后即可使用";
 
-export function PendingReviewState({ action }: { action?: ReactNode }) {
+export function PendingReviewState({
+  action,
+  titleTestId,
+}: {
+  action?: ReactNode;
+  titleTestId?: string | undefined;
+}) {
   return (
     <StatePage
       title={PENDING_REVIEW_TITLE}
+      titleTestId={titleTestId}
       description={PENDING_REVIEW_DESCRIPTION}
       hint="审核通过后会自动进入工作区，不需要重复提交。"
       action={action}

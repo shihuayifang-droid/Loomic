@@ -14,6 +14,7 @@ import { useJobFallbackPolling } from "../../hooks/use-job-fallback-polling";
 import { CanvasEditor } from "../../components/canvas-editor";
 import { ChatSidebar } from "../../components/chat-sidebar";
 import { CanvasEmptyHint } from "../../components/canvas-empty-hint";
+import { CanvasLoadErrorState } from "../../components/states/state-page";
 import { CanvasLogoMenu } from "../../components/canvas-logo-menu";
 import { EditableProjectName } from "../../components/editable-project-name";
 import {
@@ -455,9 +456,12 @@ function CanvasPageContent() {
   }
 
   if (error) {
+    // 工单 45DQ · BR-13：展示层交给共享的 CanvasLoadErrorState（CV-26）。该组件只有
+    // retryHref（导航）一个动作位，而本页的重试是「重新拉一次」（setReloadNonce），
+    // 所以重试按钮留在组件外面：行为与定位名 canvas-load-retry 都不变。
     return (
       <div className="flex min-h-screen flex-col items-center justify-center gap-3">
-        <p className="text-sm text-destructive">{error}</p>
+        <CanvasLoadErrorState reason={error} />
         {errorRetryable && (
           <button data-testid="canvas-load-retry"
             type="button"

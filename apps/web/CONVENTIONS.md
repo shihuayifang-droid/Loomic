@@ -250,6 +250,7 @@ import { AppDropdown } from "@/components/ui/app-dropdown";
 | `projects-` | 项目列表与项目弹窗（新建、删除、重试） |
 | `settings-` | 设置页（分区导航、返回、各分区表单） |
 | `skills-` | 技能（列表页、技能卡、创建/导入/市场/详情弹窗） |
+| `state-` | 状态页与空状态占位（`components/states/`：插画位占位框、404/待审核/被拒绝/加载失败页） |
 | `toast-` | 全局 toast（toast 本体与入口按钮） |
 | `ui-` | 设计系统原语（`components/ui/` 里的对话框关闭按钮等） |
 

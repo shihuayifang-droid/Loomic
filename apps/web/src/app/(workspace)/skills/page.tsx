@@ -11,6 +11,7 @@ import { CreateSkillDialog } from "@/components/skills/create-skill-dialog";
 import { MarketplacePanel } from "@/components/skills/marketplace-panel";
 import { SkillDetailDialog } from "@/components/skills/skill-detail-dialog";
 import { SkillsSkeleton } from "@/components/skeletons/skills-skeleton";
+import { EmptyState } from "@/components/states/empty-state";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -478,17 +479,21 @@ export default function SkillsPage() {
               animate="visible"
               className="flex flex-col items-center justify-center py-20 text-center"
             >
-              <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
-                <Search className="size-5 text-muted-foreground" />
-              </div>
-              <p className="text-sm font-medium text-foreground">
-                {hasActiveFilters ? "未找到匹配的技能" : "暂无技能"}
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {hasActiveFilters
-                  ? "尝试调整搜索或筛选条件"
-                  : "创建自定义技能来扩展您智能体的能力"}
-              </p>
+              {/* 工单 45DQ · BR-13（无技能）：展示层改用共享 EmptyState，文案与图标原样保留。 */}
+              <EmptyState
+                isEmpty={filteredSkills.length === 0}
+                title={hasActiveFilters ? "未找到匹配的技能" : "暂无技能"}
+                description={
+                  hasActiveFilters
+                    ? "尝试调整搜索或筛选条件"
+                    : "创建自定义技能来扩展您智能体的能力"
+                }
+                illustrationSlot={
+                  <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+                    <Search className="size-5 text-muted-foreground" />
+                  </div>
+                }
+              />
             </motion.div>
           ) : (
             <motion.div

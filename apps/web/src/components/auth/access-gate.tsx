@@ -3,6 +3,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 
 import { LoadingScreen } from "@/components/loading-screen";
+import { PendingReviewState } from "@/components/states/state-page";
 import { useAuth } from "@/lib/auth-context";
 import { fetchViewer } from "@/lib/server-api";
 
@@ -57,27 +58,21 @@ export function AccessGate({ children }: { children: ReactNode }) {
 
   if (state === "pending") {
     return (
-      <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-background px-6 text-center">
-        <h1
-          data-testid="account-pending-title"
-          className="text-lg font-medium text-foreground"
-        >
-          已提交申请，等待管理员审核
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          管理员把你加入团队后即可使用
-        </p>
-        <button
-          type="button"
-          data-testid="account-pending-signout"
-          className="mt-2 inline-flex items-center justify-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          onClick={() => {
-            void signOut();
-          }}
-        >
-          退出登录
-        </button>
-      </div>
+      <PendingReviewState
+        titleTestId="account-pending-title"
+        action={
+          <button
+            type="button"
+            data-testid="account-pending-signout"
+            className="inline-flex items-center justify-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            onClick={() => {
+              void signOut();
+            }}
+          >
+            退出登录
+          </button>
+        }
+      />
     );
   }
 

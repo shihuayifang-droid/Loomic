@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { EmptyState } from "@/components/states/empty-state";
+
 type CanvasEmptyHintProps = {
   excalidrawApi: any;
   onOpenChat: () => void;
@@ -78,13 +80,11 @@ export function CanvasEmptyHint({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [hasElements]);
 
-  if (hasElements) return null;
-
   return (
     <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
-      <p className="text-base text-muted-foreground/50">
-        {"输入你的想法开始创作"}
-      </p>
+      {/* 工单 45DQ · BR-13（画布空）：展示层改用共享 EmptyState，文案原文不动；
+          「有元素就不显示」由 EmptyState 自己的 isEmpty 判断，C 快捷键仍在上面挂。 */}
+      <EmptyState isEmpty={!hasElements} title="输入你的想法开始创作" />
     </div>
   );
 }
