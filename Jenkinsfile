@@ -5,6 +5,11 @@
 //
 // Every `sh` command below is copied verbatim from the command list in the
 // OP-12 ticket. Do not introduce new npm/pnpm scripts here.
+//
+// Every stage picks its shell by platform: the CI node is Windows and
+// its `sh` is MSYS/Git Bash, which does not see the SYSTEM account's node/pnpm
+// PATH (and `pnpm` here is a .ps1 shim bash cannot run), so `sh` exits 127.
+// `bat` runs cmd.exe and the same command works.
 
 pipeline {
     // Run on any available node. The .37 node has no custom label, so a label
@@ -29,14 +34,26 @@ pipeline {
         // The lockfile is committed, so ask pnpm to fail loudly instead of drifting.
         stage('Install') {
             steps {
-                sh 'pnpm install --frozen-lockfile'
+                script {
+                    if (isUnix()) {
+                        sh 'pnpm install --frozen-lockfile'
+                    } else {
+                        bat 'pnpm install --frozen-lockfile'
+                    }
+                }
             }
         }
 
         // Other packages consume @loomic/shared/dist, so it must be built first.
         stage('Build shared') {
             steps {
-                sh 'pnpm --filter @loomic/shared build'
+                script {
+                    if (isUnix()) {
+                        sh 'pnpm --filter @loomic/shared build'
+                    } else {
+                        bat 'pnpm --filter @loomic/shared build'
+                    }
+                }
             }
         }
 
@@ -45,8 +62,15 @@ pipeline {
         // "commit a deliberate typecheck error -> pipeline fails".
         stage('Typecheck') {
             steps {
-                sh 'pnpm --filter @loomic/server typecheck'
-                sh 'pnpm --filter @loomic/web exec tsc --noEmit'
+                script {
+                    if (isUnix()) {
+                        sh 'pnpm --filter @loomic/server typecheck'
+                        sh 'pnpm --filter @loomic/web exec tsc --noEmit'
+                    } else {
+                        bat 'pnpm --filter @loomic/server typecheck'
+                        bat 'pnpm --filter @loomic/web exec tsc --noEmit'
+                    }
+                }
             }
         }
 
@@ -77,7 +101,13 @@ pipeline {
         // --allow-skips reports them as SKIP instead of FAIL.
         stage('Invariants') {
             steps {
-                sh 'node scripts/check-invariants.mjs --allow-skips'
+                script {
+                    if (isUnix()) {
+                        sh 'node scripts/check-invariants.mjs --allow-skips'
+                    } else {
+                        bat 'node scripts/check-invariants.mjs --allow-skips'
+                    }
+                }
             }
         }
 
@@ -85,8 +115,15 @@ pipeline {
         // E2E runs against mocked providers: no real API calls, no billing.
         stage('Web build + E2E') {
             steps {
-                sh 'pnpm --filter @loomic/web build'
-                sh 'pnpm --filter @loomic/web e2e'
+                script {
+                    if (isUnix()) {
+                        sh 'pnpm --filter @loomic/web build'
+                        sh 'pnpm --filter @loomic/web e2e'
+                    } else {
+                        bat 'pnpm --filter @loomic/web build'
+                        bat 'pnpm --filter @loomic/web e2e'
+                    }
+                }
             }
         }
     }
