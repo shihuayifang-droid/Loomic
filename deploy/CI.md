@@ -1,7 +1,7 @@
 # HaHart CI 流水线（OP-12）
 
 流水线定义：仓库根 `Jenkinsfile`（声明式 pipeline）。
-运行环境：`.37` 服务器上现有的 Jenkins，节点 label `any`。
+运行环境：`.37` 服务器上现有的 Jenkins，`agent any`（不依赖任何自定义节点标签）。
 本文件说明它跑什么、为什么这么跑、以及怎么在 Jenkins 里把它建起来。
 
 ---
@@ -10,11 +10,12 @@
 
 | # | Stage | 命令（逐字，与工单一致） |
 |---|---|---|
-| 1 | Build shared | `pnpm --filter @loomic/shared build` |
-| 2 | Typecheck | `pnpm --filter @loomic/server typecheck` **且** `pnpm --filter @loomic/web exec tsc --noEmit` |
-| 3 | Unit tests | `pnpm --filter @loomic/server test` |
-| 4 | Invariants | `node scripts/check-invariants.mjs --allow-skips` |
-| 5 | Web build + E2E | `pnpm --filter @loomic/web build` → `pnpm --filter @loomic/web e2e` |
+| 1 | Install | `pnpm install --frozen-lockfile` |
+| 2 | Build shared | `pnpm --filter @loomic/shared build` |
+| 3 | Typecheck | `pnpm --filter @loomic/server typecheck` **且** `pnpm --filter @loomic/web exec tsc --noEmit` |
+| 4 | Unit tests | `pnpm --filter @loomic/server test` |
+| 5 | Invariants | `node scripts/check-invariants.mjs --allow-skips` |
+| 6 | Web build + E2E | `pnpm --filter @loomic/web build` → `pnpm --filter @loomic/web e2e` |
 
 全局设置：
 - `options { timestamps(); disableConcurrentBuilds(); timeout(time: 45, unit: 'MINUTES') }`
@@ -25,11 +26,35 @@
 
 | Stage | 对应需求项 | 说明 |
 |---|---|---|
+| Install | OP-12（流水线基础设施） | 从零检出后没有 `node_modules`，必须先装依赖；否则后面的 `tsc` 等 devDependency 二进制不存在 |
 | Build shared | OP-12（流水线基础设施） | 其它包消费 `@loomic/shared/dist`，必须先构建，否则后面的 typecheck / build 直接炸 |
 | Typecheck | **OP-12** | 这一步就是验收抓手：往任意 `.ts` 里提交一个故意写的类型错误，Typecheck stage 必须失败、流水线变红 |
 | Unit tests | OP-12（后端基线） | 只跑 server 套件；`vitest.config.ts` 里已排除需要真实 DB 的套件（本机实测：185 文件 / 2658 用例全过） |
 | Invariants | **QA-03** | 不变式脚本集；任一 `TOTAL FAILURES ≠ 0` 时脚本非 0 退出 → stage 失败 → 阻止继续部署（本机实测 `TOTAL CHECKS: 9`，其中 2 项因缺变量 SKIP） |
 | Web build + E2E | **QA-02 / QA-12** | Playwright + msedge，覆盖 H5 端关键流程 |
+
+---
+
+## 1.1 首次跑必须先 install（build 9 的失败原因）
+
+CI 每次都是从零检出，`node_modules` 不存在。build 9 的第一个 stage 就红在这里：
+
+```
++ pnpm --filter @loomic/shared build
+'tsc' 不是内部或外部命令
+WARN Local package.json exists, but node_modules missing, did you mean to install?
+```
+
+所以 `Jenkinsfile` 的第一个 stage 是 `Install`：`pnpm install --frozen-lockfile`，
+放在 `Build shared` **之前**。
+
+仓库里提交了 `pnpm-lock.yaml`，因此用 `--frozen-lockfile`：lockfile 与 `package.json` 不一致时**直接失败**，
+而不是悄悄装出另一套依赖（依赖漂移）。真碰到这种失败，正确做法是更新 `pnpm-lock.yaml` 并提交，
+**不要**把 flag 改成 `--no-frozen-lockfile` 糊过去。
+
+本机节点是 **Windows + Git Bash**：pipeline 里的 `sh` 由 Git for Windows 自带的 `sh.exe` 提供
+（实测 `sh 'pnpm install --frozen-lockfile'` 在该节点上可用），所以 `Jenkinsfile` 里全部沿用 `sh`。
+也正因如此，`Jenkinsfile` 不写死 `C:\tools\nodejs` 这类本机绝对路径 —— `pnpm` / `node` 已在机器 PATH 里。
 
 ---
 
@@ -83,7 +108,8 @@
 
 ## 5. 在 `.37` 的 Jenkins 里建这个 job
 
-1. 在 `.37` 上确认 Jenkins 已有可用的 `any` 标签节点（现有节点即可，本流水线不指定特殊 agent）。
+1. 在 `.37` 上确认 Jenkins 至少有一个空闲可用的 agent 节点（`Jenkinsfile` 用 `agent any`，
+   不要求任何自定义标签；实测写 `label 'any'` 会因为该节点没有这个标签而永远排队）。
 2. 该节点上需要预先具备：`node`、`pnpm`（版本与仓库 `package.json` 的 engines 对齐）、
    已安装 Playwright 需要的 msedge 浏览器（`pnpm --filter @loomic/web e2e` 依赖它）。
 3. Jenkins → **新建 Item** → 类型选 **Pipeline**（或 MultiBranch Pipeline，取决于该 Jenkins 的既有习惯）。
@@ -92,7 +118,8 @@
    - SCM：指向本仓库（`Loomic`）
    - Branch Specifier：`hahart/p0`（或按该 Jenkins 现有的分支策略）
    - **Script Path：`Jenkinsfile`**（即仓库根的这份文件）
-5. 保存，先手动 **Build Now** 跑一次，确认五个 stage 依次变绿。
+5. 保存，先手动 **Build Now** 跑一次，确认六个 stage（Install → Build shared → Typecheck →
+   Unit tests → Invariants → Web build + E2E）依次变绿。
 6. 验收「故意引入 typecheck 错误 → 流水线失败」：
    在仓库里随便挑一个 `.ts` 加一行类型错误（例如把某个 `number` 赋成字符串），推一次构建
    → 预期 `Typecheck` stage 红、后续 stage 不再执行；验证完**把该错误撤销并重新推一次**，确认恢复绿。

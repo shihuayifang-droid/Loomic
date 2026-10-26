@@ -7,8 +7,9 @@
 // OP-12 ticket. Do not introduce new npm/pnpm scripts here.
 
 pipeline {
-    // .37 already has a node labelled `any`.
-    agent { label 'any' }
+    // Run on any available node. The .37 node has no custom label, so a label
+    // filter here would keep every build queued forever.
+    agent any
 
     options {
         timestamps()
@@ -23,6 +24,15 @@ pipeline {
     }
 
     stages {
+        // A fresh checkout has no node_modules: every later stage calls a binary
+        // from devDependencies (tsc for the shared build), so install must run first.
+        // The lockfile is committed, so ask pnpm to fail loudly instead of drifting.
+        stage('Install') {
+            steps {
+                sh 'pnpm install --frozen-lockfile'
+            }
+        }
+
         // Other packages consume @loomic/shared/dist, so it must be built first.
         stage('Build shared') {
             steps {
