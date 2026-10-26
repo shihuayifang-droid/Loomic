@@ -24,7 +24,13 @@ type FakeGenerate = (
   providerName: string,
   params: ImageGenerateParams,
 ) => Promise<GeneratedImage>;
-type FakeFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+// `RequestInfo` comes from the DOM lib, which this server does not (and must not)
+// pull in. `Parameters<typeof fetch>[0]` is the same union the node typings give
+// the global `fetch`, so the fake stays assignable to `fetchImpl?: typeof fetch`.
+type FakeFetch = (
+  input: Parameters<typeof fetch>[0],
+  init?: RequestInit,
+) => Promise<Response>;
 
 /** ED-06's gateway answer: the edited image, inline, at the source size. */
 function editedImage(): GeneratedImage {
