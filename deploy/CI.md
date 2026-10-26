@@ -13,30 +13,50 @@
 | 1 | Install | `pnpm install --frozen-lockfile` |
 | 2 | Build shared | `pnpm --filter @loomic/shared build` |
 | 3 | Typecheck | `pnpm --filter @loomic/server typecheck` **且** `pnpm --filter @loomic/web exec tsc --noEmit` |
-| 4 | Unit tests | `cd apps/server && pnpm exec vitest run --no-file-parallelism --pool=forks --poolOptions.forks.singleFork` |
+| 4 | Unit tests | Windows 节点用 **`bat 'pnpm --filter @loomic/server test'`**；Unix 节点用 `sh`（同一命令） |
 | 5 | Invariants | `node scripts/check-invariants.mjs --allow-skips` |
 | 6 | Web build + E2E | `pnpm --filter @loomic/web build` → `pnpm --filter @loomic/web e2e` |
 
-### 为什么 CI 特殊（Unit tests 直调 vitest + forks 池）
+### 为什么 Unit tests stage 必须用 `bat`（这台节点是 Windows）
 
-CI 的 Unit tests **不经过 `pnpm run test`**，而是 `cd apps/server` 后直接 `pnpm exec vitest run`。
-两条理由各自独立，缺一条流水线都会红：
+**这台 Windows 节点必须用 `bat` 跑 vitest，`sh`(MSYS) 会让 vitest 报 `Timeout calling "onTaskUpdate"`；用例其实全过但构建会红。**
 
-1. **参数透传不可靠** —— `pnpm --filter @loomic/server test -- --no-file-parallelism` 在这台节点的 pnpm 版本下
-   没有正确透传参数，把 `--` 本身也当成了 vitest 的参数，build 12 报：
-   ```
-   ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL @loomic/server@0.0.0 test: `vitest run "--" "--no-file-parallelism"`
-   ```
-   直接调 vitest 二进制就没有这一层转手，参数原样到达。
-2. **`threads` 池的 IPC 超时** —— 即便文件串行，vitest 默认的 `threads` 池在这台 Windows 节点上依然会
-   worker→主进程 IPC 超时，表现为「用例全过但构建红」：
-   ```
-   Test Files 185 passed / Tests 2658 passed / Errors 1
-   Error: [vitest-worker]: Timeout calling "onTaskUpdate"
-   ```
-   所以显式换 `--pool=forks --poolOptions.forks.singleFork`（单 fork，进程而非线程）。
+三次 CI 实测把问题收敛到**执行外壳**（而不是命令本身）：
 
-`--no-file-parallelism` 仍然保留：它和池类型是两件事，文件级串行本来就是这台节点要的。
+| build | 命令 | 结果 |
+|---|---|---|
+| 11 | `sh 'pnpm --filter @loomic/server test'` | 185 文件全过，但 `Timeout calling "onTaskUpdate"` |
+| 12 | `sh 'pnpm --filter @loomic/server test -- --no-file-parallelism'` | 参数没透传（报 `vitest run "--" "--no-file-parallelism"`），同样报错 |
+| 13 | `sh 'cd apps/server && pnpm exec vitest run --no-file-parallelism --pool=forks --poolOptions.forks.singleFork'` | 只跑过 1 个文件就报同一个错 |
+| 本机 | PowerShell / `cmd` 里同样命令（等价于 `bat`） | **exit 0，全过** |
+
+差异在执行外壳：Jenkins 的 `sh` 在本机是 MSYS/Git Bash，vitest 的 worker→reporter IPC 在 MSYS 管道下超时，
+表现为「用例全过、Errors 1、构建红」：
+
+```
+Test Files 185 passed / Tests 2658 passed / Errors 1
+Error: [vitest-worker]: Timeout calling "onTaskUpdate"
+```
+
+换池 / 关并行（build 12、13 的两次尝试）都治不了，因为超时发生在管道层而不是线程层。所以 Unit tests stage
+按平台选外壳，Windows 走 `bat`（`cmd.exe`）：
+
+```groovy
+stage('Unit tests') {
+    steps {
+        script {
+            if (isUnix()) {
+                sh 'pnpm --filter @loomic/server test'
+            } else {
+                bat 'pnpm --filter @loomic/server test'
+            }
+        }
+    }
+}
+```
+
+其它 stage（Install / Build shared / Typecheck / Invariants / Web build + E2E）实测 `sh` 都能过，因此保持 `sh`。
+`bat` 跑的是 `cmd.exe`：不需要先 `cd`（`pnpm --filter` 在仓库任意子目录都成立），也不要包 `|| true` 掩盖失败。
 本机开发不受影响 —— 不动 `vitest.config.ts` 的全局并行度与默认池。
 
 全局设置：
@@ -75,7 +95,8 @@ WARN Local package.json exists, but node_modules missing, did you mean to instal
 **不要**把 flag 改成 `--no-frozen-lockfile` 糊过去。
 
 本机节点是 **Windows + Git Bash**：pipeline 里的 `sh` 由 Git for Windows 自带的 `sh.exe` 提供
-（实测 `sh 'pnpm install --frozen-lockfile'` 在该节点上可用），所以 `Jenkinsfile` 里全部沿用 `sh`。
+（实测 `sh 'pnpm install --frozen-lockfile'` 在该节点上可用），所以 `Jenkinsfile` 里除了 Unit tests 之外
+的 stage 都沿用 `sh`；**只有 Unit tests 走 `bat`**（原因见 §1「为什么 Unit tests stage 必须用 `bat`」）。
 也正因如此，`Jenkinsfile` 不写死 `C:\tools\nodejs` 这类本机绝对路径 —— `pnpm` / `node` 已在机器 PATH 里。
 
 ---

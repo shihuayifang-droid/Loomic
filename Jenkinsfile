@@ -1,5 +1,5 @@
 // HaHart P0 CI pipeline (OP-12).
-// Declarative pipeline only: no plugin-specific steps beyond core `sh` / `echo`.
+// Declarative pipeline only: no plugin-specific steps beyond core `sh` / `bat` / `echo`.
 // Design notes, per-stage requirement mapping, known debt and how to create the
 // job on the .37 Jenkins: see deploy/CI.md.
 //
@@ -55,17 +55,19 @@ pipeline {
         // would make CI permanently red. See deploy/CI.md for the debt + plan.
         stage('Unit tests') {
             steps {
-                // Call the vitest binary directly instead of going through
-                // `pnpm --filter @loomic/server test`: the CI pnpm version does
-                // not forward `-- <args>` correctly and leaks a literal `--`
-                // into vitest's argv (ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL,
-                // build 12). See deploy/CI.md.
-                // Also force the forks pool with a single fork: on the .37
-                // Windows node the default `threads` pool still times out on
-                // the worker->main IPC ("Timeout calling \"onTaskUpdate\"")
-                // even with file parallelism off, failing the stage while every
-                // test passes. See deploy/CI.md.
-                sh 'cd apps/server && pnpm exec vitest run --no-file-parallelism --pool=forks --poolOptions.forks.singleFork'
+                // Pick the shell by platform, not by habit. This node is Windows
+                // and its `sh` is MSYS/Git Bash: under MSYS the vitest
+                // worker->reporter IPC times out ("Timeout calling
+                // \"onTaskUpdate\"") while every test actually passes, so the
+                // stage goes red on a green suite (builds 11/12/13). `bat` runs
+                // cmd.exe and the same command exits 0 locally. See deploy/CI.md.
+                script {
+                    if (isUnix()) {
+                        sh 'pnpm --filter @loomic/server test'
+                    } else {
+                        bat 'pnpm --filter @loomic/server test'
+                    }
+                }
             }
         }
 
