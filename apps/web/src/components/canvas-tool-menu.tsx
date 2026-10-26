@@ -143,7 +143,8 @@ const GeneratingOverlay = memo(function GeneratingOverlay({
           className="h-full w-1/2"
           style={{
             background:
-              "linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.5) 50%, transparent 100%)",
+              // BR-12: 扫光的亮色取自主题表面色，不写死白色
+              "linear-gradient(110deg, transparent 0%, color-mix(in oklab, var(--background) 50%, transparent) 50%, transparent 100%)",
           }}
         />
       </div>
