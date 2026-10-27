@@ -6,6 +6,7 @@ import { signProjectAssetUrl } from "../../storage/project-asset-urls.js";
 import { JOB_TYPE_REGISTRY } from "../job-registry.js";
 import { generateImage } from "../../../generation/image-generation.js";
 import { resolveImageProviderName } from "../../../generation/providers/registry.js";
+import { isTaskBudgetExceededError, runBillableStep } from "../../../generation/task-spend.js";
 
 import { DEFAULT_IMAGE_MODEL_ID } from "@loomic/shared";
 import { gptImage2SizeOption } from "../../../generation/providers/openai-image.js";
@@ -156,9 +157,30 @@ registerExecutor("image_generation", async (jobId, _rawPayload, ctx: ExecutorCon
     // Generate image via the registered provider
     lap(`${providerName}_call_start`);
     let generated;
+
+    // QA-15 (workorder 45DX): the ONE billable step of this task goes through the
+    // task's credit guard. The cost is the amount this job was already charged
+    // (`credits_cost` read by the billing gate and handed in as
+    // `ctx.creditsCharged`) — this executor does not invent a price of its own.
+    // Before the call the guard can refuse it (no request is sent, no credits
+    // burned); after it the guard is charged, so a task that reached its budget
+    // while the request was in flight still ends instead of continuing.
+    const billableCost = typeof ctx.creditsCharged === "number" ? ctx.creditsCharged : 0;
+
     try {
-      generated = await generateImage(providerName, imageJobGenerateParams(payload, model));
+      const params = imageJobGenerateParams(payload, model);
+      generated = await runBillableStep(
+        ctx.spendGuard,
+        billableCost,
+        () => generateImage(providerName, params),
+        jobId,
+      );
     } catch (genError) {
+      // A budget refusal is not a provider failure: its code and its sentence
+      // have to reach the job runner unchanged so it can be recorded as
+      // `task_budget_exceeded`, not wrapped into a generation error.
+      if (isTaskBudgetExceededError(genError)) throw genError;
+
       const detail = genError instanceof Error ? genError.message : String(genError);
       const wrapped = new Error(`Image generation failed for model ${model}: ${detail}`);
       (wrapped as Error & { code?: string }).code =

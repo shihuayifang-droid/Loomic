@@ -61,6 +61,8 @@ import type {
   JobBillingGateRepository,
   JobBillingGateRow,
 } from "../../db/job-billing-gate-repository.js";
+import { createSpendGuard, TASK_CREDIT_LIMIT } from "../../generation/spend-guard.js";
+import { isTaskBudgetExceededError, TASK_BUDGET_ERROR_CODE } from "../../generation/task-spend.js";
 import type { PgmqClient, PgmqMessage } from "../../queue/pgmq-client.js";
 import type { ExecutorContext, JobExecutor } from "./job-executor.js";
 import { JOB_TYPE_REGISTRY } from "./job-registry.js";
@@ -457,6 +459,12 @@ export async function processJobMessage(
     return;
   }
 
+  // QA-15 (workorder 45DX): the task starts here, so its credit budget starts
+  // here too. One guard per EXECUTION of one job — never a module-level counter,
+  // which would make two unrelated tasks share one 200-credit budget. `limit` is
+  // the requirement's 200 (TASK_CREDIT_LIMIT), not a value chosen locally.
+  const spendGuard = createSpendGuard({ limit: TASK_CREDIT_LIMIT });
+
   // T-15: only the EXECUTION is inside this try. Producing a result and
   // recording it are separate concerns, and the `catch` below is the executor's
   // failure path — it writes `retrying` (so the executor runs again) or fails the
@@ -466,8 +474,14 @@ export async function processJobMessage(
   let result: Record<string, unknown>;
 
   try {
-    const executorCtx: ExecutorContext =
+    const billedCtx: ExecutorContext =
       typeof gate?.creditsCost === "number" ? { ...ctx, creditsCharged: gate.creditsCost } : ctx;
+
+    // QA-15: the guard travels WITH the context, so the executor refuses a
+    // billable upstream call before sending it instead of paying and asking
+    // later. Spreading rather than mutating keeps the caller's context object
+    // untouched, exactly as `creditsCharged` above already does.
+    const executorCtx: ExecutorContext = { ...billedCtx, spendGuard };
 
     // GN-31. The executor renews the visibility timeout from the inside while it
     // works, so an upstream that hangs keeps its own message invisible forever
@@ -486,6 +500,31 @@ export async function processJobMessage(
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const errorCode = (error as { code?: string })?.code ?? "executor_error";
+
+    // QA-15 (workorder 45DX). A budget refusal ends the task: no retry (a retry
+    // would hand the same task a fresh 200 credits and burn them again), no
+    // success record (the step that was refused never produced a result) and no
+    // refund (the credits already spent bought real upstream work; refunding
+    // here would credit the workspace for work it received). It is written
+    // directly instead of through `terminalFail`, whose contract is
+    // "mark failed AND refund" — the one thing this branch must not do.
+    if (isTaskBudgetExceededError(error)) {
+      const markedBudget = await deps.jobService.markFailed(
+        jobId,
+        TASK_BUDGET_ERROR_CODE,
+        errorMessage,
+      );
+
+      // The message is archived whether or not this delivery changed the row:
+      // re-delivering it would run the executor again for a task that is over.
+      await deps.pgmq.archive(queue, msg.msg_id);
+      deps.log(
+        `Job ${jobId} stopped by the task credit budget after ${attemptCount} attempt(s) ` +
+          `(row ${markedBudget ? "marked failed" : "was already moved"}) ` +
+          `+${Date.now() - startedAt}ms: ${errorMessage}`,
+      );
+      return;
+    }
 
     if (attemptCount >= maxAttempts || NON_RETRYABLE_CODES.has(errorCode)) {
       await terminalFail(errorCode, errorMessage);

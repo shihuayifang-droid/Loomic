@@ -7,6 +7,7 @@ import type { CreditReadRepository } from "../../db/credit-read-repository.js";
 import type { AssetProvenanceRepository } from "../../db/asset-provenance-repository.js";
 import type { AssetReadRepository } from "../../db/asset-read-repository.js";
 import type { AssetRecordRepository } from "../../db/asset-record-repository.js";
+import type { SpendGuard } from "../../generation/spend-guard.js";
 import type { ObjectStore } from "../storage/object-store.js";
 
 export type ExecutorContext = {
@@ -60,6 +61,20 @@ export type ExecutorContext = {
    * Optional: absent means "unknown", and the executors then record null.
    */
   creditsCharged?: number;
+  /**
+   * QA-15 (workorder 45DX): the credit guard for THIS task.
+   *
+   * `processJobMessage` creates one guard per task execution
+   * (`createSpendGuard({ limit: TASK_CREDIT_LIMIT })`) and hands it in here, so
+   * an executor can refuse a billable upstream call before it is made and report
+   * it afterwards (`runBillableStep` in `generation/task-spend.ts` does both).
+   * Optional for the same reason as the repositories above: the worker and this
+   * one runner wire it, while every other construction site and every test
+   * substitute stays valid. Absent means "no per-task budget in this context",
+   * and the executor then runs its single step unguarded rather than guessing a
+   * budget of its own.
+   */
+  spendGuard?: SpendGuard;
   /** PGMQ queue name for the current job (set per-message by the worker). */
   queue: string;
   /** PGMQ message id for the current job (set per-message by the worker). */
