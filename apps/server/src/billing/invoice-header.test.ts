@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  INVOICE_ACCOUNT_ENV,
+  INVOICE_ADDRESS_ENV,
+  INVOICE_BANK_ENV,
   INVOICE_COMPANY_ENV,
+  INVOICE_PHONE_ENV,
   INVOICE_TAX_ID_ENV,
   PRODUCT_NAME,
   createInvoiceHeader,
@@ -84,5 +88,92 @@ describe("createInvoiceHeader / formatInvoiceHeader (BR-18)", () => {
     expect(header.ready).toBe(true);
     expect(header.taxId).toBeNull();
     expect(formatInvoiceHeader(header)?.split("\n")).toHaveLength(2);
+  });
+
+  it("四项专票信息齐全：complete=true、format 含四项与可开专票行", () => {
+    const header = createInvoiceHeader({
+      [INVOICE_COMPANY_ENV]: "某某开票主体",
+      [INVOICE_ADDRESS_ENV]: "示例地址B",
+      [INVOICE_PHONE_ENV]: "000-0000-0000",
+      [INVOICE_BANK_ENV]: "示例银行C",
+      [INVOICE_ACCOUNT_ENV]: "6222 0000 0000 0000",
+    });
+
+    expect(header.ready).toBe(true);
+    expect(header.complete).toBe(true);
+    expect(header.address).toBe("示例地址B");
+    expect(header.phone).toBe("000-0000-0000");
+    expect(header.bank).toBe("示例银行C");
+    expect(header.account).toBe("6222 0000 0000 0000");
+
+    const text = formatInvoiceHeader(header);
+    expect(text).not.toBeNull();
+    expect(text).toContain("某某开票主体");
+    expect(text).toContain("示例地址B");
+    expect(text).toContain("000-0000-0000");
+    expect(text).toContain("示例银行C");
+    expect(text).toContain("6222 0000 0000 0000");
+    expect(text).toContain("可开具专用发票");
+    // 产品 / 开票主体 / 地址 / 电话 / 开户行 / 银行账号 / 可开专票
+    expect(text?.split("\n")).toHaveLength(7);
+  });
+
+  it("只缺银行账号：complete=false、跳过账号行且不写占位", () => {
+    const header = createInvoiceHeader({
+      [INVOICE_COMPANY_ENV]: "某某开票主体",
+      [INVOICE_ADDRESS_ENV]: "示例地址B",
+      [INVOICE_PHONE_ENV]: "000-0000-0000",
+      [INVOICE_BANK_ENV]: "示例银行C",
+    });
+
+    expect(header.ready).toBe(true);
+    expect(header.account).toBeNull();
+    expect(header.complete).toBe(false);
+
+    const text = formatInvoiceHeader(header);
+    expect(text).not.toBeNull();
+    expect(text).toContain("示例地址B");
+    expect(text).toContain("000-0000-0000");
+    expect(text).toContain("示例银行C");
+    expect(text).not.toContain("银行账号");
+    expect(text).not.toContain("可开具专用发票");
+    expect(text).not.toContain("无");
+    expect(text).not.toContain("N/A");
+    expect(text).not.toContain("未配置");
+    expect(text).not.toContain("null");
+    // 产品 / 开票主体 / 地址 / 电话 / 开户行
+    expect(text?.split("\n")).toHaveLength(5);
+
+    for (const line of text === null ? [] : text.split("\n")) {
+      expect(line.trimEnd().endsWith("：")).toBe(false);
+    }
+  });
+
+  it("四项为空串（或纯空白）：按未配置处理、complete=false、不产生对应行", () => {
+    for (const blank of ["", "   ", "\t\n"]) {
+      const header = createInvoiceHeader({
+        [INVOICE_COMPANY_ENV]: "某某开票主体",
+        [INVOICE_ADDRESS_ENV]: blank,
+        [INVOICE_PHONE_ENV]: blank,
+        [INVOICE_BANK_ENV]: blank,
+        [INVOICE_ACCOUNT_ENV]: blank,
+      });
+
+      expect(header.ready).toBe(true);
+      expect(header.address).toBeNull();
+      expect(header.phone).toBeNull();
+      expect(header.bank).toBeNull();
+      expect(header.account).toBeNull();
+      expect(header.complete).toBe(false);
+
+      const text = formatInvoiceHeader(header);
+      expect(text).not.toBeNull();
+      expect(text).not.toContain("地址");
+      expect(text).not.toContain("电话");
+      expect(text).not.toContain("开户行");
+      expect(text).not.toContain("银行账号");
+      expect(text).not.toContain("可开具专用发票");
+      expect(text?.split("\n")).toHaveLength(2);
+    }
   });
 });
